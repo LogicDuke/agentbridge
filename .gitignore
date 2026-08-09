@@ -1,0 +1,17 @@
+node_modules/
+dist/
+coverage/
+
+*.db
+*.db-shm
+*.db-wal
+
+.env
+.env.*
+
+.agentbridge/
+artifacts/
+scratch/
+logs/
+
+.DS_Store
