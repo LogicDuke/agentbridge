@@ -1,0 +1,26 @@
+{
+  "name": "agentbridge",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Multi-Agent Development Orchestrator",
+  "type": "module",
+  "engines": {
+    "node": ">=24 <25",
+    "npm": ">=11"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "verify": "npm run typecheck && npm run lint && npm test && npm run build"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.32.0",
+    "@types/node": "24.2.1",
+    "eslint": "9.32.0",
+    "typescript": "5.9.2",
+    "typescript-eslint": "8.39.0",
+    "vitest": "3.2.4"
+  }
+}
