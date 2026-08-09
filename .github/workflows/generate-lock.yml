@@ -1,9 +1,9 @@
 name: Generate bootstrap lockfile
 
 on:
-  push:
+  pull_request:
     branches:
-      - pr-001/repository-bootstrap
+      - main
 
 permissions:
   contents: read
