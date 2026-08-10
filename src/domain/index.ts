@@ -77,6 +77,33 @@ export {
 } from './evidence.js';
 
 export {
+  INGESTION_OUTCOME,
+  INGESTION_OUTCOMES,
+  REQUIRED_CONTEXT_FIELDS,
+  REVIEW_BOUNDS,
+  REVIEW_CLASSIFICATION,
+  REVIEW_CLASSIFICATIONS,
+  REVIEW_FINDING_STATUS,
+  REVIEW_FINDING_STATUSES,
+  REVIEW_REJECTION,
+  REVIEW_SEVERITIES,
+  REVIEW_SEVERITY,
+  type IngestionOutcome,
+  type RejectedFinding,
+  type ReviewClassification,
+  type ReviewContext,
+  type ReviewFinding,
+  type ReviewFindingInput,
+  type ReviewFindingStatus,
+  type ReviewResult,
+  type ReviewRejection,
+  type ReviewSeverity,
+  type ReviewSubmission,
+} from './review.js';
+
+export { ingestReview } from './review-ingestion.js';
+
+export {
   currentEvidenceOfKind,
   evaluateEvidenceFreshness,
   evaluateEvidenceSet,
