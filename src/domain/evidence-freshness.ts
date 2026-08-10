@@ -25,13 +25,25 @@ import {
 } from './evidence.js';
 
 /**
+ * Intrinsics captured at module load, before any untrusted property access is
+ * possible. See the matching note in `evidence.ts`: a hostile getter or Proxy
+ * trap runs mid-evaluation and could otherwise repoint these.
+ *
+ * Array handling below additionally avoids `push`, `filter`, and spread, so no
+ * `Array.prototype` method is on the path at all. Bucket arrays are built with
+ * indexed assignment on arrays this module owns.
+ */
+const objectFreeze = Object.freeze;
+const arrayIsArray = Array.isArray;
+const numberIsInteger = Number.isInteger;
+
+/**
  * - `CURRENT`  — structurally valid, and repository + commit match the target.
  * - `STALE`    — well-formed and about this repository, but bound to a
  *                different commit than the supplied HEAD.
  * - `INVALID`  — malformed, missing provenance, or otherwise unable to take
  *                part in reconciliation for this target.
- */
-/**
+ *
  * Frozen at runtime, not merely `as const`.
  *
  * `as const` is a compile-time assertion only: a JS consumer, or a TS caller
@@ -39,7 +51,7 @@ import {
  * evaluator — which reads these properties when building its result — would
  * start reporting stale evidence as current. Freezing removes that lever.
  */
-export const FRESHNESS = Object.freeze({
+export const FRESHNESS = objectFreeze({
   CURRENT: 'CURRENT',
   STALE: 'STALE',
   INVALID: 'INVALID',
@@ -48,14 +60,14 @@ export const FRESHNESS = Object.freeze({
 export type FreshnessState = (typeof FRESHNESS)[keyof typeof FRESHNESS];
 
 /** Every member of the {@link FreshnessState} union. */
-export const FRESHNESS_STATES: readonly FreshnessState[] = Object.freeze([
+export const FRESHNESS_STATES: readonly FreshnessState[] = objectFreeze([
   FRESHNESS.CURRENT,
   FRESHNESS.STALE,
   FRESHNESS.INVALID,
 ]);
 
 /** Stable, machine-readable rationale for a freshness state. */
-export const FRESHNESS_REASON = Object.freeze({
+export const FRESHNESS_REASON = objectFreeze({
   /** Repository and commit both match the evaluation target. */
   BOUND_TO_CURRENT_HEAD: 'BOUND_TO_CURRENT_HEAD',
   /** About this repository, but bound to a different commit. */
@@ -71,7 +83,7 @@ export const FRESHNESS_REASON = Object.freeze({
 export type FreshnessReason = (typeof FRESHNESS_REASON)[keyof typeof FRESHNESS_REASON];
 
 /** Every member of the {@link FreshnessReason} union. */
-export const FRESHNESS_REASONS: readonly FreshnessReason[] = Object.freeze([
+export const FRESHNESS_REASONS: readonly FreshnessReason[] = objectFreeze([
   FRESHNESS_REASON.BOUND_TO_CURRENT_HEAD,
   FRESHNESS_REASON.COMMIT_SHA_MISMATCH,
   FRESHNESS_REASON.REPOSITORY_MISMATCH,
@@ -114,7 +126,42 @@ export interface EvidenceFreshness {
 }
 
 function freeze(result: EvidenceFreshness): EvidenceFreshness {
-  return Object.freeze({ ...result, invalidFields: Object.freeze(result.invalidFields) });
+  return objectFreeze({ ...result, invalidFields: objectFreeze(result.invalidFields) });
+}
+
+/** Append without `Array.prototype.push`, which an attacker may have poisoned. */
+function append<T>(list: T[], value: T): void {
+  list[list.length] = value;
+}
+
+/** Partition without `Array.prototype.filter`. */
+function bucketFor(
+  results: readonly EvidenceFreshness[],
+  state: FreshnessState,
+): readonly EvidenceFreshness[] {
+  const bucket: EvidenceFreshness[] = [];
+  for (let index = 0; index < results.length; index += 1) {
+    const result = results[index];
+    if (result !== undefined && result.state === state) {
+      append(bucket, result);
+    }
+  }
+  return objectFreeze(bucket);
+}
+
+/** Target field names that failed validation, without array spread. */
+function targetInvalidFields(
+  targetRepositoryId: string | null,
+  targetHeadSha: string | null,
+): readonly string[] {
+  const fields: string[] = [];
+  if (targetRepositoryId === null) {
+    append(fields, 'target.repositoryId');
+  }
+  if (targetHeadSha === null) {
+    append(fields, 'target.currentHeadSha');
+  }
+  return fields;
 }
 
 /** The result for a record that cannot be read at all. */
@@ -238,24 +285,35 @@ export function evaluateEvidenceFreshness(
       ...base,
       state: FRESHNESS.INVALID,
       reason: FRESHNESS_REASON.EVALUATION_TARGET_INVALID,
-      invalidFields: [
-        ...(targetRepositoryId === null ? ['target.repositoryId'] : []),
-        ...(targetHeadSha === null ? ['target.currentHeadSha'] : []),
-      ],
+      invalidFields: targetInvalidFields(targetRepositoryId, targetHeadSha),
     });
   }
 
   // Derived from the snapshot above, in REQUIRED_EVIDENCE_FIELDS order. The
-  // record is deliberately not re-read here.
-  const invalidFields = [
-    ...(evidenceId === null ? ['evidenceId'] : []),
-    ...(repositoryId === null ? ['repositoryId'] : []),
-    ...(commitSha === null ? ['commitSha'] : []),
-    ...(readIdentifier(rawReference) === null ? ['reference'] : []),
-    ...(readIdentifier(rawObservedAt) === null ? ['observedAt'] : []),
-    ...(kind === null ? ['kind'] : []),
-    ...(source === null ? ['source'] : []),
-  ];
+  // record is deliberately not re-read here. Built with indexed appends rather
+  // than array spread, so a poisoned array iterator cannot drop entries.
+  const invalidFields: string[] = [];
+  if (evidenceId === null) {
+    append(invalidFields, 'evidenceId');
+  }
+  if (repositoryId === null) {
+    append(invalidFields, 'repositoryId');
+  }
+  if (commitSha === null) {
+    append(invalidFields, 'commitSha');
+  }
+  if (readIdentifier(rawReference) === null) {
+    append(invalidFields, 'reference');
+  }
+  if (readIdentifier(rawObservedAt) === null) {
+    append(invalidFields, 'observedAt');
+  }
+  if (kind === null) {
+    append(invalidFields, 'kind');
+  }
+  if (source === null) {
+    append(invalidFields, 'source');
+  }
 
   if (invalidFields.length > 0) {
     return freeze({
@@ -334,7 +392,7 @@ export function evaluateEvidenceSet(
       rawTargetHeadSha = undefined;
     }
   }
-  const snapshotTarget: EvidenceTarget = Object.freeze({
+  const snapshotTarget: EvidenceTarget = objectFreeze({
     repositoryId: readIdentifier(rawTargetRepositoryId) ?? '',
     currentHeadSha: readIdentifier(rawTargetHeadSha) ?? '',
   });
@@ -347,38 +405,48 @@ export function evaluateEvidenceSet(
   // poisoned `Array.prototype.map`. A plain indexed loop touches none of those.
   // `length` on a real array is a non-configurable own data property, but a
   // Proxy wrapping an array also passes `Array.isArray`, so both the length and
-  // each element read are guarded. Input order is preserved.
+  // each element read are guarded. `Array.isArray` itself throws on a revoked
+  // Proxy, so even that call is guarded. Input order is preserved.
   const rawRecords: unknown = evidence;
   const results: EvidenceFreshness[] = [];
 
-  if (Array.isArray(rawRecords)) {
+  // `Array.isArray` itself throws on a revoked Proxy, so the check is guarded
+  // and the narrowed reference is kept for the reads below.
+  let elements: readonly unknown[] | null = null;
+  try {
+    elements = arrayIsArray(rawRecords) ? (rawRecords as readonly unknown[]) : null;
+  } catch {
+    elements = null;
+  }
+
+  if (elements !== null) {
     let rawLength: unknown;
     try {
-      rawLength = rawRecords.length;
+      rawLength = elements.length;
     } catch {
       rawLength = 0;
     }
     const length =
-      typeof rawLength === 'number' && Number.isInteger(rawLength) && rawLength >= 0
+      typeof rawLength === 'number' && numberIsInteger(rawLength) && rawLength >= 0
         ? rawLength
         : 0;
 
     for (let index = 0; index < length; index += 1) {
       let element: unknown;
       try {
-        element = rawRecords[index];
+        element = elements[index];
       } catch {
         element = undefined;
       }
-      results.push(evaluateEvidenceFreshness(element as EvidenceRecord, snapshotTarget));
+      append(results, evaluateEvidenceFreshness(element as EvidenceRecord, snapshotTarget));
     }
   }
 
-  return Object.freeze({
-    results: Object.freeze(results),
-    current: Object.freeze(results.filter((r) => r.state === FRESHNESS.CURRENT)),
-    stale: Object.freeze(results.filter((r) => r.state === FRESHNESS.STALE)),
-    invalid: Object.freeze(results.filter((r) => r.state === FRESHNESS.INVALID)),
+  return objectFreeze({
+    results: objectFreeze(results),
+    current: bucketFor(results, FRESHNESS.CURRENT),
+    stale: bucketFor(results, FRESHNESS.STALE),
+    invalid: bucketFor(results, FRESHNESS.INVALID),
   });
 }
 
@@ -387,5 +455,13 @@ export function currentEvidenceOfKind(
   evaluation: EvidenceSetEvaluation,
   kind: EvidenceKind,
 ): readonly EvidenceFreshness[] {
-  return Object.freeze(evaluation.current.filter((result) => result.kind === kind));
+  const matches: EvidenceFreshness[] = [];
+  const current = evaluation.current;
+  for (let index = 0; index < current.length; index += 1) {
+    const result = current[index];
+    if (result !== undefined && result.kind === kind) {
+      append(matches, result);
+    }
+  }
+  return objectFreeze(matches);
 }

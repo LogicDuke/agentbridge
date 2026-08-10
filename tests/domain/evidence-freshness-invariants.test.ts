@@ -760,6 +760,269 @@ describe('set iteration does not use the collection’s own map', () => {
   });
 });
 
+/**
+ * Regression cover for the shared root cause behind the intrinsic findings:
+ * untrusted evidence is read through getters and Proxy traps that run *during*
+ * evaluation, so they can repoint any built-in the evaluator relies on
+ * afterwards.
+ *
+ * Every poisoned global is restored in a `finally` so one test cannot
+ * contaminate another, and assertions run only after restoration.
+ */
+describe('poisoned intrinsics cannot alter evaluation', () => {
+  /** Run `body` while `owner[key]` is replaced, restoring it unconditionally. */
+  function withPoisoned<T>(
+    owner: object,
+    key: PropertyKey,
+    replacement: unknown,
+    body: () => T,
+  ): T {
+    const original = Object.getOwnPropertyDescriptor(owner, key);
+    Object.defineProperty(owner, key, {
+      value: replacement,
+      configurable: true,
+      writable: true,
+    });
+    try {
+      return body();
+    } finally {
+      if (original === undefined) {
+        Reflect.deleteProperty(owner, key);
+      } else {
+        Object.defineProperty(owner, key, original);
+      }
+    }
+  }
+
+  /** A record whose first-read property poisons an intrinsic mid-evaluation. */
+  function poisoningRecord(
+    poison: () => void,
+    rest: Record<string, unknown>,
+  ): ReturnType<typeof buildEvidence> {
+    return {
+      get evidenceId(): string {
+        poison();
+        return 'ev-attack';
+      },
+      repositoryId: REPO_A,
+      commitSha: HEAD_A,
+      kind: 'ci-result',
+      source: 'github',
+      reference: 'ref',
+      observedAt: 'ts',
+      ...rest,
+    } as unknown as ReturnType<typeof buildEvidence>;
+  }
+
+  it('rejects a bogus kind and source when Set.prototype.has is poisoned', () => {
+    const result = withPoisoned(Set.prototype, 'has', () => true, () =>
+      evaluateEvidenceFreshness(
+        poisoningRecord(
+          () => {
+            Object.defineProperty(Set.prototype, 'has', {
+              value: () => true,
+              configurable: true,
+              writable: true,
+            });
+          },
+          { kind: 'TOTALLY-BOGUS', source: 'evil' },
+        ),
+        buildTarget(),
+      ),
+    );
+
+    expect(result.state).not.toBe('CURRENT');
+    expect(result.state).toBe('INVALID');
+    expect(result.kind).toBeNull();
+    expect(result.source).toBeNull();
+  });
+
+  it('rejects blank identifiers when String.prototype.trim is poisoned', () => {
+    const result = withPoisoned(String.prototype, 'trim', () => 'x', () =>
+      evaluateEvidenceFreshness(
+        poisoningRecord(
+          () => {
+            Object.defineProperty(String.prototype, 'trim', {
+              value: () => 'x',
+              configurable: true,
+              writable: true,
+            });
+          },
+          { reference: '   ', observedAt: '   ' },
+        ),
+        buildTarget(),
+      ),
+    );
+
+    expect(result.state).not.toBe('CURRENT');
+    expect(result.state).toBe('INVALID');
+    expect([...result.invalidFields].sort()).toEqual(['observedAt', 'reference'].sort());
+  });
+
+  it('still freezes results when Object.freeze is poisoned', () => {
+    const result = withPoisoned(Object, 'freeze', (value: unknown) => value, () =>
+      evaluateEvidenceFreshness(
+        buildEvidence({ commitSha: HEAD_A }),
+        buildTarget({ currentHeadSha: HEAD_B }),
+      ),
+    );
+
+    expect(Object.isFrozen(result)).toBe(true);
+    expect(Object.isFrozen(result.invalidFields)).toBe(true);
+
+    const mutable = result as { state: FreshnessState };
+    expect(() => {
+      mutable.state = 'CURRENT';
+    }).toThrow(TypeError);
+    expect(result.state).toBe('STALE');
+  });
+
+  it('builds invalidFields when Array.prototype[Symbol.iterator] is poisoned', () => {
+    const result = withPoisoned(
+      Array.prototype,
+      Symbol.iterator,
+      function poisoned(): never {
+        throw new Error('poisoned iterator');
+      },
+      () => evaluateEvidenceFreshness(buildEvidence({ commitSha: '' }), buildTarget()),
+    );
+
+    expect(result.state).toBe('INVALID');
+    expect(result.invalidFields.length).toBe(1);
+    expect(result.invalidFields[0]).toBe('commitSha');
+  });
+
+  it('partitions a set when Array.prototype.filter is poisoned', () => {
+    const evaluation = withPoisoned(
+      Array.prototype,
+      'filter',
+      function poisoned(): never {
+        throw new Error('poisoned filter');
+      },
+      () =>
+        evaluateEvidenceSet(
+          [
+            buildEvidence({ evidenceId: 'ev-current', commitSha: HEAD_A }),
+            buildEvidence({ evidenceId: 'ev-stale', commitSha: HEAD_B }),
+          ],
+          buildTarget(),
+        ),
+    );
+
+    expect(evaluation.results.length).toBe(2);
+    expect(evaluation.current.length).toBe(1);
+    expect(evaluation.current[0]?.evidenceId).toBe('ev-current');
+    expect(evaluation.stale[0]?.evidenceId).toBe('ev-stale');
+  });
+
+  it('collects results when Array.prototype.push is poisoned', () => {
+    const evaluation = withPoisoned(
+      Array.prototype,
+      'push',
+      function poisoned(): never {
+        throw new Error('poisoned push');
+      },
+      () =>
+        evaluateEvidenceSet(
+          [
+            buildEvidence({ evidenceId: 'ev-a', commitSha: HEAD_A }),
+            buildEvidence({ evidenceId: 'ev-b', commitSha: HEAD_B }),
+            buildEvidence({ evidenceId: 'ev-c', commitSha: HEAD_A }),
+          ],
+          buildTarget(),
+        ),
+    );
+
+    expect(evaluation.results.length).toBe(3);
+    expect(evaluation.current.length).toBe(2);
+    expect(evaluation.stale.length).toBe(1);
+  });
+
+  it('keeps a stale record stale when every array intrinsic is poisoned at once', () => {
+    const evaluation = withPoisoned(Array.prototype, 'push', null, () =>
+      withPoisoned(Array.prototype, 'filter', null, () =>
+        withPoisoned(Array.prototype, 'map', null, () =>
+          evaluateEvidenceSet(
+            [
+              buildEvidence({ evidenceId: 'ev-stale', commitSha: HEAD_A }),
+              buildEvidence({ evidenceId: 'ev-current', commitSha: HEAD_B }),
+            ],
+            buildTarget({ currentHeadSha: HEAD_B }),
+          ),
+        ),
+      ),
+    );
+
+    expect(evaluation.results.length).toBe(2);
+    expect(evaluation.current[0]?.evidenceId).toBe('ev-current');
+    expect(evaluation.stale[0]?.evidenceId).toBe('ev-stale');
+  });
+
+  it('does not let a poisoned intrinsic promote cross-repository evidence', () => {
+    const result = withPoisoned(Set.prototype, 'has', () => true, () =>
+      withPoisoned(String.prototype, 'trim', () => 'x', () =>
+        evaluateEvidenceFreshness(
+          buildEvidence({ repositoryId: REPO_B, commitSha: HEAD_A }),
+          buildTarget({ repositoryId: REPO_A, currentHeadSha: HEAD_A }),
+        ),
+      ),
+    );
+
+    expect(result.state).not.toBe('CURRENT');
+    expect(result.state).toBe('INVALID');
+  });
+});
+
+/** Regression cover for revoked Proxy inputs. */
+describe('revoked proxies fail closed', () => {
+  it('treats a revoked proxy collection as empty without throwing', () => {
+    const revocable = Proxy.revocable([buildEvidence()], {});
+    revocable.revoke();
+    const collection = revocable.proxy as unknown as ReturnType<typeof buildEvidence>[];
+
+    expect(() => evaluateEvidenceSet(collection, buildTarget())).not.toThrow();
+
+    const evaluation = evaluateEvidenceSet(collection, buildTarget());
+    expect(evaluation.results).toEqual([]);
+    expect(evaluation.current).toEqual([]);
+  });
+
+  it('treats a revoked proxy record as INVALID without throwing', () => {
+    const revocable = Proxy.revocable(buildEvidence(), {});
+    revocable.revoke();
+    const record = revocable.proxy;
+
+    expect(() => evaluateEvidenceFreshness(record, buildTarget())).not.toThrow();
+    expect(evaluateEvidenceFreshness(record, buildTarget()).state).toBe('INVALID');
+  });
+
+  it('treats a revoked proxy target as INVALID without throwing', () => {
+    const revocable = Proxy.revocable(buildTarget(), {});
+    revocable.revoke();
+    const target = revocable.proxy;
+
+    expect(() => evaluateEvidenceFreshness(buildEvidence(), target)).not.toThrow();
+    expect(evaluateEvidenceFreshness(buildEvidence(), target).state).toBe('INVALID');
+  });
+
+  it('keeps evaluating a set that contains a revoked proxy element', () => {
+    const revocable = Proxy.revocable(buildEvidence(), {});
+    revocable.revoke();
+    const records = [
+      buildEvidence({ evidenceId: 'ev-ok', commitSha: HEAD_A }),
+      revocable.proxy,
+      buildEvidence({ evidenceId: 'ev-stale', commitSha: HEAD_B }),
+    ];
+
+    expect(() => evaluateEvidenceSet(records, buildTarget())).not.toThrow();
+
+    const evaluation = evaluateEvidenceSet(records, buildTarget());
+    expect(evaluation.results.length).toBe(3);
+    expect(evaluation.current[0]?.evidenceId).toBe('ev-ok');
+    expect(evaluation.invalid.length).toBe(1);
+  });
+});
+
 describe('the kernel answers freshness, not authority', () => {
   it('reaches the same freshness regardless of how favourable the evidence claims to be', () => {
     const favourable = buildEvidence({
