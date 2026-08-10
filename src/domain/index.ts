@@ -62,3 +62,31 @@ export {
   type GateOutcome,
   type GateReason,
 } from './policy-gate.js';
+
+export {
+  EVIDENCE_KIND,
+  EVIDENCE_KINDS,
+  EVIDENCE_SOURCE,
+  EVIDENCE_SOURCES,
+  isEvidenceKind,
+  isEvidenceSource,
+  REQUIRED_EVIDENCE_FIELDS,
+  type EvidenceKind,
+  type EvidenceRecord,
+  type EvidenceSource,
+} from './evidence.js';
+
+export {
+  currentEvidenceOfKind,
+  evaluateEvidenceFreshness,
+  evaluateEvidenceSet,
+  FRESHNESS,
+  FRESHNESS_REASON,
+  FRESHNESS_REASONS,
+  FRESHNESS_STATES,
+  type EvidenceFreshness,
+  type EvidenceSetEvaluation,
+  type EvidenceTarget,
+  type FreshnessReason,
+  type FreshnessState,
+} from './evidence-freshness.js';

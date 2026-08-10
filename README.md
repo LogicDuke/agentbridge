@@ -20,6 +20,8 @@ PR 002 adds the domain and action kernel: pure TypeScript models for requested o
 
 PR 003 adds the action request envelope and policy gate: a structured, untrusted request from an agent is evaluated into a `GateDecision` that answers exactly one question — may AgentBridge execute this without human approval? Agents request actions; they do not authorize them. Agent identity, provider, rationale, and metadata cannot increase authority, and human approval is a separate trust boundary. The gate evaluates only and executes nothing. See `docs/architecture/003-action-request-gate.md`.
 
+PR 004 adds the commit-bound evidence and freshness kernel: evidence records are bound to a repository and a commit SHA, and are evaluated against a caller-supplied HEAD into `CURRENT`, `STALE`, or `INVALID`. Evidence whose SHA differs from HEAD is never current, so a new commit automatically stales prior evidence. Evidence is data, never authority, and the kernel performs no I/O. See `docs/architecture/004-evidence-freshness-kernel.md`.
+
 ## Runtime
 
 - Node.js 24 LTS
