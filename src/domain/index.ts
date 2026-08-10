@@ -37,3 +37,28 @@ export {
   type ActionClassification,
   type ActionPolicyEntry,
 } from './classification.js';
+
+export {
+  findInvalidRequestFields,
+  REQUIRED_REQUEST_FIELDS,
+  type ActionRequest,
+  type RequiredRequestField,
+} from './action-request.js';
+
+export {
+  APPROVAL_STATE,
+  APPROVAL_STATES,
+  type ApprovalRecord,
+  type ApprovalState,
+} from './approval.js';
+
+export {
+  evaluateActionRequest,
+  GATE_OUTCOME,
+  GATE_OUTCOMES,
+  GATE_REASON,
+  GATE_REASONS,
+  type GateDecision,
+  type GateOutcome,
+  type GateReason,
+} from './policy-gate.js';
