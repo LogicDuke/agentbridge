@@ -24,6 +24,8 @@ PR 004 adds the commit-bound evidence and freshness kernel: evidence records are
 
 PR 005 adds review ingestion: untrusted reviewer output is normalized into commit-bound review findings. Trusted caller-supplied context is the only source of repository, pull request, commit SHA, provider, and reviewer identity — reviewer content can never set a binding field, and a review of one commit stays bound to that commit. Ingestion is provider-neutral, decides neither freshness nor authority, and performs no I/O. See `docs/architecture/005-review-ingestion.md`.
 
+PR 006 adds the provider-neutral agent invocation boundary: a commit-bound record of what AgentBridge asked which agent to do, and normalization of what that agent reported back. An agent's report is an untrusted **claim** — PR 006 records that an artifact was claimed, never that it exists remotely, is integrated, is validated, or is authorized. Provider identity is inert: it never implies a role or grants authority, and roles remain configurable. The layer invokes nothing, models no lifecycle transitions, and performs no I/O. See `docs/architecture/006-agent-invocation-boundary.md`.
+
 ## Runtime
 
 - Node.js 24 LTS

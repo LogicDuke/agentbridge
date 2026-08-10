@@ -104,6 +104,41 @@ export {
 export { ingestReview } from './review-ingestion.js';
 
 export {
+  AGENT_REPORT_STATUS,
+  AGENT_REPORT_STATUSES,
+  ARTIFACT_TYPE,
+  ARTIFACT_TYPES,
+  CLAIM_REJECTION,
+  findInvalidInvocationFields,
+  INVOCATION_BOUNDS,
+  INVOCATION_FIELD_ORDER,
+  INVOCATION_PURPOSE,
+  INVOCATION_PURPOSES,
+  isArtifactType,
+  isInvocationPurpose,
+  readArtifactType,
+  readReportStatus,
+  REPORT_OUTCOME,
+  REPORT_OUTCOMES,
+  REQUIRED_INVOCATION_FIELDS,
+  type AgentInvocation,
+  type AgentReport,
+  type AgentReportStatus,
+  type ArtifactType,
+  type ClaimedArtifactInput,
+  type ClaimRejection,
+  type InvocationPurpose,
+  type ReportOutcome,
+} from './agent-invocation.js';
+
+export {
+  ingestInvocationReport,
+  type ClaimedArtifact,
+  type InvocationReportResult,
+  type RejectedClaim,
+} from './agent-invocation-report.js';
+
+export {
   currentEvidenceOfKind,
   evaluateEvidenceFreshness,
   evaluateEvidenceSet,
