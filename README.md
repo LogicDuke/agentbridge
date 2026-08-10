@@ -14,7 +14,9 @@ Unknown or unclassified actions must fail closed and escalate.
 
 ## Development status
 
-This repository is in early bootstrap. PR 001 contains only development scaffolding, documentation, CI, and reproducible build/test tooling. Security kernel implementation begins only after PR 001 is reviewed and merged.
+This repository is in early bootstrap. PR 001 contains only development scaffolding, documentation, CI, and reproducible build/test tooling.
+
+PR 002 adds the domain and action kernel: pure TypeScript models for requested operations and a deterministic classifier that maps them to `ALLOW`, `ESCALATE`, or `DENY`. It classifies only and executes nothing. Unknown actions never resolve to `ALLOW`. See `docs/architecture/002-domain-action-kernel.md`.
 
 ## Runtime
 
