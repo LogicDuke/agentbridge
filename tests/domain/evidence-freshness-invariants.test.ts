@@ -6,6 +6,9 @@ import {
   evaluateEvidenceFreshness,
   evaluateEvidenceSet,
   FRESHNESS,
+  FRESHNESS_REASON,
+  FRESHNESS_REASONS,
+  FRESHNESS_STATES,
   type FreshnessState,
 } from '../../src/domain/index.js';
 import {
@@ -303,6 +306,233 @@ describe('results are immutable', () => {
     expect(staleResult).toBeDefined();
     expect(() => mutableBucket.push(staleResult)).toThrow(TypeError);
     expect(evaluation.current).toEqual([]);
+  });
+});
+
+/**
+ * Regression cover for the exported vocabulary being mutable at runtime.
+ *
+ * `as const` is compile-time only. Expected states here are bare literals, not
+ * `FRESHNESS.*`, because the vocabulary object is exactly what is under test.
+ */
+describe('the exported freshness vocabulary is frozen', () => {
+  it('cannot be mutated to make a stale SHA report CURRENT', () => {
+    expect(Object.isFrozen(FRESHNESS)).toBe(true);
+
+    const mutable = FRESHNESS as unknown as Record<string, string>;
+    expect(() => {
+      mutable['STALE'] = 'CURRENT';
+    }).toThrow(TypeError);
+
+    const result = evaluateEvidenceFreshness(
+      buildEvidence({ commitSha: HEAD_A }),
+      buildTarget({ currentHeadSha: HEAD_B }),
+    );
+
+    expect(result.state).toBe('STALE');
+    expect(result.state).not.toBe('CURRENT');
+  });
+
+  it('cannot have CURRENT redefined', () => {
+    const mutable = FRESHNESS as unknown as Record<string, string>;
+
+    expect(() => {
+      mutable['CURRENT'] = 'STALE';
+    }).toThrow(TypeError);
+    expect(FRESHNESS.CURRENT).toBe('CURRENT');
+  });
+
+  it('freezes the reason vocabulary and both listing arrays', () => {
+    expect(Object.isFrozen(FRESHNESS_REASON)).toBe(true);
+    expect(Object.isFrozen(FRESHNESS_STATES)).toBe(true);
+    expect(Object.isFrozen(FRESHNESS_REASONS)).toBe(true);
+  });
+});
+
+/**
+ * Regression cover for time-of-check/time-of-use on an untrusted record.
+ * A getter or Proxy may return a different value on each read.
+ */
+describe('untrusted evidence is snapshotted exactly once', () => {
+  it('reads every freshness-relevant property exactly once', () => {
+    const reads: Record<string, number> = {};
+    const backing = buildEvidence() as unknown as Record<string, unknown>;
+    const counted = new Proxy(backing, {
+      get(t, p) {
+        const key = String(p);
+        reads[key] = (reads[key] ?? 0) + 1;
+        return t[key];
+      },
+    }) as unknown as ReturnType<typeof buildEvidence>;
+
+    evaluateEvidenceFreshness(counted, buildTarget());
+
+    for (const field of [
+      'evidenceId',
+      'repositoryId',
+      'commitSha',
+      'reference',
+      'observedAt',
+      'kind',
+      'source',
+    ]) {
+      expect(reads[field], field).toBe(1);
+    }
+  });
+
+  it('compares the same commitSha it reports, when the value flips between reads', () => {
+    let reads = 0;
+    const flipping = {
+      ...buildEvidence(),
+      get commitSha(): string {
+        reads += 1;
+        return reads === 1 ? HEAD_B : HEAD_A;
+      },
+    } as ReturnType<typeof buildEvidence>;
+
+    const result = evaluateEvidenceFreshness(flipping, buildTarget({ currentHeadSha: HEAD_B }));
+
+    expect(reads).toBe(1);
+    // The reported SHA is the one that was compared — no second value slipped in.
+    expect(result.state === 'CURRENT').toBe(result.commitSha === result.targetHeadSha);
+  });
+
+  it('never reports CURRENT when the reported repositoryId differs from the target', () => {
+    let reads = 0;
+    const flipping = {
+      ...buildEvidence(),
+      get repositoryId(): string {
+        reads += 1;
+        return reads === 1 ? REPO_B : REPO_A;
+      },
+    } as ReturnType<typeof buildEvidence>;
+
+    const result = evaluateEvidenceFreshness(flipping, buildTarget({ repositoryId: REPO_A }));
+
+    expect(result.state).not.toBe('CURRENT');
+    expect(result.repositoryId).toBe(REPO_B);
+  });
+
+  it('does not throw on a Proxy that flips every property', () => {
+    let reads = 0;
+    const hostile = new Proxy(buildEvidence() as unknown as Record<string, unknown>, {
+      get(t, p) {
+        reads += 1;
+        return reads % 2 === 0 ? undefined : t[String(p)];
+      },
+    }) as unknown as ReturnType<typeof buildEvidence>;
+
+    expect(() => evaluateEvidenceFreshness(hostile, buildTarget())).not.toThrow();
+  });
+
+  it('keeps a stale record stale even when its SHA later claims to be HEAD', () => {
+    let reads = 0;
+    const flipping = {
+      ...buildEvidence(),
+      get commitSha(): string {
+        reads += 1;
+        return reads === 1 ? HEAD_A : HEAD_B;
+      },
+    } as ReturnType<typeof buildEvidence>;
+
+    const result = evaluateEvidenceFreshness(flipping, buildTarget({ currentHeadSha: HEAD_B }));
+
+    expect(result.state).toBe('STALE');
+    expect(result.commitSha).toBe(HEAD_A);
+  });
+});
+
+/** Regression cover for dereferencing a non-object record. */
+describe('non-object evidence fails closed', () => {
+  const NON_OBJECTS: readonly (readonly [string, unknown])[] = [
+    ['null', null],
+    ['undefined', undefined],
+    ['a string', 'evidence'],
+    ['a number', 42],
+    ['a zero', 0],
+    ['a boolean', true],
+    ['a function', (): string => HEAD_A],
+    ['a symbol', Symbol('evidence')],
+    ['a bigint', 10n],
+  ];
+
+  for (const [label, value] of NON_OBJECTS) {
+    it(`returns INVALID without throwing when evidence is ${label}`, () => {
+      const evidence = value as ReturnType<typeof buildEvidence>;
+
+      expect(() => evaluateEvidenceFreshness(evidence, buildTarget())).not.toThrow();
+
+      const result = evaluateEvidenceFreshness(evidence, buildTarget());
+      expect(result.state).toBe('INVALID');
+      expect(result.state).not.toBe('CURRENT');
+      expect(result.invalidFields).toContain('evidence');
+      expect(result.commitSha).toBeNull();
+    });
+  }
+
+  it('evaluates the rest of a set when one element is null or undefined', () => {
+    const records = [
+      buildEvidence({ evidenceId: 'ev-ok', commitSha: HEAD_A }),
+      null,
+      buildEvidence({ evidenceId: 'ev-stale', commitSha: HEAD_B }),
+      undefined,
+      { ...buildEvidence({ evidenceId: 'ev-bad' }), commitSha: 42 },
+    ] as ReturnType<typeof buildEvidence>[];
+
+    expect(() => evaluateEvidenceSet(records, buildTarget())).not.toThrow();
+
+    const evaluation = evaluateEvidenceSet(records, buildTarget());
+    expect(evaluation.results.length).toBe(5);
+    expect(evaluation.current.map((r) => r.evidenceId)).toEqual(['ev-ok']);
+    expect(evaluation.stale.map((r) => r.evidenceId)).toEqual(['ev-stale']);
+    expect(evaluation.invalid.length).toBe(3);
+  });
+
+  for (const [label, value] of NON_OBJECTS) {
+    it(`returns INVALID without throwing when the target is ${label}`, () => {
+      const target = value as ReturnType<typeof buildTarget>;
+
+      expect(() => evaluateEvidenceFreshness(buildEvidence(), target)).not.toThrow();
+
+      const result = evaluateEvidenceFreshness(buildEvidence(), target);
+      expect(result.state).toBe('INVALID');
+      expect(result.state).not.toBe('CURRENT');
+      expect(result.reason).toBe(FRESHNESS_REASON.EVALUATION_TARGET_INVALID);
+      expect(result.targetRepositoryId).toBeNull();
+      expect(result.targetHeadSha).toBeNull();
+    });
+  }
+
+  for (const [label, value] of NON_OBJECTS) {
+    it(`evaluates an empty set without throwing when the collection is ${label}`, () => {
+      const records = value as ReturnType<typeof buildEvidence>[];
+
+      expect(() => evaluateEvidenceSet(records, buildTarget())).not.toThrow();
+
+      const evaluation = evaluateEvidenceSet(records, buildTarget());
+      expect(evaluation.results).toEqual([]);
+      expect(evaluation.current).toEqual([]);
+      expect(evaluation.stale).toEqual([]);
+      expect(evaluation.invalid).toEqual([]);
+    });
+  }
+
+  it('keeps a mixed set deterministic and never promotes a bad record', () => {
+    const records = [
+      null,
+      buildEvidence({ commitSha: HEAD_B }),
+      undefined,
+      buildEvidence({ commitSha: HEAD_A }),
+    ] as ReturnType<typeof buildEvidence>[];
+
+    const first = evaluateEvidenceSet(records, buildTarget());
+    const second = evaluateEvidenceSet(records, buildTarget());
+
+    expect(second).toEqual(first);
+    expect(first.current.length).toBe(1);
+    for (const result of first.current) {
+      expect(result.commitSha).toBe(HEAD_A);
+    }
   });
 });
 

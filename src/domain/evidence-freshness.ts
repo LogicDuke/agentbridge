@@ -22,7 +22,6 @@ import {
   isEvidenceKind,
   isEvidenceSource,
   readIdentifier,
-  REQUIRED_EVIDENCE_FIELDS,
 } from './evidence.js';
 
 /**
@@ -32,23 +31,31 @@ import {
  * - `INVALID`  — malformed, missing provenance, or otherwise unable to take
  *                part in reconciliation for this target.
  */
-export const FRESHNESS = {
+/**
+ * Frozen at runtime, not merely `as const`.
+ *
+ * `as const` is a compile-time assertion only: a JS consumer, or a TS caller
+ * using a cast, could otherwise assign `FRESHNESS.STALE = 'CURRENT'` and the
+ * evaluator — which reads these properties when building its result — would
+ * start reporting stale evidence as current. Freezing removes that lever.
+ */
+export const FRESHNESS = Object.freeze({
   CURRENT: 'CURRENT',
   STALE: 'STALE',
   INVALID: 'INVALID',
-} as const;
+} as const);
 
 export type FreshnessState = (typeof FRESHNESS)[keyof typeof FRESHNESS];
 
 /** Every member of the {@link FreshnessState} union. */
-export const FRESHNESS_STATES: readonly FreshnessState[] = [
+export const FRESHNESS_STATES: readonly FreshnessState[] = Object.freeze([
   FRESHNESS.CURRENT,
   FRESHNESS.STALE,
   FRESHNESS.INVALID,
-];
+]);
 
 /** Stable, machine-readable rationale for a freshness state. */
-export const FRESHNESS_REASON = {
+export const FRESHNESS_REASON = Object.freeze({
   /** Repository and commit both match the evaluation target. */
   BOUND_TO_CURRENT_HEAD: 'BOUND_TO_CURRENT_HEAD',
   /** About this repository, but bound to a different commit. */
@@ -59,18 +66,18 @@ export const FRESHNESS_REASON = {
   EVIDENCE_MALFORMED: 'EVIDENCE_MALFORMED',
   /** The caller-supplied evaluation target is itself unusable. */
   EVALUATION_TARGET_INVALID: 'EVALUATION_TARGET_INVALID',
-} as const;
+} as const);
 
 export type FreshnessReason = (typeof FRESHNESS_REASON)[keyof typeof FRESHNESS_REASON];
 
 /** Every member of the {@link FreshnessReason} union. */
-export const FRESHNESS_REASONS: readonly FreshnessReason[] = [
+export const FRESHNESS_REASONS: readonly FreshnessReason[] = Object.freeze([
   FRESHNESS_REASON.BOUND_TO_CURRENT_HEAD,
   FRESHNESS_REASON.COMMIT_SHA_MISMATCH,
   FRESHNESS_REASON.REPOSITORY_MISMATCH,
   FRESHNESS_REASON.EVIDENCE_MALFORMED,
   FRESHNESS_REASON.EVALUATION_TARGET_INVALID,
-];
+]);
 
 /**
  * The repository state evidence is evaluated against.
@@ -137,14 +144,50 @@ export function evaluateEvidenceFreshness(
   evidence: EvidenceRecord,
   target: EvidenceTarget,
 ): EvidenceFreshness {
-  const targetRepositoryId = readIdentifier(target.repositoryId);
-  const targetHeadSha = readIdentifier(target.currentHeadSha);
+  // The target is trusted but still dereferenced, so a non-object value must
+  // fail closed rather than throw. Both identifiers then read as `null`, which
+  // the target check below turns into EVALUATION_TARGET_INVALID.
+  const targetRecord: unknown = target;
+  const targetIsObject = typeof targetRecord === 'object' && targetRecord !== null;
+  const targetRepositoryId = targetIsObject ? readIdentifier(target.repositoryId) : null;
+  const targetHeadSha = targetIsObject ? readIdentifier(target.currentHeadSha) : null;
 
-  const evidenceId = readIdentifier(evidence.evidenceId);
-  const repositoryId = readIdentifier(evidence.repositoryId);
-  const commitSha = readIdentifier(evidence.commitSha);
-  const kind = isEvidenceKind(evidence.kind) ? evidence.kind : null;
-  const source = isEvidenceSource(evidence.source) ? evidence.source : null;
+  // Reject a non-object record before dereferencing it, so `null`, `undefined`,
+  // and primitives fail closed instead of throwing.
+  const record: unknown = evidence;
+  if (typeof record !== 'object' || record === null) {
+    return freeze({
+      evidenceId: null,
+      repositoryId: null,
+      commitSha: null,
+      kind: null,
+      source: null,
+      targetRepositoryId,
+      targetHeadSha,
+      state: FRESHNESS.INVALID,
+      reason: FRESHNESS_REASON.EVIDENCE_MALFORMED,
+      invalidFields: ['evidence'],
+    });
+  }
+
+  // Snapshot every freshness-relevant property exactly once. A getter or Proxy
+  // can return a different value on each read, so validating one read and
+  // comparing another would let a record pass validation with one SHA and be
+  // matched against HEAD with a different one. Everything below reads only
+  // these locals; the record is never touched again.
+  const rawEvidenceId: unknown = evidence.evidenceId;
+  const rawRepositoryId: unknown = evidence.repositoryId;
+  const rawCommitSha: unknown = evidence.commitSha;
+  const rawReference: unknown = evidence.reference;
+  const rawObservedAt: unknown = evidence.observedAt;
+  const rawKind: unknown = evidence.kind;
+  const rawSource: unknown = evidence.source;
+
+  const evidenceId = readIdentifier(rawEvidenceId);
+  const repositoryId = readIdentifier(rawRepositoryId);
+  const commitSha = readIdentifier(rawCommitSha);
+  const kind = isEvidenceKind(rawKind) ? rawKind : null;
+  const source = isEvidenceSource(rawSource) ? rawSource : null;
 
   const base = {
     evidenceId,
@@ -168,8 +211,14 @@ export function evaluateEvidenceFreshness(
     });
   }
 
+  // Derived from the snapshot above, in REQUIRED_EVIDENCE_FIELDS order. The
+  // record is deliberately not re-read here.
   const invalidFields = [
-    ...REQUIRED_EVIDENCE_FIELDS.filter((field) => readIdentifier(evidence[field]) === null),
+    ...(evidenceId === null ? ['evidenceId'] : []),
+    ...(repositoryId === null ? ['repositoryId'] : []),
+    ...(commitSha === null ? ['commitSha'] : []),
+    ...(readIdentifier(rawReference) === null ? ['reference'] : []),
+    ...(readIdentifier(rawObservedAt) === null ? ['observedAt'] : []),
     ...(kind === null ? ['kind'] : []),
     ...(source === null ? ['source'] : []),
   ];
@@ -234,7 +283,13 @@ export function evaluateEvidenceSet(
   evidence: readonly EvidenceRecord[],
   target: EvidenceTarget,
 ): EvidenceSetEvaluation {
-  const results = evidence.map((record) => evaluateEvidenceFreshness(record, target));
+  // A non-array collection fails closed to an empty evaluation rather than
+  // throwing, matching the totality guarantee of the single-record evaluator.
+  const rawRecords: unknown = evidence;
+  const records: readonly EvidenceRecord[] = Array.isArray(rawRecords)
+    ? (rawRecords as readonly EvidenceRecord[])
+    : [];
+  const results = records.map((record) => evaluateEvidenceFreshness(record, target));
 
   return Object.freeze({
     results: Object.freeze(results),
