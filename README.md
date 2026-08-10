@@ -18,6 +18,8 @@ This repository is in early bootstrap. PR 001 contains only development scaffold
 
 PR 002 adds the domain and action kernel: pure TypeScript models for requested operations and a deterministic classifier that maps them to a policy decision. It classifies only and executes nothing. V1 defaults allow a fixed read-only allowlist and escalate everything else to human review; unrecognized actions fail closed and never resolve to `ALLOW`. See `docs/architecture/002-domain-action-kernel.md`.
 
+PR 003 adds the action request envelope and policy gate: a structured, untrusted request from an agent is evaluated into a `GateDecision` that answers exactly one question — may AgentBridge execute this without human approval? Agents request actions; they do not authorize them. Agent identity, provider, rationale, and metadata cannot increase authority, and human approval is a separate trust boundary. The gate evaluates only and executes nothing. See `docs/architecture/003-action-request-gate.md`.
+
 ## Runtime
 
 - Node.js 24 LTS
