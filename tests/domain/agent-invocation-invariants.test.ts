@@ -451,13 +451,8 @@ describe('hostile runtime input is total', () => {
       ).not.toThrow();
 
       const result = ingestInvocationReport(invocation, buildReport([buildClaim()]));
-      if (field === 'pullRequestId') {
-        // An unreadable optional field reads as absent, not as a forged binding.
-        expect(result.pullRequestId).toBeNull();
-      } else {
-        expect(result.outcome).toBe('INVOCATION_INVALID');
-        expect(result.invalidInvocationFields).toContain(field);
-      }
+      expect(result.outcome).toBe('INVOCATION_INVALID');
+      expect(result.invalidInvocationFields).toContain(field);
     });
   }
 

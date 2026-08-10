@@ -431,8 +431,19 @@ export function findInvalidInvocationFields(
   if (readExactIdentifier(readOwnProperty(record, 'repositoryId')) === null) {
     append(invalid, 'repositoryId');
   }
-  const rawPullRequestId = readOwnProperty(record, 'pullRequestId');
-  if (rawPullRequestId !== undefined && readExactIdentifier(rawPullRequestId) === null) {
+  let rawPullRequestId: unknown;
+  let pullRequestIdReadFailed = false;
+  try {
+    if (objectHasOwn(record, 'pullRequestId')) {
+      rawPullRequestId = (record as Record<string, unknown>).pullRequestId;
+    }
+  } catch {
+    pullRequestIdReadFailed = true;
+  }
+  if (
+    pullRequestIdReadFailed ||
+    (rawPullRequestId !== undefined && readExactIdentifier(rawPullRequestId) === null)
+  ) {
     append(invalid, 'pullRequestId');
   }
   if (readExactIdentifier(readOwnProperty(record, 'targetCommitSha')) === null) {

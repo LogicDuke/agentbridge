@@ -66,6 +66,7 @@ import {
  */
 const objectFreeze = Object.freeze;
 const objectDefineProperty = Object.defineProperty;
+const objectHasOwn = Object.hasOwn;
 const arrayIsArray = Array.isArray;
 const numberIsInteger = Number.isInteger;
 const stringConstructor = String;
@@ -224,7 +225,15 @@ function normalizeInvocation(invocation: AgentInvocation): {
 
   const invocationId = readExactIdentifier(readOwnProperty(record, 'invocationId'));
   const repositoryId = readExactIdentifier(readOwnProperty(record, 'repositoryId'));
-  const rawPullRequestId = readOwnProperty(record, 'pullRequestId');
+  let rawPullRequestId: unknown;
+  let pullRequestIdReadFailed = false;
+  try {
+    if (objectHasOwn(record, 'pullRequestId')) {
+      rawPullRequestId = (record as Record<string, unknown>).pullRequestId;
+    }
+  } catch {
+    pullRequestIdReadFailed = true;
+  }
   const pullRequestId =
     rawPullRequestId === undefined ? null : readExactIdentifier(rawPullRequestId);
   const targetCommitSha = readExactIdentifier(readOwnProperty(record, 'targetCommitSha'));
@@ -243,7 +252,10 @@ function normalizeInvocation(invocation: AgentInvocation): {
   if (repositoryId === null) {
     append(invalidFields, 'repositoryId');
   }
-  if (rawPullRequestId !== undefined && pullRequestId === null) {
+  if (
+    pullRequestIdReadFailed ||
+    (rawPullRequestId !== undefined && pullRequestId === null)
+  ) {
     append(invalidFields, 'pullRequestId');
   }
   if (targetCommitSha === null) {
@@ -319,9 +331,24 @@ function normalizeClaim(
     };
   }
 
-  const rawReference = readOwnProperty(candidate, 'reference');
+  let rawReference: unknown;
+  let referenceReadFailed = false;
+  try {
+    if (objectHasOwn(candidate, 'reference')) {
+      rawReference = (candidate as Record<string, unknown>).reference;
+    }
+  } catch {
+    referenceReadFailed = true;
+  }
   const rawArtifactType = readOwnProperty(candidate, 'artifactType');
   const rawCommitSha = readOwnProperty(candidate, 'commitSha');
+
+  if (referenceReadFailed) {
+    return {
+      claim: null,
+      rejection: objectFreeze({ ordinal, reason: CLAIM_REJECTION.CLAIM_UNREADABLE }),
+    };
+  }
 
   // Oversize is distinguished from absent on purpose: an oversized reference is
   // something the provider did send, and rejecting it loudly is what stops a

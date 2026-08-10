@@ -242,6 +242,26 @@ describe('optional pull request binding', () => {
     expect(result.pullRequestId).toBeNull();
   });
 
+  it('rejects an invocation when a present pull request binding cannot be read', () => {
+    const invocation = Object.defineProperty(
+      { ...buildInvocation() },
+      'pullRequestId',
+      {
+        get(): never {
+          throw new Error('unreadable pull request binding');
+        },
+        configurable: true,
+        enumerable: true,
+      },
+    ) as AgentInvocation;
+
+    const result = ingestInvocationReport(invocation, buildReport([]));
+
+    expect(result.outcome).toBe('INVOCATION_INVALID');
+    expect(result.invalidInvocationFields).toContain('pullRequestId');
+    expect(findInvalidInvocationFields(invocation)).toContain('pullRequestId');
+  });
+
   for (const [valueLabel, value] of MALFORMED_VALUES) {
     if (valueLabel === 'undefined') {
       continue;
@@ -377,6 +397,24 @@ describe('untrusted report normalization', () => {
     expect(result.claims).toEqual([]);
     expect(result.rejectedClaims[0]).toEqual({ ordinal: 0, reason: 'REFERENCE_OVERSIZED' });
     expect(JSON.stringify(result)).not.toContain(oversized(IDENTIFIER_LIMIT));
+  });
+
+  it('classifies a throwing reference read as unreadable rather than missing', () => {
+    const candidate = Object.defineProperty(buildClaim(), 'reference', {
+      get(): never {
+        throw new Error('unreadable reference');
+      },
+      configurable: true,
+      enumerable: true,
+    });
+
+    const result = ingestInvocationReport(buildInvocation(), buildReport([candidate]));
+
+    expect(result.claims).toEqual([]);
+    expect(result.rejectedClaims[0]).toEqual({
+      ordinal: 0,
+      reason: 'CLAIM_UNREADABLE',
+    });
   });
 
   it('accepts a reference of exactly the identifier limit', () => {
