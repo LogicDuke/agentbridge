@@ -70,6 +70,13 @@ export function findInvalidRequestFields(
   request: ActionRequest,
 ): readonly RequiredRequestField[] {
   return Object.freeze(
-    REQUIRED_REQUEST_FIELDS.filter((field) => request[field].trim().length === 0),
+    REQUIRED_REQUEST_FIELDS.filter((field) => {
+      // Read as `unknown`: the envelope arrives as untrusted external data, so
+      // a required property may be absent or hold a non-string at runtime even
+      // though the type says otherwise. Anything that is not a non-blank string
+      // is invalid, which fails the request closed instead of throwing.
+      const value: unknown = request[field];
+      return typeof value !== 'string' || value.trim().length === 0;
+    }),
   );
 }

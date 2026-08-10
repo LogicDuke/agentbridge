@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  type ActionRequest,
   APPROVAL_STATE,
   type ApprovalRecord,
   classifyAction,
@@ -9,6 +10,7 @@ import {
   GATE_OUTCOME,
   GATE_REASON,
   REQUIRED_REQUEST_FIELDS,
+  type RequiredRequestField,
 } from '../../src/domain/index.js';
 import {
   EXPECTED_ALLOWED_ACTIONS,
@@ -99,6 +101,117 @@ describe('envelope traceability', () => {
 
   it('reports no invalid fields for a well-formed request', () => {
     expect(evaluateActionRequest(buildRequest()).invalidFields).toEqual([]);
+  });
+});
+
+/**
+ * Regression cover for the runtime shape of an untrusted envelope.
+ *
+ * TypeScript types describe the intended contract, not what actually arrives.
+ * An external caller can omit a required property or send a non-string, and the
+ * gate must answer INVALID_REQUEST deterministically rather than throw.
+ */
+describe('malformed envelopes fail closed instead of throwing', () => {
+  /** Rebuild a request without one required property. */
+  function omitField(field: RequiredRequestField): ActionRequest {
+    const raw: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(buildRequest())) {
+      if (key !== field) {
+        raw[key] = value;
+      }
+    }
+    return raw as unknown as ActionRequest;
+  }
+
+  /** Replace one required property with an arbitrary runtime value. */
+  function overrideField(field: RequiredRequestField, value: unknown): ActionRequest {
+    return { ...buildRequest(), [field]: value } as unknown as ActionRequest;
+  }
+
+  const MALFORMED_VALUES: readonly (readonly [string, unknown])[] = [
+    ['undefined', undefined],
+    ['null', null],
+    ['a number', 42],
+    ['a zero', 0],
+    ['a boolean', true],
+    ['an object', {}],
+    ['an array', []],
+    ['a function', (): string => 'git.status'],
+    ['whitespace only', '   \t\n '],
+    ['an empty string', ''],
+  ];
+
+  for (const field of REQUIRED_REQUEST_FIELDS) {
+    it(`fails closed when ${field} is omitted entirely`, () => {
+      const request = omitField(field);
+
+      expect(() => evaluateActionRequest(request)).not.toThrow();
+
+      const decision = evaluateActionRequest(request);
+      expect(decision.outcome).toBe(GATE_OUTCOME.INVALID_REQUEST);
+      expect(decision.reason).toBe(GATE_REASON.REQUEST_ENVELOPE_INVALID);
+      expect(decision.mayExecuteAutonomously).toBe(false);
+      expect(decision.requiresHumanApproval).toBe(true);
+      expect(decision.invalidFields).toContain(field);
+    });
+  }
+
+  for (const [label, value] of MALFORMED_VALUES) {
+    it(`fails closed when repositoryId is ${label}`, () => {
+      const request = overrideField('repositoryId', value);
+
+      expect(() => evaluateActionRequest(request)).not.toThrow();
+
+      const decision = evaluateActionRequest(request);
+      expect(decision.outcome).toBe(GATE_OUTCOME.INVALID_REQUEST);
+      expect(decision.mayExecuteAutonomously).toBe(false);
+      expect(decision.requiresHumanApproval).toBe(true);
+      expect(decision.invalidFields).toContain('repositoryId');
+    });
+  }
+
+  it('rejects a malformed value in every required field', () => {
+    for (const field of REQUIRED_REQUEST_FIELDS) {
+      for (const [label, value] of MALFORMED_VALUES) {
+        const decision = evaluateActionRequest(overrideField(field, value));
+
+        expect(decision.mayExecuteAutonomously, `${field} = ${label}`).toBe(false);
+        expect(decision.invalidFields, `${field} = ${label}`).toContain(field);
+      }
+    }
+  });
+
+  it('does not let a malformed envelope smuggle an allowed action through', () => {
+    for (const [, value] of MALFORMED_VALUES) {
+      const decision = evaluateActionRequest(
+        overrideField('repositoryId', value),
+      );
+
+      expect(decision.classification.decision).toBe(DECISION.ALLOW);
+      expect(decision.mayExecuteAutonomously).toBe(false);
+      expect(decision.outcome).toBe(GATE_OUTCOME.INVALID_REQUEST);
+    }
+  });
+
+  it('stays deterministic across repeated evaluations of a malformed envelope', () => {
+    const request = omitField('repositoryId');
+
+    expect(evaluateActionRequest(request)).toEqual(evaluateActionRequest(request));
+  });
+
+  it('reports every malformed required field at once', () => {
+    const raw = {
+      ...buildRequest(),
+      requestId: undefined,
+      actorId: null,
+      repositoryId: 42,
+    } as unknown as ActionRequest;
+    const decision = evaluateActionRequest(raw);
+
+    expect([...decision.invalidFields].sort()).toEqual(
+      ['actorId', 'repositoryId', 'requestId'].sort(),
+    );
+    expect(decision.mayExecuteAutonomously).toBe(false);
   });
 });
 
