@@ -1,0 +1,253 @@
+/**
+ * Deterministic freshness evaluation for commit-bound evidence.
+ *
+ *     Evidence -> SHA binding -> freshness evaluation -> evidence status
+ *
+ * PR 004 scope: evaluation only. Nothing here fetches evidence, calls GitHub,
+ * invokes agents, persists records, executes commands, reads a clock, touches
+ * the filesystem or network, or makes a merge decision.
+ *
+ * This kernel answers exactly one question:
+ *
+ *     Is this evidence valid and current for this repository at this HEAD?
+ *
+ * It does not answer "may AgentBridge execute this action?" — that remains
+ * PR 003's policy gate. Evidence is data, never authority.
+ */
+
+import {
+  type EvidenceKind,
+  type EvidenceRecord,
+  type EvidenceSource,
+  isEvidenceKind,
+  isEvidenceSource,
+  readIdentifier,
+  REQUIRED_EVIDENCE_FIELDS,
+} from './evidence.js';
+
+/**
+ * - `CURRENT`  — structurally valid, and repository + commit match the target.
+ * - `STALE`    — well-formed and about this repository, but bound to a
+ *                different commit than the supplied HEAD.
+ * - `INVALID`  — malformed, missing provenance, or otherwise unable to take
+ *                part in reconciliation for this target.
+ */
+export const FRESHNESS = {
+  CURRENT: 'CURRENT',
+  STALE: 'STALE',
+  INVALID: 'INVALID',
+} as const;
+
+export type FreshnessState = (typeof FRESHNESS)[keyof typeof FRESHNESS];
+
+/** Every member of the {@link FreshnessState} union. */
+export const FRESHNESS_STATES: readonly FreshnessState[] = [
+  FRESHNESS.CURRENT,
+  FRESHNESS.STALE,
+  FRESHNESS.INVALID,
+];
+
+/** Stable, machine-readable rationale for a freshness state. */
+export const FRESHNESS_REASON = {
+  /** Repository and commit both match the evaluation target. */
+  BOUND_TO_CURRENT_HEAD: 'BOUND_TO_CURRENT_HEAD',
+  /** About this repository, but bound to a different commit. */
+  COMMIT_SHA_MISMATCH: 'COMMIT_SHA_MISMATCH',
+  /** About a different repository entirely. */
+  REPOSITORY_MISMATCH: 'REPOSITORY_MISMATCH',
+  /** Required provenance is missing, blank, or not a supported value. */
+  EVIDENCE_MALFORMED: 'EVIDENCE_MALFORMED',
+  /** The caller-supplied evaluation target is itself unusable. */
+  EVALUATION_TARGET_INVALID: 'EVALUATION_TARGET_INVALID',
+} as const;
+
+export type FreshnessReason = (typeof FRESHNESS_REASON)[keyof typeof FRESHNESS_REASON];
+
+/** Every member of the {@link FreshnessReason} union. */
+export const FRESHNESS_REASONS: readonly FreshnessReason[] = [
+  FRESHNESS_REASON.BOUND_TO_CURRENT_HEAD,
+  FRESHNESS_REASON.COMMIT_SHA_MISMATCH,
+  FRESHNESS_REASON.REPOSITORY_MISMATCH,
+  FRESHNESS_REASON.EVIDENCE_MALFORMED,
+  FRESHNESS_REASON.EVALUATION_TARGET_INVALID,
+];
+
+/**
+ * The repository state evidence is evaluated against.
+ *
+ * This is a **trusted** input. It is a separate argument, not a field on the
+ * evidence, so HEAD can never be inferred from agent-controlled data. PR 004
+ * does not discover HEAD; a GitHub adapter will eventually supply it.
+ */
+export interface EvidenceTarget {
+  readonly repositoryId: string;
+  readonly currentHeadSha: string;
+}
+
+/**
+ * The kernel's answer about a single evidence record.
+ *
+ * Echoed evidence values are `null` unless they validated as non-blank
+ * strings, so a malformed record cannot put a non-string into the result.
+ * Every field is a primitive or `null`, so the result is JSON-serializable and
+ * survives a round trip unchanged.
+ */
+export interface EvidenceFreshness {
+  readonly evidenceId: string | null;
+  readonly repositoryId: string | null;
+  readonly commitSha: string | null;
+  readonly kind: EvidenceKind | null;
+  readonly source: EvidenceSource | null;
+  readonly targetRepositoryId: string | null;
+  readonly targetHeadSha: string | null;
+  readonly state: FreshnessState;
+  readonly reason: FreshnessReason;
+  /** Fields that failed validation, in declaration order. */
+  readonly invalidFields: readonly string[];
+}
+
+function freeze(result: EvidenceFreshness): EvidenceFreshness {
+  return Object.freeze({ ...result, invalidFields: Object.freeze(result.invalidFields) });
+}
+
+/**
+ * Evaluate one evidence record against a repository HEAD.
+ *
+ * Pure, total, and deterministic: equal arguments always yield an equal result,
+ * and no input throws. Every field of both arguments is read as `unknown` and
+ * narrowed before use, so absent properties and non-string runtime values fail
+ * closed instead of raising.
+ *
+ * **The only path to `CURRENT` is the final return**, reached only after the
+ * target validates, every required field validates, the repository matches, and
+ * `commitSha === currentHeadSha` by exact string equality. Each earlier guard
+ * returns a non-`CURRENT` state. Nothing inside the record — verdict, status,
+ * metadata, provider, actor, claimed confidence, or a literal `current: true`
+ * annotation — is consulted, so nothing inside it can override a SHA mismatch.
+ *
+ * Comparison is exact and case-sensitive, with no trimming or normalisation.
+ * A SHA that differs by case or surrounding whitespace does not match, which
+ * fails closed. Format is deliberately not validated: a malformed SHA simply
+ * cannot equal a trusted HEAD, so it fails closed on its own.
+ *
+ * @param evidence Untrusted evidence record.
+ * @param target Trusted repository identity and current HEAD.
+ */
+export function evaluateEvidenceFreshness(
+  evidence: EvidenceRecord,
+  target: EvidenceTarget,
+): EvidenceFreshness {
+  const targetRepositoryId = readIdentifier(target.repositoryId);
+  const targetHeadSha = readIdentifier(target.currentHeadSha);
+
+  const evidenceId = readIdentifier(evidence.evidenceId);
+  const repositoryId = readIdentifier(evidence.repositoryId);
+  const commitSha = readIdentifier(evidence.commitSha);
+  const kind = isEvidenceKind(evidence.kind) ? evidence.kind : null;
+  const source = isEvidenceSource(evidence.source) ? evidence.source : null;
+
+  const base = {
+    evidenceId,
+    repositoryId,
+    commitSha,
+    kind,
+    source,
+    targetRepositoryId,
+    targetHeadSha,
+  };
+
+  if (targetRepositoryId === null || targetHeadSha === null) {
+    return freeze({
+      ...base,
+      state: FRESHNESS.INVALID,
+      reason: FRESHNESS_REASON.EVALUATION_TARGET_INVALID,
+      invalidFields: [
+        ...(targetRepositoryId === null ? ['target.repositoryId'] : []),
+        ...(targetHeadSha === null ? ['target.currentHeadSha'] : []),
+      ],
+    });
+  }
+
+  const invalidFields = [
+    ...REQUIRED_EVIDENCE_FIELDS.filter((field) => readIdentifier(evidence[field]) === null),
+    ...(kind === null ? ['kind'] : []),
+    ...(source === null ? ['source'] : []),
+  ];
+
+  if (invalidFields.length > 0) {
+    return freeze({
+      ...base,
+      state: FRESHNESS.INVALID,
+      reason: FRESHNESS_REASON.EVIDENCE_MALFORMED,
+      invalidFields,
+    });
+  }
+
+  if (repositoryId !== targetRepositoryId) {
+    return freeze({
+      ...base,
+      state: FRESHNESS.INVALID,
+      reason: FRESHNESS_REASON.REPOSITORY_MISMATCH,
+      invalidFields: [],
+    });
+  }
+
+  if (commitSha !== targetHeadSha) {
+    return freeze({
+      ...base,
+      state: FRESHNESS.STALE,
+      reason: FRESHNESS_REASON.COMMIT_SHA_MISMATCH,
+      invalidFields: [],
+    });
+  }
+
+  return freeze({
+    ...base,
+    state: FRESHNESS.CURRENT,
+    reason: FRESHNESS_REASON.BOUND_TO_CURRENT_HEAD,
+    invalidFields: [],
+  });
+}
+
+/**
+ * The result of evaluating a collection of evidence against one target.
+ *
+ * `results` preserves input order. The three buckets are filtered views of it —
+ * partitioning only, with no quorum rules, required-review policy, merge
+ * readiness, or reviewer requirements. Those belong to a later PR.
+ */
+export interface EvidenceSetEvaluation {
+  readonly results: readonly EvidenceFreshness[];
+  readonly current: readonly EvidenceFreshness[];
+  readonly stale: readonly EvidenceFreshness[];
+  readonly invalid: readonly EvidenceFreshness[];
+}
+
+/**
+ * Evaluate many records against one target.
+ *
+ * Each record is evaluated independently by {@link evaluateEvidenceFreshness},
+ * so a record's neighbours cannot change its state — there is no path by which
+ * a set operation promotes a stale record to current.
+ */
+export function evaluateEvidenceSet(
+  evidence: readonly EvidenceRecord[],
+  target: EvidenceTarget,
+): EvidenceSetEvaluation {
+  const results = evidence.map((record) => evaluateEvidenceFreshness(record, target));
+
+  return Object.freeze({
+    results: Object.freeze(results),
+    current: Object.freeze(results.filter((r) => r.state === FRESHNESS.CURRENT)),
+    stale: Object.freeze(results.filter((r) => r.state === FRESHNESS.STALE)),
+    invalid: Object.freeze(results.filter((r) => r.state === FRESHNESS.INVALID)),
+  });
+}
+
+/** Current evidence of one kind. Reads the already-partitioned current bucket. */
+export function currentEvidenceOfKind(
+  evaluation: EvidenceSetEvaluation,
+  kind: EvidenceKind,
+): readonly EvidenceFreshness[] {
+  return Object.freeze(evaluation.current.filter((result) => result.kind === kind));
+}
