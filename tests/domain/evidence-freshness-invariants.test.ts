@@ -970,6 +970,38 @@ describe('poisoned intrinsics cannot alter evaluation', () => {
     expect(evaluation.stale.length).toBe(1);
   });
 
+  it('defines own entries when Array.prototype has an inherited index setter', () => {
+    const malformed = buildEvidence({ evidenceId: '' });
+    const records = [
+      buildEvidence({ evidenceId: 'ev-current', commitSha: HEAD_A }),
+      buildEvidence({ evidenceId: 'ev-stale', commitSha: HEAD_B }),
+    ];
+    const previous = Object.getOwnPropertyDescriptor(Array.prototype, '0');
+    let malformedResult: ReturnType<typeof evaluateEvidenceFreshness>;
+    let evaluation: ReturnType<typeof evaluateEvidenceSet>;
+
+    Object.defineProperty(Array.prototype, '0', {
+      set() {},
+      configurable: true,
+    });
+    try {
+      malformedResult = evaluateEvidenceFreshness(malformed, buildTarget());
+      evaluation = evaluateEvidenceSet(records, buildTarget());
+    } finally {
+      if (previous === undefined) {
+        delete (Array.prototype as unknown as Record<string, unknown>)['0'];
+      } else {
+        Object.defineProperty(Array.prototype, '0', previous);
+      }
+    }
+
+    expect(malformedResult.state).toBe('INVALID');
+    expect(malformedResult.invalidFields).toEqual(['evidenceId']);
+    expect(evaluation.results.length).toBe(2);
+    expect(evaluation.current[0]?.evidenceId).toBe('ev-current');
+    expect(evaluation.stale[0]?.evidenceId).toBe('ev-stale');
+  });
+
   it('keeps a stale record stale when every array intrinsic is poisoned at once', () => {
     const evaluation = withPoisoned(Array.prototype, 'push', null, () =>
       withPoisoned(Array.prototype, 'filter', null, () =>

@@ -29,11 +29,12 @@ import {
  * possible. See the matching note in `evidence.ts`: a hostile getter or Proxy
  * trap runs mid-evaluation and could otherwise repoint these.
  *
- * Array handling below additionally avoids `push`, `filter`, and spread, so no
- * `Array.prototype` method is on the path at all. Bucket arrays are built with
- * indexed assignment on arrays this module owns.
+ * Array handling below additionally avoids `push`, `filter`, spread, and
+ * ordinary indexed assignment, so neither methods nor inherited index setters
+ * on `Array.prototype` are on the path.
  */
 const objectFreeze = Object.freeze;
+const objectDefineProperty = Object.defineProperty;
 const arrayIsArray = Array.isArray;
 const numberIsInteger = Number.isInteger;
 
@@ -132,9 +133,14 @@ function freeze(result: EvidenceFreshness): EvidenceFreshness {
   return objectFreeze({ ...result, invalidFields: objectFreeze(result.invalidFields) });
 }
 
-/** Append without `Array.prototype.push`, which an attacker may have poisoned. */
+/** Append by defining an own element, bypassing inherited index setters. */
 function append<T>(list: T[], value: T): void {
-  list[list.length] = value;
+  objectDefineProperty(list, list.length, {
+    value,
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  });
 }
 
 /** Partition without `Array.prototype.filter`. */
