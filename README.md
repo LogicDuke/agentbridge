@@ -22,6 +22,8 @@ PR 003 adds the action request envelope and policy gate: a structured, untrusted
 
 PR 004 adds the commit-bound evidence and freshness kernel: evidence records are bound to a repository and a commit SHA, and are evaluated against a caller-supplied HEAD into `CURRENT`, `STALE`, or `INVALID`. Evidence whose SHA differs from HEAD is never current, so a new commit automatically stales prior evidence. Evidence is data, never authority, and the kernel performs no I/O. See `docs/architecture/004-evidence-freshness-kernel.md`.
 
+PR 005 adds review ingestion: untrusted reviewer output is normalized into commit-bound review findings. Trusted caller-supplied context is the only source of repository, pull request, commit SHA, provider, and reviewer identity — reviewer content can never set a binding field, and a review of one commit stays bound to that commit. Ingestion is provider-neutral, decides neither freshness nor authority, and performs no I/O. See `docs/architecture/005-review-ingestion.md`.
+
 ## Runtime
 
 - Node.js 24 LTS
