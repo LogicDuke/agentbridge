@@ -760,6 +760,38 @@ describe('set iteration does not use the collection’s own map', () => {
   });
 });
 
+/** Regression cover for hostile collection lengths causing unbounded work. */
+describe('set iteration is bounded', () => {
+  it('rejects an array with the maximum sparse-array length', () => {
+    const records = new Array(4_294_967_295) as ReturnType<typeof buildEvidence>[];
+
+    const evaluation = evaluateEvidenceSet(records, buildTarget());
+
+    expect(evaluation.results).toEqual([]);
+    expect(evaluation.invalid).toEqual([]);
+  });
+
+  it('rejects a proxy reporting an unreasonable length without reading elements', () => {
+    let elementReads = 0;
+    const records = new Proxy([buildEvidence()], {
+      get(target, property, receiver): unknown {
+        if (property === 'length') {
+          return Number.MAX_SAFE_INTEGER;
+        }
+        if (property === '0') {
+          elementReads += 1;
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+
+    const evaluation = evaluateEvidenceSet(records, buildTarget());
+
+    expect(evaluation.results).toEqual([]);
+    expect(elementReads).toBe(0);
+  });
+});
+
 /**
  * Regression cover for the shared root cause behind the intrinsic findings:
  * untrusted evidence is read through getters and Proxy traps that run *during*

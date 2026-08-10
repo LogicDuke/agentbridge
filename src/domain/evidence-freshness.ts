@@ -37,6 +37,9 @@ const objectFreeze = Object.freeze;
 const arrayIsArray = Array.isArray;
 const numberIsInteger = Number.isInteger;
 
+/** Prevent an untrusted collection length from causing unbounded synchronous work. */
+const MAX_EVIDENCE_SET_LENGTH = 10_000;
+
 /**
  * - `CURRENT`  — structurally valid, and repository + commit match the target.
  * - `STALE`    — well-formed and about this repository, but bound to a
@@ -427,7 +430,10 @@ export function evaluateEvidenceSet(
       rawLength = 0;
     }
     const length =
-      typeof rawLength === 'number' && numberIsInteger(rawLength) && rawLength >= 0
+      typeof rawLength === 'number' &&
+      numberIsInteger(rawLength) &&
+      rawLength >= 0 &&
+      rawLength <= MAX_EVIDENCE_SET_LENGTH
         ? rawLength
         : 0;
 
