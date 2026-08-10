@@ -7,16 +7,22 @@ import {
   DECISION,
   type Decision,
   DECISIONS,
-  HUMAN_GATED_ACTION_KINDS,
   isAutonomouslyAllowed,
   isModeledActionKind,
   MODELED_ACTION_KINDS,
-  READ_ONLY_ACTION_KINDS,
   resolveActionKind,
 } from '../../src/domain/index.js';
+import {
+  EXPECTED_ALLOWED_ACTIONS,
+  EXPECTED_NEVER_ALLOWED_ACTIONS,
+} from './expected-policy.js';
 
-/** Exact strings that must classify as ALLOW. Everything else must not. */
-const ALLOWED = new Set<string>(READ_ONLY_ACTION_KINDS);
+/**
+ * Exact strings that must classify as ALLOW, taken from the independently
+ * declared table rather than from the production taxonomy. If production moves
+ * an action between tiers, this set does not move with it.
+ */
+const ALLOWED = new Set<string>(EXPECTED_ALLOWED_ACTIONS);
 
 /**
  * Strings an agent could plausibly emit that are *not* exact taxonomy members.
@@ -93,18 +99,20 @@ describe('security invariant: nothing outside the allowlist is ALLOW', () => {
       const result = classifyAction(input);
 
       expect(result.decision, `"${input}" must not be ALLOW`).not.toBe(DECISION.ALLOW);
-      expect(result.decision, `"${input}" must fail closed`).toBe(DECISION.DENY);
+      expect(result.decision, `"${input}" must route to human review`).toBe(DECISION.ESCALATE);
       expect(result.requiresHumanApproval, `"${input}" must require a human`).toBe(true);
       expect(result.known, `"${input}" must not be treated as known`).toBe(false);
       expect(result.kind, `"${input}" must resolve to the unknown sentinel`).toBe('unknown');
     }
   });
 
-  it('allows a string only when it is an exact read-only taxonomy member', () => {
-    const corpus = [...ALL_ACTION_KINDS, ...HOSTILE_INPUTS];
+  it('allows a string only when the independent table says it is allowed', () => {
+    const corpus = [...ALL_ACTION_KINDS, ...EXPECTED_NEVER_ALLOWED_ACTIONS, ...HOSTILE_INPUTS];
 
     for (const input of corpus) {
-      expect(classifyAction(input).decision === DECISION.ALLOW).toBe(ALLOWED.has(input));
+      expect(classifyAction(input).decision === DECISION.ALLOW, `"${input}"`).toBe(
+        ALLOWED.has(input),
+      );
     }
   });
 
@@ -124,7 +132,8 @@ describe('security invariant: nothing outside the allowlist is ALLOW', () => {
 
     expect(isModeledActionKind(futureAction)).toBe(false);
     expect(resolveActionKind(futureAction)).toBe('unknown');
-    expect(classifyAction(futureAction).decision).toBe(DECISION.DENY);
+    expect(classifyAction(futureAction).decision).not.toBe(DECISION.ALLOW);
+    expect(classifyAction(futureAction).decision).toBe(DECISION.ESCALATE);
     expect(classifyAction(futureAction).requiresHumanApproval).toBe(true);
   });
 });
@@ -143,9 +152,9 @@ describe('security invariant: human approval tracks autonomy', () => {
     }
   });
 
-  it('requires approval for every dangerous action', () => {
-    for (const kind of HUMAN_GATED_ACTION_KINDS) {
-      expect(classifyAction(kind).requiresHumanApproval).toBe(true);
+  it('requires approval for every independently declared never-allowed action', () => {
+    for (const action of EXPECTED_NEVER_ALLOWED_ACTIONS) {
+      expect(classifyAction(action).requiresHumanApproval, action).toBe(true);
     }
   });
 });
@@ -200,7 +209,7 @@ describe('serialization', () => {
     });
   });
 
-  it('serializes an unknown action as a denial', () => {
+  it('serializes an unknown action as an escalation, never an allow', () => {
     const revived: unknown = JSON.parse(JSON.stringify(classifyAction('nope')));
 
     expect(revived).toEqual({
@@ -208,8 +217,22 @@ describe('serialization', () => {
       kind: 'unknown',
       known: false,
       riskTier: 'unknown',
-      decision: 'DENY',
-      reason: 'UNRECOGNIZED_ACTION_DENIED',
+      decision: 'ESCALATE',
+      reason: 'UNRECOGNIZED_ACTION_ESCALATED',
+      requiresHumanApproval: true,
+    });
+  });
+
+  it('serializes git.fetch as gated, not allowed', () => {
+    const revived: unknown = JSON.parse(JSON.stringify(classifyAction('git.fetch')));
+
+    expect(revived).toEqual({
+      action: 'git.fetch',
+      kind: 'git.fetch',
+      known: true,
+      riskTier: 'human-gated',
+      decision: 'ESCALATE',
+      reason: 'HUMAN_AUTHORITY_REQUIRED',
       requiresHumanApproval: true,
     });
   });

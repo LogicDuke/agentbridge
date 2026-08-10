@@ -39,10 +39,22 @@ const HUMAN_GATED_POLICY: ActionPolicyEntry = Object.freeze({
   reason: REASON_CODE.HUMAN_AUTHORITY_REQUIRED,
 });
 
+/**
+ * Unrecognized actions escalate rather than deny.
+ *
+ * There is exactly one fail-closed contract in V1: anything not on the
+ * read-only allowlist routes to human review. Denying the unmodeled while
+ * escalating the merely dangerous would create two different non-allowed
+ * outcomes with no operational difference, and would strand an unrecognized
+ * request with no route to a human who could resolve it.
+ *
+ * `riskTier` and `known` still distinguish this case from a modeled dangerous
+ * action, so a reviewer can tell "authority required" from "never analyzed".
+ */
 const UNKNOWN_POLICY: ActionPolicyEntry = Object.freeze({
   riskTier: 'unknown',
-  decision: DECISION.DENY,
-  reason: REASON_CODE.UNRECOGNIZED_ACTION_DENIED,
+  decision: DECISION.ESCALATE,
+  reason: REASON_CODE.UNRECOGNIZED_ACTION_ESCALATED,
 });
 
 /**
@@ -63,7 +75,6 @@ export const ACTION_POLICY: Readonly<Record<ActionKind, ActionPolicyEntry>> = Ob
   'git.status': READ_ONLY_POLICY,
   'git.diff': READ_ONLY_POLICY,
   'git.log': READ_ONLY_POLICY,
-  'git.fetch': READ_ONLY_POLICY,
   'source.search': READ_ONLY_POLICY,
   'test.run': READ_ONLY_POLICY,
   'lint.run': READ_ONLY_POLICY,
@@ -81,6 +92,7 @@ export const ACTION_POLICY: Readonly<Record<ActionKind, ActionPolicyEntry>> = Ob
   'git.reset': HUMAN_GATED_POLICY,
   'git.force_push': HUMAN_GATED_POLICY,
   'git.branch_delete': HUMAN_GATED_POLICY,
+  'git.fetch': HUMAN_GATED_POLICY,
   'deployment.run': HUMAN_GATED_POLICY,
   'staging.change': HUMAN_GATED_POLICY,
   'production.change': HUMAN_GATED_POLICY,
@@ -115,9 +127,8 @@ export interface ActionClassification {
   /**
    * True whenever the orchestrator may not proceed on its own authority.
    *
-   * For `ESCALATE` a human may approve in band. For `DENY` there is no V1
-   * approval path: the action must first be deliberately modeled in the
-   * taxonomy, which is a reviewed code change.
+   * Always the exact inverse of `decision === 'ALLOW'`, so it can never
+   * contradict the decision it accompanies.
    */
   readonly requiresHumanApproval: boolean;
 }
@@ -130,7 +141,7 @@ export interface ActionClassification {
  *
  * The only path to `ALLOW` is an exact match against an entry whose policy is
  * `ALLOW`. Unrecognized input resolves to the unknown sentinel, whose policy is
- * `DENY`. There is no `else { allow }` branch, and no fallback branch at all:
+ * `ESCALATE`. There is no `else { allow }` branch, and no fallback branch at all:
  * `resolveActionKind` only ever returns a member of `ActionKind`, and
  * {@link ACTION_POLICY} is total over that union, so the lookup cannot miss.
  * Totality is enforced by the compiler and pinned by a test, rather than by a

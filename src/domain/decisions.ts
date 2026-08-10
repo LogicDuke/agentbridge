@@ -8,8 +8,14 @@
 
 /**
  * - `ALLOW`    — the orchestrator may proceed autonomously.
- * - `ESCALATE` — legitimate operation, but authority belongs to a human.
- * - `DENY`     — refused; no in-band autonomous or approval path exists.
+ * - `ESCALATE` — not permitted autonomously; routed to human review.
+ * - `DENY`     — refused outright, with no human review path.
+ *
+ * V1 defaults never emit `DENY`. Every non-allowed outcome — dangerous *and*
+ * unrecognized — routes to human review, so there is exactly one fail-closed
+ * contract rather than two. `DENY` remains in the vocabulary because the
+ * decision model must be able to express an outright refusal once policy
+ * becomes repository-configurable; nothing in V1 selects it.
  */
 export const DECISION = {
   ALLOW: 'ALLOW',
@@ -37,8 +43,11 @@ export const REASON_CODE = {
   READ_ONLY_ACTION_ALLOWED: 'READ_ONLY_ACTION_ALLOWED',
   /** Action is modeled but carries authority a human must grant. */
   HUMAN_AUTHORITY_REQUIRED: 'HUMAN_AUTHORITY_REQUIRED',
-  /** Action is not modeled by the taxonomy; the kernel fails closed. */
-  UNRECOGNIZED_ACTION_DENIED: 'UNRECOGNIZED_ACTION_DENIED',
+  /**
+   * Action is not modeled by the taxonomy. The kernel fails closed and routes
+   * it to human review; it is never allowed autonomously.
+   */
+  UNRECOGNIZED_ACTION_ESCALATED: 'UNRECOGNIZED_ACTION_ESCALATED',
 } as const;
 
 export type ReasonCode = (typeof REASON_CODE)[keyof typeof REASON_CODE];
@@ -47,7 +56,7 @@ export type ReasonCode = (typeof REASON_CODE)[keyof typeof REASON_CODE];
 export const REASON_CODES: readonly ReasonCode[] = [
   REASON_CODE.READ_ONLY_ACTION_ALLOWED,
   REASON_CODE.HUMAN_AUTHORITY_REQUIRED,
-  REASON_CODE.UNRECOGNIZED_ACTION_DENIED,
+  REASON_CODE.UNRECOGNIZED_ACTION_ESCALATED,
 ];
 
 /**

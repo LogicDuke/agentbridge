@@ -27,7 +27,6 @@ export const READ_ONLY_ACTION_KINDS = [
   'git.status',
   'git.diff',
   'git.log',
-  'git.fetch',
   'source.search',
   'test.run',
   'lint.run',
@@ -44,6 +43,12 @@ export type ReadOnlyActionKind = (typeof READ_ONLY_ACTION_KINDS)[number];
 /**
  * Actions that carry authority: they mutate repository, infrastructure, or
  * data state, expose secrets, or change the policy that governs the kernel.
+ *
+ * `git.fetch` sits here despite reading nothing from the working tree. It
+ * opens an outbound network connection to a remote and writes to the local
+ * `.git` directory — downloading objects and moving remote-tracking refs — so
+ * it is neither side-effect free nor purely local. V1 gates it rather than
+ * granting the orchestrator autonomous network egress.
  */
 export const HUMAN_GATED_ACTION_KINDS = [
   'repository.write',
@@ -52,6 +57,7 @@ export const HUMAN_GATED_ACTION_KINDS = [
   'git.reset',
   'git.force_push',
   'git.branch_delete',
+  'git.fetch',
   'deployment.run',
   'staging.change',
   'production.change',
