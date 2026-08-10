@@ -61,8 +61,10 @@ prototype pollution cannot supply content the reviewer never sent.
 holding a numeric PR number stringifies it.
 
 If any required binding field is missing or blank, ingestion returns
-`CONTEXT_INVALID` with the offending field names and **no findings at all**. A
-review that cannot be bound is not ingested.
+`CONTEXT_INVALID` with the offending field names and **no findings at all**.
+Oversized repository, pull-request, and reviewed-SHA identifiers are likewise
+invalid rather than truncated, preserving their exact trusted binding. A review
+that cannot be bound exactly is not ingested.
 
 `ReviewSubmission` carries `findings`, an array of candidate objects. Anything
 else — absent, `null`, a non-array, a Proxy, a revoked Proxy — yields an empty
@@ -137,11 +139,12 @@ Reviewer payloads are hostile input, so every unbounded dimension is capped
 | `MAX_TITLE_LENGTH` | 512 | A title is a single line |
 | `MAX_MESSAGE_LENGTH` | 8 192 | Generous for prose plus a code excerpt |
 | `MAX_PATH_LENGTH` | 1 024 | Beyond any real repository path |
-| `MAX_IDENTIFIER_LENGTH` | 256 | Binding and provider identifiers |
+| `MAX_IDENTIFIER_LENGTH` | 256 | Binding and provider identifiers; exact trusted repository/PR/SHA bindings over this size are rejected |
 
-Excess findings are dropped and text is cut, and in both cases `truncated` is
-set on the result — deliberately, so a bounded payload can never be mistaken for
-a clean review. A per-finding `truncated` flag marks which findings lost text.
+Excess findings are dropped and untrusted finding text is cut, and in both cases
+`truncated` is set on the result — deliberately, so a bounded payload can never
+be mistaken for a clean review. A per-finding `truncated` flag marks which
+findings lost text. Blankness is checked only after each text field is bounded.
 
 Note this differs from PR 004's evidence-set bound, which collapses an
 over-length collection to zero. Here, silently reporting "no findings" would be

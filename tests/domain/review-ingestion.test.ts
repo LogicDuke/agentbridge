@@ -255,6 +255,21 @@ describe('required finding fields', () => {
       expect(rejection.reason).toBe(REVIEW_REJECTION.FINDING_UNREADABLE);
     }
   });
+
+  it('rejects required text that becomes blank when bounded', () => {
+    const title = `${' '.repeat(REVIEW_BOUNDS.MAX_TITLE_LENGTH)}not-in-bounds`;
+    const message = `${'\t'.repeat(REVIEW_BOUNDS.MAX_MESSAGE_LENGTH)}not-in-bounds`;
+    const result = ingestReview(
+      buildContext(),
+      buildSubmission([buildFinding({ title }), buildFinding({ message })]),
+    );
+
+    expect(result.findings).toEqual([]);
+    expect(result.rejected).toEqual([
+      { ordinal: 0, reason: REVIEW_REJECTION.REQUIRED_FIELD_MISSING },
+      { ordinal: 1, reason: REVIEW_REJECTION.REQUIRED_FIELD_MISSING },
+    ]);
+  });
 });
 
 describe('locations', () => {
@@ -377,6 +392,20 @@ describe('binding context validation', () => {
 
     expect(result.findings).toEqual([]);
     expect(result.rejected).toEqual([]);
+  });
+
+  it('rejects oversized repository, pull request, and reviewed SHA bindings', () => {
+    for (const field of ['repositoryId', 'pullRequestId', 'reviewedCommitSha'] as const) {
+      const oversized = `${'x'.repeat(REVIEW_BOUNDS.MAX_IDENTIFIER_LENGTH)}-distinct-suffix`;
+      const result = ingestReview(
+        buildContext({ [field]: oversized }),
+        buildSubmission([buildFinding()]),
+      );
+
+      expect(result.outcome, field).toBe(INGESTION_OUTCOME.CONTEXT_INVALID);
+      expect(result.invalidContextFields, field).toContain(field);
+      expect(result.findings, field).toEqual([]);
+    }
   });
 });
 

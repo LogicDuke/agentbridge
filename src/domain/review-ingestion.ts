@@ -19,7 +19,6 @@
  */
 
 import {
-  clampText,
   INGESTION_OUTCOME,
   type IngestionOutcome,
   readClassification,
@@ -47,6 +46,7 @@ const objectFreeze = Object.freeze;
 const objectDefineProperty = Object.defineProperty;
 const arrayIsArray = Array.isArray;
 const numberIsInteger = Number.isInteger;
+const stringConstructor = String;
 
 /** Append by defining an own element, bypassing inherited index setters. */
 function append<T>(list: T[], value: T): void {
@@ -61,6 +61,13 @@ function append<T>(list: T[], value: T): void {
 /** Read a positive integer line number, or `null`. */
 function readLine(value: unknown): number | null {
   return typeof value === 'number' && numberIsInteger(value) && value >= 1 ? value : null;
+}
+
+/** Read an exact trusted binding, rejecting rather than aliasing oversized IDs. */
+function readExactBinding(value: unknown): string | null {
+  return typeof value === 'string' && value.length <= REVIEW_BOUNDS.MAX_IDENTIFIER_LENGTH
+    ? readText(value, REVIEW_BOUNDS.MAX_IDENTIFIER_LENGTH)
+    : null;
 }
 
 interface NormalizedContext {
@@ -117,12 +124,21 @@ function normalizeContext(context: ReviewContext): {
     return { normalized: null, invalidFields: objectFreeze(all) };
   }
 
-  const repositoryId = readText(readOwnProperty(record, 'repositoryId'));
-  const pullRequestId = readText(readOwnProperty(record, 'pullRequestId'));
-  const reviewedCommitSha = readText(readOwnProperty(record, 'reviewedCommitSha'));
-  const provider = readText(readOwnProperty(record, 'provider'));
-  const reviewerId = readText(readOwnProperty(record, 'reviewerId'));
-  const reviewId = readText(readOwnProperty(record, 'reviewId'));
+  const repositoryId = readExactBinding(readOwnProperty(record, 'repositoryId'));
+  const pullRequestId = readExactBinding(readOwnProperty(record, 'pullRequestId'));
+  const reviewedCommitSha = readExactBinding(readOwnProperty(record, 'reviewedCommitSha'));
+  const provider = readText(
+    readOwnProperty(record, 'provider'),
+    REVIEW_BOUNDS.MAX_IDENTIFIER_LENGTH,
+  );
+  const reviewerId = readText(
+    readOwnProperty(record, 'reviewerId'),
+    REVIEW_BOUNDS.MAX_IDENTIFIER_LENGTH,
+  );
+  const reviewId = readText(
+    readOwnProperty(record, 'reviewId'),
+    REVIEW_BOUNDS.MAX_IDENTIFIER_LENGTH,
+  );
 
   const invalidFields: string[] = [];
   if (repositoryId === null) {
@@ -153,12 +169,12 @@ function normalizeContext(context: ReviewContext): {
 
   return {
     normalized: {
-      repositoryId: clampText(repositoryId, REVIEW_BOUNDS.MAX_IDENTIFIER_LENGTH),
-      pullRequestId: clampText(pullRequestId, REVIEW_BOUNDS.MAX_IDENTIFIER_LENGTH),
-      reviewedCommitSha: clampText(reviewedCommitSha, REVIEW_BOUNDS.MAX_IDENTIFIER_LENGTH),
-      provider: clampText(provider, REVIEW_BOUNDS.MAX_IDENTIFIER_LENGTH),
-      reviewerId: clampText(reviewerId, REVIEW_BOUNDS.MAX_IDENTIFIER_LENGTH),
-      reviewId: reviewId === null ? null : clampText(reviewId, REVIEW_BOUNDS.MAX_IDENTIFIER_LENGTH),
+      repositoryId,
+      pullRequestId,
+      reviewedCommitSha,
+      provider,
+      reviewerId,
+      reviewId,
     },
     invalidFields: objectFreeze(invalidFields),
   };
@@ -202,8 +218,8 @@ function normalizeFinding(
   const rawSourceId = readOwnProperty(candidate, 'sourceId');
   const rawProviderFindingId = readOwnProperty(candidate, 'providerFindingId');
 
-  const title = readText(rawTitle);
-  const message = readText(rawMessage);
+  const title = readText(rawTitle, REVIEW_BOUNDS.MAX_TITLE_LENGTH);
+  const message = readText(rawMessage, REVIEW_BOUNDS.MAX_MESSAGE_LENGTH);
   if (title === null || message === null) {
     return {
       finding: null,
@@ -211,9 +227,12 @@ function normalizeFinding(
     };
   }
 
-  const filePath = readText(rawFilePath);
-  const sourceId = readText(rawSourceId);
-  const providerFindingId = readText(rawProviderFindingId);
+  const filePath = readText(rawFilePath, REVIEW_BOUNDS.MAX_PATH_LENGTH);
+  const sourceId = readText(rawSourceId, REVIEW_BOUNDS.MAX_IDENTIFIER_LENGTH);
+  const providerFindingId = readText(
+    rawProviderFindingId,
+    REVIEW_BOUNDS.MAX_IDENTIFIER_LENGTH,
+  );
 
   const startLine = readLine(rawStartLine);
   const endLineCandidate = readLine(rawEndLine);
@@ -224,28 +243,18 @@ function normalizeFinding(
       ? endLineCandidate
       : null;
 
-  const clampedTitle = clampText(title, REVIEW_BOUNDS.MAX_TITLE_LENGTH);
-  const clampedMessage = clampText(message, REVIEW_BOUNDS.MAX_MESSAGE_LENGTH);
-  const clampedPath = filePath === null ? null : clampText(filePath, REVIEW_BOUNDS.MAX_PATH_LENGTH);
-  const clampedSourceId =
-    sourceId === null ? null : clampText(sourceId, REVIEW_BOUNDS.MAX_IDENTIFIER_LENGTH);
-  const clampedProviderFindingId =
-    providerFindingId === null
-      ? null
-      : clampText(providerFindingId, REVIEW_BOUNDS.MAX_IDENTIFIER_LENGTH);
-
   const truncated =
-    clampedTitle.length !== title.length ||
-    clampedMessage.length !== message.length ||
-    (filePath !== null && clampedPath !== null && clampedPath.length !== filePath.length) ||
-    (sourceId !== null && clampedSourceId !== null && clampedSourceId.length !== sourceId.length) ||
-    (providerFindingId !== null &&
-      clampedProviderFindingId !== null &&
-      clampedProviderFindingId.length !== providerFindingId.length);
+    (typeof rawTitle === 'string' && rawTitle.length > REVIEW_BOUNDS.MAX_TITLE_LENGTH) ||
+    (typeof rawMessage === 'string' && rawMessage.length > REVIEW_BOUNDS.MAX_MESSAGE_LENGTH) ||
+    (typeof rawFilePath === 'string' && rawFilePath.length > REVIEW_BOUNDS.MAX_PATH_LENGTH) ||
+    (typeof rawSourceId === 'string' &&
+      rawSourceId.length > REVIEW_BOUNDS.MAX_IDENTIFIER_LENGTH) ||
+    (typeof rawProviderFindingId === 'string' &&
+      rawProviderFindingId.length > REVIEW_BOUNDS.MAX_IDENTIFIER_LENGTH);
 
   return {
     finding: objectFreeze({
-      findingId: `f${String(ordinal)}`,
+      findingId: `f${stringConstructor(ordinal)}`,
       ordinal,
       repositoryId: context.repositoryId,
       pullRequestId: context.pullRequestId,
@@ -256,13 +265,13 @@ function normalizeFinding(
       severity: readSeverity(rawSeverity),
       classification: readClassification(rawClassification),
       status: readStatus(rawStatus),
-      title: clampedTitle,
-      message: clampedMessage,
-      filePath: clampedPath,
+      title,
+      message,
+      filePath,
       startLine,
       endLine,
-      sourceId: clampedSourceId,
-      providerFindingId: clampedProviderFindingId,
+      sourceId,
+      providerFindingId,
       truncated,
     }),
     rejection: null,

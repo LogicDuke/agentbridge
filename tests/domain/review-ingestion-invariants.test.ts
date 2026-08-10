@@ -216,6 +216,29 @@ describe('hostile runtime input is total', () => {
     ).not.toThrow();
   });
 
+  it('does not consult a String global poisoned by a finding getter', () => {
+    const intrinsicString = globalThis.String;
+    const hostile = Object.defineProperty({ ...buildFinding() }, 'title', {
+      get(): string {
+        globalThis.String = (() => {
+          throw new Error('poisoned String global');
+        }) as unknown as StringConstructor;
+        return 'valid title';
+      },
+      configurable: true,
+      enumerable: true,
+    }) as ReturnType<typeof buildFinding>;
+
+    try {
+      expect(() => ingestReview(buildContext(), buildSubmission([hostile]))).not.toThrow();
+      expect(ingestReview(buildContext(), buildSubmission([buildFinding()])).findings[0]?.findingId).toBe(
+        'f0',
+      );
+    } finally {
+      globalThis.String = intrinsicString;
+    }
+  });
+
   for (const [label, value] of NON_OBJECTS) {
     it(`fails closed when the context is ${label}`, () => {
       const context = value as ReturnType<typeof buildContext>;

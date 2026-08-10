@@ -286,18 +286,20 @@ export interface ReviewResult {
 }
 
 /**
- * Narrow an untrusted value to a non-blank string, or `null`.
+ * Bound an untrusted value, then narrow it to a non-blank string or `null`.
  *
- * Returns the value **unmodified**. Blankness is detected with a captured
- * `trim`, but the trimmed form is never returned — normalising an identifier
- * before it is stored would let `" abc"` and `"abc"` become the same binding.
+ * The bound is applied before `trim`, so blankness checks never scan more than
+ * the field's advertised limit. The trimmed form is never returned —
+ * normalising an identifier before it is stored would let `" abc"` and
+ * `"abc"` become the same binding.
  */
-export function readText(value: unknown): string | null {
+export function readText(value: unknown, limit: number): string | null {
   if (typeof value !== 'string') {
     return null;
   }
-  const trimmed: unknown = reflectApply(stringTrim, value, []);
-  return typeof trimmed === 'string' && trimmed.length > 0 ? value : null;
+  const bounded = clampText(value, limit);
+  const trimmed: unknown = reflectApply(stringTrim, bounded, []);
+  return typeof trimmed === 'string' && trimmed.length > 0 ? bounded : null;
 }
 
 /** Cut a string to `limit` characters using a captured `slice`. */
