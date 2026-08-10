@@ -536,6 +536,230 @@ describe('non-object evidence fails closed', () => {
   });
 });
 
+/**
+ * Regression cover for a hostile record mutating the caller-supplied target
+ * partway through a set evaluation.
+ */
+describe('the set target is snapshotted before any record is evaluated', () => {
+  it('does not let one record retarget the evaluation for a later record', () => {
+    const target = { repositoryId: REPO_A, currentHeadSha: HEAD_A };
+    const hostile = {
+      ...buildEvidence({ evidenceId: 'ev-hostile', repositoryId: REPO_A, commitSha: HEAD_A }),
+      get kind(): string {
+        // Retarget the caller's object midway through the set.
+        target.repositoryId = REPO_B;
+        target.currentHeadSha = HEAD_B;
+        return 'ci-result';
+      },
+    } as ReturnType<typeof buildEvidence>;
+    const later = buildEvidence({
+      evidenceId: 'ev-later',
+      repositoryId: REPO_B,
+      commitSha: HEAD_B,
+    });
+
+    const evaluation = evaluateEvidenceSet([hostile, later], target);
+    const laterResult = evaluation.results[1];
+
+    expect(laterResult?.state).not.toBe('CURRENT');
+    expect(laterResult?.state).toBe('INVALID');
+    expect(evaluation.current.map((r) => r.evidenceId)).toEqual(['ev-hostile']);
+  });
+
+  it('evaluates every record against the same repository and HEAD', () => {
+    const target = { repositoryId: REPO_A, currentHeadSha: HEAD_A };
+    const hostile = {
+      ...buildEvidence({ evidenceId: 'ev-hostile' }),
+      get source(): string {
+        target.currentHeadSha = HEAD_B;
+        return 'github';
+      },
+    } as ReturnType<typeof buildEvidence>;
+
+    const evaluation = evaluateEvidenceSet(
+      [hostile, buildEvidence({ evidenceId: 'ev-a', commitSha: HEAD_A })],
+      target,
+    );
+
+    for (const result of evaluation.results) {
+      expect(result.targetRepositoryId).toBe(REPO_A);
+      expect(result.targetHeadSha).toBe(HEAD_A);
+    }
+  });
+
+  it('is unaffected by a target mutated after evaluation returns', () => {
+    const target = { repositoryId: REPO_A, currentHeadSha: HEAD_A };
+    const evaluation = evaluateEvidenceSet([buildEvidence({ commitSha: HEAD_A })], target);
+
+    target.repositoryId = REPO_B;
+    target.currentHeadSha = HEAD_B;
+
+    expect(evaluation.results[0]?.targetHeadSha).toBe(HEAD_A);
+    expect(evaluation.current.length).toBe(1);
+  });
+});
+
+/** Regression cover for property reads that throw. */
+describe('hostile property access fails closed', () => {
+  const throwingGetter = (field: string): ReturnType<typeof buildEvidence> =>
+    Object.defineProperty({ ...buildEvidence() }, field, {
+      get(): never {
+        throw new Error(`hostile ${field}`);
+      },
+      configurable: true,
+      enumerable: true,
+    }) as ReturnType<typeof buildEvidence>;
+
+  for (const field of ['commitSha', 'repositoryId', 'evidenceId', 'kind', 'source']) {
+    it(`returns INVALID when the ${field} getter throws`, () => {
+      const evidence = throwingGetter(field);
+
+      expect(() => evaluateEvidenceFreshness(evidence, buildTarget())).not.toThrow();
+
+      const result = evaluateEvidenceFreshness(evidence, buildTarget());
+      expect(result.state).toBe('INVALID');
+      expect(result.state).not.toBe('CURRENT');
+      expect(result.invalidFields).toContain('evidence');
+    });
+  }
+
+  it('returns INVALID when a Proxy get trap throws', () => {
+    const hostile = new Proxy(buildEvidence() as unknown as Record<string, unknown>, {
+      get(): never {
+        throw new Error('trap');
+      },
+    }) as unknown as ReturnType<typeof buildEvidence>;
+
+    expect(() => evaluateEvidenceFreshness(hostile, buildTarget())).not.toThrow();
+    expect(evaluateEvidenceFreshness(hostile, buildTarget()).state).toBe('INVALID');
+  });
+
+  it('returns INVALID when a target getter throws', () => {
+    const hostileTarget = new Proxy(buildTarget() as unknown as Record<string, unknown>, {
+      get(): never {
+        throw new Error('hostile target');
+      },
+    }) as unknown as ReturnType<typeof buildTarget>;
+
+    expect(() => evaluateEvidenceFreshness(buildEvidence(), hostileTarget)).not.toThrow();
+
+    const result = evaluateEvidenceFreshness(buildEvidence(), hostileTarget);
+    expect(result.state).toBe('INVALID');
+    expect(result.reason).toBe(FRESHNESS_REASON.EVALUATION_TARGET_INVALID);
+    expect(result.targetHeadSha).toBeNull();
+  });
+
+  it('does not let a hostile target abort a whole set', () => {
+    const hostileTarget = new Proxy(buildTarget() as unknown as Record<string, unknown>, {
+      get(): never {
+        throw new Error('hostile target');
+      },
+    }) as unknown as ReturnType<typeof buildTarget>;
+
+    expect(() =>
+      evaluateEvidenceSet([buildEvidence(), buildEvidence()], hostileTarget),
+    ).not.toThrow();
+
+    const evaluation = evaluateEvidenceSet([buildEvidence(), buildEvidence()], hostileTarget);
+    expect(evaluation.results.length).toBe(2);
+    expect(evaluation.current).toEqual([]);
+  });
+
+  it('does not let a hostile record abort a set containing valid records', () => {
+    const records = [
+      throwingGetter('commitSha'),
+      buildEvidence({ evidenceId: 'ev-ok', commitSha: HEAD_A }),
+      new Proxy(buildEvidence() as unknown as Record<string, unknown>, {
+        get(): never {
+          throw new Error('trap');
+        },
+      }) as unknown as ReturnType<typeof buildEvidence>,
+      buildEvidence({ evidenceId: 'ev-stale', commitSha: HEAD_B }),
+    ];
+
+    expect(() => evaluateEvidenceSet(records, buildTarget())).not.toThrow();
+
+    const evaluation = evaluateEvidenceSet(records, buildTarget());
+    expect(evaluation.results.length).toBe(4);
+    expect(evaluation.current.map((r) => r.evidenceId)).toEqual(['ev-ok']);
+    expect(evaluation.stale.map((r) => r.evidenceId)).toEqual(['ev-stale']);
+    expect(evaluation.invalid.length).toBe(2);
+  });
+});
+
+/** Regression cover for invoking an untrusted collection's own `map`. */
+describe('set iteration does not use the collection’s own map', () => {
+  it('evaluates an array carrying an own non-function map', () => {
+    const records = [buildEvidence({ commitSha: HEAD_A })];
+    (records as unknown as Record<string, unknown>)['map'] = 'not a function';
+
+    expect(() => evaluateEvidenceSet(records, buildTarget())).not.toThrow();
+    expect(evaluateEvidenceSet(records, buildTarget()).current.length).toBe(1);
+  });
+
+  it('evaluates an array whose map getter throws', () => {
+    const records = [buildEvidence({ commitSha: HEAD_A })];
+    Object.defineProperty(records, 'map', {
+      get(): never {
+        throw new Error('poisoned map getter');
+      },
+      configurable: true,
+    });
+
+    expect(() => evaluateEvidenceSet(records, buildTarget())).not.toThrow();
+    expect(evaluateEvidenceSet(records, buildTarget()).current.length).toBe(1);
+  });
+
+  it('evaluates when Array.prototype.map is poisoned', () => {
+    const original = Array.prototype.map;
+    Object.defineProperty(Array.prototype, 'map', {
+      value: function poisoned(): never {
+        throw new Error('poisoned prototype');
+      },
+      configurable: true,
+      writable: true,
+    });
+
+    try {
+      const evaluation = evaluateEvidenceSet(
+        [buildEvidence({ commitSha: HEAD_A }), buildEvidence({ commitSha: HEAD_B })],
+        buildTarget(),
+      );
+
+      expect(evaluation.results.length).toBe(2);
+      expect(evaluation.current.length).toBe(1);
+      expect(evaluation.stale.length).toBe(1);
+    } finally {
+      Object.defineProperty(Array.prototype, 'map', {
+        value: original,
+        configurable: true,
+        writable: true,
+      });
+    }
+  });
+
+  it('preserves input order and survives a throwing index getter', () => {
+    const records = [
+      buildEvidence({ evidenceId: 'ev-0', commitSha: HEAD_A }),
+      buildEvidence({ evidenceId: 'ev-2', commitSha: HEAD_B }),
+    ];
+    Object.defineProperty(records, 1, {
+      get(): never {
+        throw new Error('hostile index');
+      },
+      configurable: true,
+      enumerable: true,
+    });
+
+    expect(() => evaluateEvidenceSet(records, buildTarget())).not.toThrow();
+
+    const evaluation = evaluateEvidenceSet(records, buildTarget());
+    expect(evaluation.results.length).toBe(2);
+    expect(evaluation.results[0]?.evidenceId).toBe('ev-0');
+    expect(evaluation.results[1]?.state).toBe('INVALID');
+  });
+});
+
 describe('the kernel answers freshness, not authority', () => {
   it('reaches the same freshness regardless of how favourable the evidence claims to be', () => {
     const favourable = buildEvidence({

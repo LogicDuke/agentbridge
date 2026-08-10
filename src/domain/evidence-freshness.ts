@@ -117,6 +117,25 @@ function freeze(result: EvidenceFreshness): EvidenceFreshness {
   return Object.freeze({ ...result, invalidFields: Object.freeze(result.invalidFields) });
 }
 
+/** The result for a record that cannot be read at all. */
+function malformedEvidence(
+  targetRepositoryId: string | null,
+  targetHeadSha: string | null,
+): EvidenceFreshness {
+  return freeze({
+    evidenceId: null,
+    repositoryId: null,
+    commitSha: null,
+    kind: null,
+    source: null,
+    targetRepositoryId,
+    targetHeadSha,
+    state: FRESHNESS.INVALID,
+    reason: FRESHNESS_REASON.EVIDENCE_MALFORMED,
+    invalidFields: ['evidence'],
+  });
+}
+
 /**
  * Evaluate one evidence record against a repository HEAD.
  *
@@ -144,30 +163,31 @@ export function evaluateEvidenceFreshness(
   evidence: EvidenceRecord,
   target: EvidenceTarget,
 ): EvidenceFreshness {
-  // The target is trusted but still dereferenced, so a non-object value must
-  // fail closed rather than throw. Both identifiers then read as `null`, which
-  // the target check below turns into EVALUATION_TARGET_INVALID.
+  // The target is trusted but still dereferenced, so a non-object value — or a
+  // getter that throws — must fail closed rather than abort. Both identifiers
+  // then read as `null`, which the target check below turns into
+  // EVALUATION_TARGET_INVALID.
   const targetRecord: unknown = target;
   const targetIsObject = typeof targetRecord === 'object' && targetRecord !== null;
-  const targetRepositoryId = targetIsObject ? readIdentifier(target.repositoryId) : null;
-  const targetHeadSha = targetIsObject ? readIdentifier(target.currentHeadSha) : null;
+  let rawTargetRepositoryId: unknown;
+  let rawTargetHeadSha: unknown;
+  if (targetIsObject) {
+    try {
+      rawTargetRepositoryId = target.repositoryId;
+      rawTargetHeadSha = target.currentHeadSha;
+    } catch {
+      rawTargetRepositoryId = undefined;
+      rawTargetHeadSha = undefined;
+    }
+  }
+  const targetRepositoryId = readIdentifier(rawTargetRepositoryId);
+  const targetHeadSha = readIdentifier(rawTargetHeadSha);
 
   // Reject a non-object record before dereferencing it, so `null`, `undefined`,
   // and primitives fail closed instead of throwing.
   const record: unknown = evidence;
   if (typeof record !== 'object' || record === null) {
-    return freeze({
-      evidenceId: null,
-      repositoryId: null,
-      commitSha: null,
-      kind: null,
-      source: null,
-      targetRepositoryId,
-      targetHeadSha,
-      state: FRESHNESS.INVALID,
-      reason: FRESHNESS_REASON.EVIDENCE_MALFORMED,
-      invalidFields: ['evidence'],
-    });
+    return malformedEvidence(targetRepositoryId, targetHeadSha);
   }
 
   // Snapshot every freshness-relevant property exactly once. A getter or Proxy
@@ -175,13 +195,27 @@ export function evaluateEvidenceFreshness(
   // comparing another would let a record pass validation with one SHA and be
   // matched against HEAD with a different one. Everything below reads only
   // these locals; the record is never touched again.
-  const rawEvidenceId: unknown = evidence.evidenceId;
-  const rawRepositoryId: unknown = evidence.repositoryId;
-  const rawCommitSha: unknown = evidence.commitSha;
-  const rawReference: unknown = evidence.reference;
-  const rawObservedAt: unknown = evidence.observedAt;
-  const rawKind: unknown = evidence.kind;
-  const rawSource: unknown = evidence.source;
+  //
+  // The reads are guarded because a getter or `get` trap may also *throw*. A
+  // hostile record must fail closed, never abort the evaluation.
+  let rawEvidenceId: unknown;
+  let rawRepositoryId: unknown;
+  let rawCommitSha: unknown;
+  let rawReference: unknown;
+  let rawObservedAt: unknown;
+  let rawKind: unknown;
+  let rawSource: unknown;
+  try {
+    rawEvidenceId = evidence.evidenceId;
+    rawRepositoryId = evidence.repositoryId;
+    rawCommitSha = evidence.commitSha;
+    rawReference = evidence.reference;
+    rawObservedAt = evidence.observedAt;
+    rawKind = evidence.kind;
+    rawSource = evidence.source;
+  } catch {
+    return malformedEvidence(targetRepositoryId, targetHeadSha);
+  }
 
   const evidenceId = readIdentifier(rawEvidenceId);
   const repositoryId = readIdentifier(rawRepositoryId);
@@ -283,13 +317,62 @@ export function evaluateEvidenceSet(
   evidence: readonly EvidenceRecord[],
   target: EvidenceTarget,
 ): EvidenceSetEvaluation {
+  // Snapshot the trusted target exactly once, into a frozen object of our own.
+  // Records are evaluated against this copy, never the caller's object, so a
+  // hostile getter on one record cannot mutate the target and change the
+  // verdict of a later record in the same set.
+  const targetRecord: unknown = target;
+  const targetIsObject = typeof targetRecord === 'object' && targetRecord !== null;
+  let rawTargetRepositoryId: unknown;
+  let rawTargetHeadSha: unknown;
+  if (targetIsObject) {
+    try {
+      rawTargetRepositoryId = target.repositoryId;
+      rawTargetHeadSha = target.currentHeadSha;
+    } catch {
+      rawTargetRepositoryId = undefined;
+      rawTargetHeadSha = undefined;
+    }
+  }
+  const snapshotTarget: EvidenceTarget = Object.freeze({
+    repositoryId: readIdentifier(rawTargetRepositoryId) ?? '',
+    currentHeadSha: readIdentifier(rawTargetHeadSha) ?? '',
+  });
+
   // A non-array collection fails closed to an empty evaluation rather than
   // throwing, matching the totality guarantee of the single-record evaluator.
+  //
+  // Iteration deliberately avoids the collection's own `map`: an array can
+  // carry an own non-function `map`, a throwing `map` getter, or inherit a
+  // poisoned `Array.prototype.map`. A plain indexed loop touches none of those.
+  // `length` on a real array is a non-configurable own data property, but a
+  // Proxy wrapping an array also passes `Array.isArray`, so both the length and
+  // each element read are guarded. Input order is preserved.
   const rawRecords: unknown = evidence;
-  const records: readonly EvidenceRecord[] = Array.isArray(rawRecords)
-    ? (rawRecords as readonly EvidenceRecord[])
-    : [];
-  const results = records.map((record) => evaluateEvidenceFreshness(record, target));
+  const results: EvidenceFreshness[] = [];
+
+  if (Array.isArray(rawRecords)) {
+    let rawLength: unknown;
+    try {
+      rawLength = rawRecords.length;
+    } catch {
+      rawLength = 0;
+    }
+    const length =
+      typeof rawLength === 'number' && Number.isInteger(rawLength) && rawLength >= 0
+        ? rawLength
+        : 0;
+
+    for (let index = 0; index < length; index += 1) {
+      let element: unknown;
+      try {
+        element = rawRecords[index];
+      } catch {
+        element = undefined;
+      }
+      results.push(evaluateEvidenceFreshness(element as EvidenceRecord, snapshotTarget));
+    }
+  }
 
   return Object.freeze({
     results: Object.freeze(results),
