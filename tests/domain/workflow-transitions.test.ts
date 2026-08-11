@@ -354,6 +354,18 @@ describe('applyWorkflowEvent — group C, invocation lifecycle', () => {
     expect(result.rejection).toBe('DUPLICATE_INVOCATION_ID');
   });
 
+  it('rejects a deserialized state with duplicate tracked invocation ids', () => {
+    const state = withRequestedInvocation();
+    const duplicateState = {
+      ...state,
+      invocations: [state.invocations[0], state.invocations[0]],
+    } as WorkflowState;
+    const result = applyWorkflowEvent(duplicateState, reportInvocation());
+
+    expect(result.rejection).toBe('WORKFLOW_UNREADABLE');
+    expect(result.state).toBe(duplicateState);
+  });
+
   it('refuses a report for an invocation it never requested', () => {
     const result = applyWorkflowEvent(
       openedWorkflow(),
@@ -604,6 +616,36 @@ describe('applyWorkflowEvent — group E, evidence admission and A2', () => {
     expect(result.invalidFields).toEqual(['verdict.targetRepositoryId']);
   });
 
+  it.each([
+    ['repository', { repositoryId: REPO_B }, ['verdict.repositoryId']],
+    ['commit', { commitSha: SHA_B }, ['verdict.commitSha']],
+    [
+      'repository and commit',
+      { repositoryId: REPO_B, commitSha: SHA_B },
+      ['verdict.repositoryId', 'verdict.commitSha'],
+    ],
+  ] as const)('refuses CURRENT evidence whose own %s binding is stale', (_name, overrides, fields) => {
+    const result = applyWorkflowEvent(
+      openedWorkflow(),
+      admitEvidence(buildVerdict(overrides)),
+    );
+
+    expect(result.rejection).toBe('EVIDENCE_NOT_CURRENT');
+    expect(result.invalidFields).toEqual(fields);
+  });
+
+  it('does not let a cross-repository human decision clear an open gate', () => {
+    const state = awaitingHuman();
+    const result = applyWorkflowEvent(
+      state,
+      admitEvidence(buildHumanDecisionVerdict({ repositoryId: REPO_B })),
+    );
+
+    expect(result.rejection).toBe('EVIDENCE_NOT_CURRENT');
+    expect(result.state).toBe(state);
+    expect(result.state.status).toBe('AWAITING_HUMAN_DECISION');
+  });
+
   it.each(MALFORMED_VALUES)('refuses a verdict whose evidenceId is %s', (_name, value) => {
     const result = applyWorkflowEvent(
       openedWorkflow(),
@@ -673,7 +715,9 @@ describe('applyWorkflowEvent — group E, evidence admission and A2', () => {
     const moved = applyOrThrow(admitted, observeHead(SHA_B));
     const later = applyOrThrow(
       moved,
-      admitEvidence(buildVerdict({ evidenceId: EVIDENCE_B, targetHeadSha: SHA_B })),
+      admitEvidence(
+        buildVerdict({ evidenceId: EVIDENCE_B, commitSha: SHA_B, targetHeadSha: SHA_B }),
+      ),
     );
 
     expect(later.evidence[0]?.admittedAtCommitSha).toBe(SHA_A);
@@ -1001,6 +1045,21 @@ describe('applyWorkflowEvent — group G, binding integrity', () => {
 
     expect(result.rejection).toBe('BINDING_MISMATCH');
     expect(result.invalidFields).toEqual(['event.atCommitSha']);
+  });
+
+  it('rejects an already-open human gate before reading atCommitSha', () => {
+    const event = { kind: 'HUMAN_GATE_OPENED' } as Record<string, unknown>;
+    Object.defineProperty(event, 'atCommitSha', {
+      enumerable: true,
+      get() {
+        throw new Error('must not be read');
+      },
+    });
+
+    const result = applyWorkflowEvent(awaitingHuman(), event as never);
+
+    expect(result.rejection).toBe('HUMAN_GATE_ALREADY_OPEN');
+    expect(result.invalidFields).toEqual(['workflow.status']);
   });
 
   it('retains the gate revision when a workflow closes while awaiting a human', () => {

@@ -238,6 +238,8 @@ result carries the target it was answered against. The only thing left to check
 is that the answer is about *this* workflow's binding:
 
 - `state` is `CURRENT` and `reason` is `BOUND_TO_CURRENT_HEAD`;
+- the evidence's own `repositoryId` equals the workflow's repository;
+- the evidence's own `commitSha` equals the bound commit;
 - `targetRepositoryId` equals the workflow's repository;
 - `targetHeadSha` equals the bound commit.
 

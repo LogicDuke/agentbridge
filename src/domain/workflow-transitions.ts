@@ -473,6 +473,11 @@ function snapshotWorkflow(state: WorkflowState): WorkflowSnapshot | null {
     if (tracked === null) {
       return null;
     }
+    for (let priorIndex = 0; priorIndex < invocations.length; priorIndex += 1) {
+      if (invocations[priorIndex]?.invocationId === tracked.invocationId) {
+        return null;
+      }
+    }
     append(invocations, tracked);
   }
 
@@ -1135,6 +1140,12 @@ function applyEvidenceAdmitted(
   if (readOwnProperty(verdictRecord, 'reason') !== FRESHNESS_REASON.BOUND_TO_CURRENT_HEAD) {
     append(notCurrent, 'verdict.reason');
   }
+  if (readOwnProperty(verdictRecord, 'repositoryId') !== snapshot.repositoryId) {
+    append(notCurrent, 'verdict.repositoryId');
+  }
+  if (readOwnProperty(verdictRecord, 'commitSha') !== snapshot.boundCommitSha) {
+    append(notCurrent, 'verdict.commitSha');
+  }
   if (readOwnProperty(verdictRecord, 'targetRepositoryId') !== snapshot.repositoryId) {
     append(notCurrent, 'verdict.targetRepositoryId');
   }
@@ -1260,16 +1271,16 @@ function applyHumanGateOpened(
   snapshot: WorkflowSnapshot,
   eventRecord: object,
 ): TransitionResult {
+  if (snapshot.status === WORKFLOW_STATUS.AWAITING_HUMAN_DECISION) {
+    return rejected(original, TRANSITION_REJECTION.HUMAN_GATE_ALREADY_OPEN, [
+      'workflow.status',
+    ]);
+  }
+
   const atCommitSha = readExactIdentifier(readOwnProperty(eventRecord, 'atCommitSha'));
   if (atCommitSha === null) {
     return rejected(original, TRANSITION_REJECTION.EVENT_PAYLOAD_INVALID, [
       'event.atCommitSha',
-    ]);
-  }
-
-  if (snapshot.status === WORKFLOW_STATUS.AWAITING_HUMAN_DECISION) {
-    return rejected(original, TRANSITION_REJECTION.HUMAN_GATE_ALREADY_OPEN, [
-      'workflow.status',
     ]);
   }
 
