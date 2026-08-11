@@ -966,6 +966,19 @@ function snapshotWorkflow(state: WorkflowState): WorkflowSnapshot | null {
     return null;
   }
 
+  // A status that only a transition can produce means that transition already
+  // ran, and it stamps no record — so it needs a sequence slot of its own,
+  // distinct from every retained stamp. `AWAITING_HUMAN_DECISION` comes from
+  // `HUMAN_GATE_OPENED` and `CLOSED` from `CLOSE_REQUESTED`; `OPEN` is the
+  // opening state and requires nothing.
+  if (
+    (rawStatus === WORKFLOW_STATUS.AWAITING_HUMAN_DECISION ||
+      rawStatus === WORKFLOW_STATUS.CLOSED) &&
+    sequence <= seenSequences.length
+  ) {
+    return null;
+  }
+
   return {
     workflowId,
     repositoryId,

@@ -1504,6 +1504,92 @@ describe('group J — hostile input fails closed', () => {
     expect(applyWorkflowEvent(legal, closeWorkflow()).outcome).toBe('APPLIED');
   });
 
+  /* ---- a status-producing transition needs an unstamped slot of its own ---- */
+
+  it('refuses AWAITING_HUMAN_DECISION with no slot for the gate transition', () => {
+    const forged = {
+      ...openedWorkflow(),
+      status: 'AWAITING_HUMAN_DECISION',
+      humanGateOpenedAtRevision: 0,
+      sequence: 0,
+    } as unknown as WorkflowState;
+
+    expect(applyWorkflowEvent(forged, observeHead(SHA_B)).rejection).toBe('WORKFLOW_UNREADABLE');
+  });
+
+  it('accepts the nearest valid awaiting-human state', () => {
+    const legal = {
+      ...openedWorkflow(),
+      status: 'AWAITING_HUMAN_DECISION',
+      humanGateOpenedAtRevision: 0,
+      sequence: 1,
+    } as unknown as WorkflowState;
+
+    expect(applyWorkflowEvent(legal, observeHead(SHA_B)).outcome).toBe('APPLIED');
+  });
+
+  it('requires the gate slot to be unstamped', () => {
+    // The single slot is already claimed by the request stamp, leaving none for
+    // the gate opening; one more slot makes it reachable.
+    const requested = applyOrThrow(openedWorkflow(), requestInvocation());
+    const contended = {
+      ...requested,
+      status: 'AWAITING_HUMAN_DECISION',
+      humanGateOpenedAtRevision: 0,
+    } as unknown as WorkflowState;
+
+    expect(requested.sequence).toBe(1);
+    expect(applyWorkflowEvent(contended, observeHead(SHA_B)).rejection).toBe(
+      'WORKFLOW_UNREADABLE',
+    );
+    expect(
+      applyWorkflowEvent({ ...contended, sequence: 2 } as WorkflowState, observeHead(SHA_B))
+        .outcome,
+    ).toBe('APPLIED');
+  });
+
+  it('refuses CLOSED with no slot for the closing transition', () => {
+    const forged = {
+      ...openedWorkflow(),
+      status: 'CLOSED',
+      closureReason: 'CALLER_CLOSED',
+      sequence: 0,
+    } as unknown as WorkflowState;
+
+    // Unreadable, rather than merely refused by the terminal-status gate.
+    expect(applyWorkflowEvent(forged, observeHead(SHA_B)).rejection).toBe('WORKFLOW_UNREADABLE');
+  });
+
+  it('accepts the nearest valid closed state', () => {
+    const legal = {
+      ...openedWorkflow(),
+      status: 'CLOSED',
+      closureReason: 'CALLER_CLOSED',
+      sequence: 1,
+    } as unknown as WorkflowState;
+
+    // Readable now, so the terminal-status rule is what refuses the event.
+    expect(applyWorkflowEvent(legal, observeHead(SHA_B)).rejection).toBe('WORKFLOW_CLOSED');
+  });
+
+  it('leaves OPEN states that never made either transition unaffected', () => {
+    const fresh = openedWorkflow();
+
+    expect(fresh.sequence).toBe(0);
+    expect(applyWorkflowEvent(fresh, observeHead(SHA_B)).outcome).toBe('APPLIED');
+    expect(applyOrThrow(fresh, requestInvocation()).sequence).toBe(1);
+  });
+
+  it('keeps genuinely produced gate and closure states valid', () => {
+    const gated = applyOrThrow(openedWorkflow(), openHumanGate());
+    const closed = applyOrThrow(openedWorkflow(), closeWorkflow());
+
+    expect(gated.sequence).toBe(1);
+    expect(closed.sequence).toBe(1);
+    expect(applyWorkflowEvent(gated, observeHead(SHA_B)).outcome).toBe('APPLIED');
+    expect(applyWorkflowEvent(closed, observeHead(SHA_B)).rejection).toBe('WORKFLOW_CLOSED');
+  });
+
   /* ---- intervening HEAD transitions must have sequence slots of their own ---- */
 
   /** One invocation whose request and report straddle a revision advance. */
