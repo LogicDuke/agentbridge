@@ -26,6 +26,8 @@ PR 005 adds review ingestion: untrusted reviewer output is normalized into commi
 
 PR 006 adds the provider-neutral agent invocation boundary: a commit-bound record of what AgentBridge asked which agent to do, and normalization of what that agent reported back. An agent's report is an untrusted **claim** — PR 006 records that an artifact was claimed, never that it exists remotely, is integrated, is validated, or is authorized. Provider identity is inert: it never implies a role or grants authority, and roles remain configurable. The layer invokes nothing, models no lifecycle transitions, and performs no I/O. See `docs/architecture/006-agent-invocation-boundary.md`.
 
+PR 007 adds the Autoflow state machine: the smallest durable orchestration state model that binds a unit of work to an exact repository, pull request, and commit, and records — in order — what was requested and what was independently established. It consumes only the outputs of PR 004, 005, and 006; it never normalizes agent output, never judges freshness, and never grants authority. Provider identity, invocation purpose, and agent-reported status are inert: no transition's legality depends on any of them, and a claim can never become an observation. State is an immutable value produced by a pure, total transition function, and the layer performs no I/O. See `docs/architecture/007-autoflow-state-machine.md`.
+
 ## Runtime
 
 - Node.js 24 LTS
