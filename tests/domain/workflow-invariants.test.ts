@@ -1278,15 +1278,60 @@ describe('group J — hostile input fails closed', () => {
     expect(withList(state, collection, extensible).rejection).toBe('WORKFLOW_UNREADABLE');
   });
 
-  it.each(COLLECTIONS)('accepts %s as a non-extensible list of the same records', (collection) => {
+  it.each(COLLECTIONS)('accepts %s as a frozen list of the same records', (collection) => {
+    const state = populatedAggregate();
+    const result = withList(state, collection, Object.freeze([...state[collection]]));
+
+    expect(result.outcome).toBe('APPLIED');
+    expect(result.state[collection]).toHaveLength(2);
+  });
+
+  it.each(COLLECTIONS)('refuses %s that is merely sealed, not frozen', (collection) => {
     const state = populatedAggregate();
 
-    for (const seal of [Object.freeze, Object.seal, Object.preventExtensions]) {
-      const result = withList(state, collection, seal([...state[collection]]));
+    // A sealed array keeps its elements writable, and the `get` invariant binds
+    // a Proxy only for a non-configurable *and non-writable* property — so a
+    // sealed view can substitute a record while every other channel stays
+    // compliant. Non-extensibility alone is therefore not sufficient.
+    for (const weaken of [Object.seal, Object.preventExtensions]) {
+      const weakened = weaken([...state[collection]]);
 
-      expect(result.outcome).toBe('APPLIED');
-      expect(result.state[collection]).toHaveLength(2);
+      expect(Object.isExtensible(weakened)).toBe(false);
+      expect(Object.isFrozen(weakened)).toBe(false);
+      expect(withList(state, collection, weakened).rejection).toBe('WORKFLOW_UNREADABLE');
     }
+  });
+
+  it('refuses a sealed view that substitutes a record for a real entry', () => {
+    const state = populatedAggregate();
+    const real = [...state.invocations];
+    const decoy = { ...real[0], invocationId: 'i-substituted', providerId: 'attacker' };
+    const substituting = new Proxy(Object.seal([...real]), {
+      get: (target, key): unknown => (key === '0' ? decoy : Reflect.get(target, key)),
+    });
+    const result = withList(state, 'invocations', substituting);
+
+    expect(result.rejection).toBe('WORKFLOW_UNREADABLE');
+    expect(result.outcome).toBe('REJECTED');
+
+    // The real entry is never displaced, and the decoy never becomes durable.
+    const ids = state.invocations.map((tracked) => tracked.invocationId);
+    expect(ids).toContain(INVOCATION_A);
+    expect(ids).not.toContain('i-substituted');
+  });
+
+  it('cannot have an element substituted once the list is frozen', () => {
+    const state = populatedAggregate();
+    const real = [...state.invocations];
+    const decoy = { ...real[0], invocationId: 'i-substituted' };
+    const overFrozen = new Proxy(Object.freeze([...real]), {
+      get: (target, key): unknown => (key === '0' ? decoy : Reflect.get(target, key)),
+    });
+
+    // The engine itself refuses the lie for a non-writable, non-configurable
+    // element, so the substitution cannot even be observed.
+    expect(() => overFrozen[0]).toThrow(TypeError);
+    expect(withList(state, 'invocations', overFrozen).rejection).toBe('WORKFLOW_UNREADABLE');
   });
 
   it.each(COLLECTIONS)('refuses %s whose ownKeys trap throws', (collection) => {
@@ -1426,21 +1471,35 @@ describe('group J — hostile input fails closed', () => {
   });
 
   it('refuses a report stamp that precedes its own revision', () => {
-    const forged = stampedState({
-      revision: 2,
-      sequence: 6,
-      invocations: stored([
-        {
-          ...(trackedAt(2, 3) as Record<string, unknown>),
-          state: 'REPORTED',
-          reportedStatus: 'reported-complete',
-          reportedAtRevision: 2,
-          reportedAtSequence: 2,
-        },
-      ]),
-    });
+    // The request sits at revision 0 / sequence 1 so the report at sequence 2
+    // clears the pre-existing `reportedAtSequence > requestedAtSequence` rule.
+    // The only rule it breaks is `reportedAtSequence > reportedAtRevision`.
+    const request = trackedAt(0, 1) as Record<string, unknown>;
+    const reported = {
+      ...request,
+      state: 'REPORTED',
+      reportedStatus: 'reported-complete',
+      reportedAtRevision: 2,
+      reportedAtSequence: 2,
+    };
+
+    expect(reported.reportedAtSequence).toBeGreaterThan(request.requestedAtSequence as number);
+    expect(reported.reportedAtRevision).toBeGreaterThanOrEqual(
+      request.requestedAtRevision as number,
+    );
+
+    const forged = stampedState({ revision: 2, sequence: 6, invocations: stored([reported]) });
 
     expect(applyWorkflowEvent(forged, closeWorkflow()).rejection).toBe('WORKFLOW_UNREADABLE');
+
+    // Moving only the report stamp past its own revision makes it legal again.
+    const legal = stampedState({
+      revision: 2,
+      sequence: 6,
+      invocations: stored([{ ...reported, reportedAtSequence: 3 }]),
+    });
+
+    expect(applyWorkflowEvent(legal, closeWorkflow()).outcome).toBe('APPLIED');
   });
 
   it('accepts a report whose stamps follow both its request and its revision', () => {
@@ -1653,42 +1712,42 @@ describe('group J — hostile input fails closed', () => {
   it.each([
     [
       'evidence reusing the request stamp',
-      (s: WorkflowState) => ({ ...s, evidence: [{ ...s.evidence[0], admittedAtSequence: 1 }] }),
+      (s: WorkflowState) => ({ ...s, evidence: stored([{ ...s.evidence[0], admittedAtSequence: 1 }]) }),
     ],
     [
       'review reusing the request stamp',
-      (s: WorkflowState) => ({ ...s, reviews: [{ ...s.reviews[0], admittedAtSequence: 1 }] }),
+      (s: WorkflowState) => ({ ...s, reviews: stored([{ ...s.reviews[0], admittedAtSequence: 1 }]) }),
     ],
     [
       'review reusing the evidence stamp',
-      (s: WorkflowState) => ({ ...s, reviews: [{ ...s.reviews[0], admittedAtSequence: 2 }] }),
+      (s: WorkflowState) => ({ ...s, reviews: stored([{ ...s.reviews[0], admittedAtSequence: 2 }]) }),
     ],
     [
       'report reusing the evidence stamp',
       (s: WorkflowState) => ({
         ...s,
-        invocations: [{ ...s.invocations[0], reportedAtSequence: 2 }],
+        invocations: stored([{ ...s.invocations[0], reportedAtSequence: 2 }]),
       }),
     ],
     [
       'report reusing the review stamp',
       (s: WorkflowState) => ({
         ...s,
-        invocations: [{ ...s.invocations[0], reportedAtSequence: 3 }],
+        invocations: stored([{ ...s.invocations[0], reportedAtSequence: 3 }]),
       }),
     ],
     [
       'two evidence admissions sharing a stamp',
       (s: WorkflowState) => ({
         ...s,
-        evidence: [s.evidence[0], { ...s.evidence[0], evidenceId: EVIDENCE_B }],
+        evidence: stored([s.evidence[0], { ...s.evidence[0], evidenceId: EVIDENCE_B }]),
       }),
     ],
     [
       'two reviews sharing a stamp',
       (s: WorkflowState) => ({
         ...s,
-        reviews: [s.reviews[0], { ...s.reviews[0], reviewId: 'rv-other' }],
+        reviews: stored([s.reviews[0], { ...s.reviews[0], reviewId: 'rv-other' }]),
       }),
     ],
   ])('refuses a state where %s', (_name, forge) => {
@@ -1706,7 +1765,7 @@ describe('group J — hostile input fails closed', () => {
     const tracked = base.invocations[0];
     const forged = {
       ...base,
-      invocations: [
+      invocations: stored([
         tracked,
         {
           ...tracked,
@@ -1716,7 +1775,7 @@ describe('group J — hostile input fails closed', () => {
           reportedAtRevision: null,
           reportedAtSequence: null,
         },
-      ],
+      ]),
     } as unknown as WorkflowState;
 
     expect(applyWorkflowEvent(forged, admitEvidence()).rejection).toBe('WORKFLOW_UNREADABLE');

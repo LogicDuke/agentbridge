@@ -104,6 +104,8 @@ import {
 const objectFreeze = Object.freeze;
 const objectHasOwn = Object.hasOwn;
 const arrayIsArray = Array.isArray;
+const objectDefineProperty = Object.defineProperty;
+const objectIsFrozen = Object.isFrozen;
 const reflectIsExtensible = Reflect.isExtensible;
 const reflectOwnKeys = Reflect.ownKeys;
 
@@ -297,6 +299,83 @@ function bindRevisionCommit(
 }
 
 /**
+ * Note that revision `revision` covers sequence slot `sequence`.
+ *
+ * Revision never decreases, so ordering every stamped record by sequence must
+ * produce non-decreasing revisions. Tracking the lowest and highest slot each
+ * revision covers reduces that to a comparison between revision *bands*, which
+ * the caller checks once at the end. Derived transiently; nothing is stored.
+ */
+function noteRevisionSpan(
+  revisions: number[],
+  lowest: number[],
+  highest: number[],
+  revision: number,
+  sequence: number,
+): void {
+  for (let index = 0; index < revisions.length; index += 1) {
+    if (revisions[index] === revision) {
+      const low = lowest[index];
+      const high = highest[index];
+      if (low !== undefined && sequence < low) {
+        objectDefineProperty(lowest, index, {
+          value: sequence,
+          writable: true,
+          enumerable: true,
+          configurable: true,
+        });
+      }
+      if (high !== undefined && sequence > high) {
+        objectDefineProperty(highest, index, {
+          value: sequence,
+          writable: true,
+          enumerable: true,
+          configurable: true,
+        });
+      }
+      return;
+    }
+  }
+  append(revisions, revision);
+  append(lowest, sequence);
+  append(highest, sequence);
+}
+
+/**
+ * Do the recorded revision bands respect chronology?
+ *
+ * An earlier revision may not hold a slot at or after a later revision's
+ * earliest slot: the HEAD transition that produced the later revision consumed
+ * a slot between them.
+ */
+function revisionBandsOrdered(
+  revisions: readonly number[],
+  lowest: readonly number[],
+  highest: readonly number[],
+): boolean {
+  for (let a = 0; a < revisions.length; a += 1) {
+    for (let b = 0; b < revisions.length; b += 1) {
+      const earlier = revisions[a];
+      const later = revisions[b];
+      const earlierHigh = highest[a];
+      const laterLow = lowest[b];
+      if (
+        earlier === undefined ||
+        later === undefined ||
+        earlierHigh === undefined ||
+        laterLow === undefined
+      ) {
+        return false;
+      }
+      if (earlier < later && earlierHigh >= laterLow) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+/**
  * Materialise an untrusted list with guarded reads and a hard length cap.
  *
  * A throwing element read returns `null` rather than dropping the element:
@@ -318,29 +397,33 @@ function readList(value: unknown, limit: number): readonly unknown[] | null {
 
   // **Every content signal a Proxy exposes is one the same Proxy controls.**
   // Over an *extensible* target it may report a short `length`, return a
-  // matching `ownKeys`, and deny the hidden indices through
-  // `getOwnPropertyDescriptor` — all consistently. Corroborating one trapped
-  // channel with another proves nothing when one adversary owns both, so a real
-  // own record could be hidden and then silently deleted from the durable
-  // snapshot by the next applied transition.
+  // matching `ownKeys`, and deny the hidden indices — all consistently.
+  // Corroborating one trapped channel with another proves nothing when one
+  // adversary owns both, so a real own record could be hidden and then silently
+  // deleted from the durable snapshot by the next applied transition.
   //
-  // Non-extensibility is the one property the engine refuses to let a Proxy
-  // fake: the `isExtensible` trap must agree with its target, and once the
-  // target is non-extensible the `ownKeys` trap must return *exactly* the
-  // target's own keys. Only then do the structural checks below become proof
-  // rather than assertion.
+  // Non-extensibility alone is not enough. A *sealed* array's elements stay
+  // writable, and the `get` invariant binds a Proxy only for a non-configurable
+  // **and non-writable** data property — so a sealed view can keep `length`,
+  // `ownKeys`, and `hasOwn` perfectly compliant while substituting an arbitrary
+  // record for an index, erasing the real entry and freeing its identity.
+  //
+  // Frozen-ness is what the engine underwrites end to end: `isExtensible` must
+  // agree with the target, `ownKeys` must then return exactly the target's own
+  // keys, and every element — now non-configurable and non-writable — must read
+  // back as its true value. `Object.isFrozen` cannot be faked either, because a
+  // non-configurable writable property may not be reported as non-writable.
   //
   // Every list this layer emits is frozen by `freezeState`, so a state produced
   // here always satisfies this. A caller that rebuilds a state from JSON must
-  // freeze the three collections before handing it back; an extensible list is
-  // refused rather than partially trusted.
-  let extensible = true;
+  // freeze the three collections before handing it back.
+  let frozen = false;
   try {
-    extensible = reflectIsExtensible(elements);
+    frozen = objectIsFrozen(elements);
   } catch {
     return null;
   }
-  if (extensible) {
+  if (!frozen) {
     return null;
   }
 
@@ -603,7 +686,9 @@ function readAdmittedReview(
  *   consuming a distinct sequence slot, so the R-th advance sat at slot >= R
  *   and the record stamped at revision R was created by a later transition
  *   still. The bound is tight — open, one HEAD advance at slot 1, then a
- *   request at slot 2 stamps revision 1 with sequence 2.
+ *   request at slot 2 stamps revision 1 with sequence 2;
+ * - ordering every stamped record by sequence yields non-decreasing revisions,
+ *   since a revision never decreases once a HEAD transition advances it.
  */
 function snapshotWorkflow(state: WorkflowState): WorkflowSnapshot | null {
   const record = asRecord(state);
@@ -768,6 +853,9 @@ function snapshotWorkflow(state: WorkflowState): WorkflowSnapshot | null {
   const seenRevisions: number[] = [];
   const seenCommits: string[] = [];
   const seenSequences: number[] = [];
+  const spanRevisions: number[] = [];
+  const spanLowest: number[] = [];
+  const spanHighest: number[] = [];
   for (let index = 0; index < invocations.length; index += 1) {
     const tracked = invocations[index];
     if (
@@ -784,6 +872,22 @@ function snapshotWorkflow(state: WorkflowState): WorkflowSnapshot | null {
     ) {
       return null;
     }
+    noteRevisionSpan(
+      spanRevisions,
+      spanLowest,
+      spanHighest,
+      tracked.requestedAtRevision,
+      tracked.requestedAtSequence,
+    );
+    if (tracked.reportedAtRevision !== null && tracked.reportedAtSequence !== null) {
+      noteRevisionSpan(
+        spanRevisions,
+        spanLowest,
+        spanHighest,
+        tracked.reportedAtRevision,
+        tracked.reportedAtSequence,
+      );
+    }
   }
   for (let index = 0; index < evidence.length; index += 1) {
     const admitted = evidence[index];
@@ -799,6 +903,13 @@ function snapshotWorkflow(state: WorkflowState): WorkflowSnapshot | null {
     ) {
       return null;
     }
+    noteRevisionSpan(
+      spanRevisions,
+      spanLowest,
+      spanHighest,
+      admitted.admittedAtRevision,
+      admitted.admittedAtSequence,
+    );
   }
   for (let index = 0; index < reviews.length; index += 1) {
     const admitted = reviews[index];
@@ -814,6 +925,19 @@ function snapshotWorkflow(state: WorkflowState): WorkflowSnapshot | null {
     ) {
       return null;
     }
+    noteRevisionSpan(
+      spanRevisions,
+      spanLowest,
+      spanHighest,
+      admitted.admittedAtRevision,
+      admitted.admittedAtSequence,
+    );
+  }
+
+  // Revision never decreases, so ordering every stamped record by sequence must
+  // yield non-decreasing revisions.
+  if (!revisionBandsOrdered(spanRevisions, spanLowest, spanHighest)) {
+    return null;
   }
 
   return {
