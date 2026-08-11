@@ -104,6 +104,8 @@ import {
 const objectFreeze = Object.freeze;
 const objectHasOwn = Object.hasOwn;
 const arrayIsArray = Array.isArray;
+const reflectIsExtensible = Reflect.isExtensible;
+const reflectOwnKeys = Reflect.ownKeys;
 
 /** Shared frozen empty list, so an empty result is byte-identical every time. */
 const NO_FIELDS: readonly string[] = objectFreeze([]);
@@ -172,15 +174,33 @@ function readOptionalOwn(target: object, key: string): {
 }
 
 /**
- * Is this value a genuinely empty list?
+ * Is this value **provably** an empty list under the hostile-runtime model?
  *
  * Used to check the `invalidFields` of a verdict claiming `CURRENT`. PR 004
  * only ever emits an empty list alongside `CURRENT`, so a populated,
- * non-array, or unreadable value marks a verdict that PR 004 could not have
- * produced. Every read is guarded, and the length is narrowed through
- * {@link readCount}, so a Proxy reporting a hostile length fails closed.
+ * non-array, or unprovable value marks a verdict PR 004 could not have
+ * produced.
+ *
+ * **Reading `length` is not proof.** A Proxy over an *extensible* array can
+ * report `length` as `0` while the target holds entries, and can lie just as
+ * consistently through `ownKeys`, `getOwnPropertyDescriptor`, and `hasOwn` —
+ * no amount of reflection can contradict it. Emptiness is therefore proved the
+ * only way the engine underwrites:
+ *
+ * 1. it is an array (`Array.isArray` pierces a Proxy to its target);
+ * 2. it is **non-extensible** — the `isExtensible` trap is required to agree
+ *    with the target, so this cannot be faked;
+ * 3. its own keys are exactly `['length']` — for a non-extensible target the
+ *    `ownKeys` trap must return exactly the target's own keys, so an element
+ *    cannot be hidden;
+ * 4. `length` still reads as `0`, as a redundant cross-check.
+ *
+ * Step 2 is what turns steps 3 and 4 from assertions into proof. PR 004 freezes
+ * every result list, so a genuine verdict satisfies this; anything that cannot
+ * prove it fails closed. Every read is guarded, so a throwing or revoked value
+ * is rejected rather than raised.
  */
-function isEmptyList(value: unknown): boolean {
+function isProvablyEmptyList(value: unknown): boolean {
   let isArray = false;
   try {
     isArray = arrayIsArray(value);
@@ -190,6 +210,27 @@ function isEmptyList(value: unknown): boolean {
   if (!isArray) {
     return false;
   }
+
+  let extensible = true;
+  try {
+    extensible = reflectIsExtensible(value as object);
+  } catch {
+    return false;
+  }
+  if (extensible) {
+    return false;
+  }
+
+  let keys: readonly (string | symbol)[];
+  try {
+    keys = reflectOwnKeys(value as object);
+  } catch {
+    return false;
+  }
+  if (keys.length !== 1 || keys[0] !== 'length') {
+    return false;
+  }
+
   let rawLength: unknown;
   try {
     rawLength = (value as readonly unknown[]).length;
@@ -197,6 +238,30 @@ function isEmptyList(value: unknown): boolean {
     return false;
   }
   return readCount(rawLength, 0) === 0;
+}
+
+/**
+ * Claim one transition sequence stamp, reporting a collision.
+ *
+ * Every applied transition advances `sequence` exactly once, and stamps at most
+ * one record with the new value: `INVOCATION_REQUESTED` stamps a request,
+ * `INVOCATION_REPORTED` a report, and the two admission events an admission.
+ * `HEAD_OBSERVED`, `HUMAN_GATE_OPENED`, and `CLOSE_REQUESTED` advance the
+ * sequence without stamping anything. **No two retained stamps can therefore
+ * share a value**, across every collection — some sequence values simply have
+ * no stamp at all.
+ *
+ * Derived transiently during validation; no timeline is stored. Uses an indexed
+ * scan rather than a `Set`, so no prototype method is on the path.
+ */
+function claimSequence(seen: number[], stamp: number): boolean {
+  for (let index = 0; index < seen.length; index += 1) {
+    if (seen[index] === stamp) {
+      return false;
+    }
+  }
+  append(seen, stamp);
+  return true;
 }
 
 /**
@@ -259,6 +324,27 @@ function readList(value: unknown, limit: number): readonly unknown[] | null {
   }
   const length = readCount(rawLength, limit);
   if (length === null) {
+    return null;
+  }
+
+  // A reported length is not, on its own, a statement about what the list
+  // holds: a Proxy can report a *smaller* length than the own indices actually
+  // present, and iterating to that length would silently drop the excess —
+  // precisely the shortening of orchestration history this layer refuses.
+  //
+  // The own-key structure is therefore required to agree with the reported
+  // cardinality. A genuine array of `n` elements has exactly `n + 1` own keys:
+  // one per index, plus `length`. Any surplus key — a hidden element past the
+  // claimed range, a stray property, a symbol — breaks the equality, and any
+  // missing index is caught by the per-index ownership check below. Together
+  // they pin the structure exactly rather than trusting either signal alone.
+  let keys: readonly (string | symbol)[];
+  try {
+    keys = reflectOwnKeys(elements);
+  } catch {
+    return null;
+  }
+  if (keys.length !== length + 1) {
     return null;
   }
 
@@ -474,7 +560,9 @@ function readAdmittedReview(
  *   external reconciliation, and revisions with no entries are unconstrained;
  * - `revision <= sequence`, since every revision advance is itself an applied
  *   transition;
- * - no admission identity — the value pair (id, revision) — appears twice.
+ * - no admission identity — the value pair (id, revision) — appears twice;
+ * - no two retained transition sequence stamps share a value, since every
+ *   applied transition advances `sequence` once and stamps at most one record.
  */
 function snapshotWorkflow(state: WorkflowState): WorkflowSnapshot | null {
   const record = asRecord(state);
@@ -627,10 +715,18 @@ function snapshotWorkflow(state: WorkflowState): WorkflowSnapshot | null {
     append(reviews, admitted);
   }
 
-  // Every represented revision must map to exactly one commit across all three
-  // collections. Derived transiently from entries already validated above.
+  // Two aggregate-wide invariants, derived transiently from entries already
+  // validated above. Nothing is stored.
+  //
+  // 1. Every represented revision maps to exactly one commit across all three
+  //    collections, because every entry stamped at revision R was created while
+  //    `boundCommitSha` held one value.
+  // 2. No two retained transition sequence stamps share a value, because every
+  //    applied transition advances `sequence` once and stamps at most one
+  //    record with the new value.
   const seenRevisions: number[] = [];
   const seenCommits: string[] = [];
+  const seenSequences: number[] = [];
   for (let index = 0; index < invocations.length; index += 1) {
     const tracked = invocations[index];
     if (
@@ -640,7 +736,10 @@ function snapshotWorkflow(state: WorkflowState): WorkflowSnapshot | null {
         seenCommits,
         tracked.requestedAtRevision,
         tracked.targetCommitSha,
-      )
+      ) ||
+      !claimSequence(seenSequences, tracked.requestedAtSequence) ||
+      (tracked.reportedAtSequence !== null &&
+        !claimSequence(seenSequences, tracked.reportedAtSequence))
     ) {
       return null;
     }
@@ -654,7 +753,8 @@ function snapshotWorkflow(state: WorkflowState): WorkflowSnapshot | null {
         seenCommits,
         admitted.admittedAtRevision,
         admitted.admittedAtCommitSha,
-      )
+      ) ||
+      !claimSequence(seenSequences, admitted.admittedAtSequence)
     ) {
       return null;
     }
@@ -668,7 +768,8 @@ function snapshotWorkflow(state: WorkflowState): WorkflowSnapshot | null {
         seenCommits,
         admitted.admittedAtRevision,
         admitted.admittedAtCommitSha,
-      )
+      ) ||
+      !claimSequence(seenSequences, admitted.admittedAtSequence)
     ) {
       return null;
     }
@@ -1334,7 +1435,7 @@ function applyEvidenceAdmitted(
   if (!isVocabularyMember(EVIDENCE_SOURCES, readOwnProperty(verdictRecord, 'source'))) {
     append(notCurrent, 'verdict.source');
   }
-  if (!isEmptyList(readOwnProperty(verdictRecord, 'invalidFields'))) {
+  if (!isProvablyEmptyList(readOwnProperty(verdictRecord, 'invalidFields'))) {
     append(notCurrent, 'verdict.invalidFields');
   }
   if (notCurrent.length > 0) {

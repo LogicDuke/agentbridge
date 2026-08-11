@@ -217,7 +217,10 @@ const BASE_VERDICT: EvidenceFreshness = {
   targetHeadSha: SHA_A,
   state: 'CURRENT',
   reason: 'BOUND_TO_CURRENT_HEAD',
-  invalidFields: [],
+  // Frozen, exactly as PR 004 emits it: `evaluateEvidenceFreshness` freezes
+  // every result list, and emptiness is only provable for a non-extensible
+  // value. A plain `[]` here would not be faithful to the real producer.
+  invalidFields: Object.freeze([]),
 };
 
 /** A well-formed PR 004 freshness verdict, CURRENT at the bound commit. */

@@ -331,22 +331,26 @@ describe('group J — hostile input fails closed', () => {
     const invocation = withUnstableGetter(buildInvocation(), 'targetCommitSha', [SHA_A, SHA_B, SHA_B]);
     const result = applyWorkflowEvent(openedWorkflow(), requestInvocation(invocation));
 
-    if (result.outcome === 'APPLIED') {
-      expect(result.state.invocations[0]?.targetCommitSha).toBe(SHA_A);
-    } else {
-      expect(result.rejection).toBe('BINDING_MISMATCH');
-    }
+    // Each field is read exactly once, so the first observed value is the one
+    // validated *and* stored. The swapped value must never reach the state —
+    // asserted unconditionally, so an unrelated rejection cannot satisfy it.
+    expect(JSON.stringify(result.state)).not.toContain(SHA_B);
+    expect(result.outcome).toBe('APPLIED');
+    expect(result.state.invocations).toHaveLength(1);
+    expect(result.state.invocations[0]?.targetCommitSha).toBe(SHA_A);
   });
 
   it('never lets an unstable evidence verdict be admitted under a different id', () => {
     const verdict = withUnstableGetter(buildVerdict(), 'evidenceId', [EVIDENCE_A, 'ev-forged']);
     const result = applyWorkflowEvent(openedWorkflow(), admitEvidence(verdict));
 
-    if (result.outcome === 'APPLIED') {
-      expect(result.state.evidence[0]?.evidenceId).toBe(EVIDENCE_A);
-    } else {
-      expect(result.outcome).toBe('REJECTED');
-    }
+    // The forged second value must never appear anywhere in the resulting
+    // state. Asserted unconditionally: a rejection for an unrelated reason
+    // cannot satisfy this the way a bare `outcome === 'REJECTED'` would.
+    expect(JSON.stringify(result.state)).not.toContain('ev-forged');
+    expect(result.outcome).toBe('APPLIED');
+    expect(result.state.evidence).toHaveLength(1);
+    expect(result.state.evidence[0]?.evidenceId).toBe(EVIDENCE_A);
   });
 
   it.each(['outcome', 'state', 'status', 'revision', 'sequence', 'kind', 'boundCommitSha'])(
@@ -968,6 +972,469 @@ describe('group J — hostile input fails closed', () => {
     expect(readmitted.evidence[0]?.admittedAtRevision).toBe(0);
     expect(readmitted.evidence[1]?.admittedAtRevision).toBe(1);
     expect(readmitted.evidence[0]?.evidenceId).toBe(readmitted.evidence[1]?.evidenceId);
+  });
+
+  /* ---- readList: observable cardinality must match own-index structure ---- */
+
+  /**
+   * A workflow carrying two entries in each collection, so an under-reported
+   * length has something to hide.
+   */
+  function populatedAggregate(): WorkflowState {
+    let state = applyOrThrow(openedWorkflow(), requestInvocation());
+    state = applyOrThrow(
+      state,
+      requestInvocation(buildInvocation({ invocationId: INVOCATION_B })),
+    );
+    state = applyOrThrow(state, admitEvidence());
+    state = applyOrThrow(state, admitEvidence(buildVerdict({ evidenceId: EVIDENCE_B })));
+    state = applyOrThrow(state, admitReview());
+    return applyOrThrow(state, admitReview(buildReview({ reviewId: 'rv-second' })));
+  }
+
+  const COLLECTIONS = ['invocations', 'evidence', 'reviews'] as const;
+
+  /** Swap one collection for a hostile list and apply an unrelated event. */
+  function withList(
+    state: WorkflowState,
+    collection: (typeof COLLECTIONS)[number],
+    list: unknown,
+  ): ReturnType<typeof applyWorkflowEvent> {
+    const forged = { ...state, [collection]: list } as unknown as WorkflowState;
+    return applyWorkflowEvent(forged, closeWorkflow());
+  }
+
+  it.each(COLLECTIONS)('refuses %s whose proxy under-reports its length', (collection) => {
+    const state = populatedAggregate();
+    const real = [...state[collection]];
+    const under = new Proxy(real, {
+      get: (target, key): unknown => (key === 'length' ? 1 : Reflect.get(target, key)),
+    });
+
+    expect(real).toHaveLength(2);
+    expect(withList(state, collection, under).rejection).toBe('WORKFLOW_UNREADABLE');
+  });
+
+  it.each(COLLECTIONS)('refuses %s reporting length 0 over a populated list', (collection) => {
+    const state = populatedAggregate();
+    const zero = new Proxy([...state[collection]], {
+      get: (target, key): unknown => (key === 'length' ? 0 : Reflect.get(target, key)),
+    });
+
+    expect(withList(state, collection, zero).rejection).toBe('WORKFLOW_UNREADABLE');
+  });
+
+  it.each(COLLECTIONS)('refuses %s with own indices beyond the reported length', (collection) => {
+    const state = populatedAggregate();
+    const real = [...state[collection], state[collection][0]];
+
+    // A genuine Array cannot hold an own index past its own length — lowering
+    // `length` makes the engine delete the surplus — so the only way to present
+    // this shape is a Proxy that under-reports while the target keeps them.
+    const truncated = [...real];
+    truncated.length = 1;
+    expect(Object.hasOwn(truncated, 1)).toBe(false);
+
+    const hiding = new Proxy(real, {
+      get: (target, key): unknown => (key === 'length' ? 1 : Reflect.get(target, key)),
+    });
+
+    expect(real).toHaveLength(3);
+    expect(Object.hasOwn(hiding, 1)).toBe(true);
+    expect(Object.hasOwn(hiding, 2)).toBe(true);
+    expect(withList(state, collection, hiding).rejection).toBe('WORKFLOW_UNREADABLE');
+  });
+
+  it.each(COLLECTIONS)('refuses %s carrying a stray non-index own property', (collection) => {
+    const state = populatedAggregate();
+    const strayed = [...state[collection]] as unknown[] & { smuggled?: unknown };
+    strayed.smuggled = state[collection][0];
+
+    expect(withList(state, collection, strayed).rejection).toBe('WORKFLOW_UNREADABLE');
+  });
+
+  it.each(COLLECTIONS)('refuses %s that over-reports its length', (collection) => {
+    const state = populatedAggregate();
+    const over = new Proxy([...state[collection]], {
+      get: (target, key): unknown => (key === 'length' ? 5 : Reflect.get(target, key)),
+    });
+
+    expect(withList(state, collection, over).rejection).toBe('WORKFLOW_UNREADABLE');
+  });
+
+  it.each(COLLECTIONS)('refuses %s with an unstable length', (collection) => {
+    const state = populatedAggregate();
+    let reads = 0;
+    const unstable = new Proxy([...state[collection]], {
+      get: (target, key): unknown => {
+        if (key === 'length') {
+          reads += 1;
+          return reads === 1 ? 2 : 0;
+        }
+        return Reflect.get(target, key);
+      },
+    });
+    const result = withList(state, collection, unstable);
+
+    // Either the structure check catches the disagreement, or the first read
+    // stands and every entry is kept — never a silent shortening.
+    if (result.outcome === 'APPLIED') {
+      expect(result.state[collection]).toHaveLength(2);
+    } else {
+      expect(result.rejection).toBe('WORKFLOW_UNREADABLE');
+    }
+  });
+
+  it.each(COLLECTIONS)('refuses %s with a throwing length', (collection) => {
+    const state = populatedAggregate();
+    const throwing = new Proxy([...state[collection]], {
+      get: (target, key): unknown => {
+        if (key === 'length') {
+          throw new Error('hostile length');
+        }
+        return Reflect.get(target, key);
+      },
+    });
+
+    expect(withList(state, collection, throwing).rejection).toBe('WORKFLOW_UNREADABLE');
+  });
+
+  it.each(COLLECTIONS)('refuses %s that is a revoked proxy', (collection) => {
+    expect(withList(populatedAggregate(), collection, revokedProxy()).rejection).toBe(
+      'WORKFLOW_UNREADABLE',
+    );
+  });
+
+  it.each(COLLECTIONS)('refuses %s that is sparse with an inherited numeric entry', (collection) => {
+    const state = populatedAggregate();
+    const planted = state[collection][0];
+    const holed: unknown[] = [];
+    holed.length = 2;
+    let observed: string | null = null;
+
+    withPoisoned(Array.prototype, 0, planted, () => {
+      withPoisoned(Array.prototype, 1, planted, () => {
+        const result = withList(state, collection, holed);
+        observed = result.rejection;
+        // The inherited value must never become a durable own entry.
+        expect(Object.hasOwn(holed, 0)).toBe(false);
+        expect(JSON.stringify(result.state[collection])).not.toBe('[]');
+      });
+    });
+
+    expect(observed).toBe('WORKFLOW_UNREADABLE');
+  });
+
+  it.each(COLLECTIONS)('accepts %s as an ordinary dense list with an accurate length', (collection) => {
+    const state = populatedAggregate();
+    const dense = [...state[collection]];
+    const result = withList(state, collection, dense);
+
+    expect(result.outcome).toBe('APPLIED');
+    expect(result.state[collection]).toHaveLength(2);
+  });
+
+  it('accepts genuinely empty collections', () => {
+    const empty = openedWorkflow();
+
+    expect(empty.invocations).toEqual([]);
+    expect(applyWorkflowEvent(empty, admitEvidence()).outcome).toBe('APPLIED');
+    expect(
+      applyWorkflowEvent({ ...empty, evidence: [], reviews: [] } as WorkflowState, admitReview())
+        .outcome,
+    ).toBe('APPLIED');
+  });
+
+  it('accepts a JSON round-tripped aggregate, whose lists are plain and dense', () => {
+    const state = populatedAggregate();
+    const restored = JSON.parse(JSON.stringify(state)) as WorkflowState;
+
+    expect(applyWorkflowEvent(restored, closeWorkflow()).outcome).toBe('APPLIED');
+  });
+
+  it('keeps capacity and duplicate scans working after the cardinality check', () => {
+    const state = populatedAggregate();
+
+    // Duplicate detection still fires on a structurally sound list.
+    const duplicated = {
+      ...state,
+      evidence: [state.evidence[0], { ...state.evidence[0], admittedAtSequence: 9 }],
+      sequence: 20,
+    } as unknown as WorkflowState;
+    expect(applyWorkflowEvent(duplicated, closeWorkflow()).rejection).toBe('WORKFLOW_UNREADABLE');
+
+    // Capacity still rejects rather than truncating.
+    const full = Array.from({ length: WORKFLOW_BOUNDS.MAX_ADMITTED_EVIDENCE }, (_v, index) => ({
+      evidenceId: `ev-${String(index)}`,
+      kind: 'ci-result' as const,
+      admittedAtCommitSha: SHA_A,
+      admittedAtRevision: 0,
+      admittedAtSequence: index + 1,
+    }));
+    const saturated = {
+      ...openedWorkflow(),
+      sequence: WORKFLOW_BOUNDS.MAX_ADMITTED_EVIDENCE,
+      evidence: full,
+    } as WorkflowState;
+
+    expect(applyWorkflowEvent(saturated, admitEvidence()).rejection).toBe('CAPACITY_EXCEEDED');
+  });
+
+  /* ---- P1: emptiness of invalidFields must be provable, not reported ---- */
+
+  /** A gated workflow plus a forged human-decision verdict carrying `invalidFields`. */
+  function gateAttack(invalidFields: unknown): {
+    readonly state: WorkflowState;
+    readonly result: ReturnType<typeof applyWorkflowEvent>;
+  } {
+    const state = applyOrThrow(openedWorkflow(), openHumanGate());
+    return {
+      state,
+      result: applyWorkflowEvent(
+        state,
+        admitEvidence(buildHumanDecisionVerdict({ invalidFields } as never)),
+      ),
+    };
+  }
+
+  it('refuses a list proxy reporting length 0 over a populated target', () => {
+    const lying = new Proxy(['commitSha'], {
+      get: (target, key): unknown => (key === 'length' ? 0 : Reflect.get(target, key)),
+    });
+    const { state, result } = gateAttack(lying);
+
+    expect(result.rejection).toBe('EVIDENCE_NOT_CURRENT');
+    expect(result.invalidFields).toEqual(['verdict.invalidFields']);
+    expect(result.state).toBe(state);
+    expect(result.state.status).toBe('AWAITING_HUMAN_DECISION');
+  });
+
+  it.each([
+    [
+      'a length lie over three elements',
+      (): unknown =>
+        new Proxy(['a', 'b', 'c'], {
+          get: (target, key): unknown => (key === 'length' ? 0 : Reflect.get(target, key)),
+        }),
+    ],
+    [
+      'a length lie larger than the target',
+      (): unknown =>
+        new Proxy([], {
+          get: (target, key): unknown => (key === 'length' ? 5 : Reflect.get(target, key)),
+        }),
+    ],
+    [
+      'an unstable length',
+      (): unknown => {
+        let reads = 0;
+        return new Proxy(['x'], {
+          get: (target, key): unknown => {
+            if (key === 'length') {
+              reads += 1;
+              return reads === 1 ? 0 : 9;
+            }
+            return Reflect.get(target, key);
+          },
+        });
+      },
+    ],
+    [
+      'a throwing length',
+      (): unknown =>
+        new Proxy(['x'], {
+          get: (target, key): unknown => {
+            if (key === 'length') {
+              throw new Error('hostile length');
+            }
+            return Reflect.get(target, key);
+          },
+        }),
+    ],
+    [
+      'an ownKeys trap hiding the element',
+      (): unknown =>
+        new Proxy(['x'], {
+          get: (target, key): unknown => (key === 'length' ? 0 : Reflect.get(target, key)),
+          ownKeys: (): ArrayLike<string | symbol> => ['length'],
+          getOwnPropertyDescriptor: (target, key): PropertyDescriptor | undefined =>
+            key === 'length'
+              ? { value: 0, writable: true, enumerable: false, configurable: false }
+              : undefined,
+        }),
+    ],
+    ['an ordinary non-empty list', (): unknown => ['commitSha']],
+    [
+      'a sparse single-hole list',
+      (): unknown => {
+        const holed: unknown[] = [];
+        holed.length = 1;
+        return holed;
+      },
+    ],
+    ['an object inheriting from an array', (): unknown => Object.create([]) as unknown],
+    ['an array-like plain object', (): unknown => ({ length: 0 })],
+    ['a revoked proxy', (): unknown => revokedProxy()],
+    ['an extensible empty array', (): unknown => []],
+  ])('refuses a CURRENT verdict whose invalidFields is %s', (_name, build) => {
+    const { state, result } = gateAttack(build());
+
+    expect(result.rejection).toBe('EVIDENCE_NOT_CURRENT');
+    expect(result.state).toBe(state);
+    expect(result.state.status).toBe('AWAITING_HUMAN_DECISION');
+    expect(result.state.evidence).toEqual([]);
+  });
+
+  it('accepts a frozen empty list, exactly as PR 004 emits it', () => {
+    const { result } = gateAttack(Object.freeze([]));
+
+    expect(result.outcome).toBe('APPLIED');
+    expect(result.state.status).toBe('OPEN');
+  });
+
+  it('accepts the genuine list a real PR 004 verdict carries', () => {
+    const genuine = evaluateEvidenceFreshness(
+      {
+        evidenceId: EVIDENCE_A,
+        repositoryId: REPO_A,
+        commitSha: SHA_A,
+        kind: 'human-decision',
+        source: 'human',
+        reference: 'd1',
+        observedAt: '2026-01-01T00:00:00.000Z',
+      },
+      { repositoryId: REPO_A, currentHeadSha: SHA_A },
+    );
+    const gated = applyOrThrow(openedWorkflow(), openHumanGate());
+
+    expect(Object.isFrozen(genuine.invalidFields)).toBe(true);
+    expect(applyWorkflowEvent(gated, admitEvidence(genuine)).state.status).toBe('OPEN');
+  });
+
+  /* ---- P2: every retained transition sequence stamp is unique ---- */
+
+  /** A workflow carrying one of every sequence-stamped record. */
+  function stampedAggregate(): WorkflowState {
+    let state = applyOrThrow(openedWorkflow(), requestInvocation());
+    state = applyOrThrow(state, admitEvidence());
+    state = applyOrThrow(state, admitReview());
+    return applyOrThrow(state, reportInvocation());
+  }
+
+  it('stamps each applied transition with a distinct sequence', () => {
+    const state = stampedAggregate();
+
+    expect(state.sequence).toBe(4);
+    expect(state.invocations[0]?.requestedAtSequence).toBe(1);
+    expect(state.evidence[0]?.admittedAtSequence).toBe(2);
+    expect(state.reviews[0]?.admittedAtSequence).toBe(3);
+    expect(state.invocations[0]?.reportedAtSequence).toBe(4);
+  });
+
+  it.each([
+    [
+      'evidence reusing the request stamp',
+      (s: WorkflowState) => ({ ...s, evidence: [{ ...s.evidence[0], admittedAtSequence: 1 }] }),
+    ],
+    [
+      'review reusing the request stamp',
+      (s: WorkflowState) => ({ ...s, reviews: [{ ...s.reviews[0], admittedAtSequence: 1 }] }),
+    ],
+    [
+      'review reusing the evidence stamp',
+      (s: WorkflowState) => ({ ...s, reviews: [{ ...s.reviews[0], admittedAtSequence: 2 }] }),
+    ],
+    [
+      'report reusing the evidence stamp',
+      (s: WorkflowState) => ({
+        ...s,
+        invocations: [{ ...s.invocations[0], reportedAtSequence: 2 }],
+      }),
+    ],
+    [
+      'report reusing the review stamp',
+      (s: WorkflowState) => ({
+        ...s,
+        invocations: [{ ...s.invocations[0], reportedAtSequence: 3 }],
+      }),
+    ],
+    [
+      'two evidence admissions sharing a stamp',
+      (s: WorkflowState) => ({
+        ...s,
+        evidence: [s.evidence[0], { ...s.evidence[0], evidenceId: EVIDENCE_B }],
+      }),
+    ],
+    [
+      'two reviews sharing a stamp',
+      (s: WorkflowState) => ({
+        ...s,
+        reviews: [s.reviews[0], { ...s.reviews[0], reviewId: 'rv-other' }],
+      }),
+    ],
+  ])('refuses a state where %s', (_name, forge) => {
+    const forged = forge(stampedAggregate()) as unknown as WorkflowState;
+
+    for (const [, event] of everyEvent()) {
+      const result = applyWorkflowEvent(forged, event);
+      expect(result.rejection).toBe('WORKFLOW_UNREADABLE');
+      expect(result.state).toBe(forged);
+    }
+  });
+
+  it('refuses two invocations sharing a request stamp', () => {
+    const base = stampedAggregate();
+    const tracked = base.invocations[0];
+    const forged = {
+      ...base,
+      invocations: [
+        tracked,
+        {
+          ...tracked,
+          invocationId: INVOCATION_B,
+          state: 'REQUESTED',
+          reportedStatus: null,
+          reportedAtRevision: null,
+          reportedAtSequence: null,
+        },
+      ],
+    } as unknown as WorkflowState;
+
+    expect(applyWorkflowEvent(forged, admitEvidence()).rejection).toBe('WORKFLOW_UNREADABLE');
+  });
+
+  it('accepts a legitimate history whose stamps are all distinct', () => {
+    const state = stampedAggregate();
+    const moved = applyOrThrow(state, observeHead(SHA_B));
+
+    // HEAD_OBSERVED advances the sequence while stamping nothing, so the gap it
+    // leaves must not be mistaken for a violation.
+    expect(moved.sequence).toBe(5);
+    expect(moved.invocations[0]?.requestedAtSequence).toBe(1);
+    expect(moved.evidence[0]?.admittedAtSequence).toBe(2);
+    expect(
+      applyWorkflowEvent(
+        moved,
+        admitEvidence(
+          buildVerdict({ evidenceId: EVIDENCE_B, commitSha: SHA_B, targetHeadSha: SHA_B }),
+        ),
+      ).outcome,
+    ).toBe('APPLIED');
+  });
+
+  it('keeps historical stamps intact across a HEAD advance', () => {
+    const moved = applyOrThrow(stampedAggregate(), observeHead(SHA_B));
+    const later = applyOrThrow(
+      moved,
+      admitEvidence(
+        buildVerdict({ evidenceId: EVIDENCE_B, commitSha: SHA_B, targetHeadSha: SHA_B }),
+      ),
+    );
+
+    expect(later.evidence[0]?.admittedAtSequence).toBe(2);
+    expect(later.evidence[1]?.admittedAtSequence).toBe(6);
+    expect(later.invocations[0]?.requestedAtSequence).toBe(1);
+    expect(later.invocations[0]?.reportedAtSequence).toBe(4);
   });
 
   it('cannot have duplicate detection bypassed through a hostile prototype', () => {
