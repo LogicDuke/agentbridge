@@ -1492,14 +1492,104 @@ describe('group J — hostile input fails closed', () => {
 
     expect(applyWorkflowEvent(forged, closeWorkflow()).rejection).toBe('WORKFLOW_UNREADABLE');
 
-    // Moving only the report stamp past its own revision makes it legal again.
+    // Moving the report stamp past its own revision makes it legal again — but
+    // only once it also clears the two HEAD transitions that revision 2 costs,
+    // which occupy slots 2 and 3. Slot 4 is the earliest reachable one.
     const legal = stampedState({
       revision: 2,
       sequence: 6,
-      invocations: stored([{ ...reported, reportedAtSequence: 3 }]),
+      invocations: stored([{ ...reported, reportedAtSequence: 4 }]),
     });
 
     expect(applyWorkflowEvent(legal, closeWorkflow()).outcome).toBe('APPLIED');
+  });
+
+  /* ---- intervening HEAD transitions must have sequence slots of their own ---- */
+
+  /** One invocation whose request and report straddle a revision advance. */
+  function straddling(
+    requestRevision: number,
+    requestSequence: number,
+    reportRevision: number,
+    reportSequence: number,
+    sequence: number,
+  ): WorkflowState {
+    return stampedState({
+      revision: reportRevision,
+      sequence,
+      invocations: stored([
+        {
+          ...(trackedAt(requestRevision, requestSequence) as Record<string, unknown>),
+          state: 'REPORTED',
+          reportedStatus: 'reported-complete',
+          reportedAtRevision: reportRevision,
+          reportedAtSequence: reportSequence,
+        },
+      ]),
+    });
+  }
+
+  it('refuses a two-revision jump that leaves no slot for the HEAD transitions', () => {
+    // Reaching revision 2 from 0 costs two HEAD_OBSERVED transitions, which take
+    // slots 2 and 3, so the report cannot also occupy slot 3.
+    const forged = straddling(0, 1, 2, 3, 4);
+
+    expect(applyWorkflowEvent(forged, closeWorkflow()).rejection).toBe('WORKFLOW_UNREADABLE');
+  });
+
+  it('accepts the nearest reachable two-revision jump', () => {
+    const legal = straddling(0, 1, 2, 4, 4);
+
+    expect(applyWorkflowEvent(legal, closeWorkflow()).outcome).toBe('APPLIED');
+  });
+
+  it('pins the boundary for a single intervening HEAD transition', () => {
+    // Slot 2 is the HEAD transition itself, so the report cannot sit there.
+    expect(applyWorkflowEvent(straddling(0, 1, 1, 2, 3), closeWorkflow()).rejection).toBe(
+      'WORKFLOW_UNREADABLE',
+    );
+    expect(applyWorkflowEvent(straddling(0, 1, 1, 3, 3), closeWorkflow()).outcome).toBe('APPLIED');
+  });
+
+  it('leaves stamps within one revision unaffected', () => {
+    expect(applyWorkflowEvent(straddling(0, 1, 0, 2, 2), closeWorkflow()).outcome).toBe('APPLIED');
+  });
+
+  it.each([
+    [2, 2, 'WORKFLOW_UNREADABLE'],
+    [2, 3, null],
+    [1, 2, null],
+  ])(
+    'reserves slots between the final stamp and aggregate revision %i / sequence %i',
+    (revision, sequence, rejection) => {
+      // The last stamp sits at revision 0 / sequence 1; reaching the aggregate's
+      // revision costs that many further HEAD transitions, each needing a slot
+      // up to and including the aggregate's own sequence.
+      const state = stampedState({
+        revision,
+        sequence,
+        invocations: stored([trackedAt(0, 1)]),
+      });
+      const result = applyWorkflowEvent(state, closeWorkflow());
+
+      if (rejection === null) {
+        expect(result.outcome).toBe('APPLIED');
+      } else {
+        expect(result.rejection).toBe(rejection);
+      }
+    },
+  );
+
+  it('keeps a genuinely replayed two-HEAD history valid', () => {
+    let state = applyOrThrow(openedWorkflow(), requestInvocation());
+    state = applyOrThrow(state, observeHead(SHA_B));
+    state = applyOrThrow(state, observeHead(SHA_C));
+    state = applyOrThrow(state, reportInvocation());
+
+    expect(state.invocations[0]?.requestedAtSequence).toBe(1);
+    expect(state.invocations[0]?.reportedAtRevision).toBe(2);
+    expect(state.invocations[0]?.reportedAtSequence).toBe(4);
+    expect(applyWorkflowEvent(state, closeWorkflow()).outcome).toBe('APPLIED');
   });
 
   it('accepts a report whose stamps follow both its request and its revision', () => {

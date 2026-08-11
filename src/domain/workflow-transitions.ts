@@ -344,30 +344,54 @@ function noteRevisionSpan(
 /**
  * Do the recorded revision bands respect chronology?
  *
- * An earlier revision may not hold a slot at or after a later revision's
- * earliest slot: the HEAD transition that produced the later revision consumed
- * a slot between them.
+ * Each applied transition consumes exactly one sequence slot, and advancing
+ * from revision `r1` to `r2` costs `r2 - r1` `HEAD_OBSERVED` transitions that
+ * stamp nothing. Those transitions need slots of their own, so two stamped
+ * records cannot merely be ordered — they must leave room between them:
+ *
+ *     later stamp at (r2, s2) after an earlier stamp at (r1, s1), r1 < r2
+ *       => s2 - s1 > r2 - r1
+ *
+ * The intervening HEAD transitions occupy distinct slots strictly between `s1`
+ * and `s2`, of which there are `s2 - s1 - 1`. Only the highest slot of the
+ * earlier revision against the lowest slot of the later one has to be checked;
+ * every other cross pair leaves a wider gap. This subsumes the plain ordering
+ * rule, because the gap is always at least two slots when revisions differ.
+ *
+ * The same accounting applies after the last stamp: reaching the aggregate's
+ * `revision` from a band's revision costs that many further HEAD transitions,
+ * each needing a slot up to and including the aggregate's `sequence`:
+ *
+ *     band at (r, high)  =>  sequence - high >= revision - r
+ *
+ * That bound is inclusive, because the aggregate's own final slot may itself be
+ * one of those HEAD transitions. The origin needs no separate case: measured
+ * against the opening `(0, 0)`, the pairwise rule reduces to
+ * `recordedSequence > recordedRevision`, which is already enforced per record.
  */
 function revisionBandsOrdered(
   revisions: readonly number[],
   lowest: readonly number[],
   highest: readonly number[],
+  revision: number,
+  sequence: number,
 ): boolean {
   for (let a = 0; a < revisions.length; a += 1) {
+    const earlier = revisions[a];
+    const earlierHigh = highest[a];
+    if (earlier === undefined || earlierHigh === undefined) {
+      return false;
+    }
+    if (sequence - earlierHigh < revision - earlier) {
+      return false;
+    }
     for (let b = 0; b < revisions.length; b += 1) {
-      const earlier = revisions[a];
       const later = revisions[b];
-      const earlierHigh = highest[a];
       const laterLow = lowest[b];
-      if (
-        earlier === undefined ||
-        later === undefined ||
-        earlierHigh === undefined ||
-        laterLow === undefined
-      ) {
+      if (later === undefined || laterLow === undefined) {
         return false;
       }
-      if (earlier < later && earlierHigh >= laterLow) {
+      if (earlier < later && laterLow - earlierHigh <= later - earlier) {
         return false;
       }
     }
@@ -688,7 +712,9 @@ function readAdmittedReview(
  *   still. The bound is tight — open, one HEAD advance at slot 1, then a
  *   request at slot 2 stamps revision 1 with sequence 2;
  * - ordering every stamped record by sequence yields non-decreasing revisions,
- *   since a revision never decreases once a HEAD transition advances it.
+ *   since a revision never decreases once a HEAD transition advances it, and
+ *   consecutive stamps leave room for the `HEAD_OBSERVED` transitions between
+ *   their revisions — each of which consumes a sequence slot of its own.
  */
 function snapshotWorkflow(state: WorkflowState): WorkflowSnapshot | null {
   const record = asRecord(state);
@@ -936,7 +962,7 @@ function snapshotWorkflow(state: WorkflowState): WorkflowSnapshot | null {
 
   // Revision never decreases, so ordering every stamped record by sequence must
   // yield non-decreasing revisions.
-  if (!revisionBandsOrdered(spanRevisions, spanLowest, spanHighest)) {
+  if (!revisionBandsOrdered(spanRevisions, spanLowest, spanHighest, revision, sequence)) {
     return null;
   }
 
