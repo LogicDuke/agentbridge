@@ -511,6 +511,90 @@ describe('group J — hostile input fails closed', () => {
 
     expect(applyWorkflowEvent(forged, admitReview()).rejection).toBe('WORKFLOW_UNREADABLE');
   });
+
+  it.each(['invocations', 'evidence', 'reviews'] as const)(
+    'rejects a prototype-planted numeric entry in %s without making it durable',
+    (listName) => {
+      const invocationState = requested();
+      const evidenceState = applyOrThrow(openedWorkflow(), admitEvidence());
+      const reviewState = applyOrThrow(openedWorkflow(), admitReview());
+      const planted =
+        listName === 'invocations'
+          ? invocationState.invocations[0]
+          : listName === 'evidence'
+            ? evidenceState.evidence[0]
+            : reviewState.reviews[0];
+      expect(planted).toBeDefined();
+
+      const sparse = new Array<unknown>(1);
+      const forged = {
+        ...openedWorkflow(),
+        sequence: 1,
+        [listName]: sparse,
+      } as unknown as WorkflowState;
+      const event =
+        listName === 'invocations'
+          ? reportInvocation()
+          : requestInvocation(buildInvocation({ invocationId: INVOCATION_B }));
+
+      withPoisoned(Array.prototype, 0, planted, () => {
+        const result = applyWorkflowEvent(forged, event);
+        expect(result.rejection).toBe('WORKFLOW_UNREADABLE');
+        expect(result.state).toBe(forged);
+        expect(Object.hasOwn(sparse, 0)).toBe(false);
+      });
+    },
+  );
+
+  it.each(['evidence', 'reviews'] as const)(
+    'requires a current %s admission commit to match while retaining historical commits',
+    (listName) => {
+      const admitted =
+        listName === 'evidence'
+          ? applyOrThrow(openedWorkflow(), admitEvidence())
+          : applyOrThrow(openedWorkflow(), admitReview());
+      const admission = listName === 'evidence' ? admitted.evidence[0] : admitted.reviews[0];
+      expect(admission).toBeDefined();
+
+      const mismatched = {
+        ...admitted,
+        [listName]: [{ ...admission, admittedAtCommitSha: SHA_B }],
+      } as unknown as WorkflowState;
+      const laterEvent =
+        listName === 'evidence'
+          ? admitEvidence(buildVerdict({ evidenceId: EVIDENCE_A }))
+          : admitReview(buildReview({ reviewId: REVIEW_A }));
+      expect(applyWorkflowEvent(mismatched, laterEvent).rejection).toBe(
+        'WORKFLOW_UNREADABLE',
+      );
+
+      const matching = {
+        ...admitted,
+        [listName]: [{ ...admission, admittedAtCommitSha: SHA_A }],
+      } as unknown as WorkflowState;
+      expect(
+        applyWorkflowEvent(
+          matching,
+          requestInvocation(buildInvocation({ invocationId: INVOCATION_B })),
+        ).outcome,
+      ).toBe('APPLIED');
+
+      const historical = applyOrThrow(admitted, observeHead(SHA_B));
+      expect(
+        applyWorkflowEvent(
+          historical,
+          requestInvocation(buildInvocation({
+            invocationId: INVOCATION_B,
+            targetCommitSha: SHA_B,
+          })),
+        ).outcome,
+      ).toBe('APPLIED');
+      expect(
+        (listName === 'evidence' ? historical.evidence[0] : historical.reviews[0])
+          ?.admittedAtCommitSha,
+      ).toBe(SHA_A);
+    },
+  );
 });
 
 describe('group K — bounds', () => {

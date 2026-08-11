@@ -206,6 +206,9 @@ function readList(value: unknown, limit: number): readonly unknown[] | null {
   for (let index = 0; index < length; index += 1) {
     let element: unknown;
     try {
+      if (!objectHasOwn(elements, index)) {
+        return null;
+      }
       element = elements[index];
     } catch {
       return null;
@@ -492,7 +495,11 @@ function snapshotWorkflow(state: WorkflowState): WorkflowSnapshot | null {
   const evidence: AdmittedEvidence[] = [];
   for (let index = 0; index < evidenceCandidates.length; index += 1) {
     const admitted = readAdmittedEvidence(evidenceCandidates[index], revision, sequence);
-    if (admitted === null) {
+    if (
+      admitted === null ||
+      (admitted.admittedAtRevision === revision &&
+        admitted.admittedAtCommitSha !== boundCommitSha)
+    ) {
       return null;
     }
     append(evidence, admitted);
@@ -501,7 +508,11 @@ function snapshotWorkflow(state: WorkflowState): WorkflowSnapshot | null {
   const reviews: AdmittedReview[] = [];
   for (let index = 0; index < reviewCandidates.length; index += 1) {
     const admitted = readAdmittedReview(reviewCandidates[index], revision, sequence);
-    if (admitted === null) {
+    if (
+      admitted === null ||
+      (admitted.admittedAtRevision === revision &&
+        admitted.admittedAtCommitSha !== boundCommitSha)
+    ) {
       return null;
     }
     append(reviews, admitted);
