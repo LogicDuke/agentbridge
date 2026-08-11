@@ -356,14 +356,27 @@ describe('applyWorkflowEvent — group C, invocation lifecycle', () => {
 
   it('rejects a deserialized state with duplicate tracked invocation ids', () => {
     const state = withRequestedInvocation();
+    // Frozen, as every collection this layer emits is: an unfrozen list is
+    // refused at the frozen-list gate before the duplicate-id scan ever runs,
+    // which would leave this assertion green for the wrong reason.
     const duplicateState = {
       ...state,
-      invocations: [state.invocations[0], state.invocations[0]],
+      invocations: Object.freeze([state.invocations[0], state.invocations[0]]),
     } as WorkflowState;
     const result = applyWorkflowEvent(duplicateState, reportInvocation());
 
+    expect(result.outcome).toBe('REJECTED');
     expect(result.rejection).toBe('WORKFLOW_UNREADABLE');
     expect(result.state).toBe(duplicateState);
+
+    // The same frozen shape without the duplicate is accepted, so the rejection
+    // above is caused by the duplicate identity rather than the freeze gate.
+    const uniqueState = {
+      ...state,
+      invocations: Object.freeze([state.invocations[0]]),
+    } as WorkflowState;
+
+    expect(applyWorkflowEvent(uniqueState, reportInvocation()).outcome).toBe('APPLIED');
   });
 
   it('refuses a report for an invocation it never requested', () => {
@@ -1231,6 +1244,24 @@ describe('applyWorkflowEvent — group N, end-to-end lifecycle replay', () => {
     expect(state.reviews[0]?.admittedAtCommitSha).toBe(SHA_A);
     expect(state.reviews[2]?.admittedAtCommitSha).toBe(SHA_B);
     expect(JSON.parse(JSON.stringify(state))).toEqual(state);
+
+    // Serialization preserves the data, but `JSON.parse` does not restore the
+    // frozen-collection runtime invariant — that is a caller obligation. The
+    // raw parse is refused as unreadable; a re-frozen copy is readable again
+    // and reaches the terminal-status rule this closed workflow expects.
+    const restored = JSON.parse(JSON.stringify(state)) as WorkflowState;
+
+    expect(Object.isFrozen(restored.invocations)).toBe(false);
+    expect(applyWorkflowEvent(restored, closeWorkflow()).rejection).toBe('WORKFLOW_UNREADABLE');
+
+    const refrozen = {
+      ...restored,
+      invocations: Object.freeze([...restored.invocations]),
+      evidence: Object.freeze([...restored.evidence]),
+      reviews: Object.freeze([...restored.reviews]),
+    } as WorkflowState;
+
+    expect(applyWorkflowEvent(refrozen, closeWorkflow()).rejection).toBe('WORKFLOW_CLOSED');
   });
 
   it('rejects a claim passed where an observation belongs', () => {
