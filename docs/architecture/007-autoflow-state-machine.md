@@ -241,19 +241,29 @@ all-or-nothing, and `BINDING_MISMATCH` on the report and review paths.
 ### Evidence — the anti-duplication mechanism
 
 `EVIDENCE_ADMITTED` takes a PR 004 `EvidenceFreshness`, not an `EvidenceRecord`.
-Freshness is never re-derived here; PR 004 already answered the question, and its
-result carries the target it was answered against. The only thing left to check
-is that the answer is about *this* workflow's binding:
+**Freshness is never re-derived here**: PR 004 alone determines whether evidence
+is current, and its result carries the target it was answered against. What is
+left to this layer is defensive — verifying that the result it consumes is about
+*this* workflow's binding, and that it has a shape PR 004 could legitimately
+have produced. A verdict admitted as `CURRENT` must satisfy all of:
 
 - `state` is `CURRENT` and `reason` is `BOUND_TO_CURRENT_HEAD`;
 - the evidence's own `repositoryId` equals the workflow's repository;
 - the evidence's own `commitSha` equals the bound commit;
 - `targetRepositoryId` equals the workflow's repository;
-- `targetHeadSha` equals the bound commit.
+- `targetHeadSha` equals the bound commit;
+- `source` is a member of PR 004's evidence-source vocabulary;
+- `invalidFields` is a genuinely empty list.
+
+The last two are shape checks, not freshness judgments: PR 004 never emits a
+`CURRENT` verdict with a missing source or a populated invalid-field list, so a
+value carrying either is one PR 004 could not have produced. Checking them stops
+a cast or hand-built object from reaching the human-gate path on the strength of
+a few matching fields — trusting the *type* is not trusting the *value*.
 
 A caller therefore cannot launder stale evidence by judging it against a
 convenient target and handing over the verdict. **No change to PR 004 was
-required**: its result shape already carries everything this check needs.
+required**: its result shape already carries everything these checks need.
 
 Admissions are unique per `(id, revision)`. The same evidence can legitimately be
 current again at a later revision, and is then a fresh admission.

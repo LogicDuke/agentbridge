@@ -14,6 +14,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   applyWorkflowEvent,
+  evaluateEvidenceFreshness,
   INVOCATION_BOUNDS,
   openWorkflow,
   REVIEW_BOUNDS,
@@ -38,6 +39,7 @@ import {
   buildVerdict,
   closeWorkflow,
   EVIDENCE_A,
+  EVIDENCE_B,
   FORBIDDEN_STATE_KEYS,
   FORBIDDEN_STATE_VALUES,
   INVOCATION_A,
@@ -720,6 +722,272 @@ describe('group J — hostile input fails closed', () => {
       expect(result.state).toBe(forged);
     }
   });
+
+  /* ---- finding 1: a CURRENT verdict must carry a complete PR 004 shape ---- */
+
+  it.each([
+    ['an absent source', { source: undefined }],
+    ['a null source', { source: null }],
+    ['a bogus source', { source: 'not-a-source' }],
+    ['a numeric source', { source: 7 }],
+    ['a non-empty invalidFields', { invalidFields: ['commitSha'] }],
+    ['a non-array invalidFields', { invalidFields: 'none' }],
+    ['a null invalidFields', { invalidFields: null }],
+    ['an absent invalidFields', { invalidFields: undefined }],
+  ])('refuses a CURRENT human-decision verdict with %s', (_name, overrides) => {
+    const gated = applyOrThrow(openedWorkflow(), openHumanGate());
+    const result = applyWorkflowEvent(
+      gated,
+      admitEvidence(buildHumanDecisionVerdict(overrides as never)),
+    );
+
+    expect(result.rejection).toBe('EVIDENCE_NOT_CURRENT');
+    expect(result.state).toBe(gated);
+    expect(result.state.status).toBe('AWAITING_HUMAN_DECISION');
+    expect(result.state.humanGateOpenedAtRevision).toBe(0);
+  });
+
+  it('refuses a CURRENT verdict whose invalidFields is prototype-backed or hostile', () => {
+    const gated = applyOrThrow(openedWorkflow(), openHumanGate());
+    const inherited = Object.create([]) as unknown[];
+    const throwingLength = new Proxy([], {
+      get(target, key): unknown {
+        if (key === 'length') {
+          throw new Error('hostile length');
+        }
+        return Reflect.get(target, key);
+      },
+    });
+    const lyingLength = new Proxy([], {
+      get(target, key): unknown {
+        if (key === 'length') {
+          return Number.MAX_SAFE_INTEGER;
+        }
+        return Reflect.get(target, key);
+      },
+    });
+
+    for (const invalidFields of [inherited, throwingLength, lyingLength, revokedProxy()]) {
+      const result = applyWorkflowEvent(
+        gated,
+        admitEvidence(buildHumanDecisionVerdict({ invalidFields } as never)),
+      );
+
+      expect(result.rejection).toBe('EVIDENCE_NOT_CURRENT');
+      expect(result.state.status).toBe('AWAITING_HUMAN_DECISION');
+    }
+  });
+
+  it('still admits a genuine PR 004 verdict and still clears the gate', () => {
+    const gated = applyOrThrow(openedWorkflow(), openHumanGate());
+    const genuine = evaluateEvidenceFreshness(
+      {
+        evidenceId: EVIDENCE_A,
+        repositoryId: REPO_A,
+        commitSha: SHA_A,
+        kind: 'human-decision',
+        source: 'human',
+        reference: 'decision-1',
+        observedAt: '2026-01-01T00:00:00.000Z',
+      },
+      { repositoryId: REPO_A, currentHeadSha: SHA_A },
+    );
+
+    expect(genuine.state).toBe('CURRENT');
+    expect(genuine.source).toBe('human');
+    expect(genuine.invalidFields).toEqual([]);
+
+    const result = applyWorkflowEvent(gated, admitEvidence(genuine));
+
+    expect(result.outcome).toBe('APPLIED');
+    expect(result.state.status).toBe('OPEN');
+    expect(result.state.humanGateOpenedAtRevision).toBeNull();
+  });
+
+  /* ---- finding 2: one revision maps to exactly one commit ---- */
+
+  /** A workflow with an invocation, an evidence and a review all at revision 0. */
+  function historicalAggregate(): WorkflowState {
+    const populated = applyOrThrow(
+      applyOrThrow(applyOrThrow(openedWorkflow(), requestInvocation()), admitEvidence()),
+      admitReview(),
+    );
+    return applyOrThrow(populated, observeHead(SHA_B));
+  }
+
+  it.each([
+    ['within invocations', (s: WorkflowState) => ({
+      ...s,
+      invocations: [
+        { ...s.invocations[0], targetCommitSha: SHA_C },
+        { ...s.invocations[0], invocationId: INVOCATION_B, targetCommitSha: SHA_A },
+      ],
+    })],
+    ['within evidence', (s: WorkflowState) => ({
+      ...s,
+      evidence: [
+        s.evidence[0],
+        { ...s.evidence[0], evidenceId: 'ev-other', admittedAtCommitSha: SHA_C },
+      ],
+    })],
+    ['within reviews', (s: WorkflowState) => ({
+      ...s,
+      reviews: [
+        s.reviews[0],
+        { ...s.reviews[0], reviewId: 'rv-other', admittedAtCommitSha: SHA_C },
+      ],
+    })],
+    ['across invocations and evidence', (s: WorkflowState) => ({
+      ...s,
+      evidence: [{ ...s.evidence[0], admittedAtCommitSha: SHA_C }],
+    })],
+    ['across evidence and reviews', (s: WorkflowState) => ({
+      ...s,
+      reviews: [{ ...s.reviews[0], admittedAtCommitSha: SHA_C }],
+    })],
+  ])('refuses a revision bound to two commits %s', (_name, forge) => {
+    const forged = forge(historicalAggregate()) as unknown as WorkflowState;
+
+    for (const [, event] of everyEvent()) {
+      const result = applyWorkflowEvent(forged, event);
+      expect(result.rejection).toBe('WORKFLOW_UNREADABLE');
+      expect(result.state).toBe(forged);
+    }
+  });
+
+  it('accepts a legitimate multi-revision history and preserves its commits', () => {
+    const historical = historicalAggregate();
+
+    expect(historical.invocations[0]?.targetCommitSha).toBe(SHA_A);
+    expect(historical.evidence[0]?.admittedAtCommitSha).toBe(SHA_A);
+    expect(historical.reviews[0]?.admittedAtCommitSha).toBe(SHA_A);
+
+    const next = applyOrThrow(
+      historical,
+      admitEvidence(buildVerdict({ evidenceId: 'ev-next', commitSha: SHA_B, targetHeadSha: SHA_B })),
+    );
+
+    // Revision 0 keeps commit A; revision 1 records commit B. Different
+    // revisions may of course differ.
+    expect(next.evidence[0]?.admittedAtCommitSha).toBe(SHA_A);
+    expect(next.evidence[1]?.admittedAtCommitSha).toBe(SHA_B);
+    expect(next.invocations[0]?.targetCommitSha).toBe(SHA_A);
+  });
+
+  it('accepts many entries sharing one revision and one commit', () => {
+    const state = applyOrThrow(
+      applyOrThrow(applyOrThrow(openedWorkflow(), requestInvocation()), admitEvidence()),
+      admitReview(),
+    );
+
+    expect(applyWorkflowEvent(state, observeHead(SHA_B)).outcome).toBe('APPLIED');
+  });
+
+  /* ---- finding 3: revision may never exceed sequence ---- */
+
+  it.each([
+    [2, 0],
+    [1, 0],
+    [5, 4],
+    [WORKFLOW_BOUNDS.MAX_REVISION, 0],
+  ])('refuses a state with revision %i and sequence %i', (revision, sequence) => {
+    const forged = { ...openedWorkflow(), revision, sequence } as WorkflowState;
+
+    for (const [, event] of everyEvent()) {
+      expect(applyWorkflowEvent(forged, event).rejection).toBe('WORKFLOW_UNREADABLE');
+    }
+  });
+
+  it.each([
+    [0, 0],
+    [1, 1],
+    [1, 5],
+  ])('accepts an otherwise valid state with revision %i and sequence %i', (revision, sequence) => {
+    const forged = { ...openedWorkflow(), revision, sequence } as WorkflowState;
+
+    expect(applyWorkflowEvent(forged, admitEvidence(buildVerdict())).outcome).toBe('APPLIED');
+  });
+
+  it('leaves legitimate histories unaffected by the counter invariant', () => {
+    let state = openedWorkflow();
+    for (const event of [requestInvocation(), admitEvidence(), admitReview(), observeHead(SHA_B)]) {
+      state = applyOrThrow(state, event);
+      expect(state.revision).toBeLessThanOrEqual(state.sequence);
+    }
+  });
+
+  /* ---- finding 4: duplicate admission identities in deserialized state ---- */
+
+  it('refuses a duplicate evidence admission identity already in state', () => {
+    const admitted = applyOrThrow(openedWorkflow(), admitEvidence());
+    const entry = admitted.evidence[0];
+    const forged = {
+      ...admitted,
+      sequence: 2,
+      // A copied object with the same value identity — not the same reference.
+      evidence: [entry, { ...entry, admittedAtSequence: 2 }],
+    } as unknown as WorkflowState;
+
+    for (const [, event] of everyEvent()) {
+      expect(applyWorkflowEvent(forged, event).rejection).toBe('WORKFLOW_UNREADABLE');
+    }
+    expect(applyWorkflowEvent(forged, admitEvidence()).state).toBe(forged);
+  });
+
+  it('refuses a duplicate review admission identity already in state', () => {
+    const admitted = applyOrThrow(openedWorkflow(), admitReview());
+    const entry = admitted.reviews[0];
+    const forged = {
+      ...admitted,
+      sequence: 2,
+      reviews: [entry, { ...entry, admittedAtSequence: 2 }],
+    } as unknown as WorkflowState;
+
+    expect(applyWorkflowEvent(forged, admitEvidence()).rejection).toBe('WORKFLOW_UNREADABLE');
+  });
+
+  it('accepts distinct admission ids sharing one revision', () => {
+    const state = applyOrThrow(
+      applyOrThrow(openedWorkflow(), admitEvidence()),
+      admitEvidence(buildVerdict({ evidenceId: EVIDENCE_B })),
+    );
+
+    expect(state.evidence).toHaveLength(2);
+    expect(applyWorkflowEvent(state, admitReview()).outcome).toBe('APPLIED');
+  });
+
+  it('still allows the same admission id at a different revision', () => {
+    const admitted = applyOrThrow(openedWorkflow(), admitEvidence());
+    const moved = applyOrThrow(admitted, observeHead(SHA_B));
+    const readmitted = applyOrThrow(
+      moved,
+      admitEvidence(buildVerdict({ commitSha: SHA_B, targetHeadSha: SHA_B })),
+    );
+
+    expect(readmitted.evidence).toHaveLength(2);
+    expect(readmitted.evidence[0]?.admittedAtRevision).toBe(0);
+    expect(readmitted.evidence[1]?.admittedAtRevision).toBe(1);
+    expect(readmitted.evidence[0]?.evidenceId).toBe(readmitted.evidence[1]?.evidenceId);
+  });
+
+  it('cannot have duplicate detection bypassed through a hostile prototype', () => {
+    const admitted = applyOrThrow(openedWorkflow(), admitEvidence());
+    const entry = admitted.evidence[0];
+    const forged = {
+      ...admitted,
+      sequence: 2,
+      evidence: [entry, { ...entry, admittedAtSequence: 2 }],
+    } as unknown as WorkflowState;
+    let observed: unknown;
+
+    withPoisoned(Array.prototype, 'includes', () => false, () => {
+      withPoisoned(Array.prototype, 'indexOf', () => -1, () => {
+        observed = applyWorkflowEvent(forged, admitReview()).rejection;
+      });
+    });
+
+    expect(observed).toBe('WORKFLOW_UNREADABLE');
+  });
 });
 
 describe('group K — bounds', () => {
@@ -832,10 +1100,13 @@ describe('group K — bounds', () => {
   });
 
   it('refuses to advance past the revision bound', () => {
+    // `sequence` must be at least `revision`: every revision advance is itself
+    // an applied transition, so a state at the revision bound has advanced the
+    // sequence at least as far.
     const state = {
       ...openedWorkflow(),
       revision: WORKFLOW_BOUNDS.MAX_REVISION,
-      sequence: 1,
+      sequence: WORKFLOW_BOUNDS.MAX_REVISION,
     } as WorkflowState;
 
     expect(applyWorkflowEvent(state, observeHead(SHA_B)).rejection).toBe('CAPACITY_EXCEEDED');

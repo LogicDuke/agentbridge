@@ -55,7 +55,7 @@
  * Each order is fixed per event kind, so rejection reasons stay deterministic.
  */
 
-import { EVIDENCE_KIND, EVIDENCE_KINDS } from './evidence.js';
+import { EVIDENCE_KIND, EVIDENCE_KINDS, EVIDENCE_SOURCES } from './evidence.js';
 import { FRESHNESS, FRESHNESS_REASON } from './evidence-freshness.js';
 import { INGESTION_OUTCOME } from './review.js';
 import {
@@ -169,6 +169,66 @@ function readOptionalOwn(target: object, key: string): {
   } catch {
     return { value: undefined, failed: true };
   }
+}
+
+/**
+ * Is this value a genuinely empty list?
+ *
+ * Used to check the `invalidFields` of a verdict claiming `CURRENT`. PR 004
+ * only ever emits an empty list alongside `CURRENT`, so a populated,
+ * non-array, or unreadable value marks a verdict that PR 004 could not have
+ * produced. Every read is guarded, and the length is narrowed through
+ * {@link readCount}, so a Proxy reporting a hostile length fails closed.
+ */
+function isEmptyList(value: unknown): boolean {
+  let isArray = false;
+  try {
+    isArray = arrayIsArray(value);
+  } catch {
+    return false;
+  }
+  if (!isArray) {
+    return false;
+  }
+  let rawLength: unknown;
+  try {
+    rawLength = (value as readonly unknown[]).length;
+  } catch {
+    return false;
+  }
+  return readCount(rawLength, 0) === 0;
+}
+
+/**
+ * Record one revision-to-commit binding, reporting a contradiction.
+ *
+ * No workflow history can bind a single revision to two commits: every entry
+ * stamped at revision R was created while `boundCommitSha` held one value. The
+ * mapping is derived **transiently** during validation from the per-entry
+ * commits the model already retains — nothing is stored, no field is added,
+ * and no revision-to-commit ledger is introduced.
+ *
+ * Parallel indexed arrays are used rather than a `Map`, so no prototype method
+ * is on the path, matching the accumulation strategy used elsewhere here.
+ *
+ * This says nothing about whether a historical commit is *genuine*; that stays
+ * recoverable only through external reconciliation against the retained
+ * per-entry commit. Only internal contradiction is detectable here.
+ */
+function bindRevisionCommit(
+  revisions: number[],
+  commits: string[],
+  revision: number,
+  commit: string,
+): boolean {
+  for (let index = 0; index < revisions.length; index += 1) {
+    if (revisions[index] === revision) {
+      return commits[index] === commit;
+    }
+  }
+  append(revisions, revision);
+  append(commits, commit);
+  return true;
 }
 
 /**
@@ -406,7 +466,15 @@ function readAdmittedReview(
  *   whose `requestedAtRevision` equals `revision` targets `boundCommitSha`, and
  *   an evidence or review admission whose `admittedAtRevision` equals
  *   `revision` was admitted at `boundCommitSha`. Entries from earlier revisions
- *   keep their own historical commit and are never rewritten.
+ *   keep their own historical commit and are never rewritten;
+ * - every **represented** revision maps to exactly one commit across all three
+ *   collections, because every entry stamped at revision R was created while
+ *   `boundCommitSha` held one value. Derived transiently here; nothing is
+ *   stored. Whether a historical commit is *genuine* stays recoverable only by
+ *   external reconciliation, and revisions with no entries are unconstrained;
+ * - `revision <= sequence`, since every revision advance is itself an applied
+ *   transition;
+ * - no admission identity — the value pair (id, revision) — appears twice.
  */
 function snapshotWorkflow(state: WorkflowState): WorkflowSnapshot | null {
   const record = asRecord(state);
@@ -435,6 +503,14 @@ function snapshotWorkflow(state: WorkflowState): WorkflowSnapshot | null {
     sequence === null ||
     !isWorkflowStatus(rawStatus)
   ) {
+    return null;
+  }
+
+  // Both counters start at 0, every revision advance happens inside an applied
+  // `HEAD_OBSERVED` that also advances the sequence, and other events advance
+  // the sequence alone. `revision > sequence` is therefore unreachable, and an
+  // aggregate claiming it is not one this layer could have produced.
+  if (revision > sequence) {
     return null;
   }
 
@@ -512,6 +588,19 @@ function snapshotWorkflow(state: WorkflowState): WorkflowSnapshot | null {
     ) {
       return null;
     }
+    // Admission identity is the value pair (id, revision), exactly as the
+    // admission handlers enforce it. A duplicate already present in state
+    // would consume capacity and shadow a legitimate admission of the same id.
+    for (let priorIndex = 0; priorIndex < evidence.length; priorIndex += 1) {
+      const prior = evidence[priorIndex];
+      if (
+        prior !== undefined &&
+        prior.evidenceId === admitted.evidenceId &&
+        prior.admittedAtRevision === admitted.admittedAtRevision
+      ) {
+        return null;
+      }
+    }
     append(evidence, admitted);
   }
 
@@ -525,7 +614,64 @@ function snapshotWorkflow(state: WorkflowState): WorkflowSnapshot | null {
     ) {
       return null;
     }
+    for (let priorIndex = 0; priorIndex < reviews.length; priorIndex += 1) {
+      const prior = reviews[priorIndex];
+      if (
+        prior !== undefined &&
+        prior.reviewId === admitted.reviewId &&
+        prior.admittedAtRevision === admitted.admittedAtRevision
+      ) {
+        return null;
+      }
+    }
     append(reviews, admitted);
+  }
+
+  // Every represented revision must map to exactly one commit across all three
+  // collections. Derived transiently from entries already validated above.
+  const seenRevisions: number[] = [];
+  const seenCommits: string[] = [];
+  for (let index = 0; index < invocations.length; index += 1) {
+    const tracked = invocations[index];
+    if (
+      tracked === undefined ||
+      !bindRevisionCommit(
+        seenRevisions,
+        seenCommits,
+        tracked.requestedAtRevision,
+        tracked.targetCommitSha,
+      )
+    ) {
+      return null;
+    }
+  }
+  for (let index = 0; index < evidence.length; index += 1) {
+    const admitted = evidence[index];
+    if (
+      admitted === undefined ||
+      !bindRevisionCommit(
+        seenRevisions,
+        seenCommits,
+        admitted.admittedAtRevision,
+        admitted.admittedAtCommitSha,
+      )
+    ) {
+      return null;
+    }
+  }
+  for (let index = 0; index < reviews.length; index += 1) {
+    const admitted = reviews[index];
+    if (
+      admitted === undefined ||
+      !bindRevisionCommit(
+        seenRevisions,
+        seenCommits,
+        admitted.admittedAtRevision,
+        admitted.admittedAtCommitSha,
+      )
+    ) {
+      return null;
+    }
   }
 
   return {
@@ -1180,6 +1326,16 @@ function applyEvidenceAdmitted(
   }
   if (readOwnProperty(verdictRecord, 'targetHeadSha') !== snapshot.boundCommitSha) {
     append(notCurrent, 'verdict.targetHeadSha');
+  }
+  // A verdict is trusted for its *type*, never for its *value*. PR 004 emits a
+  // valid source and an empty invalid-field list alongside every `CURRENT`
+  // verdict, so a value missing either is one PR 004 could not have produced —
+  // and an impossible verdict must never reach the human-gate path below.
+  if (!isVocabularyMember(EVIDENCE_SOURCES, readOwnProperty(verdictRecord, 'source'))) {
+    append(notCurrent, 'verdict.source');
+  }
+  if (!isEmptyList(readOwnProperty(verdictRecord, 'invalidFields'))) {
+    append(notCurrent, 'verdict.invalidFields');
   }
   if (notCurrent.length > 0) {
     return rejected(original, TRANSITION_REJECTION.EVIDENCE_NOT_CURRENT, notCurrent);
