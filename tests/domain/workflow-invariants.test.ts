@@ -96,6 +96,17 @@ function stripComments(source: string): string {
   return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
 }
 
+/**
+ * Freeze a collection the way `freezeState` always does.
+ *
+ * Every list this layer emits is frozen, and emptiness/cardinality is only
+ * provable for a non-extensible list, so a synthetic state must be frozen to be
+ * a faithful stand-in for one the layer produced.
+ */
+function stored<T>(list: readonly T[]): readonly T[] {
+  return Object.freeze([...list]);
+}
+
 /** Run `body` with one property replaced, restoring it whatever happens. */
 function withPoisoned(target: object, key: PropertyKey, value: unknown, body: () => void): void {
   const original = Object.getOwnPropertyDescriptor(target, key);
@@ -565,7 +576,7 @@ describe('group J — hostile input fails closed', () => {
 
       const mismatched = {
         ...admitted,
-        [listName]: [{ ...admission, admittedAtCommitSha: SHA_B }],
+        [listName]: stored([{ ...admission, admittedAtCommitSha: SHA_B }]),
       } as unknown as WorkflowState;
       const laterEvent =
         listName === 'evidence'
@@ -577,7 +588,7 @@ describe('group J — hostile input fails closed', () => {
 
       const matching = {
         ...admitted,
-        [listName]: [{ ...admission, admittedAtCommitSha: SHA_A }],
+        [listName]: stored([{ ...admission, admittedAtCommitSha: SHA_A }]),
       } as unknown as WorkflowState;
       expect(
         applyWorkflowEvent(
@@ -1127,7 +1138,7 @@ describe('group J — hostile input fails closed', () => {
 
   it.each(COLLECTIONS)('accepts %s as an ordinary dense list with an accurate length', (collection) => {
     const state = populatedAggregate();
-    const dense = [...state[collection]];
+    const dense = stored([...state[collection]]);
     const result = withList(state, collection, dense);
 
     expect(result.outcome).toBe('APPLIED');
@@ -1140,16 +1151,33 @@ describe('group J — hostile input fails closed', () => {
     expect(empty.invocations).toEqual([]);
     expect(applyWorkflowEvent(empty, admitEvidence()).outcome).toBe('APPLIED');
     expect(
-      applyWorkflowEvent({ ...empty, evidence: [], reviews: [] } as WorkflowState, admitReview())
-        .outcome,
+      applyWorkflowEvent(
+        { ...empty, evidence: stored([]), reviews: stored([]) } as WorkflowState,
+        admitReview(),
+      ).outcome,
     ).toBe('APPLIED');
   });
 
-  it('accepts a JSON round-tripped aggregate, whose lists are plain and dense', () => {
+  it('requires a JSON round-tripped aggregate to have its collections re-frozen', () => {
     const state = populatedAggregate();
     const restored = JSON.parse(JSON.stringify(state)) as WorkflowState;
 
-    expect(applyWorkflowEvent(restored, closeWorkflow()).outcome).toBe('APPLIED');
+    // `JSON.parse` yields extensible arrays, and an extensible list cannot be
+    // proven complete under the hostile-runtime model, so it is refused rather
+    // than partially trusted. A caller restoring persisted state re-freezes the
+    // three collections — which is the shape this layer itself always emits.
+    expect(Object.isFrozen(restored.invocations)).toBe(false);
+    expect(applyWorkflowEvent(restored, closeWorkflow()).rejection).toBe('WORKFLOW_UNREADABLE');
+
+    const refrozen = {
+      ...restored,
+      invocations: stored(restored.invocations),
+      evidence: stored(restored.evidence),
+      reviews: stored(restored.reviews),
+    } as WorkflowState;
+
+    expect(applyWorkflowEvent(refrozen, closeWorkflow()).outcome).toBe('APPLIED');
+    expect(applyWorkflowEvent(refrozen, closeWorkflow()).state.invocations).toHaveLength(2);
   });
 
   it('keeps capacity and duplicate scans working after the cardinality check', () => {
@@ -1158,7 +1186,7 @@ describe('group J — hostile input fails closed', () => {
     // Duplicate detection still fires on a structurally sound list.
     const duplicated = {
       ...state,
-      evidence: [state.evidence[0], { ...state.evidence[0], admittedAtSequence: 9 }],
+      evidence: stored([state.evidence[0], { ...state.evidence[0], admittedAtSequence: 9 }]),
       sequence: 20,
     } as unknown as WorkflowState;
     expect(applyWorkflowEvent(duplicated, closeWorkflow()).rejection).toBe('WORKFLOW_UNREADABLE');
@@ -1174,10 +1202,301 @@ describe('group J — hostile input fails closed', () => {
     const saturated = {
       ...openedWorkflow(),
       sequence: WORKFLOW_BOUNDS.MAX_ADMITTED_EVIDENCE,
-      evidence: full,
+      evidence: stored(full),
     } as WorkflowState;
 
     expect(applyWorkflowEvent(saturated, admitEvidence()).rejection).toBe('CAPACITY_EXCEEDED');
+  });
+
+  /* ---- a hostile list view may never hide a real own record ---- */
+
+  /**
+   * A Proxy that lies *consistently* about length, ownKeys, and descriptors,
+   * exposing only a prefix of a larger target. Every channel agrees, so no
+   * amount of cross-checking can contradict it — which is why acceptance rests
+   * on non-extensibility instead.
+   */
+  function hidingView(target: readonly unknown[], visible: number): unknown {
+    const shown: string[] = [];
+    for (let index = 0; index < visible; index += 1) {
+      shown.push(String(index));
+    }
+    shown.push('length');
+    return new Proxy(target, {
+      get: (t, key): unknown => (key === 'length' ? visible : Reflect.get(t, key)),
+      ownKeys: (): ArrayLike<string | symbol> => shown,
+      getOwnPropertyDescriptor: (t, key): PropertyDescriptor | undefined => {
+        if (key === 'length') {
+          return { value: visible, writable: true, enumerable: false, configurable: false };
+        }
+        if (typeof key === 'string' && Number(key) < visible) {
+          return Reflect.getOwnPropertyDescriptor(t, key);
+        }
+        return undefined;
+      },
+      has: (t, key): boolean =>
+        typeof key === 'string' && Number(key) >= visible ? false : Reflect.has(t, key),
+    });
+  }
+
+  it.each(COLLECTIONS)('refuses %s whose view hides a trailing own record', (collection) => {
+    const state = populatedAggregate();
+    const real = [...state[collection]];
+    const result = withList(state, collection, hidingView(real, 1));
+
+    expect(real).toHaveLength(2);
+    expect(result.rejection).toBe('WORKFLOW_UNREADABLE');
+    expect(result.outcome).toBe('REJECTED');
+  });
+
+  it.each(COLLECTIONS)('refuses %s whose view hides a middle own record', (collection) => {
+    const state = populatedAggregate();
+    const three = [...state[collection], state[collection][0]];
+    const middle = new Proxy(three, {
+      get: (t, key): unknown =>
+        key === 'length' ? 2 : Reflect.get(t, key === '1' ? '2' : key),
+      ownKeys: (): ArrayLike<string | symbol> => ['0', '1', 'length'],
+      getOwnPropertyDescriptor: (t, key): PropertyDescriptor | undefined => {
+        if (key === 'length') {
+          return { value: 2, writable: true, enumerable: false, configurable: false };
+        }
+        if (key === '0' || key === '1') {
+          return Reflect.getOwnPropertyDescriptor(t, '0');
+        }
+        return undefined;
+      },
+    });
+
+    expect(withList(state, collection, middle).rejection).toBe('WORKFLOW_UNREADABLE');
+  });
+
+  it.each(COLLECTIONS)('refuses %s presented as an extensible list', (collection) => {
+    const state = populatedAggregate();
+    const extensible = [...state[collection]];
+
+    expect(Object.isExtensible(extensible)).toBe(true);
+    expect(withList(state, collection, extensible).rejection).toBe('WORKFLOW_UNREADABLE');
+  });
+
+  it.each(COLLECTIONS)('accepts %s as a non-extensible list of the same records', (collection) => {
+    const state = populatedAggregate();
+
+    for (const seal of [Object.freeze, Object.seal, Object.preventExtensions]) {
+      const result = withList(state, collection, seal([...state[collection]]));
+
+      expect(result.outcome).toBe('APPLIED');
+      expect(result.state[collection]).toHaveLength(2);
+    }
+  });
+
+  it.each(COLLECTIONS)('refuses %s whose ownKeys trap throws', (collection) => {
+    const state = populatedAggregate();
+    const throwing = new Proxy(Object.freeze([...state[collection]]), {
+      ownKeys: (): never => {
+        throw new Error('hostile ownKeys');
+      },
+    });
+
+    expect(withList(state, collection, throwing).rejection).toBe('WORKFLOW_UNREADABLE');
+  });
+
+  it.each(COLLECTIONS)('refuses %s whose key view is unstable', (collection) => {
+    const state = populatedAggregate();
+    let reads = 0;
+    const unstable = new Proxy([...state[collection]], {
+      ownKeys: (t): ArrayLike<string | symbol> => {
+        reads += 1;
+        return reads === 1 ? ['0', 'length'] : Reflect.ownKeys(t);
+      },
+    });
+
+    expect(withList(state, collection, unstable).rejection).toBe('WORKFLOW_UNREADABLE');
+  });
+
+  it('loses no record through a later legitimate transition', () => {
+    const state = populatedAggregate();
+    const hidden = withList(state, 'invocations', hidingView([...state.invocations], 1));
+
+    expect(hidden.rejection).toBe('WORKFLOW_UNREADABLE');
+
+    // The genuine aggregate still carries both records after further work.
+    const advanced = applyOrThrow(state, observeHead(SHA_B));
+
+    expect(advanced.invocations).toHaveLength(2);
+    expect(advanced.evidence).toHaveLength(2);
+    expect(advanced.reviews).toHaveLength(2);
+    expect(Object.isFrozen(advanced.invocations)).toBe(true);
+  });
+
+  /* ---- a stamped record may not precede the transition that created it ---- */
+
+  /**
+   * Reaching revision R costs R applied `HEAD_OBSERVED` transitions, each
+   * consuming a distinct sequence slot, so the R-th advance sat at slot >= R
+   * and a record stamped at revision R was created by a later transition still:
+   *
+   *     recordedSequence > recordedRevision
+   *
+   * The bound is tight — open, one HEAD advance at slot 1, then a request at
+   * slot 2 legitimately stamps revision 1 with sequence 2.
+   */
+  function stampedState(overrides: Record<string, unknown>): WorkflowState {
+    return {
+      ...openedWorkflow(),
+      boundCommitSha: SHA_B,
+      ...overrides,
+    } as unknown as WorkflowState;
+  }
+
+  function trackedAt(revision: number, sequence: number): unknown {
+    return {
+      invocationId: INVOCATION_A,
+      targetCommitSha: SHA_B,
+      purpose: 'review',
+      providerId: 'codex',
+      agentId: 'agent-1',
+      requestedAtRevision: revision,
+      requestedAtSequence: sequence,
+      state: 'REQUESTED',
+      reportedStatus: null,
+      reportedAtRevision: null,
+      reportedAtSequence: null,
+    };
+  }
+
+  const admittedAt = (revision: number, sequence: number): unknown => ({
+    evidenceId: EVIDENCE_A,
+    kind: 'ci-result',
+    admittedAtCommitSha: SHA_B,
+    admittedAtRevision: revision,
+    admittedAtSequence: sequence,
+  });
+
+  const reviewedAt = (revision: number, sequence: number): unknown => ({
+    reviewId: REVIEW_A,
+    admittedAtCommitSha: SHA_B,
+    admittedAtRevision: revision,
+    admittedAtSequence: sequence,
+  });
+
+  it.each([
+    ['an invocation', (r: number, q: number) => ({ invocations: stored([trackedAt(r, q)]) })],
+    ['an evidence admission', (r: number, q: number) => ({ evidence: stored([admittedAt(r, q)]) })],
+    ['a review admission', (r: number, q: number) => ({ reviews: stored([reviewedAt(r, q)]) })],
+  ])('refuses %s stamped at revision 1 with sequence 1', (_name, build) => {
+    const forged = stampedState({ revision: 1, sequence: 2, ...build(1, 1) });
+
+    expect(applyWorkflowEvent(forged, closeWorkflow()).rejection).toBe('WORKFLOW_UNREADABLE');
+  });
+
+  it.each([
+    ['an invocation', (r: number, q: number) => ({ invocations: stored([trackedAt(r, q)]) })],
+    ['an evidence admission', (r: number, q: number) => ({ evidence: stored([admittedAt(r, q)]) })],
+    ['a review admission', (r: number, q: number) => ({ reviews: stored([reviewedAt(r, q)]) })],
+  ])('accepts %s stamped at revision 1 with sequence 2', (_name, build) => {
+    const legal = stampedState({ revision: 1, sequence: 2, ...build(1, 2) });
+
+    expect(applyWorkflowEvent(legal, closeWorkflow()).outcome).toBe('APPLIED');
+  });
+
+  it.each([
+    ['an invocation', (r: number, q: number) => ({ invocations: stored([trackedAt(r, q)]) })],
+    ['an evidence admission', (r: number, q: number) => ({ evidence: stored([admittedAt(r, q)]) })],
+    ['a review admission', (r: number, q: number) => ({ reviews: stored([reviewedAt(r, q)]) })],
+  ])('accepts %s stamped at revision 0 with sequence 1', (_name, build) => {
+    // Bound to SHA_B so the revision-0 entries match their own commit binding.
+    const legal = stampedState({ sequence: 1, ...build(0, 1) });
+
+    expect(applyWorkflowEvent(legal, closeWorkflow()).outcome).toBe('APPLIED');
+  });
+
+  it.each([
+    [3, 2],
+    [3, 3],
+    [5, 1],
+    [2, 2],
+  ])('refuses a record stamped at revision %i with sequence %i', (revision, sequence) => {
+    const forged = stampedState({
+      revision,
+      sequence: revision + 2,
+      evidence: stored([admittedAt(revision, sequence)]),
+    });
+
+    expect(applyWorkflowEvent(forged, closeWorkflow()).rejection).toBe('WORKFLOW_UNREADABLE');
+  });
+
+  it('refuses a report stamp that precedes its own revision', () => {
+    const forged = stampedState({
+      revision: 2,
+      sequence: 6,
+      invocations: stored([
+        {
+          ...(trackedAt(2, 3) as Record<string, unknown>),
+          state: 'REPORTED',
+          reportedStatus: 'reported-complete',
+          reportedAtRevision: 2,
+          reportedAtSequence: 2,
+        },
+      ]),
+    });
+
+    expect(applyWorkflowEvent(forged, closeWorkflow()).rejection).toBe('WORKFLOW_UNREADABLE');
+  });
+
+  it('accepts a report whose stamps follow both its request and its revision', () => {
+    const legal = stampedState({
+      revision: 2,
+      sequence: 6,
+      invocations: stored([
+        {
+          ...(trackedAt(2, 3) as Record<string, unknown>),
+          state: 'REPORTED',
+          reportedStatus: 'reported-complete',
+          reportedAtRevision: 2,
+          reportedAtSequence: 4,
+        },
+      ]),
+    });
+
+    expect(applyWorkflowEvent(legal, closeWorkflow()).outcome).toBe('APPLIED');
+  });
+
+  it('keeps a real multi-HEAD history valid and its stamps ahead of their revisions', () => {
+    let state = applyOrThrow(openedWorkflow(), requestInvocation());
+    state = applyOrThrow(state, observeHead(SHA_B));
+    state = applyOrThrow(
+      state,
+      requestInvocation(buildInvocation({ invocationId: INVOCATION_B, targetCommitSha: SHA_B })),
+    );
+    state = applyOrThrow(
+      state,
+      admitEvidence(buildVerdict({ commitSha: SHA_B, targetHeadSha: SHA_B })),
+    );
+    state = applyOrThrow(state, observeHead(SHA_C));
+    state = applyOrThrow(
+      state,
+      admitReview(buildReview({ reviewId: 'rv-late', reviewedCommitSha: SHA_C })),
+    );
+
+    for (const tracked of state.invocations) {
+      expect(tracked.requestedAtSequence).toBeGreaterThan(tracked.requestedAtRevision);
+    }
+    for (const admission of [...state.evidence, ...state.reviews]) {
+      expect(admission.admittedAtSequence).toBeGreaterThan(admission.admittedAtRevision);
+    }
+    expect(state.revision).toBe(2);
+    expect(applyWorkflowEvent(state, closeWorkflow()).outcome).toBe('APPLIED');
+  });
+
+  it('still enforces global stamp uniqueness alongside the revision relation', () => {
+    const forged = stampedState({
+      revision: 1,
+      sequence: 4,
+      evidence: stored([admittedAt(1, 3)]),
+      reviews: stored([reviewedAt(1, 3)]),
+    });
+
+    expect(applyWorkflowEvent(forged, closeWorkflow()).rejection).toBe('WORKFLOW_UNREADABLE');
   });
 
   /* ---- P1: emptiness of invalidFields must be provable, not reported ---- */
@@ -1517,7 +1836,7 @@ describe('group K — bounds', () => {
       admittedAtRevision: 0,
       admittedAtSequence: index + 1,
     }));
-    return { ...openedWorkflow(), sequence: count, evidence } as WorkflowState;
+    return { ...openedWorkflow(), sequence: count, evidence: stored(evidence) } as WorkflowState;
   }
 
   it('refuses a new admission once the evidence bound is reached', () => {
@@ -1550,7 +1869,7 @@ describe('group K — bounds', () => {
     const state = {
       ...openedWorkflow(),
       sequence: WORKFLOW_BOUNDS.MAX_ADMITTED_REVIEWS,
-      reviews,
+      reviews: stored(reviews),
     } as WorkflowState;
 
     expect(applyWorkflowEvent(state, admitReview()).rejection).toBe('CAPACITY_EXCEEDED');

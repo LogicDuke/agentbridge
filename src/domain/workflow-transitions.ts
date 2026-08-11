@@ -316,6 +316,34 @@ function readList(value: unknown, limit: number): readonly unknown[] | null {
     return null;
   }
 
+  // **Every content signal a Proxy exposes is one the same Proxy controls.**
+  // Over an *extensible* target it may report a short `length`, return a
+  // matching `ownKeys`, and deny the hidden indices through
+  // `getOwnPropertyDescriptor` — all consistently. Corroborating one trapped
+  // channel with another proves nothing when one adversary owns both, so a real
+  // own record could be hidden and then silently deleted from the durable
+  // snapshot by the next applied transition.
+  //
+  // Non-extensibility is the one property the engine refuses to let a Proxy
+  // fake: the `isExtensible` trap must agree with its target, and once the
+  // target is non-extensible the `ownKeys` trap must return *exactly* the
+  // target's own keys. Only then do the structural checks below become proof
+  // rather than assertion.
+  //
+  // Every list this layer emits is frozen by `freezeState`, so a state produced
+  // here always satisfies this. A caller that rebuilds a state from JSON must
+  // freeze the three collections before handing it back; an extensible list is
+  // refused rather than partially trusted.
+  let extensible = true;
+  try {
+    extensible = reflectIsExtensible(elements);
+  } catch {
+    return null;
+  }
+  if (extensible) {
+    return null;
+  }
+
   let rawLength: unknown;
   try {
     rawLength = elements.length;
@@ -407,6 +435,10 @@ function readTrackedInvocation(
     requestedAtRevision === null ||
     requestedAtSequence === null ||
     requestedAtSequence < 1 ||
+    // Reaching revision R costs R applied HEAD_OBSERVED transitions, each
+    // consuming a distinct sequence slot, so the R-th advance sat at slot >= R
+    // and any record stamped at revision R was created later still.
+    requestedAtSequence <= requestedAtRevision ||
     !isVocabularyMember<InvocationPurpose>(INVOCATION_PURPOSES, rawPurpose) ||
     !isVocabularyMember(INVOCATION_STATES, rawState)
   ) {
@@ -428,7 +460,8 @@ function readTrackedInvocation(
       reportedAtRevision === null ||
       reportedAtSequence === null ||
       reportedAtRevision < requestedAtRevision ||
-      reportedAtSequence <= requestedAtSequence
+      reportedAtSequence <= requestedAtSequence ||
+      reportedAtSequence <= reportedAtRevision
     ) {
       return null;
     }
@@ -480,6 +513,7 @@ function readAdmittedEvidence(
     admittedAtRevision === null ||
     admittedAtSequence === null ||
     admittedAtSequence < 1 ||
+    admittedAtSequence <= admittedAtRevision ||
     !isVocabularyMember(EVIDENCE_KINDS, rawKind)
   ) {
     return null;
@@ -517,7 +551,8 @@ function readAdmittedReview(
     admittedAtCommitSha === null ||
     admittedAtRevision === null ||
     admittedAtSequence === null ||
-    admittedAtSequence < 1
+    admittedAtSequence < 1 ||
+    admittedAtSequence <= admittedAtRevision
   ) {
     return null;
   }
@@ -562,7 +597,13 @@ function readAdmittedReview(
  *   transition;
  * - no admission identity — the value pair (id, revision) — appears twice;
  * - no two retained transition sequence stamps share a value, since every
- *   applied transition advances `sequence` once and stamps at most one record.
+ *   applied transition advances `sequence` once and stamps at most one record;
+ * - every stamped record satisfies `recordedSequence > recordedRevision`:
+ *   reaching revision R costs R applied `HEAD_OBSERVED` transitions, each
+ *   consuming a distinct sequence slot, so the R-th advance sat at slot >= R
+ *   and the record stamped at revision R was created by a later transition
+ *   still. The bound is tight — open, one HEAD advance at slot 1, then a
+ *   request at slot 2 stamps revision 1 with sequence 2.
  */
 function snapshotWorkflow(state: WorkflowState): WorkflowSnapshot | null {
   const record = asRecord(state);
