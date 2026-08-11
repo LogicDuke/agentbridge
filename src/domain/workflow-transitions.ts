@@ -42,9 +42,17 @@
  *   11  capacity                        CAPACITY_EXCEEDED
  *   12  apply
  *
- * `INVOCATION_REPORTED` is the one event whose binding check follows its
- * identity check, because the SHA it compares against comes from the tracked
- * invocation rather than from the workflow.
+ * Two events depart from that order, deliberately:
+ *
+ * - `INVOCATION_REPORTED` checks binding *after* identity, because the SHA it
+ *   compares against comes from the tracked invocation rather than from the
+ *   workflow.
+ * - `HUMAN_GATE_OPENED` checks status posture *before* its payload, so an
+ *   already-open gate returns `HUMAN_GATE_ALREADY_OPEN` without `atCommitSha`
+ *   being read at all. A request to open a gate that is already open is
+ *   answered by the gate, never by the shape of the payload accompanying it.
+ *
+ * Each order is fixed per event kind, so rejection reasons stay deterministic.
  */
 
 import { EVIDENCE_KIND, EVIDENCE_KINDS } from './evidence.js';
