@@ -56,6 +56,7 @@ import {
   revokedProxy,
   SHA_A,
   SHA_B,
+  SHA_C,
   withRawInvocationField,
   withRawReportField,
   withThrowingGetter,
@@ -595,6 +596,130 @@ describe('group J — hostile input fails closed', () => {
       ).toBe(SHA_A);
     },
   );
+
+  /**
+   * A tracked invocation stamped at the current revision must target the
+   * current bound commit, symmetrically with the two admission collections.
+   *
+   * Every state this layer produces satisfies it by construction —
+   * `INVOCATION_REQUESTED` requires `targetCommitSha === boundCommitSha`, and
+   * `revision` only moves through `HEAD_OBSERVED`. A deserialized or forged
+   * aggregate that violates it would let `INVOCATION_REPORTED` record a report
+   * against a commit the workflow was never bound to at that revision, because
+   * that comparison correctly uses the tracked invocation's own commit.
+   */
+  const forgedCurrentInvocation = (): WorkflowState => {
+    const base = requested();
+    const tracked = base.invocations[0];
+    return {
+      ...base,
+      invocations: [{ ...tracked, targetCommitSha: SHA_C }],
+    } as unknown as WorkflowState;
+  };
+
+  it('refuses a current-revision invocation that targets a foreign commit', () => {
+    const forged = forgedCurrentInvocation();
+    const tracked = forged.invocations[0];
+
+    expect(tracked?.requestedAtRevision).toBe(forged.revision);
+    expect(tracked?.targetCommitSha).not.toBe(forged.boundCommitSha);
+    expect(applyWorkflowEvent(forged, admitEvidence()).rejection).toBe('WORKFLOW_UNREADABLE');
+  });
+
+  it('refuses that forged state for every event kind, failing closed each time', () => {
+    const forged = forgedCurrentInvocation();
+
+    for (const [name, event] of everyEvent()) {
+      const result = applyWorkflowEvent(forged, event);
+
+      expect(result.rejection, name).toBe('WORKFLOW_UNREADABLE');
+      expect(result.outcome, name).toBe('REJECTED');
+      expect(result.state, name).toBe(forged);
+    }
+    expect(applyWorkflowEvent(forged, { kind: 'NOPE' } as never).state).toBe(forged);
+  });
+
+  it('refuses a report bound to the forged foreign commit', () => {
+    const forged = forgedCurrentInvocation();
+    const result = applyWorkflowEvent(
+      forged,
+      reportInvocation(buildReport({ invocationId: INVOCATION_A, targetCommitSha: SHA_C })),
+    );
+
+    expect(result.rejection).toBe('WORKFLOW_UNREADABLE');
+    expect(result.state).toBe(forged);
+    expect(result.state.invocations[0]?.state).toBe('REQUESTED');
+  });
+
+  it('keeps a legitimate current-revision invocation valid', () => {
+    const legitimate = requested();
+
+    expect(legitimate.invocations[0]?.requestedAtRevision).toBe(legitimate.revision);
+    expect(legitimate.invocations[0]?.targetCommitSha).toBe(legitimate.boundCommitSha);
+    expect(applyWorkflowEvent(legitimate, reportInvocation()).outcome).toBe('APPLIED');
+    expect(applyWorkflowEvent(legitimate, admitEvidence()).outcome).toBe('APPLIED');
+  });
+
+  it('lets a historical invocation keep its own commit after HEAD advances', () => {
+    const moved = applyOrThrow(requested(), observeHead(SHA_B));
+    const tracked = moved.invocations[0];
+
+    // Not rewritten to the new bound commit, and still below the new revision.
+    expect(tracked?.targetCommitSha).toBe(SHA_A);
+    expect(tracked?.requestedAtRevision).toBe(0);
+    expect(tracked?.state).toBe('REQUESTED');
+    expect(moved.boundCommitSha).toBe(SHA_B);
+    expect(moved.revision).toBe(1);
+
+    // The aggregate stays readable, and the historical report still applies
+    // against the invocation's own commit rather than the new HEAD.
+    expect(applyWorkflowEvent(moved, reportInvocation()).outcome).toBe('APPLIED');
+    expect(
+      applyWorkflowEvent(
+        moved,
+        requestInvocation(
+          buildInvocation({ invocationId: INVOCATION_B, targetCommitSha: SHA_B }),
+        ),
+      ).outcome,
+    ).toBe('APPLIED');
+    expect(applyOrThrow(moved, reportInvocation()).invocations[0]?.targetCommitSha).toBe(SHA_A);
+  });
+
+  it('binds all three collections to the current commit symmetrically', () => {
+    const base = requested();
+    const withAdmissions = applyOrThrow(applyOrThrow(base, admitEvidence()), admitReview());
+    const tracked = withAdmissions.invocations[0];
+    const evidence = withAdmissions.evidence[0];
+    const review = withAdmissions.reviews[0];
+
+    // The invariant holds for a legitimately built aggregate.
+    expect(tracked?.targetCommitSha).toBe(withAdmissions.boundCommitSha);
+    expect(evidence?.admittedAtCommitSha).toBe(withAdmissions.boundCommitSha);
+    expect(review?.admittedAtCommitSha).toBe(withAdmissions.boundCommitSha);
+
+    // Breaking it in any one collection makes the whole aggregate unreadable.
+    const forgeries: readonly WorkflowState[] = [
+      {
+        ...withAdmissions,
+        invocations: [{ ...tracked, targetCommitSha: SHA_C }],
+      } as unknown as WorkflowState,
+      {
+        ...withAdmissions,
+        evidence: [{ ...evidence, admittedAtCommitSha: SHA_C }],
+      } as unknown as WorkflowState,
+      {
+        ...withAdmissions,
+        reviews: [{ ...review, admittedAtCommitSha: SHA_C }],
+      } as unknown as WorkflowState,
+    ];
+
+    for (const forged of forgeries) {
+      const result = applyWorkflowEvent(forged, admitEvidence(buildVerdict({ evidenceId: 'ev-x' })));
+
+      expect(result.rejection).toBe('WORKFLOW_UNREADABLE');
+      expect(result.state).toBe(forged);
+    }
+  });
 });
 
 describe('group K — bounds', () => {

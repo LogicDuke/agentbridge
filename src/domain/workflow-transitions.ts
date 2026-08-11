@@ -400,7 +400,13 @@ function readAdmittedReview(
  *   `revision` — a HEAD advance clears the gate, so a gate can never outlive
  *   the revision it was opened at;
  * - `AWAITING_HUMAN_DECISION` always carries an open gate;
- * - every recorded revision and sequence is within the workflow's own.
+ * - every recorded revision and sequence is within the workflow's own;
+ * - **everything stamped at the current revision is bound to the current
+ *   commit**, symmetrically across all three collections: a tracked invocation
+ *   whose `requestedAtRevision` equals `revision` targets `boundCommitSha`, and
+ *   an evidence or review admission whose `admittedAtRevision` equals
+ *   `revision` was admitted at `boundCommitSha`. Entries from earlier revisions
+ *   keep their own historical commit and are never rewritten.
  */
 function snapshotWorkflow(state: WorkflowState): WorkflowSnapshot | null {
   const record = asRecord(state);
@@ -481,7 +487,11 @@ function snapshotWorkflow(state: WorkflowState): WorkflowSnapshot | null {
   const invocations: TrackedInvocation[] = [];
   for (let index = 0; index < invocationCandidates.length; index += 1) {
     const tracked = readTrackedInvocation(invocationCandidates[index], revision, sequence);
-    if (tracked === null) {
+    if (
+      tracked === null ||
+      (tracked.requestedAtRevision === revision &&
+        tracked.targetCommitSha !== boundCommitSha)
+    ) {
       return null;
     }
     for (let priorIndex = 0; priorIndex < invocations.length; priorIndex += 1) {
