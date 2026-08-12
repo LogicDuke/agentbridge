@@ -419,6 +419,10 @@ async function terminatePosix(
   pid: number,
   graceMs: number,
 ): Promise<TerminationScope> {
+  if (hasEnded(child)) {
+    return TERMINATION_SCOPE.DIRECT_CHILD_ONLY;
+  }
+
   let groupReached = signalProcessGroup(pid, 'SIGTERM');
   if (!groupReached) {
     killDirectChild(child, 'SIGTERM');
@@ -743,9 +747,19 @@ export function invokeAgentProcess(
     };
 
     if (child.stdout !== null) {
+      onEvent(child.stdout, 'error', () => {
+        // Read failures are consumed here without promoting the exchange to a
+        // terminal failure state, matching the stdin pattern. The close path
+        // decides the outcome.
+      });
       onReadableData(child.stdout, onStdout);
     }
     if (child.stderr !== null) {
+      onEvent(child.stderr, 'error', () => {
+        // Read failures are consumed here without promoting the exchange to a
+        // terminal failure state, matching the stdin pattern. The close path
+        // decides the outcome.
+      });
       onReadableData(child.stderr, onStderr);
     }
 

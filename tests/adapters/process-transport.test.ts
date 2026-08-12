@@ -117,7 +117,7 @@ describe('invokeAgentProcess — success', () => {
     }
   });
 
-  it('accepts a zero-argument argv', async () => {
+  it('accepts a single-argument argv', async () => {
     const exchange = await invokeAgentProcess(
       makeSpec({ args: ['--version'] }),
       makeLimits(),
@@ -126,6 +126,16 @@ describe('invokeAgentProcess — success', () => {
     expect(exchange.outcome).toBe('EXITED');
     expect(exchange.exitCode).toBe(0);
   });
+
+  it('accepts a zero-argument argv', async () => {
+    const exchange = await invokeAgentProcess(
+      makeSpec({ args: [] }),
+      makeLimits({ timeoutMs: 500, graceMs: 200 }),
+    );
+
+    // Node starts an interactive REPL with no arguments, which times out
+    expect(exchange.outcome).toBe('TIMED_OUT');
+  }, 15_000);
 
   it('reports source bytes that match the decoded stdout for valid UTF-8', async () => {
     const exchange = await runStub(STUB.MULTIBYTE, ['3']);
