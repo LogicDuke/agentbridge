@@ -1590,6 +1590,98 @@ describe('group J — hostile input fails closed', () => {
     expect(applyWorkflowEvent(closed, observeHead(SHA_B)).rejection).toBe('WORKFLOW_CLOSED');
   });
 
+  /* ---- HEAD slots count toward the status transition's reservation ---- */
+
+  /** Awaiting a human at revision 1, with one current-revision admission. */
+  function awaitingAfterHead(sequence: number, admissionSequence: number): WorkflowState {
+    return {
+      ...openedWorkflow(),
+      boundCommitSha: SHA_B,
+      revision: 1,
+      sequence,
+      status: 'AWAITING_HUMAN_DECISION',
+      humanGateOpenedAtRevision: 1,
+      evidence: stored([
+        {
+          evidenceId: EVIDENCE_A,
+          kind: 'ci-result',
+          admittedAtCommitSha: SHA_B,
+          admittedAtRevision: 1,
+          admittedAtSequence: admissionSequence,
+        },
+      ]),
+    } as unknown as WorkflowState;
+  }
+
+  const admitAtB = (): WorkflowEvent =>
+    admitEvidence(
+      buildVerdict({ evidenceId: EVIDENCE_B, commitSha: SHA_B, targetHeadSha: SHA_B }),
+    );
+
+  it('refuses an awaiting-human state whose HEAD slot leaves no room for the gate', () => {
+    // Slot 1 is the HEAD advance to revision 1 and slot 2 is the admission, so
+    // nothing remains for HUMAN_GATE_OPENED even though only one stamp exists.
+    const forged = awaitingAfterHead(2, 2);
+
+    expect(applyWorkflowEvent(forged, admitAtB()).rejection).toBe('WORKFLOW_UNREADABLE');
+  });
+
+  it('accepts the same history with one more slot for the gate', () => {
+    expect(applyWorkflowEvent(awaitingAfterHead(3, 2), admitAtB()).outcome).toBe('APPLIED');
+  });
+
+  it('counts a HEAD transition that leaves no retained stamp behind', () => {
+    // No admissions at all: the single HEAD advance still occupies a slot, so
+    // the gate needs a second one.
+    const withoutStamps = (sequence: number): WorkflowState =>
+      ({
+        ...openedWorkflow(),
+        boundCommitSha: SHA_B,
+        revision: 1,
+        sequence,
+        status: 'AWAITING_HUMAN_DECISION',
+        humanGateOpenedAtRevision: 1,
+      }) as unknown as WorkflowState;
+
+    expect(applyWorkflowEvent(withoutStamps(1), admitAtB()).rejection).toBe(
+      'WORKFLOW_UNREADABLE',
+    );
+    expect(applyWorkflowEvent(withoutStamps(2), admitAtB()).outcome).toBe('APPLIED');
+  });
+
+  it('keeps a genuinely replayed HEAD, admission and gate history valid', () => {
+    let state = applyOrThrow(openedWorkflow(), observeHead(SHA_B));
+    state = applyOrThrow(
+      state,
+      admitEvidence(buildVerdict({ commitSha: SHA_B, targetHeadSha: SHA_B })),
+    );
+    state = applyOrThrow(state, openHumanGate(SHA_B));
+
+    expect(state.revision).toBe(1);
+    expect(state.sequence).toBe(3);
+    expect(state.status).toBe('AWAITING_HUMAN_DECISION');
+    expect(applyWorkflowEvent(state, admitAtB()).outcome).toBe('APPLIED');
+  });
+
+  it('applies the same reservation to a closed state after a HEAD advance', () => {
+    const closedAfterHead = (sequence: number): WorkflowState =>
+      ({
+        ...openedWorkflow(),
+        boundCommitSha: SHA_B,
+        revision: 1,
+        sequence,
+        status: 'CLOSED',
+        closureReason: 'CALLER_CLOSED',
+      }) as unknown as WorkflowState;
+
+    // Unreadable while the HEAD slot leaves no room for the closing transition.
+    expect(applyWorkflowEvent(closedAfterHead(1), admitAtB()).rejection).toBe(
+      'WORKFLOW_UNREADABLE',
+    );
+    // Readable once it does, so the terminal-status rule is what refuses.
+    expect(applyWorkflowEvent(closedAfterHead(2), admitAtB()).rejection).toBe('WORKFLOW_CLOSED');
+  });
+
   /* ---- intervening HEAD transitions must have sequence slots of their own ---- */
 
   /** One invocation whose request and report straddle a revision advance. */
