@@ -985,6 +985,45 @@ function snapshotWorkflow(state: WorkflowState): WorkflowSnapshot | null {
     return null;
   }
 
+  // Counting is not enough on its own: the gate slot must also sit *after* the
+  // final `HEAD_OBSERVED` that reached the current revision. That HEAD follows
+  // every stamp recorded at an earlier revision, and the gate follows the HEAD,
+  // so the gate's slot is at least two past the latest earlier-revision stamp.
+  //
+  // Only an open gate at revision >= 1 is constrained. A gate that was already
+  // cleared — by a HEAD advance or by a human decision — leaves the workflow
+  // `OPEN`, and those histories are deliberately left alone.
+  if (rawStatus === WORKFLOW_STATUS.AWAITING_HUMAN_DECISION && revision > 0) {
+    let latestEarlier = 0;
+    for (let index = 0; index < spanRevisions.length; index += 1) {
+      const bandRevision = spanRevisions[index];
+      const bandHighest = spanHighest[index];
+      if (bandRevision === undefined || bandHighest === undefined) {
+        return null;
+      }
+      if (bandRevision < revision && bandHighest > latestEarlier) {
+        latestEarlier = bandHighest;
+      }
+    }
+    if (sequence < latestEarlier + 2) {
+      return null;
+    }
+  }
+
+  // At revision 0 with no retained stamp and no status-producing transition,
+  // nothing could have consumed a sequence slot: every event either stamps a
+  // record, advances the revision, opens the gate, or closes the workflow.
+  // Deliberately narrow — no general upper bound is claimed here, because a
+  // cleared gate legitimately consumes a slot it leaves no trace of.
+  if (
+    revision === 0 &&
+    rawStatus === WORKFLOW_STATUS.OPEN &&
+    seenSequences.length === 0 &&
+    sequence > 0
+  ) {
+    return null;
+  }
+
   return {
     workflowId,
     repositoryId,

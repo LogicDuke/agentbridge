@@ -1682,6 +1682,130 @@ describe('group J — hostile input fails closed', () => {
     expect(applyWorkflowEvent(closedAfterHead(2), admitAtB()).rejection).toBe('WORKFLOW_CLOSED');
   });
 
+  /* ---- the gate slot must follow the HEAD that reached the revision ---- */
+
+  /** Awaiting a human at revision 1, with one historical admission at revision 0. */
+  function awaitingWithHistoricalAdmission(
+    sequence: number,
+    admissionSequence: number,
+  ): WorkflowState {
+    return {
+      ...openedWorkflow(),
+      boundCommitSha: SHA_B,
+      revision: 1,
+      sequence,
+      status: 'AWAITING_HUMAN_DECISION',
+      humanGateOpenedAtRevision: 1,
+      evidence: stored([
+        {
+          evidenceId: EVIDENCE_A,
+          kind: 'ci-result',
+          admittedAtCommitSha: SHA_A,
+          admittedAtRevision: 0,
+          admittedAtSequence: admissionSequence,
+        },
+      ]),
+    } as unknown as WorkflowState;
+  }
+
+  it('refuses an open gate with no slot after the revision-advancing HEAD', () => {
+    // The admission holds slot 2, so the HEAD reaching revision 1 must hold
+    // slot 3, leaving nothing for HUMAN_GATE_OPENED.
+    expect(
+      applyWorkflowEvent(awaitingWithHistoricalAdmission(3, 2), closeWorkflow()).rejection,
+    ).toBe('WORKFLOW_UNREADABLE');
+  });
+
+  it('accepts the same history once a slot exists after that HEAD', () => {
+    expect(
+      applyWorkflowEvent(awaitingWithHistoricalAdmission(4, 2), closeWorkflow()).outcome,
+    ).toBe('APPLIED');
+  });
+
+  it('accepts a genuinely replayed admission, HEAD and gate history', () => {
+    let state = applyOrThrow(openedWorkflow(), admitEvidence());
+    state = applyOrThrow(state, observeHead(SHA_B));
+    state = applyOrThrow(state, openHumanGate(SHA_B));
+
+    expect(state.evidence[0]?.admittedAtSequence).toBe(1);
+    expect(state.revision).toBe(1);
+    expect(state.sequence).toBe(3);
+    expect(applyWorkflowEvent(state, closeWorkflow()).outcome).toBe('APPLIED');
+  });
+
+  it('leaves an A1 gate-clearing history readable', () => {
+    // Gate opened, then cleared by a HEAD advance: the workflow is OPEN, so the
+    // gate rule does not apply and the slot the cleared gate consumed is not
+    // required to be explainable.
+    const cleared = applyOrThrow(
+      applyOrThrow(openedWorkflow(), openHumanGate()),
+      observeHead(SHA_B),
+    );
+
+    expect(cleared.status).toBe('OPEN');
+    expect(cleared.revision).toBe(1);
+    expect(cleared.sequence).toBe(2);
+    expect(cleared.invocations).toEqual([]);
+    expect(applyWorkflowEvent(cleared, closeWorkflow()).outcome).toBe('APPLIED');
+  });
+
+  it('leaves a human-decision gate-clearing history readable', () => {
+    const cleared = applyOrThrow(
+      applyOrThrow(openedWorkflow(), openHumanGate()),
+      admitEvidence(buildHumanDecisionVerdict()),
+    );
+
+    expect(cleared.status).toBe('OPEN');
+    expect(cleared.revision).toBe(0);
+    expect(cleared.sequence).toBe(2);
+    expect(applyWorkflowEvent(cleared, closeWorkflow()).outcome).toBe('APPLIED');
+  });
+
+  it('leaves a gate re-opened after a clear readable', () => {
+    let state = applyOrThrow(openedWorkflow(), openHumanGate());
+    state = applyOrThrow(state, observeHead(SHA_B));
+    state = applyOrThrow(state, openHumanGate(SHA_B));
+
+    expect(state.status).toBe('AWAITING_HUMAN_DECISION');
+    expect(state.sequence).toBe(3);
+    expect(applyWorkflowEvent(state, observeHead(SHA_C)).outcome).toBe('APPLIED');
+  });
+
+  /* ---- revision 0, OPEN, no stamps: only sequence 0 is reachable ---- */
+
+  it('refuses an untouched workflow claiming a consumed sequence slot', () => {
+    for (const sequence of [1, 2]) {
+      const forged = { ...openedWorkflow(), sequence } as WorkflowState;
+
+      expect(forged.invocations).toEqual([]);
+      expect(applyWorkflowEvent(forged, observeHead(SHA_B)).rejection).toBe(
+        'WORKFLOW_UNREADABLE',
+      );
+    }
+  });
+
+  it('accepts a freshly opened workflow at sequence 0', () => {
+    const fresh = openedWorkflow();
+
+    expect(fresh.revision).toBe(0);
+    expect(fresh.status).toBe('OPEN');
+    expect(fresh.sequence).toBe(0);
+    expect(applyWorkflowEvent(fresh, observeHead(SHA_B)).outcome).toBe('APPLIED');
+  });
+
+  it('does not apply the untouched-workflow rule once any history exists', () => {
+    // A retained stamp explains the slot.
+    expect(applyOrThrow(openedWorkflow(), requestInvocation()).sequence).toBe(1);
+    // A HEAD advance explains it, at revision 1 rather than 0.
+    expect(applyOrThrow(openedWorkflow(), observeHead(SHA_B)).sequence).toBe(1);
+    // A cleared gate leaves no stamp, and the rule must not reach it.
+    const cleared = applyOrThrow(
+      applyOrThrow(openedWorkflow(), openHumanGate()),
+      admitEvidence(buildHumanDecisionVerdict()),
+    );
+    expect(applyWorkflowEvent(cleared, closeWorkflow()).outcome).toBe('APPLIED');
+  });
+
   /* ---- intervening HEAD transitions must have sequence slots of their own ---- */
 
   /** One invocation whose request and report straddle a revision advance. */
