@@ -1941,6 +1941,14 @@ describe('group J — hostile input fails closed', () => {
     expect(probeOpen(openWithAdmission(3, 'human-decision', 2))).toBe('WORKFLOW_UNREADABLE');
   });
 
+  it('refuses a decision with no earlier slot for the gate it would clear', () => {
+    // The decision itself holds slot 1, so no HUMAN_GATE_OPENED could have run
+    // before it and nothing explains slot 2.
+    expect(probeOpen(openWithAdmission(2, 'human-decision', 1))).toBe('WORKFLOW_UNREADABLE');
+    // With the decision one slot later the gate fits below it again.
+    expect(probeOpen(openWithAdmission(2, 'human-decision', 2))).toBe(null);
+  });
+
   /* ---- the open upper bound follows the revision past zero ---- */
 
   /** Open at revision 1 with nothing retained at all. */

@@ -1048,21 +1048,36 @@ function snapshotWorkflow(state: WorkflowState): WorkflowSnapshot | null {
   // costs either one of those same HEAD advances or one admitted
   // `human-decision` — each of which clears at most one gate. Hence
   //
-  //     gates opened <= revision + retained human decisions
+  //     gates opened <= revision + clearing human decisions
+  //
+  // A decision only counts as clearing when a gate could have preceded it: the
+  // `HUMAN_GATE_OPENED` it cleared has to sit at a lower slot, and that slot
+  // cannot be one a retained stamp already holds. A decision stamped at slot 1
+  // clears nothing, because nothing ran before it.
   //
   // Nothing here reconstructs which slot held what; only the totals are read.
-  // At revision 0 this reduces to stamps plus retained decisions, and with no
+  // At revision 0 this reduces to stamps plus clearing decisions, and with no
   // stamps at all to the untouched workflow, where only sequence 0 is
   // reachable. Deliberately confined to `OPEN`: a retained gate or closure
   // posture is accounted for by the lower bounds above.
   if (rawStatus === WORKFLOW_STATUS.OPEN) {
-    let humanDecisions = 0;
+    let clearingDecisions = 0;
     for (let index = 0; index < evidence.length; index += 1) {
-      if (evidence[index]?.kind === EVIDENCE_KIND.HUMAN_DECISION) {
-        humanDecisions += 1;
+      const admitted = evidence[index];
+      if (admitted !== undefined && admitted.kind === EVIDENCE_KIND.HUMAN_DECISION) {
+        let stampsBelow = 0;
+        for (let other = 0; other < seenSequences.length; other += 1) {
+          const stamp = seenSequences[other];
+          if (stamp !== undefined && stamp < admitted.admittedAtSequence) {
+            stampsBelow += 1;
+          }
+        }
+        if (admitted.admittedAtSequence - 1 > stampsBelow) {
+          clearingDecisions += 1;
+        }
       }
     }
-    const gatesOpened = revision + humanDecisions;
+    const gatesOpened = revision + clearingDecisions;
     if (sequence > seenSequences.length + revision + gatesOpened) {
       return null;
     }
