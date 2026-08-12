@@ -1,0 +1,1004 @@
+/**
+ * Security and structural invariants for the process transport.
+ *
+ * These assertions are the executable form of the guarantees in
+ * `docs/architecture/010-commander-claude-bridge.md`. Several inspect the
+ * module source text directly, because "there is no shell on any path" and
+ * "this layer performs no policy" are properties of the code as written, not of
+ * any single call.
+ */
+
+import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import { describe, expect, it } from 'vitest';
+
+import {
+  type AgentProcessSpec,
+  DEGRADED_TERMINATION_SCOPES,
+  isAbsolutePath,
+  readInvocation,
+  TERMINAL_CAUSE_PRECEDENCE,
+  TERMINATION_SCOPE,
+  TERMINATION_SCOPES,
+  TRANSPORT_BOUNDS,
+  TRANSPORT_OUTCOME,
+  TRANSPORT_OUTCOMES,
+  TRANSPORT_REJECTION,
+  type TransportLimits,
+  trimPartialUtf8,
+} from '../../src/adapters/agent-transport.js';
+import { invokeAgentProcess } from '../../src/adapters/process-transport.js';
+import { INVOCATION_BOUNDS, REVIEW_BOUNDS } from '../../src/domain/index.js';
+import {
+  ALL_OUTCOMES,
+  ALL_TERMINATION_SCOPES,
+  ascii,
+  DEGRADED_SCOPES,
+  EXPECTED_BOUNDS,
+  EXPECTED_PRECEDENCE,
+  FORBIDDEN_FIELD_NAMES,
+  FORBIDDEN_VALUES,
+  makeLimits,
+  makeSpec,
+  MALFORMED_VALUES,
+  NON_OBJECTS,
+  SHELL_ONLY_EXECUTABLES,
+  STUB,
+  WINDOWS_REQUIRED_ENVIRONMENT_VARIABLES,
+} from './transport-fixtures.js';
+
+const ADAPTER_DIRECTORY = fileURLToPath(new URL('../../src/adapters/', import.meta.url));
+
+function sourceOf(file: string): string {
+  return readFileSync(`${ADAPTER_DIRECTORY}${file}`, 'utf8');
+}
+
+const CONTRACT_SOURCE = sourceOf('agent-transport.ts');
+const IMPLEMENTATION_SOURCE = sourceOf('process-transport.ts');
+const ADAPTER_SOURCES = [CONTRACT_SOURCE, IMPLEMENTATION_SOURCE];
+
+/** Strip block and line comments so prose cannot satisfy a source assertion. */
+function code(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+}
+
+const ADAPTER_CODE = ADAPTER_SOURCES.map(code);
+
+const PLATFORM = process.platform === 'win32' ? 'win32' : 'posix';
+
+/** An empty array is a *valid* argv, so it is not a malformed-argv case. */
+const NON_ARGV_VALUES = MALFORMED_VALUES.filter(([, value]) => !Array.isArray(value));
+
+/** An empty object is a *valid* environment, so it is not a malformed-env case. */
+const NON_ENVIRONMENT_VALUES = MALFORMED_VALUES.filter(
+  ([, value]) => !(typeof value === 'object' && value !== null && !Array.isArray(value)),
+);
+
+/** A specification with one field replaced by an arbitrary runtime value. */
+function withRawSpecField(field: string, value: unknown): AgentProcessSpec {
+  return { ...makeSpec(), [field]: value } as unknown as AgentProcessSpec;
+}
+
+/** Limits with one field replaced by an arbitrary runtime value. */
+function withRawLimitField(field: string, value: unknown): TransportLimits {
+  return { ...makeLimits(), [field]: value } as unknown as TransportLimits;
+}
+
+/**
+ * Both arguments are required on purpose: a default would swallow an explicit
+ * `undefined` and silently validate a well-formed request instead of the
+ * malformed one under test.
+ */
+function rejectionFor(spec: AgentProcessSpec, limits: TransportLimits): string {
+  const result = readInvocation(spec, limits, PLATFORM);
+  return result.rejection ?? 'ACCEPTED';
+}
+
+/** Validate a specification against known-good limits. */
+function rejectionForSpec(spec: AgentProcessSpec): string {
+  return rejectionFor(spec, makeLimits());
+}
+
+describe('no shell on any path', () => {
+  it.each([
+    'shell: true',
+    'shell:true',
+    "require('child_process').exec",
+    'execSync',
+    'cmd.exe',
+    '/c ',
+    'powershell',
+    '-Command',
+  ])('never contains %j', (needle) => {
+    for (const source of ADAPTER_CODE) {
+      expect(source).not.toContain(needle);
+    }
+  });
+
+  it('passes shell: false at every spawn site', () => {
+    const executable = code(IMPLEMENTATION_SOURCE);
+    const spawnCalls = executable.match(/spawn\(/g) ?? [];
+    const shellFalse = executable.match(/shell: false/g) ?? [];
+
+    expect(spawnCalls.length).toBe(2);
+    expect(shellFalse.length).toBe(spawnCalls.length);
+  });
+
+  it('imports only child_process from Node, and no filesystem or network API', () => {
+    for (const source of ADAPTER_CODE) {
+      expect(source).not.toContain("from 'node:fs'");
+      expect(source).not.toContain("from 'node:http'");
+      expect(source).not.toContain("from 'node:https'");
+      expect(source).not.toContain("from 'node:net'");
+      expect(source).not.toContain("from 'node:path'");
+      expect(source).not.toContain('require(');
+    }
+    expect(IMPLEMENTATION_SOURCE).toContain("from 'node:child_process'");
+    expect(CONTRACT_SOURCE).not.toContain("from 'node:");
+  });
+});
+
+describe('no policy, no provider, no decoding', () => {
+  it('imports nothing from the domain kernel', () => {
+    for (const source of ADAPTER_CODE) {
+      expect(source).not.toContain('../domain/');
+      expect(source).not.toContain('src/domain');
+    }
+  });
+
+  it.each([
+    'evaluateActionRequest',
+    'GateDecision',
+    'ActionRequest',
+    'SpawnGrant',
+    'WeakMap',
+    'mayExecuteAutonomously',
+    'ingestInvocationReport',
+    'AgentReport',
+    'JSON.parse',
+    'Commander',
+    'claude',
+    'Claude',
+    'anthropic',
+    'openai',
+  ])('never references %j', (needle) => {
+    for (const source of ADAPTER_CODE) {
+      expect(source).not.toContain(needle);
+    }
+  });
+
+  it('performs no logging, no clock read, and no identifier generation', () => {
+    for (const source of ADAPTER_CODE) {
+      expect(source).not.toContain('console.');
+      expect(source).not.toContain('Date.now');
+      expect(source).not.toContain('new Date');
+      expect(source).not.toContain('Math.random');
+      expect(source).not.toContain('randomUUID');
+    }
+  });
+
+  it('reads process.env only for the internal Windows termination path', () => {
+    expect(code(CONTRACT_SOURCE)).not.toContain('process.env');
+    const reads = code(IMPLEMENTATION_SOURCE).match(/runtimeProcess\.env/g) ?? [];
+
+    expect(reads.length).toBe(2);
+    expect(IMPLEMENTATION_SOURCE).toContain(
+      "runtimeProcess.env['SystemRoot'] ?? runtimeProcess.env['windir']",
+    );
+  });
+});
+
+describe('termination vocabulary claims no more than the OS provides', () => {
+  it('matches the independently declared scope list', () => {
+    expect([...TERMINATION_SCOPES]).toEqual([...ALL_TERMINATION_SCOPES]);
+  });
+
+  it('marks exactly the degraded scopes as degraded', () => {
+    expect([...DEGRADED_TERMINATION_SCOPES]).toEqual([...DEGRADED_SCOPES]);
+  });
+
+  it('has no member that asserts termination finished', () => {
+    for (const scope of TERMINATION_SCOPES) {
+      expect(scope).not.toContain('COMPLETE');
+      expect(scope).not.toContain('TERMINATED');
+      expect(scope).not.toContain('KILLED');
+      expect(scope).not.toContain('SUCCESS');
+    }
+  });
+
+  it('names the two attempt scopes as requests rather than results', () => {
+    expect(TERMINATION_SCOPE.PROCESS_GROUP_REQUESTED).toContain('REQUESTED');
+    expect(TERMINATION_SCOPE.PROCESS_TREE_REQUESTED).toContain('REQUESTED');
+  });
+
+  it('exposes no field claiming a process tree was destroyed', async () => {
+    const exchange = await invokeAgentProcess(
+      makeSpec({ args: ['-e', STUB.WRITE_OK] }),
+      makeLimits(),
+    );
+
+    for (const forbidden of FORBIDDEN_FIELD_NAMES) {
+      expect(Object.hasOwn(exchange, forbidden)).toBe(false);
+    }
+  });
+
+  it('spawns taskkill directly with a fixed argument vector', () => {
+    expect(IMPLEMENTATION_SOURCE).toContain("['/PID', decimalPid, '/T', '/F']");
+    // No composed command line: the flags never appear inside one string.
+    expect(code(IMPLEMENTATION_SOURCE)).not.toContain('taskkill /T');
+    // The system directory is resolved, never assumed.
+    expect(IMPLEMENTATION_SOURCE).not.toContain("'C:\\\\Windows'");
+  });
+});
+
+describe('outcome vocabulary and precedence', () => {
+  it('matches the independently declared outcome list', () => {
+    expect([...TRANSPORT_OUTCOMES]).toEqual([...ALL_OUTCOMES]);
+  });
+
+  it('declares the frozen terminal-cause precedence', () => {
+    expect([...TERMINAL_CAUSE_PRECEDENCE]).toEqual([...EXPECTED_PRECEDENCE]);
+  });
+
+  it('covers every outcome exactly once in the precedence order', () => {
+    expect(new Set(TERMINAL_CAUSE_PRECEDENCE)).toEqual(new Set(TRANSPORT_OUTCOMES));
+    expect(TERMINAL_CAUSE_PRECEDENCE.length).toBe(TRANSPORT_OUTCOMES.length);
+  });
+
+  it('ranks an overflow above both signal and exit', () => {
+    const rank = (outcome: string): number => EXPECTED_PRECEDENCE.indexOf(outcome);
+
+    expect(rank('OUTPUT_LIMIT_EXCEEDED')).toBeLessThan(rank('SIGNALLED'));
+    expect(rank('OUTPUT_LIMIT_EXCEEDED')).toBeLessThan(rank('EXITED'));
+    expect(rank('CANCELLED')).toBeLessThan(rank('TIMED_OUT'));
+    expect(rank('SPEC_REJECTED')).toBe(0);
+  });
+
+  it('prefers SPEC_REJECTED over an already-aborted signal', async () => {
+    const exchange = await invokeAgentProcess(
+      makeSpec({ executablePath: 'relative/node' }),
+      { ...makeLimits(), signal: AbortSignal.abort() },
+    );
+
+    expect(exchange.outcome).toBe('SPEC_REJECTED');
+  });
+});
+
+describe('no authority value can reach a serialized exchange', () => {
+  it('carries none of the forbidden values', async () => {
+    const exchange = await invokeAgentProcess(
+      makeSpec({ args: ['-e', STUB.WRITE_OK] }),
+      makeLimits(),
+    );
+    const serialized = JSON.stringify(exchange);
+
+    for (const forbidden of FORBIDDEN_VALUES) {
+      expect(serialized).not.toContain(forbidden);
+    }
+  });
+
+  it('exposes only the declared fields', async () => {
+    const exchange = await invokeAgentProcess(
+      makeSpec({ args: ['-e', STUB.WRITE_OK] }),
+      makeLimits(),
+    );
+
+    expect(Object.keys(exchange).sort()).toEqual(
+      [
+        'exitCode',
+        'outcome',
+        'rejection',
+        'stderr',
+        'stderrBytes',
+        'stderrTruncated',
+        'stdout',
+        'stdoutBytes',
+        'stdoutTruncated',
+        'terminatingSignal',
+        'terminationScope',
+      ].sort(),
+    );
+  });
+});
+
+describe('structural validation is bounded, non-coercing and fail-closed', () => {
+  it.each(NON_OBJECTS)('refuses a specification that is %s', (_label, value) => {
+    expect(rejectionForSpec(value as AgentProcessSpec)).toBe('SPEC_UNREADABLE');
+  });
+
+  it.each(NON_OBJECTS)('refuses limits that are %s', (_label, value) => {
+    expect(rejectionFor(makeSpec(), value as TransportLimits)).toBe('LIMITS_UNREADABLE');
+  });
+
+  it.each(MALFORMED_VALUES)('refuses an executable that is %s', (_label, value) => {
+    expect(rejectionForSpec(withRawSpecField('executablePath', value))).toBe(
+      'EXECUTABLE_INVALID',
+    );
+  });
+
+  it.each(SHELL_ONLY_EXECUTABLES)('refuses %s', (_label, executablePath) => {
+    const rejection = rejectionForSpec(withRawSpecField('executablePath', executablePath));
+
+    expect(['EXECUTABLE_SUFFIX_FORBIDDEN', 'EXECUTABLE_NOT_ABSOLUTE']).toContain(rejection);
+  });
+
+  it('refuses an executable that is absolute but shell-only', () => {
+    const path = PLATFORM === 'win32' ? 'C:\\tools\\agent.cmd' : '/usr/bin/agent.cmd';
+
+    expect(rejectionForSpec(withRawSpecField('executablePath', path))).toBe(
+      'EXECUTABLE_SUFFIX_FORBIDDEN',
+    );
+  });
+
+  it('refuses a path containing a NUL', () => {
+    const path = PLATFORM === 'win32' ? 'C:\\a\u0000b\\node.exe' : '/a\u0000b/node';
+
+    expect(rejectionForSpec(withRawSpecField('executablePath', path))).toBe('EXECUTABLE_INVALID');
+  });
+
+  it('refuses an oversized path rather than truncating it', () => {
+    const prefix = PLATFORM === 'win32' ? 'C:\\' : '/';
+    const path = `${prefix}${ascii(TRANSPORT_BOUNDS.MAX_PATH_BYTES + 1)}`;
+
+    expect(rejectionForSpec(withRawSpecField('executablePath', path))).toBe('EXECUTABLE_INVALID');
+  });
+
+  it.each(NON_ARGV_VALUES)('refuses argv that is %s', (_label, value) => {
+    const rejection = rejectionForSpec(withRawSpecField('args', value));
+
+    expect(['ARGV_NOT_ARRAY', 'ARGV_UNREADABLE']).toContain(rejection);
+  });
+
+  it('refuses an argument that is not a string', () => {
+    expect(rejectionForSpec(withRawSpecField('args', ['-e', 42]))).toBe('ARGUMENT_NOT_STRING');
+  });
+
+  it('refuses an argument containing a NUL', () => {
+    expect(rejectionForSpec(withRawSpecField('args', ['-e', 'a\u0000b']))).toBe(
+      'ARGUMENT_CONTAINS_NUL',
+    );
+  });
+
+  it('refuses an argv element supplied through a getter without invoking it', () => {
+    let invoked = false;
+    const hostile: unknown[] = [];
+    Object.defineProperty(hostile, '0', {
+      get() {
+        invoked = true;
+        return '--harmless';
+      },
+      enumerable: true,
+      configurable: true,
+    });
+    Object.defineProperty(hostile, 'length', { value: 1, writable: true });
+
+    expect(rejectionForSpec(withRawSpecField('args', hostile))).toBe('ARGUMENT_UNREADABLE');
+    expect(invoked).toBe(false);
+  });
+
+  it('refuses an argv hole rather than reading an inherited value', () => {
+    const withHole: unknown[] = [];
+    withHole.length = 2;
+    const prototype = Array.prototype as unknown as Record<string, unknown>;
+    prototype['0'] = 'inherited-and-hostile';
+    try {
+      expect(rejectionForSpec(withRawSpecField('args', withHole))).toBe('ARGUMENT_UNREADABLE');
+    } finally {
+      delete prototype['0'];
+    }
+  });
+
+  it('preserves validated argv despite an inherited numeric setter', () => {
+    const descriptor = Object.getOwnPropertyDescriptor(Array.prototype, '0');
+    const args = ['-e', 'kept'];
+    Object.defineProperty(Array.prototype, '0', {
+      set() {
+        // Deliberately swallow indexed assignment.
+      },
+      configurable: true,
+    });
+    let rejection: string | null = null;
+    let first: string | undefined;
+    let second: string | undefined;
+    let ownsFirst = false;
+    try {
+      const result = readInvocation(makeSpec({ args }), makeLimits(), PLATFORM);
+      rejection = result.rejection;
+      first = result.value?.args[0];
+      second = result.value?.args[1];
+      ownsFirst = Object.hasOwn(result.value?.args ?? [], 0);
+    } finally {
+      if (descriptor === undefined) {
+        Reflect.deleteProperty(Array.prototype, '0');
+      } else {
+        Object.defineProperty(Array.prototype, '0', descriptor);
+      }
+    }
+    expect(rejection).toBeNull();
+    expect(first).toBe('-e');
+    expect(second).toBe('kept');
+    expect(ownsFirst).toBe(true);
+  });
+
+  it('uses captured string intrinsics after a validation Proxy poisons the prototype', () => {
+    const original = Object.getOwnPropertyDescriptor(String.prototype, 'charCodeAt');
+    const target = makeSpec();
+    const hostile = new Proxy(target, {
+      getOwnPropertyDescriptor(object, key) {
+        String.prototype.charCodeAt = (): never => {
+          throw new Error('poisoned charCodeAt');
+        };
+        return Reflect.getOwnPropertyDescriptor(object, key);
+      },
+    });
+    try {
+      const result = readInvocation(hostile, makeLimits(), PLATFORM);
+      expect(result.rejection).toBeNull();
+    } finally {
+      if (original !== undefined) {
+        Object.defineProperty(String.prototype, 'charCodeAt', original);
+      }
+    }
+  });
+
+  it('refuses an argv Proxy whose traps throw', () => {
+    const hostile = new Proxy([] as unknown[], {
+      get(): never {
+        throw new Error('trap');
+      },
+    });
+
+    expect(rejectionForSpec(withRawSpecField('args', hostile))).toBe('ARGV_UNREADABLE');
+  });
+
+  it('refuses a revoked argv Proxy', () => {
+    const revocable = Proxy.revocable([] as unknown[], {});
+    revocable.revoke();
+
+    expect(rejectionForSpec(withRawSpecField('args', revocable.proxy))).toBe('ARGV_UNREADABLE');
+  });
+
+  it('refuses more arguments than the count bound', () => {
+    const many = Array.from({ length: TRANSPORT_BOUNDS.MAX_ARGV_COUNT + 1 }, () => 'a');
+
+    expect(rejectionForSpec(withRawSpecField('args', many))).toBe('ARGV_COUNT_EXCEEDED');
+  });
+
+  it('refuses a single argument past the per-argument bound', () => {
+    const big = [ascii(TRANSPORT_BOUNDS.MAX_ARG_BYTES + 1)];
+
+    expect(rejectionForSpec(withRawSpecField('args', big))).toBe('ARGUMENT_BYTES_EXCEEDED');
+  });
+
+  it('applies the total argv bound before the count bound could ever bind', () => {
+    const maximal = Array.from({ length: TRANSPORT_BOUNDS.MAX_ARGV_COUNT }, () =>
+      ascii(TRANSPORT_BOUNDS.MAX_ARG_BYTES),
+    );
+
+    expect(rejectionForSpec(withRawSpecField('args', maximal))).toBe(
+      'ARGV_TOTAL_BYTES_EXCEEDED',
+    );
+    expect(
+      TRANSPORT_BOUNDS.MAX_ARGV_COUNT * TRANSPORT_BOUNDS.MAX_ARG_BYTES,
+    ).toBeGreaterThan(TRANSPORT_BOUNDS.MAX_ARGV_TOTAL_BYTES);
+  });
+
+  it('accepts argv exactly at the total byte bound', () => {
+    const perArgument = TRANSPORT_BOUNDS.MAX_ARGV_TOTAL_BYTES / 8;
+    const exact = Array.from({ length: 8 }, () => ascii(perArgument));
+
+    expect(rejectionForSpec(withRawSpecField('args', exact))).toBe('ACCEPTED');
+  });
+
+  it.each(NON_ENVIRONMENT_VALUES)('refuses an environment that is %s', (_label, value) => {
+    const rejection = rejectionForSpec(withRawSpecField('environment', value));
+
+    expect(['ENVIRONMENT_NOT_RECORD', 'ENVIRONMENT_ENTRY_INVALID']).toContain(rejection);
+  });
+
+  it('refuses an environment value supplied through a getter without invoking it', () => {
+    let invoked = false;
+    const hostile = {};
+    Object.defineProperty(hostile, 'TOKEN', {
+      get() {
+        invoked = true;
+        return 'secret';
+      },
+      enumerable: true,
+      configurable: true,
+    });
+
+    expect(rejectionForSpec(withRawSpecField('environment', hostile))).toBe(
+      'ENVIRONMENT_ENTRY_INVALID',
+    );
+    expect(invoked).toBe(false);
+  });
+
+  it('refuses an environment carrying a symbol key', () => {
+    const hostile: Record<string | symbol, unknown> = { PATH: '/usr/bin' };
+    hostile[Symbol('hidden')] = 'value';
+
+    expect(rejectionForSpec(withRawSpecField('environment', hostile))).toBe(
+      'ENVIRONMENT_ENTRY_INVALID',
+    );
+  });
+
+  it('refuses an environment value that is not a string', () => {
+    expect(rejectionForSpec(withRawSpecField('environment', { COUNT: 7 }))).toBe(
+      'ENVIRONMENT_ENTRY_INVALID',
+    );
+  });
+
+  it('refuses empty, NUL, and equals-containing environment names', () => {
+    expect(rejectionForSpec(withRawSpecField('environment', { '': 'v' }))).toBe(
+      'ENVIRONMENT_ENTRY_INVALID',
+    );
+    expect(rejectionForSpec(withRawSpecField('environment', { 'A\u0000B': 'v' }))).toBe(
+      'ENVIRONMENT_ENTRY_INVALID',
+    );
+    expect(rejectionForSpec(withRawSpecField('environment', { 'A=B': 'v' }))).toBe(
+      'ENVIRONMENT_ENTRY_INVALID',
+    );
+  });
+
+  it('refuses case-insensitive duplicate environment names', () => {
+    const spec = makeSpec({
+      executablePath: 'C:\\node.exe',
+      workingDirectory: 'C:\\work',
+      environment: { PATH: 'a', Path: 'b' },
+    });
+    expect(readInvocation(spec, makeLimits(), 'win32').rejection).toBe(
+      'ENVIRONMENT_NAME_DUPLICATED',
+    );
+  });
+
+  it('keeps POSIX environment-name matching case-sensitive', () => {
+    expect(
+      readInvocation(
+        makeSpec({
+          executablePath: '/usr/bin/node',
+          workingDirectory: '/tmp',
+          environment: { PATH: 'a', Path: 'b' },
+        }),
+        makeLimits(),
+        'posix',
+      ).rejection,
+    ).toBeNull();
+  });
+
+  it('requires every libuv-sensitive variable on Windows and permits empty values', () => {
+    const complete = {
+      HOMEDRIVE: '', HOMEPATH: '', LOGONSERVER: '', PATH: '', SYSTEMDRIVE: '',
+      SYSTEMROOT: '', TEMP: '', USERDOMAIN: '', USERNAME: '', USERPROFILE: '', WINDIR: '',
+    };
+    const windowsSpec = (environment: Record<string, string>): AgentProcessSpec =>
+      makeSpec({
+        executablePath: 'C:\\node.exe',
+        workingDirectory: 'C:\\work',
+        environment,
+      });
+    expect(readInvocation(windowsSpec(complete), makeLimits(), 'win32').rejection)
+      .toBeNull();
+    const missing: Record<string, string> = { ...complete };
+    Reflect.deleteProperty(missing, 'PATH');
+    expect(readInvocation(windowsSpec(missing), makeLimits(), 'win32').rejection)
+      .toBe('ENVIRONMENT_REQUIRED_VARIABLE_MISSING');
+  });
+
+  it('matches Windows-required environment names case-insensitively', () => {
+    const complete = {
+      homedrive: '', homepath: '', logonserver: '', path: '', systemdrive: '',
+      systemroot: '', temp: '', userdomain: '', username: '', userprofile: '', windir: '',
+    };
+    expect(readInvocation(makeSpec({
+      executablePath: 'C:\\node.exe',
+      workingDirectory: 'C:\\work',
+      environment: complete,
+    }), makeLimits(), 'win32').rejection)
+      .toBeNull();
+  });
+
+  it.each(WINDOWS_REQUIRED_ENVIRONMENT_VARIABLES)(
+    'rejects Windows environment when %s is missing',
+    (missingName) => {
+      const environment: Record<string, string> = {};
+      for (const name of WINDOWS_REQUIRED_ENVIRONMENT_VARIABLES) {
+        if (name !== missingName) {
+          environment[name] = '';
+        }
+      }
+      const spec = makeSpec({
+        executablePath: 'C:\\node.exe',
+        workingDirectory: 'C:\\work',
+        environment,
+      });
+      expect(readInvocation(spec, makeLimits(), 'win32').rejection).toBe(
+        'ENVIRONMENT_REQUIRED_VARIABLE_MISSING',
+      );
+    },
+  );
+
+  it('refuses more environment entries than the bound', () => {
+    const many: Record<string, string> = {};
+    for (let index = 0; index <= TRANSPORT_BOUNDS.MAX_ENV_ENTRIES; index += 1) {
+      many[`K${String(index)}`] = 'v';
+    }
+
+    expect(rejectionForSpec(withRawSpecField('environment', many))).toBe(
+      'ENVIRONMENT_COUNT_EXCEEDED',
+    );
+  });
+
+  it('ignores an inherited environment entry planted on a prototype', () => {
+    const prototype = Object.prototype as unknown as Record<string, unknown>;
+    prototype['INHERITED_TOKEN'] = 'secret';
+    try {
+      const result = readInvocation(
+        makeSpec({
+          executablePath: '/usr/bin/node',
+          workingDirectory: '/tmp',
+          environment: Object.create(prototype) as Record<string, string>,
+        }),
+        makeLimits(),
+        'posix',
+      );
+
+      expect(result.rejection).toBeNull();
+      expect(Object.keys(result.value?.environment ?? {})).toEqual([]);
+    } finally {
+      delete prototype['INHERITED_TOKEN'];
+    }
+  });
+
+  it.each(MALFORMED_VALUES)('refuses stdin that is %s', (_label, value) => {
+    expect(rejectionForSpec(withRawSpecField('stdin', value))).toBe('STDIN_NOT_STRING');
+  });
+
+  it('refuses a stdin payload past the bound', () => {
+    expect(
+      rejectionForSpec(withRawSpecField('stdin', ascii(TRANSPORT_BOUNDS.MAX_STDIN_BYTES + 1))),
+    ).toBe('STDIN_BYTES_EXCEEDED');
+  });
+
+  it.each([
+    ['zero', 0],
+    ['negative', -1],
+    ['fractional', 1.5],
+    ['NaN', Number.NaN],
+    ['Infinity', Number.POSITIVE_INFINITY],
+    ['past the maximum', TRANSPORT_BOUNDS.MAX_TIMEOUT_MS + 1],
+    ['a string', '1000'],
+  ])('refuses a %s timeout', (_label, value) => {
+    expect(rejectionFor(makeSpec(), withRawLimitField('timeoutMs', value))).toBe(
+      'TIMEOUT_OUT_OF_RANGE',
+    );
+  });
+
+  it('refuses a negative grace period', () => {
+    expect(rejectionFor(makeSpec(), withRawLimitField('graceMs', -1))).toBe(
+      'GRACE_OUT_OF_RANGE',
+    );
+  });
+
+  it('refuses stream bounds past their ceilings', () => {
+    expect(
+      rejectionFor(
+        makeSpec(),
+        withRawLimitField('maxStdoutBytes', TRANSPORT_BOUNDS.MAX_STDOUT_BYTES_CEILING + 1),
+      ),
+    ).toBe('STDOUT_LIMIT_OUT_OF_RANGE');
+    expect(
+      rejectionFor(
+        makeSpec(),
+        withRawLimitField('maxStderrBytes', TRANSPORT_BOUNDS.MAX_STDERR_BYTES_CEILING + 1),
+      ),
+    ).toBe('STDERR_LIMIT_OUT_OF_RANGE');
+  });
+
+  it('refuses an object that is not a usable AbortSignal', () => {
+    expect(rejectionFor(makeSpec(), withRawLimitField('signal', {}))).toBe(
+      'ABORT_SIGNAL_INVALID',
+    );
+    expect(rejectionFor(makeSpec(), withRawLimitField('signal', 'abort'))).toBe(
+      'ABORT_SIGNAL_INVALID',
+    );
+  });
+
+  it('accepts a real AbortSignal', () => {
+    const controller = new AbortController();
+
+    expect(rejectionFor(makeSpec(), withRawLimitField('signal', controller.signal))).toBe(
+      'ACCEPTED',
+    );
+  });
+
+  it('does not invoke accessor-backed or revoked-Proxy signal properties', () => {
+    let invoked = false;
+    const fake = {};
+    Object.defineProperty(fake, 'aborted', {
+      get() {
+        invoked = true;
+        return false;
+      },
+    });
+    expect(rejectionFor(makeSpec(), withRawLimitField('signal', fake))).toBe(
+      'ABORT_SIGNAL_INVALID',
+    );
+    expect(invoked).toBe(false);
+
+    const revocable = Proxy.revocable(new AbortController().signal, {});
+    revocable.revoke();
+    expect(rejectionFor(makeSpec(), withRawLimitField('signal', revocable.proxy))).toBe(
+      'ABORT_SIGNAL_INVALID',
+    );
+  });
+
+  it('reaches every rejection reason from at least one malformed request', () => {
+    // Guards against a reason that exists in the vocabulary but is unreachable.
+    const reachable = new Set<string>([
+      rejectionForSpec(null as unknown as AgentProcessSpec),
+      rejectionFor(makeSpec(), null as unknown as TransportLimits),
+      rejectionForSpec(withRawSpecField('executablePath', 42)),
+      rejectionForSpec(withRawSpecField('executablePath', 'relative')),
+      rejectionForSpec(
+        withRawSpecField(
+          'executablePath',
+          PLATFORM === 'win32' ? 'C:\\a.cmd' : '/a.cmd',
+        ),
+      ),
+      rejectionForSpec(withRawSpecField('workingDirectory', 42)),
+      rejectionForSpec(withRawSpecField('workingDirectory', 'relative')),
+      rejectionForSpec(withRawSpecField('args', 'not-an-array')),
+      rejectionForSpec(withRawSpecField('args', new Proxy([] as unknown[], {
+        get(): never {
+          throw new Error('trap');
+        },
+      }))),
+      rejectionForSpec(
+        withRawSpecField(
+          'args',
+          Array.from({ length: TRANSPORT_BOUNDS.MAX_ARGV_COUNT + 1 }, () => 'a'),
+        ),
+      ),
+      rejectionForSpec(withRawSpecField('args', [42])),
+      rejectionForSpec(withRawSpecField('args', ['a\u0000b'])),
+      rejectionForSpec(withRawSpecField('args', [ascii(TRANSPORT_BOUNDS.MAX_ARG_BYTES + 1)])),
+      rejectionForSpec(
+        withRawSpecField(
+          'args',
+          Array.from({ length: TRANSPORT_BOUNDS.MAX_ARGV_COUNT }, () =>
+            ascii(TRANSPORT_BOUNDS.MAX_ARG_BYTES),
+          ),
+        ),
+      ),
+      rejectionForSpec(withRawSpecField('environment', 'nope')),
+      rejectionForSpec(withRawSpecField('environment', { A: 1 })),
+      readInvocation(makeSpec({
+        executablePath: 'C:\\node.exe',
+        workingDirectory: 'C:\\work',
+        environment: { PATH: 'a', Path: 'b' },
+      }), makeLimits(), 'win32').rejection ?? 'ACCEPTED',
+      readInvocation(makeSpec({
+        executablePath: 'C:\\node.exe',
+        workingDirectory: 'C:\\work',
+        environment: {},
+      }), makeLimits(), 'win32').rejection ??
+        'ACCEPTED',
+      rejectionForSpec(
+        withRawSpecField(
+          'environment',
+          Object.fromEntries(
+            Array.from({ length: TRANSPORT_BOUNDS.MAX_ENV_ENTRIES + 1 }, (_unused, index) => [
+              `K${String(index)}`,
+              'v',
+            ]),
+          ),
+        ),
+      ),
+      rejectionForSpec(
+        withRawSpecField('environment', {
+          [ascii(TRANSPORT_BOUNDS.MAX_ENV_KEY_BYTES + 1)]: 'v',
+        }),
+      ),
+      rejectionForSpec(withRawSpecField('stdin', 42)),
+      rejectionForSpec(withRawSpecField('stdin', ascii(TRANSPORT_BOUNDS.MAX_STDIN_BYTES + 1))),
+      rejectionFor(makeSpec(), withRawLimitField('timeoutMs', 0)),
+      rejectionFor(makeSpec(), withRawLimitField('graceMs', -1)),
+      rejectionFor(
+        makeSpec(),
+        withRawLimitField('maxStdoutBytes', TRANSPORT_BOUNDS.MAX_STDOUT_BYTES_CEILING + 1),
+      ),
+      rejectionFor(
+        makeSpec(),
+        withRawLimitField('maxStderrBytes', TRANSPORT_BOUNDS.MAX_STDERR_BYTES_CEILING + 1),
+      ),
+      rejectionFor(makeSpec(), withRawLimitField('signal', {})),
+    ]);
+
+    const declared = Object.values(TRANSPORT_REJECTION);
+    const unreachable = declared.filter((reason) => !reachable.has(reason));
+
+    // ARGUMENT_UNREADABLE and ENVIRONMENT_UNREADABLE are covered by their own
+    // dedicated getter and revoked-Proxy cases above.
+    expect(unreachable.sort()).toEqual(
+      ['ARGUMENT_UNREADABLE', 'ENVIRONMENT_UNREADABLE'].sort(),
+    );
+  });
+});
+
+describe('single-read discipline', () => {
+  it('snapshots argv so a later mutation cannot change what is spawned', () => {
+    const mutable = ['-e', 'original'];
+    const result = readInvocation(
+      makeSpec({ args: mutable }),
+      makeLimits(),
+      PLATFORM,
+    );
+    mutable[1] = 'swapped';
+
+    expect(result.value?.args[1]).toBe('original');
+    expect(Object.isFrozen(result.value?.args)).toBe(true);
+  });
+
+  it('snapshots the environment into a null-prototype frozen record', () => {
+    const result = readInvocation(
+      makeSpec({
+        executablePath: '/usr/bin/node',
+        workingDirectory: '/tmp',
+        environment: { A: '1' },
+      }),
+      makeLimits(),
+      'posix',
+    );
+
+    expect(Object.getPrototypeOf(result.value?.environment)).toBeNull();
+    expect(Object.isFrozen(result.value?.environment)).toBe(true);
+  });
+
+  it('freezes the validated invocation itself', () => {
+    const result = readInvocation(makeSpec(), makeLimits(), PLATFORM);
+
+    expect(Object.isFrozen(result.value)).toBe(true);
+  });
+});
+
+describe('absolute-path grammar', () => {
+  it.each([
+    ['/usr/bin/node', 'posix', true],
+    ['/', 'posix', true],
+    ['usr/bin/node', 'posix', false],
+    ['./node', 'posix', false],
+    ['C:\\Windows\\node.exe', 'win32', true],
+    ['c:/windows/node.exe', 'win32', true],
+    ['\\\\server\\share\\node.exe', 'win32', true],
+    ['C:node.exe', 'win32', false],
+    ['node.exe', 'win32', false],
+    ['\\node.exe', 'win32', false],
+    ['/usr/bin/node', 'win32', false],
+  ] as const)('treats %j on %s as absolute=%s', (value, platform, expected) => {
+    expect(isAbsolutePath(value, platform)).toBe(expected);
+  });
+});
+
+describe('UTF-8 boundary correctness', () => {
+  it('leaves a complete sequence untouched', () => {
+    const buffer = Buffer.from('a\u00e9\u4e2d\u{1F600}', 'utf8');
+
+    expect(trimPartialUtf8(buffer)).toEqual(buffer);
+  });
+
+  it.each([1, 2, 3])('drops a four-byte character cut after %i byte(s)', (kept) => {
+    const full = Buffer.from('\u{1F600}', 'utf8');
+    const cut = full.subarray(0, kept);
+
+    expect(trimPartialUtf8(cut).length).toBe(0);
+  });
+
+  it('drops a two-byte character cut in half', () => {
+    const full = Buffer.from('\u00e9', 'utf8');
+
+    expect(trimPartialUtf8(full.subarray(0, 1)).length).toBe(0);
+  });
+
+  it('keeps preceding complete characters when the tail is cut', () => {
+    const buffer = Buffer.from('ab\u{1F600}', 'utf8').subarray(0, 4);
+    const trimmed = trimPartialUtf8(buffer);
+
+    expect(trimmed.toString('utf8')).toBe('ab');
+  });
+
+  it('never produces a replacement character from a boundary cut', () => {
+    const source = Buffer.from('\u{1F600}\u{1F600}\u{1F600}', 'utf8');
+    for (let length = 0; length <= source.length; length += 1) {
+      const trimmed = trimPartialUtf8(source.subarray(0, length));
+
+      expect(trimmed.toString('utf8')).not.toContain('\uFFFD');
+    }
+  });
+
+  it('handles an empty buffer', () => {
+    expect(trimPartialUtf8(Buffer.alloc(0)).length).toBe(0);
+  });
+});
+
+describe('bounds', () => {
+  it('matches the independently declared bounds', () => {
+    expect({ ...TRANSPORT_BOUNDS }).toEqual({ ...EXPECTED_BOUNDS });
+  });
+
+  it('pins the environment key bound to the identifier bound of PR 005 and PR 006', () => {
+    expect(TRANSPORT_BOUNDS.MAX_ENV_KEY_BYTES).toBe(INVOCATION_BOUNDS.MAX_IDENTIFIER_LENGTH);
+    expect(TRANSPORT_BOUNDS.MAX_ENV_KEY_BYTES).toBe(REVIEW_BOUNDS.MAX_IDENTIFIER_LENGTH);
+  });
+
+  it('keeps the total argv bound below the Windows command-line limit', () => {
+    expect(TRANSPORT_BOUNDS.MAX_ARGV_TOTAL_BYTES).toBeLessThan(32_767);
+  });
+
+  it('freezes every exported vocabulary', () => {
+    expect(Object.isFrozen(TRANSPORT_OUTCOME)).toBe(true);
+    expect(Object.isFrozen(TRANSPORT_REJECTION)).toBe(true);
+    expect(Object.isFrozen(TERMINATION_SCOPE)).toBe(true);
+    expect(Object.isFrozen(TRANSPORT_BOUNDS)).toBe(true);
+    expect(Object.isFrozen(TERMINAL_CAUSE_PRECEDENCE)).toBe(true);
+  });
+});
+
+describe('the transport is dormant', () => {
+  it('is absent from the package root export surface', () => {
+    const root = readFileSync(
+      fileURLToPath(new URL('../../src/index.ts', import.meta.url)),
+      'utf8',
+    );
+
+    expect(root).not.toContain('adapters');
+    expect(root).not.toContain('process-transport');
+    expect(root).not.toContain('agent-transport');
+  });
+
+  it('is absent from the domain barrel', () => {
+    const barrel = readFileSync(
+      fileURLToPath(new URL('../../src/domain/index.ts', import.meta.url)),
+      'utf8',
+    );
+
+    expect(barrel).not.toContain('adapters');
+  });
+
+  it('has no production caller anywhere in src', () => {
+    const sourceRoot = fileURLToPath(new URL('../../src/', import.meta.url));
+    const approved = new Set([
+      join(sourceRoot, 'adapters', 'agent-transport.ts'),
+      join(sourceRoot, 'adapters', 'process-transport.ts'),
+    ]);
+    const pending = [sourceRoot];
+    const callers: string[] = [];
+    while (pending.length > 0) {
+      const directory = pending.pop();
+      if (directory === undefined) {
+        continue;
+      }
+      for (const name of readdirSync(directory)) {
+        const path = join(directory, name);
+        if (statSync(path).isDirectory()) {
+          pending.push(path);
+          continue;
+        }
+        if (!path.endsWith('.ts') || approved.has(path)) {
+          continue;
+        }
+        const source = readFileSync(path, 'utf8');
+        if (
+          source.includes('agent-transport') ||
+          source.includes('process-transport') ||
+          source.includes('invokeAgentProcess')
+        ) {
+          callers.push(path);
+        }
+      }
+    }
+    expect(callers).toEqual([]);
+  });
+});
