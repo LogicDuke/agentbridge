@@ -1004,6 +1004,17 @@ describe('UTF-8 boundary correctness', () => {
     expect(trimmed.toString('utf8')).toBe('ab');
   });
 
+  it.each([
+    ['an invalid lead byte', [0xff]],
+    ['an overlong lead byte', [0xc0]],
+    ['a continuation byte', [0x80]],
+    ['an invalid partial sequence', [0xe0, 0x80]],
+  ])('preserves %s at a truncation boundary', (_label, bytes) => {
+    const buffer = Buffer.from(bytes);
+
+    expect(trimPartialUtf8(buffer)).toEqual(buffer);
+  });
+
   it('never produces a replacement character from a boundary cut', () => {
     const source = Buffer.from('\u{1F600}\u{1F600}\u{1F600}', 'utf8');
     for (let length = 0; length <= source.length; length += 1) {

@@ -871,6 +871,20 @@ describe('invokeAgentProcess — boundary', () => {
     expect(exchange.stdoutBytes).toBe(1_024);
   });
 
+  it('preserves an invalid UTF-8 byte retained at the overflow boundary', async () => {
+    const exchange = await runStub(
+      STUB.WRITE_RAW_BYTES,
+      ['255,65'],
+      {},
+      makeLimits({ maxStdoutBytes: 1 }),
+    );
+
+    expect(exchange.outcome).toBe('OUTPUT_LIMIT_EXCEEDED');
+    expect(exchange.stdout).toBe('\uFFFD');
+    expect(exchange.stdoutBytes).toBe(1);
+    expect(exchange.stdoutTruncated).toBe(true);
+  });
+
   it('ranks an overflow above the exit that follows it', async () => {
     const exchange = await runStub(
       STUB.WRITE_BYTES_THEN_EXIT,

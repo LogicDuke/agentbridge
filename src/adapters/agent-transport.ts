@@ -1022,7 +1022,7 @@ export function trimPartialUtf8(buffer: Buffer): Buffer {
     steps += 1;
   }
   if (start < 0) {
-    return reflectApply(bufferSubarray, buffer, [0, 0]);
+    return buffer;
   }
 
   const lead = buffer[start];
@@ -1032,16 +1032,25 @@ export function trimPartialUtf8(buffer: Buffer): Buffer {
   let expected = 0;
   if ((lead & 0x80) === 0x00) {
     expected = 1;
-  } else if ((lead & 0xe0) === 0xc0) {
+  } else if (lead >= 0xc2 && lead <= 0xdf) {
     expected = 2;
-  } else if ((lead & 0xf0) === 0xe0) {
+  } else if (lead >= 0xe0 && lead <= 0xef) {
     expected = 3;
-  } else if ((lead & 0xf8) === 0xf0) {
+  } else if (lead >= 0xf0 && lead <= 0xf4) {
     expected = 4;
   } else {
-    // A continuation byte or an invalid lead in the final position is not a
-    // recoverable sequence, so the run is dropped rather than guessed at.
-    return reflectApply(bufferSubarray, buffer, [0, start]);
+    return buffer;
+  }
+
+  const second = buffer[start + 1];
+  if (
+    second !== undefined &&
+    ((lead === 0xe0 && second < 0xa0) ||
+      (lead === 0xed && second > 0x9f) ||
+      (lead === 0xf0 && second < 0x90) ||
+      (lead === 0xf4 && second > 0x8f))
+  ) {
+    return buffer;
   }
 
   const available = length - start;
