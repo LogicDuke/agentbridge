@@ -985,15 +985,21 @@ function snapshotWorkflow(state: WorkflowState): WorkflowSnapshot | null {
     return null;
   }
 
-  // Counting is not enough on its own: the gate slot must also sit *after* the
-  // final `HEAD_OBSERVED` that reached the current revision. That HEAD follows
-  // every stamp recorded at an earlier revision, and the gate follows the HEAD,
-  // so the gate's slot is at least two past the latest earlier-revision stamp.
+  // Counting is not enough on its own: the slot belonging to the transition
+  // that produced the current status must also sit *after* the final
+  // `HEAD_OBSERVED` that reached the current revision. That HEAD follows every
+  // stamp recorded at an earlier revision, and the status transition follows
+  // the HEAD, so its slot is at least two past the latest earlier-revision
+  // stamp. This holds for `HUMAN_GATE_OPENED` and for `CLOSE_REQUESTED` alike.
   //
-  // Only an open gate at revision >= 1 is constrained. A gate that was already
-  // cleared — by a HEAD advance or by a human decision — leaves the workflow
-  // `OPEN`, and those histories are deliberately left alone.
-  if (rawStatus === WORKFLOW_STATUS.AWAITING_HUMAN_DECISION && revision > 0) {
+  // Only an open gate or a closure at revision >= 1 is constrained. A gate that
+  // was already cleared — by a HEAD advance or by a human decision — leaves the
+  // workflow `OPEN`, and those histories are deliberately left alone.
+  if (
+    (rawStatus === WORKFLOW_STATUS.AWAITING_HUMAN_DECISION ||
+      rawStatus === WORKFLOW_STATUS.CLOSED) &&
+    revision > 0
+  ) {
     let latestEarlier = 0;
     for (let index = 0; index < spanRevisions.length; index += 1) {
       const bandRevision = spanRevisions[index];

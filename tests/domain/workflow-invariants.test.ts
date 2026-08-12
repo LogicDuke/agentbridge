@@ -1771,6 +1771,56 @@ describe('group J — hostile input fails closed', () => {
     expect(applyWorkflowEvent(state, observeHead(SHA_C)).outcome).toBe('APPLIED');
   });
 
+  /* ---- the closing slot must follow the HEAD that reached the revision ---- */
+
+  /** Closed at revision 1, with the decision that cleared a gate at revision 0. */
+  function closedAfterClearedGate(sequence: number): WorkflowState {
+    return {
+      ...openedWorkflow(),
+      boundCommitSha: SHA_B,
+      revision: 1,
+      sequence,
+      status: 'CLOSED',
+      closureReason: 'CALLER_CLOSED',
+      evidence: stored([
+        {
+          evidenceId: EVIDENCE_A,
+          kind: 'human-decision',
+          admittedAtCommitSha: SHA_A,
+          admittedAtRevision: 0,
+          admittedAtSequence: 2,
+        },
+      ]),
+    } as unknown as WorkflowState;
+  }
+
+  it('refuses a closed state with no slot after the revision-advancing HEAD', () => {
+    // The gate took slot 1 and the clearing decision slot 2, so the HEAD that
+    // reached revision 1 took slot 3 and CLOSE_REQUESTED cannot share it.
+    expect(applyWorkflowEvent(closedAfterClearedGate(3), admitAtB()).rejection).toBe(
+      'WORKFLOW_UNREADABLE',
+    );
+  });
+
+  it('accepts the same closed history once a slot exists after that HEAD', () => {
+    // Readable now, so the terminal-status rule is what refuses the event.
+    expect(applyWorkflowEvent(closedAfterClearedGate(4), admitAtB()).rejection).toBe(
+      'WORKFLOW_CLOSED',
+    );
+  });
+
+  it('accepts a genuinely replayed gate, decision, HEAD and closure history', () => {
+    let state = applyOrThrow(openedWorkflow(), openHumanGate());
+    state = applyOrThrow(state, admitEvidence(buildHumanDecisionVerdict()));
+    state = applyOrThrow(state, observeHead(SHA_B));
+    state = applyOrThrow(state, closeWorkflow());
+
+    expect(state.status).toBe('CLOSED');
+    expect(state.revision).toBe(1);
+    expect(state.sequence).toBe(4);
+    expect(applyWorkflowEvent(state, admitAtB()).rejection).toBe('WORKFLOW_CLOSED');
+  });
+
   /* ---- revision 0, OPEN, no stamps: only sequence 0 is reachable ---- */
 
   it('refuses an untouched workflow claiming a consumed sequence slot', () => {
