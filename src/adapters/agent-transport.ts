@@ -814,6 +814,18 @@ function readEnvironment(raw: unknown, platform: TransportPlatform): {
     }
   }
 
+  // Node copies a parent NODE_V8_COVERAGE value into an options.env object
+  // that lacks this exact own key. A non-enumerable own value blocks that
+  // runtime mutation without adding anything to the child's environment.
+  if (objectGetOwnPropertyDescriptor(environment, 'NODE_V8_COVERAGE') === undefined) {
+    objectDefineProperty(environment, 'NODE_V8_COVERAGE', {
+      value: '',
+      writable: false,
+      enumerable: false,
+      configurable: false,
+    });
+  }
+
   return { rejection: null, value: objectFreeze(environment) };
 }
 

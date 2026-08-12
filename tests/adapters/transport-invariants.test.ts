@@ -252,6 +252,21 @@ describe('termination vocabulary claims no more than the OS provides', () => {
     expect(secondGuard).toBeGreaterThan(graceWait);
     expect(secondGuard).toBeLessThan(killSignal);
   });
+
+  it('invalidates a Windows PID before resolving or spawning taskkill', () => {
+    const start = IMPLEMENTATION_SOURCE.indexOf('async function terminateWindows');
+    const end = IMPLEMENTATION_SOURCE.indexOf('/** Dispatch termination', start);
+    const implementation = IMPLEMENTATION_SOURCE.slice(start, end);
+    const guard = implementation.indexOf('if (hasEnded(child))');
+    const resolve = implementation.indexOf('resolveTaskkill()');
+    const signal = implementation.indexOf('runTaskkill(taskkill, pid)');
+
+    expect(guard).toBeGreaterThanOrEqual(0);
+    expect(resolve).toBeGreaterThanOrEqual(0);
+    expect(signal).toBeGreaterThanOrEqual(0);
+    expect(guard).toBeLessThan(resolve);
+    expect(guard).toBeLessThan(signal);
+  });
 });
 
 describe('outcome vocabulary and precedence', () => {

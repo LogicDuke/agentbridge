@@ -403,6 +403,40 @@ describe('invokeAgentProcess — failure', () => {
 });
 
 describe('invokeAgentProcess — adversarial', () => {
+  it('does not target a numeric identity after the child handle reports ended', async () => {
+    const observed = observeNextChild();
+    let child: ChildProcess | null = null;
+    try {
+      const pending = runStub(
+        STUB.SLEEP,
+        [],
+        {},
+        makeLimits({ timeoutMs: 300, graceMs: 50 }),
+      );
+      child = await observed.child;
+      observed.restore();
+      Object.defineProperty(child, 'exitCode', {
+        configurable: true,
+        writable: true,
+        value: 0,
+      });
+
+      const exchange = await pending;
+
+      expect(exchange.outcome).toBe('TIMED_OUT');
+      expect(exchange.terminationScope).toBe('DIRECT_CHILD_ONLY');
+    } finally {
+      observed.restore();
+      if (child?.pid !== undefined) {
+        try {
+          process.kill(child.pid, 'SIGKILL');
+        } catch {
+          // The test child may have ended between settlement and cleanup.
+        }
+      }
+    }
+  });
+
   onPosix(
     'does not escalate a process-group signal after the tracked child ends',
     async () => {
@@ -703,6 +737,25 @@ describe('invokeAgentProcess — adversarial', () => {
       expect(exchange.stdout).not.toContain('must-not-be-inherited');
     } finally {
       Reflect.deleteProperty(process.env, sentinel);
+    }
+  });
+
+  it('blocks Node coverage inheritance without exposing a synthetic variable', async () => {
+    const previous = process.env.NODE_V8_COVERAGE;
+    process.env.NODE_V8_COVERAGE = 'parent-coverage-must-not-be-inherited';
+    try {
+      const exchange = await runStub(STUB.PRINT_ENV);
+      const childEnv = JSON.parse(exchange.stdout) as Record<string, string>;
+
+      expect(exchange.outcome).toBe('EXITED');
+      expect(childEnv.NODE_V8_COVERAGE).toBeUndefined();
+      expect(exchange.stdout).not.toContain('parent-coverage-must-not-be-inherited');
+    } finally {
+      if (previous === undefined) {
+        Reflect.deleteProperty(process.env, 'NODE_V8_COVERAGE');
+      } else {
+        process.env.NODE_V8_COVERAGE = previous;
+      }
     }
   });
 

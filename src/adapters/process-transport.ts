@@ -484,6 +484,12 @@ async function terminateWindows(
   pid: number,
   graceMs: number,
 ): Promise<TerminationScope> {
+  // Once the leader has ended, its numeric PID may identify an unrelated
+  // process. Safety outranks reaching descendants that outlived the leader.
+  if (hasEnded(child)) {
+    return TERMINATION_SCOPE.DIRECT_CHILD_ONLY;
+  }
+
   const taskkill = resolveTaskkill();
   if (taskkill === null) {
     killDirectChild(child);

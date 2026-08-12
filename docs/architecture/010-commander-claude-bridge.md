@@ -174,7 +174,10 @@ field can appear, and that no scope name contains `COMPLETE`, `TERMINATED`,
 Termination signals `SIGTERM` to the group, waits only the bounded grace period,
 then escalates `SIGKILL` to the group, and reaps the direct child. `ESRCH` is
 treated as "already gone". If the group cannot be signalled, the direct child is
-signalled instead and the scope degrades to `DIRECT_CHILD_ONLY`.
+signalled instead and the scope degrades to `DIRECT_CHILD_ONLY`. Once the tracked
+leader is observed to have ended, its numeric process-group ID is invalidated:
+no initial or escalation signal is sent to it because that number may have been
+reused by an unrelated process.
 
 **Windows.** `taskkill.exe` is spawned **directly** — `shell: false`, a validated
 absolute path, and the fixed argument vector `/PID <decimal pid> /T /F`, whose
@@ -188,6 +191,9 @@ returns. The direct child is then waited on. If `taskkill` cannot start, fails,
 or reaches either timeout,
 the direct child is terminated and the scope degrades to `DIRECT_CHILD_ONLY` —
 descendants are **not** claimed.
+If the tracked child is already observed to have ended, `taskkill` is not started:
+the numeric PID may have been reused, so the scope degrades to
+`DIRECT_CHILD_ONLY` and descendants that outlived the leader may escape.
 
 ### The escape, stated plainly
 
@@ -199,9 +205,10 @@ constraints: it would require a Windows Job Object (a native addon) or Linux
 cgroups / PID namespaces (single-platform). The invariant this layer does uphold:
 
 > Ordinary descendants are targeted through the available process-group or
-> process-tree mechanism, and every exchange records whether that request was
-> issued or termination degraded to the direct child. Completion for every
-> descendant is never claimed.
+> process-tree mechanism only while the tracked leader's numeric identity is
+> still valid. Once that leader has ended, AgentBridge never signals its PID or
+> process-group ID; descendants may escape, and the exchange records
+> `DIRECT_CHILD_ONLY`. Completion for every descendant is never claimed.
 
 Both halves are tested. Termination of an *ordinary* descendant is verified
 cross-platform by a heartbeat file that must stop growing. The escape itself is
@@ -215,6 +222,11 @@ supplied. This transport never merges it with `process.env` and never reads
 `process.env` to populate it; the only two `process.env` reads in the module are
 `SystemRoot` and `windir`, used solely to locate `taskkill.exe`, and a test pins
 that count at two.
+
+Node itself otherwise copies a parent `NODE_V8_COVERAGE` value into a supplied
+environment that omits that key. The validated record contains a non-enumerable
+own blocker for that exact runtime hook: it prevents the mutation while remaining
+absent from the environment serialized for the child.
 
 On Windows, `uv_spawn` would copy eleven sensitive names from the parent when
 they are absent: `HOMEDRIVE`, `HOMEPATH`, `LOGONSERVER`, `PATH`, `SYSTEMDRIVE`,
