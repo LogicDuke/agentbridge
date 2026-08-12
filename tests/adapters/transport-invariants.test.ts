@@ -244,6 +244,10 @@ describe('termination vocabulary claims no more than the OS provides', () => {
     const killSignal = implementation.indexOf("signalProcessGroup(pid, 'SIGKILL')");
 
     expect(firstGuard).toBeGreaterThanOrEqual(0);
+    expect(termSignal).toBeGreaterThanOrEqual(0);
+    expect(graceWait).toBeGreaterThanOrEqual(0);
+    expect(secondGuard).toBeGreaterThanOrEqual(0);
+    expect(killSignal).toBeGreaterThanOrEqual(0);
     expect(firstGuard).toBeLessThan(termSignal);
     expect(secondGuard).toBeGreaterThan(graceWait);
     expect(secondGuard).toBeLessThan(killSignal);

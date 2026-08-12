@@ -433,6 +433,8 @@ describe('invokeAgentProcess — adversarial', () => {
         },
       });
       vi.resetModules();
+      // The isolated module captures the patched process.kill during initialization;
+      // restore the global function before invoking through that captured reference.
       const isolated = await import('../../src/adapters/process-transport.js');
       if (killDescriptor !== undefined) {
         Object.defineProperty(process, 'kill', killDescriptor);
