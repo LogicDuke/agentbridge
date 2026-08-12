@@ -1,7 +1,9 @@
+import { ChildProcess } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import { readdirSync, existsSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   type AgentExchange,
@@ -27,6 +29,43 @@ import {
 } from './transport-fixtures.js';
 
 const onPosix = it.skipIf(process.platform === 'win32');
+
+/** Observe the next direct child without changing the transport's spawn seam. */
+function observeNextChild(): {
+  readonly child: Promise<ChildProcess>;
+  readonly restore: () => void;
+} {
+  const descriptor = Object.getOwnPropertyDescriptor(EventEmitter.prototype, 'emit');
+  const originalEmit: unknown = descriptor?.value;
+  if (typeof originalEmit !== 'function') {
+    throw new Error('ChildProcess.emit intrinsic unavailable');
+  }
+  let observe: ((child: ChildProcess) => void) | null = null;
+  const child = new Promise<ChildProcess>((resolve) => {
+    observe = resolve;
+  });
+  Object.defineProperty(EventEmitter.prototype, 'emit', {
+    configurable: true,
+    writable: true,
+    value(this: EventEmitter, event: string | symbol, ...args: unknown[]): boolean {
+      if (event === 'spawn' && observe !== null && this instanceof ChildProcess) {
+        const resolve = observe;
+        observe = null;
+        resolve(this);
+      }
+      const emitted: unknown = Reflect.apply(originalEmit, this, [event, ...args]);
+      return emitted === true;
+    },
+  });
+  return {
+    child,
+    restore(): void {
+      if (descriptor !== undefined) {
+        Object.defineProperty(EventEmitter.prototype, 'emit', descriptor);
+      }
+    },
+  };
+}
 
 /** Run a stub script with optional extra arguments. */
 function runStub(
@@ -119,7 +158,7 @@ describe('invokeAgentProcess — success', () => {
 
   it('accepts a zero-argument argv', async () => {
     const exchange = await invokeAgentProcess(
-      makeSpec({ args: ['--version'] }),
+      makeSpec({ args: [] }),
       makeLimits(),
     );
 
@@ -331,6 +370,26 @@ describe('invokeAgentProcess — failure', () => {
     expect(Object.isFrozen(exchange)).toBe(true);
   }, 20_000);
 
+  it('destroys both inherited output pipes before forced settlement', async () => {
+    const observed = observeNextChild();
+    try {
+      const pending = runStub(
+        STUB.LEAK_STDIO_THEN_EXIT,
+        [],
+        {},
+        makeLimits({ timeoutMs: 700, graceMs: 300 }),
+      );
+      const child = await observed.child;
+      observed.restore();
+      await pending;
+
+      expect(child.stdout?.destroyed).toBe(true);
+      expect(child.stderr?.destroyed).toBe(true);
+    } finally {
+      observed.restore();
+    }
+  }, 20_000);
+
   it('still enforces the deadline when the child closes stdout early', async () => {
     const exchange = await runStub(
       STUB.CLOSE_STDOUT_KEEP_RUNNING,
@@ -344,6 +403,204 @@ describe('invokeAgentProcess — failure', () => {
 });
 
 describe('invokeAgentProcess — adversarial', () => {
+  onPosix(
+    'does not escalate a process-group signal after the tracked child ends',
+    async () => {
+      const killDescriptor = Object.getOwnPropertyDescriptor(process, 'kill');
+      const originalKill: unknown = killDescriptor?.value;
+      if (typeof originalKill !== 'function') {
+        throw new Error('process.kill intrinsic unavailable');
+      }
+      const signals: string[] = [];
+      let trackedChild: ChildProcess | null = null;
+      Object.defineProperty(process, 'kill', {
+        configurable: true,
+        writable: true,
+        value(pid: number, signal?: string | number): boolean {
+          if (pid < 0) {
+            signals.push(String(signal));
+            if (signal === 'SIGTERM' && trackedChild !== null) {
+              Object.defineProperty(trackedChild, 'exitCode', {
+                configurable: true,
+                writable: true,
+                value: 0,
+              });
+            }
+            return true;
+          }
+          const killed: unknown = Reflect.apply(originalKill, process, [pid, signal]);
+          return killed === true;
+        },
+      });
+      vi.resetModules();
+      const isolated = await import('../../src/adapters/process-transport.js');
+      if (killDescriptor !== undefined) {
+        Object.defineProperty(process, 'kill', killDescriptor);
+      }
+
+      const observed = observeNextChild();
+      try {
+        const pending = isolated.invokeAgentProcess(
+          makeSpec({
+            args: [
+              '-e',
+              'setTimeout(()=>{process.stdout.write("x".repeat(4096));},50);' +
+                'setInterval(()=>{},1000);',
+            ],
+          }),
+          makeLimits({ timeoutMs: 15_000, graceMs: 50, maxStdoutBytes: 1_024 }),
+        );
+        trackedChild = await observed.child;
+        observed.restore();
+        const exchange = await pending;
+
+        expect(exchange.outcome).toBe('OUTPUT_LIMIT_EXCEEDED');
+        expect(signals).toEqual(['SIGTERM']);
+      } finally {
+        observed.restore();
+        if (trackedChild?.pid !== undefined) {
+          try {
+            Reflect.apply(originalKill, process, [trackedChild.pid, 'SIGKILL']);
+          } catch {
+            // The test child may have ended between settlement and cleanup.
+          }
+        }
+        if (killDescriptor !== undefined) {
+          Object.defineProperty(process, 'kill', killDescriptor);
+        }
+      }
+    },
+    15_000,
+  );
+
+  it.each([
+    ['stdout', 1],
+    ['stderr', 2],
+  ] as const)('contains an emitted %s stream error inside the exchange boundary', async (
+    _name,
+    streamIndex,
+  ) => {
+    const observed = observeNextChild();
+    try {
+      const pending = runStub(
+        'process.stdout.write("out");process.stderr.write("err");' +
+          'setTimeout(()=>{process.exit(0);},100);',
+      );
+      const child = await observed.child;
+      observed.restore();
+      const stream = child.stdio[streamIndex];
+      expect(stream).not.toBeNull();
+      if (stream !== null) {
+        stream.emit('error', new Error(`injected-${_name}-failure`));
+      }
+      const exchange = await pending;
+
+      expect(exchange.outcome).toBe('EXITED');
+      expect(exchange.stdout).toBe('out');
+      expect(exchange.stderr).toBe('err');
+      expect(Object.isFrozen(exchange)).toBe(true);
+    } finally {
+      observed.restore();
+    }
+  });
+
+  it('promotes an asynchronous spawn failure above cancellation', async () => {
+    const controller = new AbortController();
+    const missing = join(makeTempDirectory(), 'no-such-agent-binary');
+    const pending = invokeAgentProcess(
+      makeSpec({ executablePath: missing }),
+      withSignal(makeLimits({ graceMs: 50 }), controller.signal),
+    );
+    controller.abort();
+
+    const exchange = await pending;
+    expect(exchange.outcome).toBe('SPAWN_FAILED');
+  });
+
+  onPosix.each([
+    ['stdout', 'process.stdout', 'stdoutTruncated'],
+    ['stderr', 'process.stderr', 'stderrTruncated'],
+  ] as const)(
+    'promotes %s overflow above cancellation when cancellation arrives first',
+    async (_name, stream, truncatedField) => {
+      const controller = new AbortController();
+      const pending = invokeAgentProcess(
+        makeSpec({
+          args: [
+            '-e',
+            `process.on("SIGTERM",()=>{${stream}.write("x".repeat(4096));});` +
+              'setInterval(()=>{},1000);',
+          ],
+        }),
+        withSignal(
+          makeLimits({
+            timeoutMs: 15_000,
+            graceMs: 300,
+            maxStdoutBytes: 1_024,
+            maxStderrBytes: 1_024,
+          }),
+          controller.signal,
+        ),
+      );
+      setTimeout(() => {
+        controller.abort();
+      }, 100);
+
+      const exchange = await pending;
+      expect(exchange.outcome).toBe('OUTPUT_LIMIT_EXCEEDED');
+      expect(exchange[truncatedField]).toBe(true);
+    },
+    15_000,
+  );
+
+  onPosix(
+    'keeps overflow above cancellation when overflow arrives first',
+    async () => {
+      const controller = new AbortController();
+      setTimeout(() => {
+        controller.abort();
+      }, 200);
+      const exchange = await invokeAgentProcess(
+        makeSpec({
+          args: [
+            '-e',
+            'process.on("SIGTERM",()=>{});' +
+              'setTimeout(()=>{process.stdout.write("x".repeat(4096));},50);' +
+              'setInterval(()=>{},1000);',
+          ],
+        }),
+        withSignal(
+          makeLimits({ timeoutMs: 15_000, graceMs: 500, maxStdoutBytes: 1_024 }),
+          controller.signal,
+        ),
+      );
+
+      expect(exchange.outcome).toBe('OUTPUT_LIMIT_EXCEEDED');
+      expect(exchange.stdoutTruncated).toBe(true);
+    },
+    15_000,
+  );
+
+  onPosix.each([
+    ['timeout first', 100, 200],
+    ['cancellation first', 200, 100],
+  ] as const)(
+    'reports cancellation above timeout with %s',
+    async (_order, timeoutMs, abortAfterMs) => {
+      const controller = new AbortController();
+      setTimeout(() => {
+        controller.abort();
+      }, abortAfterMs);
+      const exchange = await invokeAgentProcess(
+        makeSpec({ args: ['-e', STUB.IGNORE_SIGTERM] }),
+        withSignal(makeLimits({ timeoutMs, graceMs: 400 }), controller.signal),
+      );
+
+      expect(exchange.outcome).toBe('CANCELLED');
+    },
+    15_000,
+  );
+
   it('uses captured Buffer methods after validation poisons the prototype', async () => {
     const subarray = Object.getOwnPropertyDescriptor(Buffer.prototype, 'subarray');
     const toString = Object.getOwnPropertyDescriptor(Buffer.prototype, 'toString');
@@ -713,6 +970,24 @@ describe('invokeAgentProcess — boundary', () => {
 
     expect(exchange.outcome).toBe('SPEC_REJECTED');
     expect(exchange.rejection).toBe('WORKING_DIRECTORY_NOT_ABSOLUTE');
+  });
+
+  it('rejects an oversized environment value before process creation', async () => {
+    const missing = join(makeTempDirectory(), 'must-not-be-spawned');
+    const exchange = await invokeAgentProcess(
+      makeSpec({
+        executablePath: missing,
+        environment: {
+          ...baseEnvironment(),
+          OVERSIZED: ascii(32_769),
+        },
+      }),
+      makeLimits(),
+    );
+
+    expect(exchange.outcome).toBe('SPEC_REJECTED');
+    expect(exchange.rejection).toBe('ENVIRONMENT_BYTES_EXCEEDED');
+    expect(exchange.terminationScope).toBe('NOT_REQUIRED');
   });
 
   it('reports the executable path used by the fixtures as spawnable', () => {

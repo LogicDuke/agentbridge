@@ -35,6 +35,7 @@ import {
   ALL_OUTCOMES,
   ALL_TERMINATION_SCOPES,
   ascii,
+  baseEnvironment,
   DEGRADED_SCOPES,
   EXPECTED_BOUNDS,
   EXPECTED_PRECEDENCE,
@@ -230,6 +231,22 @@ describe('termination vocabulary claims no more than the OS provides', () => {
     expect(code(IMPLEMENTATION_SOURCE)).not.toContain('taskkill /T');
     // The system directory is resolved, never assumed.
     expect(IMPLEMENTATION_SOURCE).not.toContain("'C:\\\\Windows'");
+  });
+
+  it('invalidates a POSIX group target before either possible signal', () => {
+    const start = IMPLEMENTATION_SOURCE.indexOf('async function terminatePosix');
+    const end = IMPLEMENTATION_SOURCE.indexOf('async function terminateWindows');
+    const implementation = IMPLEMENTATION_SOURCE.slice(start, end);
+    const firstGuard = implementation.indexOf('if (hasEnded(child))');
+    const termSignal = implementation.indexOf("signalProcessGroup(pid, 'SIGTERM')");
+    const graceWait = implementation.indexOf('if (await waitForExit(child, graceMs))');
+    const secondGuard = implementation.indexOf('if (hasEnded(child))', firstGuard + 1);
+    const killSignal = implementation.indexOf("signalProcessGroup(pid, 'SIGKILL')");
+
+    expect(firstGuard).toBeGreaterThanOrEqual(0);
+    expect(firstGuard).toBeLessThan(termSignal);
+    expect(secondGuard).toBeGreaterThan(graceWait);
+    expect(secondGuard).toBeLessThan(killSignal);
   });
 });
 
@@ -492,6 +509,64 @@ describe('structural validation is bounded, non-coercing and fail-closed', () =>
     expect(rejectionForSpec(withRawSpecField('args', exact))).toBe('ACCEPTED');
   });
 
+  it('accepts a serialized Windows command line exactly at the OS boundary', () => {
+    const args = Array.from({ length: 8 }, () => ascii(3_750));
+    const exactPath = `C:\\${ascii(2_755)}`;
+    const overPath = `${exactPath}x`;
+    const environment: Record<string, string> = {};
+    for (const name of WINDOWS_REQUIRED_ENVIRONMENT_VARIABLES) {
+      environment[name] = '';
+    }
+    const windowsSpec = (executablePath: string): AgentProcessSpec =>
+      makeSpec({ executablePath, workingDirectory: 'C:\\work', args, environment });
+
+    expect(readInvocation(windowsSpec(exactPath), makeLimits(), 'win32').rejection).toBeNull();
+    expect(readInvocation(windowsSpec(overPath), makeLimits(), 'win32').rejection).toBe(
+      'ARGV_TOTAL_BYTES_EXCEEDED',
+    );
+  });
+
+  it('rejects Windows quoting expansion even when raw argv bytes are below the bound', () => {
+    const expands = '\\"'.repeat(2_048);
+    const args = [expands, expands, expands, expands];
+    const environment: Record<string, string> = {};
+    for (const name of WINDOWS_REQUIRED_ENVIRONMENT_VARIABLES) {
+      environment[name] = '';
+    }
+    const result = readInvocation(
+      makeSpec({
+        executablePath: 'C:\\node.exe',
+        workingDirectory: 'C:\\work',
+        args,
+        environment,
+      }),
+      makeLimits(),
+      'win32',
+    );
+
+    expect(args.join('').length).toBeLessThan(TRANSPORT_BOUNDS.MAX_ARGV_TOTAL_BYTES);
+    expect(result.rejection).toBe('ARGV_TOTAL_BYTES_EXCEEDED');
+  });
+
+  it('accepts Windows empty, whitespace, quoted, and backslash argument forms in range', () => {
+    const environment: Record<string, string> = {};
+    for (const name of WINDOWS_REQUIRED_ENVIRONMENT_VARIABLES) {
+      environment[name] = '';
+    }
+    const result = readInvocation(
+      makeSpec({
+        executablePath: 'C:\\Program Files\\node.exe',
+        workingDirectory: 'C:\\work',
+        args: ['', 'two words', 'a"b', 'a\\"b', 'trailing\\'],
+        environment,
+      }),
+      makeLimits(),
+      'win32',
+    );
+
+    expect(result.rejection).toBeNull();
+  });
+
   it.each(NON_ENVIRONMENT_VALUES)('refuses an environment that is %s', (_label, value) => {
     const rejection = rejectionForSpec(withRawSpecField('environment', value));
 
@@ -528,6 +603,22 @@ describe('structural validation is bounded, non-coercing and fail-closed', () =>
   it('refuses an environment value that is not a string', () => {
     expect(rejectionForSpec(withRawSpecField('environment', { COUNT: 7 }))).toBe(
       'ENVIRONMENT_ENTRY_INVALID',
+    );
+  });
+
+  it('accepts an environment value exactly at its bound and rejects one byte more', () => {
+    const exact = {
+      ...baseEnvironment(),
+      BOUNDED: ascii(TRANSPORT_BOUNDS.MAX_ENV_VALUE_BYTES),
+    };
+    const oversized = {
+      ...baseEnvironment(),
+      BOUNDED: ascii(TRANSPORT_BOUNDS.MAX_ENV_VALUE_BYTES + 1),
+    };
+
+    expect(rejectionForSpec(makeSpec({ environment: exact }))).toBe('ACCEPTED');
+    expect(rejectionForSpec(makeSpec({ environment: oversized }))).toBe(
+      'ENVIRONMENT_BYTES_EXCEEDED',
     );
   });
 

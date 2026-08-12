@@ -54,6 +54,7 @@ import {
   containsNul,
   isAbsolutePath,
   readInvocation,
+  TERMINAL_CAUSE_PRECEDENCE,
   TERMINATION_SCOPE,
   type TerminationScope,
   TRANSPORT_BOUNDS,
@@ -98,6 +99,7 @@ const eventEmitterOn = EventEmitter.prototype.on;
 const eventEmitterRemoveListener = EventEmitter.prototype.removeListener;
 const eventEmitterRemoveAllListeners = EventEmitter.prototype.removeAllListeners;
 const readableOn = Readable.prototype.on;
+const readableDestroy = Readable.prototype.destroy;
 const writableEnd = Writable.prototype.end;
 const childProcessKill = ChildProcess.prototype.kill;
 const processKill = process.kill;
@@ -142,6 +144,23 @@ function removeAllEvents(emitter: EventEmitter): void {
 function onReadableData(readable: Readable, listener: (chunk: unknown) => void): void {
   // Readable overrides EventEmitter.on to enter flowing mode for `data`.
   reflectApply(readableOn, readable, ['data', listener]);
+}
+
+/** Release a child output pipe through the intrinsic captured at module load. */
+function destroyReadable(readable: Readable | null): void {
+  if (readable !== null) {
+    reflectApply(readableDestroy, readable, []);
+  }
+}
+
+/** Position in the declared precedence; lower indices bind more strongly. */
+function precedenceRank(outcome: TransportOutcome): number {
+  for (let index = 0; index < TERMINAL_CAUSE_PRECEDENCE.length; index += 1) {
+    if (TERMINAL_CAUSE_PRECEDENCE[index] === outcome) {
+      return index;
+    }
+  }
+  return TERMINAL_CAUSE_PRECEDENCE.length;
 }
 
 /** Append by defining an own element, bypassing inherited index setters. */
@@ -419,11 +438,24 @@ async function terminatePosix(
   pid: number,
   graceMs: number,
 ): Promise<TerminationScope> {
+  if (hasEnded(child)) {
+    return TERMINATION_SCOPE.DIRECT_CHILD_ONLY;
+  }
+
   let groupReached = signalProcessGroup(pid, 'SIGTERM');
   if (!groupReached) {
     killDirectChild(child, 'SIGTERM');
   }
   if (await waitForExit(child, graceMs)) {
+    return groupReached
+      ? TERMINATION_SCOPE.PROCESS_GROUP_REQUESTED
+      : TERMINATION_SCOPE.DIRECT_CHILD_ONLY;
+  }
+
+  // The grace timer and child exit can become ready in the same event-loop
+  // turn. Once the child is observed ended, its numeric process-group ID may
+  // be reused, so it must not receive the escalation signal.
+  if (hasEnded(child)) {
     return groupReached
       ? TERMINATION_SCOPE.PROCESS_GROUP_REQUESTED
       : TERMINATION_SCOPE.DIRECT_CHILD_ONLY;
@@ -497,11 +529,10 @@ async function terminate(
  * pipe, a hostile `AbortSignal` getter — so a programmer defect still surfaces
  * as a defect rather than being laundered into a failure code.
  *
- * **Deterministic precedence.** The first terminal cause to be claimed wins and
- * is immutable; see `TERMINAL_CAUSE_PRECEDENCE`. Overflow, cancellation, and
- * timeout are claimed the moment they are detected, while `SIGNALLED` and
- * `EXITED` are claimed only after stdio closes, so a child that overflows its
- * bound and then exits zero is reported as `OUTPUT_LIMIT_EXCEEDED`.
+ * **Deterministic precedence.** Every detected terminal cause is compared with
+ * `TERMINAL_CAUSE_PRECEDENCE`; callback arrival order cannot demote a stronger
+ * cause. Overflow, cancellation, and timeout are detected eagerly, while
+ * `SIGNALLED` and `EXITED` are detected when stdio closes.
  *
  * **No policy.** Nothing here decides whether this process should run. That
  * question belongs to `evaluateActionRequest` and to a later adapter that must
@@ -608,13 +639,13 @@ export function invokeAgentProcess(
     let deadline: NodeJS.Timeout | null = null;
     let notifyClosed: (() => void) | null = null;
 
-    /** First writer wins. A claimed cause is never overwritten. */
+    /** Promote only to a stronger declared cause. */
     const claim = (next: TransportOutcome): boolean => {
-      if (cause !== null) {
-        return false;
+      if (cause === null || precedenceRank(next) < precedenceRank(cause)) {
+        cause = next;
+        return true;
       }
-      cause = next;
-      return true;
+      return false;
     };
 
     const dispatchAbort = (): void => {
@@ -675,19 +706,19 @@ export function invokeAgentProcess(
       );
     };
 
-    /** Resolve when stdio closes, or after a bounded wait — whichever is first. */
-    function awaitClose(ms: number): Promise<void> {
+    /** Resolve true on close, false when the bounded close wait expires. */
+    function awaitClose(ms: number): Promise<boolean> {
       if (closed) {
-        return resolved(undefined);
+        return resolved(true);
       }
-      return new NativePromise<void>((resolveWait) => {
+      return new NativePromise<boolean>((resolveWait) => {
         const waiter = scheduleTimeout(() => {
           notifyClosed = null;
-          resolveWait();
+          resolveWait(false);
         }, ms);
         notifyClosed = (): void => {
           cancelTimeout(waiter);
-          resolveWait();
+          resolveWait(true);
         };
       });
     }
@@ -719,7 +750,14 @@ export function invokeAgentProcess(
         if (!hasEnded(child)) {
           terminationScope = TERMINATION_SCOPE.ESCALATION_FAILED;
         }
-        await awaitClose(invocation.graceMs);
+        const closeObserved = await awaitClose(invocation.graceMs);
+        if (!closeObserved) {
+          // A detached descendant can retain the inherited pipe handles after
+          // the direct child ends. Release this process's local ends before the
+          // forced settlement so the caller is not kept alive by leaked wraps.
+          destroyReadable(child.stdout);
+          destroyReadable(child.stderr);
+        }
       }
       settle();
     }
@@ -743,9 +781,17 @@ export function invokeAgentProcess(
     };
 
     if (child.stdout !== null) {
+      onEvent(child.stdout, 'error', () => {
+        // A read-side pipe failure must not escape as an uncaught EventEmitter
+        // error. The child close path remains the provider-neutral outcome.
+      });
       onReadableData(child.stdout, onStdout);
     }
     if (child.stderr !== null) {
+      onEvent(child.stderr, 'error', () => {
+        // Kept separate from stdout so neither stream can contaminate the
+        // other's transcript or settlement path.
+      });
       onReadableData(child.stderr, onStderr);
     }
 

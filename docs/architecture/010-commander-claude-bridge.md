@@ -127,27 +127,32 @@ When several terminal events compete, the ranking is frozen:
     SPEC_REJECTED > SPAWN_FAILED > OUTPUT_LIMIT_EXCEEDED > CANCELLED
                   > TIMED_OUT > SIGNALLED > EXITED
 
-The first cause claimed wins and is **immutable**: no later close, exit, signal,
-timeout, abort, or stream event overwrites it. Two mechanisms produce the order
-rather than one, because first-writer-wins alone is not sufficient:
+The highest-ranked detected cause wins regardless of callback arrival order. A
+later event may promote the reported cause to a stronger member, but it cannot
+demote it to a weaker member. Two mechanisms produce this order:
 
 1. Pre-spawn checks run in rank order — structural validation before the
    already-aborted check — so a request that is both malformed and aborted is
    `SPEC_REJECTED`.
-2. After spawn, overflow, cancellation, and timeout are claimed the instant they
-   are detected, whereas `SIGNALLED` and `EXITED` are claimed only once stdio has
-   fully closed. A child that overflows its bound and then exits zero is
-   therefore `OUTPUT_LIMIT_EXCEEDED`, never `EXITED`.
+2. After spawn, every detected cause is compared with the frozen ranking. A
+   child that overflows its bound and then exits zero is therefore
+   `OUTPUT_LIMIT_EXCEEDED`, never `EXITED`; cancellation remains `CANCELLED`
+   when its termination signal is later observed as `SIGNALLED`; and an
+   asynchronous failure to start promotes an earlier cancellation to
+   `SPAWN_FAILED`.
 
 `EXITED` is not a synonym for success, and exit code 0 is recorded rather than
 interpreted. Interpretation belongs to PR 006's vocabularies, which fail closed
 to `unknown`.
 
-Every listener, timer, and abort handler is removed on every settle path, and the
-function resolves exactly one frozen record on every validation, spawn, I/O,
-timeout, cancellation, overflow, termination, and close path. It never rejects.
-Catches wrap only defined operational failures, so a programmer defect still
-surfaces as a defect rather than being laundered into a failure code.
+Every listener, timer, and abort handler is removed on every settle path. A
+forced settlement also destroys the local stdout and stderr pipe ends, and
+stdout or stderr read errors are contained until the child close path reports
+the provider-neutral outcome. The function resolves exactly one frozen record
+on every validation, spawn, I/O, timeout, cancellation, overflow, termination,
+and close path. It never rejects. Catches wrap only defined operational
+failures, so a programmer defect still surfaces as a defect rather than being
+laundered into a failure code.
 
 ## Termination is qualified, and the limit is disclosed
 
@@ -232,7 +237,7 @@ credential storage and no secret resolution.
 | --- | --- | --- |
 | `MAX_ARGV_COUNT` | 64 | a real invocation uses a handful |
 | `MAX_ARG_BYTES` | 4 096 | per argument, UTF-8 |
-| `MAX_ARGV_TOTAL_BYTES` | 30 000 | Windows caps a composed command line at 32 767 characters; this binds first on every platform |
+| `MAX_ARGV_TOTAL_BYTES` | 30 000 | bounds raw caller input on every platform; Windows additionally validates the fully quoted command line, including executable, separators, and terminating NUL, against the 32 767 UTF-16-code-unit `CreateProcess` limit |
 | `MAX_PATH_BYTES` | 4 096 | executable and working directory |
 | `MAX_STDIN_BYTES` | 1 048 576 | the payload channel |
 | `MAX_STDOUT_BYTES_CEILING` | 8 388 608 | the caller's cap is measured against this |

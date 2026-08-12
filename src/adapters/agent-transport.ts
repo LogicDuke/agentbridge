@@ -135,22 +135,20 @@ export const TRANSPORT_OUTCOMES: readonly TransportOutcome[] = objectFreeze([
 /**
  * Terminal-cause precedence, highest first.
  *
- * When several terminal events compete, the earlier member wins and the winning
- * cause is **immutable**: no later close, exit, signal, timeout, abort, or
- * stream event may overwrite it.
+ * When several terminal events compete, this ranking decides the reported
+ * outcome, not callback arrival order. The exchange reports the highest-ranked
+ * cause claimed before it settles: a later stronger cause promotes the result,
+ * while a weaker cause can never demote it.
  *
- * Two mechanisms produce this ordering rather than one, because a single
- * first-writer-wins rule is not sufficient on its own:
+ * Two mechanisms produce this ordering rather than one:
  *
  * 1. The pre-spawn checks run in this order — structural validation first, then
  *    an already-aborted signal — so a request that is both malformed and
  *    aborted is `SPEC_REJECTED`.
- * 2. After spawn, `OUTPUT_LIMIT_EXCEEDED`, `CANCELLED`, and `TIMED_OUT` are
- *    claimed the instant they are detected, whereas `SIGNALLED` and `EXITED`
- *    are claimed only once the child's stdio has fully closed. A child that
- *    overflows its bound and then exits zero is therefore
- *    `OUTPUT_LIMIT_EXCEEDED`, never `EXITED` — which is the whole point of
- *    ranking overflow above exit.
+ * 2. After spawn, every detected cause is compared with the current cause. A
+ *    child that overflows its bound and then exits zero is therefore
+ *    `OUTPUT_LIMIT_EXCEEDED`, never `EXITED`; a cancellation that races a
+ *    failure to start is `SPAWN_FAILED`, regardless of callback order.
  */
 export const TERMINAL_CAUSE_PRECEDENCE: readonly TransportOutcome[] = objectFreeze([
   TRANSPORT_OUTCOME.SPEC_REJECTED,
@@ -270,10 +268,11 @@ export type TransportRejection =
  * Every unbounded dimension is capped **before** anything is spawned, following
  * the rule established in PR 005 and PR 006.
  *
- * `MAX_ARGV_TOTAL_BYTES` is the load-bearing one. Windows composes argv into a
- * single command line for `CreateProcess`, which caps at 32 767 characters, so
- * the total bound binds before `MAX_ARGV_COUNT * MAX_ARG_BYTES` ever could and
- * keeps every platform below the strictest operating-system limit.
+ * `MAX_ARGV_TOTAL_BYTES` bounds caller input before
+ * `MAX_ARGV_COUNT * MAX_ARG_BYTES` could bind. Windows also composes the
+ * executable and argv into one quoted command line. A separate private check
+ * measures that serialized form, including separators and its terminating NUL,
+ * against the operating-system limit.
  *
  * `MAX_ENV_KEY_BYTES` equals PR 005's and PR 006's `MAX_IDENTIFIER_LENGTH`; a
  * test pins the three together.
@@ -480,6 +479,62 @@ export function utf8ByteLength(value: string): number {
 export function containsNul(value: string): boolean {
   const index: unknown = reflectApply(stringIndexOf, value, ['\u0000']);
   return typeof index !== 'number' || index !== -1;
+}
+
+/** CreateProcess command-line capacity in UTF-16 code units, including NUL. */
+const WINDOWS_COMMAND_LINE_LIMIT = 32_767;
+
+/**
+ * Length of one argument after libuv's non-verbatim Windows quoting.
+ *
+ * Arguments without a space, tab, or quote are emitted unchanged. Every other
+ * argument is quoted. Within quotes, backslashes are doubled only when they
+ * precede a quote or the closing quote; a literal quote gains one additional
+ * escaping backslash.
+ */
+function quotedWindowsArgumentLength(value: string): number {
+  let needsQuotes = value.length === 0;
+  for (let index = 0; index < value.length && !needsQuotes; index += 1) {
+    const character = reflectApply(stringCharCodeAt, value, [index]);
+    needsQuotes = character === 0x09 || character === 0x20 || character === 0x22;
+  }
+  if (!needsQuotes) {
+    return value.length;
+  }
+
+  let emitted = 2;
+  let backslashes = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const character = reflectApply(stringCharCodeAt, value, [index]);
+    if (character === 0x5c) {
+      backslashes += 1;
+      continue;
+    }
+    if (character === 0x22) {
+      emitted += backslashes * 2 + 2;
+      backslashes = 0;
+      continue;
+    }
+    emitted += backslashes + 1;
+    backslashes = 0;
+  }
+  return emitted + backslashes * 2;
+}
+
+/** Serialized Windows command-line length, including separators and final NUL. */
+function windowsCommandLineLength(
+  executablePath: string,
+  args: readonly string[],
+): number {
+  let total = quotedWindowsArgumentLength(executablePath) + 1;
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    if (argument === undefined) {
+      return WINDOWS_COMMAND_LINE_LIMIT + 1;
+    }
+    total += 1 + quotedWindowsArgumentLength(argument);
+  }
+  return total;
 }
 
 /**
@@ -850,6 +905,13 @@ export function readInvocation(
   const argsResult = readArgs(readOwnData(rawSpec, 'args'));
   if (argsResult.rejection !== null) {
     return refuse(argsResult.rejection);
+  }
+  if (
+    platform === 'win32' &&
+    windowsCommandLineLength(executablePath, argsResult.value) >
+      WINDOWS_COMMAND_LINE_LIMIT
+  ) {
+    return refuse(TRANSPORT_REJECTION.ARGV_TOTAL_BYTES_EXCEEDED);
   }
 
   const environmentResult = readEnvironment(
