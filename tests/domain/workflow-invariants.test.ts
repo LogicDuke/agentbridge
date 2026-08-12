@@ -1821,6 +1821,123 @@ describe('group J — hostile input fails closed', () => {
     expect(applyWorkflowEvent(state, admitAtB()).rejection).toBe('WORKFLOW_CLOSED');
   });
 
+  /* ---- the closing transition owns the aggregate's final slot ---- */
+
+  /** Closed at revision 0, with one admission stamped at `admissionSequence`. */
+  function closedWithAdmission(sequence: number, admissionSequence: number): WorkflowState {
+    return {
+      ...openedWorkflow(),
+      sequence,
+      status: 'CLOSED',
+      closureReason: 'CALLER_CLOSED',
+      evidence: stored([
+        {
+          evidenceId: EVIDENCE_A,
+          kind: 'ci-result',
+          admittedAtCommitSha: SHA_A,
+          admittedAtRevision: 0,
+          admittedAtSequence: admissionSequence,
+        },
+      ]),
+    } as unknown as WorkflowState;
+  }
+
+  it('refuses a closed state whose final slot is held by a retained stamp', () => {
+    // CLOSE_REQUESTED is terminal, so slot 2 cannot be both the admission and
+    // the closure.
+    expect(applyWorkflowEvent(closedWithAdmission(2, 2), admitAtB()).rejection).toBe(
+      'WORKFLOW_UNREADABLE',
+    );
+  });
+
+  it('accepts the same closed history with a slot of its own for the closure', () => {
+    // Readable now, so the terminal-status rule is what refuses the event.
+    expect(applyWorkflowEvent(closedWithAdmission(3, 2), admitAtB()).rejection).toBe(
+      'WORKFLOW_CLOSED',
+    );
+  });
+
+  /* ---- a closed aggregate that kept its gate posture paid for both ---- */
+
+  /** Closed at revision 0 while a human was still deciding. */
+  const closedWhileGated = (sequence: number): WorkflowState =>
+    ({
+      ...openedWorkflow(),
+      sequence,
+      status: 'CLOSED',
+      closureReason: 'CALLER_CLOSED',
+      humanGateOpenedAtRevision: 0,
+    }) as unknown as WorkflowState;
+
+  it('refuses a closed gated state with room for only one of the two slots', () => {
+    expect(applyWorkflowEvent(closedWhileGated(1), admitAtB()).rejection).toBe(
+      'WORKFLOW_UNREADABLE',
+    );
+  });
+
+  it('accepts a closed gated state with room for the gate and the closure', () => {
+    expect(applyWorkflowEvent(closedWhileGated(2), admitAtB()).rejection).toBe(
+      'WORKFLOW_CLOSED',
+    );
+  });
+
+  it('keeps a genuinely replayed gate-then-close history valid', () => {
+    const closed = applyOrThrow(
+      applyOrThrow(openedWorkflow(), openHumanGate()),
+      closeWorkflow(),
+    );
+
+    expect(closed.status).toBe('CLOSED');
+    expect(closed.humanGateOpenedAtRevision).toBe(0);
+    expect(closed.sequence).toBe(2);
+    expect(applyWorkflowEvent(closed, admitAtB()).rejection).toBe('WORKFLOW_CLOSED');
+  });
+
+  /* ---- revision 0, OPEN: only a human decision explains an extra slot ---- */
+
+  /** Open at revision 0 with one admission of `kind` at `admissionSequence`. */
+  function openWithAdmission(
+    sequence: number,
+    kind: string,
+    admissionSequence: number,
+  ): WorkflowState {
+    return {
+      ...openedWorkflow(),
+      sequence,
+      evidence: stored([
+        {
+          evidenceId: EVIDENCE_A,
+          kind,
+          admittedAtCommitSha: SHA_A,
+          admittedAtRevision: 0,
+          admittedAtSequence: admissionSequence,
+        },
+      ]),
+    } as unknown as WorkflowState;
+  }
+
+  /** Probe an OPEN state: APPLIED when readable. */
+  const probeOpen = (state: WorkflowState): string | null =>
+    applyWorkflowEvent(state, observeHead(SHA_B)).rejection;
+
+  it('refuses a revision-0 open state whose extra slot nothing explains', () => {
+    // Slot 1 is the ci-result admission. No HEAD advance has happened, a
+    // closure would not leave the workflow OPEN, and only a human decision
+    // could have cleared a gate — so slot 2 has no explanation.
+    expect(probeOpen(openWithAdmission(2, 'ci-result', 1))).toBe('WORKFLOW_UNREADABLE');
+  });
+
+  it('accepts the same admission with no unexplained slot', () => {
+    expect(probeOpen(openWithAdmission(1, 'ci-result', 1))).toBe(null);
+  });
+
+  it('lets a retained human decision explain the gate slot it cleared', () => {
+    // Gate at slot 1, cleared by the human decision stamped at slot 2.
+    expect(probeOpen(openWithAdmission(2, 'human-decision', 2))).toBe(null);
+    // One retained decision explains one gate, not two.
+    expect(probeOpen(openWithAdmission(3, 'human-decision', 2))).toBe('WORKFLOW_UNREADABLE');
+  });
+
   /* ---- revision 0, OPEN, no stamps: only sequence 0 is reachable ---- */
 
   it('refuses an untouched workflow claiming a consumed sequence slot', () => {

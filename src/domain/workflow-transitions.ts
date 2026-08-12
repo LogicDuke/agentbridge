@@ -971,18 +971,39 @@ function snapshotWorkflow(state: WorkflowState): WorkflowSnapshot | null {
   // `AWAITING_HUMAN_DECISION` comes from `HUMAN_GATE_OPENED` and `CLOSED` from
   // `CLOSE_REQUESTED`; `OPEN` is the opening state and requires nothing.
   //
+  // A `CLOSED` aggregate still carrying a gate posture needs *two* such slots.
+  // Closing retains `humanGateOpenedAtRevision` untouched, so that gate was
+  // opened by a `HUMAN_GATE_OPENED` of its own and the closure came later; both
+  // stamp nothing. Under `AWAITING_HUMAN_DECISION` the gate *is* the status
+  // transition and is already counted once.
+  const closedGateSlot =
+    rawStatus === WORKFLOW_STATUS.CLOSED && humanGateOpenedAtRevision !== null ? 1 : 0;
+
   // Counting retained stamps alone under-counts the occupied slots: reaching
   // `revision` also cost that many `HEAD_OBSERVED` transitions, and those stamp
-  // nothing, so they never appear among the retained stamps. All three groups
+  // nothing, so they never appear among the retained stamps. All these groups
   // occupy distinct slots in `[1, sequence]`, hence
   //
-  //     sequence >= revision + retained stamps + 1
+  //     sequence >= revision + retained stamps + 1 + retained gate slot
   if (
     (rawStatus === WORKFLOW_STATUS.AWAITING_HUMAN_DECISION ||
       rawStatus === WORKFLOW_STATUS.CLOSED) &&
-    sequence <= revision + seenSequences.length
+    sequence <= revision + seenSequences.length + closedGateSlot
   ) {
     return null;
+  }
+
+  // `CLOSE_REQUESTED` is terminal — nothing can follow it — so it is the last
+  // transition the aggregate ran and owns the slot its counter names. A
+  // retained stamp sitting on that same slot would have to be the closing
+  // transition itself, and closing stamps nothing.
+  if (rawStatus === WORKFLOW_STATUS.CLOSED) {
+    for (let index = 0; index < seenSequences.length; index += 1) {
+      const stamp = seenSequences[index];
+      if (stamp === undefined || stamp >= sequence) {
+        return null;
+      }
+    }
   }
 
   // Counting is not enough on its own: the slot belonging to the transition
@@ -1016,18 +1037,30 @@ function snapshotWorkflow(state: WorkflowState): WorkflowSnapshot | null {
     }
   }
 
-  // At revision 0 with no retained stamp and no status-producing transition,
-  // nothing could have consumed a sequence slot: every event either stamps a
-  // record, advances the revision, opens the gate, or closes the workflow.
-  // Deliberately narrow — no general upper bound is claimed here, because a
-  // cleared gate legitimately consumes a slot it leaves no trace of.
-  if (
-    revision === 0 &&
-    rawStatus === WORKFLOW_STATUS.OPEN &&
-    seenSequences.length === 0 &&
-    sequence > 0
-  ) {
-    return null;
+  // At revision 0 an `OPEN` workflow's unstamped transitions are knowable, so
+  // the slots can be bounded from above too. No `HEAD_OBSERVED` has been
+  // applied, and a `CLOSE_REQUESTED` would have left the workflow `CLOSED`, so
+  // the only unstamped transition it can have run is `HUMAN_GATE_OPENED` — and
+  // with no HEAD advance available, the sole way back to `OPEN` is admitting a
+  // `human-decision`, which is retained with a stamp of its own. Every gate
+  // opened here is therefore paid for by a retained human decision:
+  //
+  //     sequence <= retained stamps + retained human decisions
+  //
+  // Deliberately bounded to revision 0 and `OPEN`. Once a HEAD advance is in
+  // play it clears a gate while leaving nothing behind, and no upper bound is
+  // claimed there. With no stamps at all this reduces to the untouched
+  // workflow: only sequence 0 is reachable.
+  if (revision === 0 && rawStatus === WORKFLOW_STATUS.OPEN) {
+    let humanDecisions = 0;
+    for (let index = 0; index < evidence.length; index += 1) {
+      if (evidence[index]?.kind === EVIDENCE_KIND.HUMAN_DECISION) {
+        humanDecisions += 1;
+      }
+    }
+    if (sequence > seenSequences.length + humanDecisions) {
+      return null;
+    }
   }
 
   return {
