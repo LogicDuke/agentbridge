@@ -913,10 +913,13 @@ describe('group J — hostile input fails closed', () => {
     }
   });
 
+  // The sequence may run ahead of the revision, but only as far as the
+  // transitions the state still accounts for: at revision 1 with nothing
+  // retained, the HEAD advance and the gate it cleared reach slot 2.
   it.each([
     [0, 0],
     [1, 1],
-    [1, 5],
+    [1, 2],
   ])('accepts an otherwise valid state with revision %i and sequence %i', (revision, sequence) => {
     const forged = { ...openedWorkflow(), revision, sequence } as WorkflowState;
 
@@ -1936,6 +1939,32 @@ describe('group J — hostile input fails closed', () => {
     expect(probeOpen(openWithAdmission(2, 'human-decision', 2))).toBe(null);
     // One retained decision explains one gate, not two.
     expect(probeOpen(openWithAdmission(3, 'human-decision', 2))).toBe('WORKFLOW_UNREADABLE');
+  });
+
+  /* ---- the open upper bound follows the revision past zero ---- */
+
+  /** Open at revision 1 with nothing retained at all. */
+  const openAfterHead = (sequence: number): WorkflowState =>
+    ({
+      ...openedWorkflow(),
+      boundCommitSha: SHA_B,
+      revision: 1,
+      sequence,
+    }) as unknown as WorkflowState;
+
+  it('refuses a revision-1 open state whose extra slots nothing explains', () => {
+    // One HEAD advance reached revision 1 and one gate could have been opened
+    // for it to clear, so slot 3 has no explanation: nothing is retained, so no
+    // human decision cleared a second gate.
+    expect(applyWorkflowEvent(openAfterHead(3), observeHead(SHA_C)).rejection).toBe(
+      'WORKFLOW_UNREADABLE',
+    );
+  });
+
+  it('accepts revision-1 open states the HEAD advance alone explains', () => {
+    // The bare advance, and the advance that also cleared a gate.
+    expect(applyWorkflowEvent(openAfterHead(1), observeHead(SHA_C)).outcome).toBe('APPLIED');
+    expect(applyWorkflowEvent(openAfterHead(2), observeHead(SHA_C)).outcome).toBe('APPLIED');
   });
 
   /* ---- revision 0, OPEN, no stamps: only sequence 0 is reachable ---- */

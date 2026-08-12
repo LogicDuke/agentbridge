@@ -1037,28 +1037,33 @@ function snapshotWorkflow(state: WorkflowState): WorkflowSnapshot | null {
     }
   }
 
-  // At revision 0 an `OPEN` workflow's unstamped transitions are knowable, so
-  // the slots can be bounded from above too. No `HEAD_OBSERVED` has been
-  // applied, and a `CLOSE_REQUESTED` would have left the workflow `CLOSED`, so
-  // the only unstamped transition it can have run is `HUMAN_GATE_OPENED` — and
-  // with no HEAD advance available, the sole way back to `OPEN` is admitting a
-  // `human-decision`, which is retained with a stamp of its own. Every gate
-  // opened here is therefore paid for by a retained human decision:
+  // An `OPEN` workflow's unstamped transitions are knowable, so its slots can
+  // be bounded from above too. A `CLOSE_REQUESTED` would have left the workflow
+  // `CLOSED`, so every slot is a retained stamp, one of the `revision`
+  // `HEAD_OBSERVED` advances, or a `HUMAN_GATE_OPENED`:
   //
-  //     sequence <= retained stamps + retained human decisions
+  //     sequence = retained stamps + revision + gates opened
   //
-  // Deliberately bounded to revision 0 and `OPEN`. Once a HEAD advance is in
-  // play it clears a gate while leaving nothing behind, and no upper bound is
-  // claimed there. With no stamps at all this reduces to the untouched
-  // workflow: only sequence 0 is reachable.
-  if (revision === 0 && rawStatus === WORKFLOW_STATUS.OPEN) {
+  // No gate is open now, so every gate that was opened was cleared, and a clear
+  // costs either one of those same HEAD advances or one admitted
+  // `human-decision` — each of which clears at most one gate. Hence
+  //
+  //     gates opened <= revision + retained human decisions
+  //
+  // Nothing here reconstructs which slot held what; only the totals are read.
+  // At revision 0 this reduces to stamps plus retained decisions, and with no
+  // stamps at all to the untouched workflow, where only sequence 0 is
+  // reachable. Deliberately confined to `OPEN`: a retained gate or closure
+  // posture is accounted for by the lower bounds above.
+  if (rawStatus === WORKFLOW_STATUS.OPEN) {
     let humanDecisions = 0;
     for (let index = 0; index < evidence.length; index += 1) {
       if (evidence[index]?.kind === EVIDENCE_KIND.HUMAN_DECISION) {
         humanDecisions += 1;
       }
     }
-    if (sequence > seenSequences.length + humanDecisions) {
+    const gatesOpened = revision + humanDecisions;
+    if (sequence > seenSequences.length + revision + gatesOpened) {
       return null;
     }
   }
