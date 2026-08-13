@@ -1,6 +1,14 @@
 import { ChildProcess, spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { readdirSync, existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import {
+  readdirSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -78,7 +86,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-const [transportUrl, mode] = process.argv.slice(2);
+const [transportUrl, mode, scratchPrefix] = process.argv.slice(2);
 const realSystemRoot = process.env.SystemRoot;
 const { invokeAgentProcess } = await import(transportUrl);
 
@@ -117,7 +125,7 @@ let spec;
 if (mode === 'helper') {
   // Point taskkill resolution at a directory that holds no taskkill executable,
   // so the helper spawn reports ENOENT asynchronously.
-  process.env.SystemRoot = scratchDirectory('probe-fakeroot-');
+  process.env.SystemRoot = scratchDirectory(scratchPrefix + 'fakeroot-');
   let helpers = 0;
   let wouldThrow = false;
   const realSpawnMethod = ChildProcess.prototype.spawn;
@@ -185,7 +193,7 @@ if (mode === 'helper') {
       });
     }
   }
-  const missing = join(scratchDirectory('probe-missing-'), 'no-such-binary');
+  const missing = join(scratchDirectory(scratchPrefix + 'missing-'), 'no-such-binary');
   spec = {
     executablePath: missing,
     args: [],
@@ -219,15 +227,32 @@ interface ProbeResult {
   readonly stderr: string;
 }
 
-/** Count the scratch directories a probe subprocess owns, by its own prefix. */
-function probeScratchCount(): number {
-  return readdirSync(tmpdir()).filter((entry) => entry.startsWith('probe-')).length;
+let probeRuns = 0;
+
+/**
+ * A scratch namespace owned by exactly one probe run.
+ *
+ * The system temp directory is shared, so a concurrent test run — vitest runs
+ * files in parallel, and a second `vitest run` can overlap this one entirely —
+ * would otherwise add to or remove from the same namespace and make the leak
+ * assertion below both falsely fail and falsely pass. The process id separates
+ * concurrent runners; the counter separates invocations within one runner.
+ */
+function nextProbePrefix(): string {
+  probeRuns += 1;
+  return `probe-${String(process.pid)}-${String(probeRuns)}-`;
+}
+
+/** Count the scratch directories owned by one probe run, and no others. */
+function probeScratchCount(prefix: string): number {
+  return readdirSync(tmpdir()).filter((entry) => entry.startsWith(prefix)).length;
 }
 
 /** Run one probe mode in its own process so a host crash cannot kill vitest. */
 async function runIsolatedProbe(mode: string): Promise<ProbeResult> {
   const directory = makeTempDirectory();
-  const scratchBefore = probeScratchCount();
+  const scratchPrefix = nextProbePrefix();
+  const scratchBefore = probeScratchCount(scratchPrefix);
   try {
     const hook = join(directory, 'hook.mjs');
     const script = join(directory, 'probe.mjs');
@@ -236,7 +261,14 @@ async function runIsolatedProbe(mode: string): Promise<ProbeResult> {
     const result = await new Promise<ProbeResult>((resolve) => {
       const probe = spawn(
         process.execPath,
-        ['--import', pathToFileURL(hook).href, script, TRANSPORT_SOURCE_URL, mode],
+        [
+          '--import',
+          pathToFileURL(hook).href,
+          script,
+          TRANSPORT_SOURCE_URL,
+          mode,
+          scratchPrefix,
+        ],
         { stdio: ['ignore', 'pipe', 'pipe'] },
       );
       let stdout = '';
@@ -252,7 +284,7 @@ async function runIsolatedProbe(mode: string): Promise<ProbeResult> {
       });
     });
     // The probe owns every directory it creates and must leave none behind.
-    expect(probeScratchCount()).toBe(scratchBefore);
+    expect(probeScratchCount(scratchPrefix)).toBe(scratchBefore);
     return result;
   } finally {
     removeTempDirectory(directory);
@@ -723,6 +755,29 @@ describe('invokeAgentProcess — adversarial', () => {
         } catch {
           // The repair may have reaped the child between the check and cleanup.
         }
+      }
+    }
+  });
+
+  it('scopes the probe leak assertion to the run that owns the directory', () => {
+    const mine = nextProbePrefix();
+    const foreign = nextProbePrefix();
+    const foreignDirectory = mkdtempSync(join(tmpdir(), `${foreign}missing-`));
+    let ownedDirectory: string | null = null;
+    try {
+      // A concurrent run's scratch directory must not register against this one,
+      // or its mere presence would fail this run's leak assertion.
+      expect(probeScratchCount(mine)).toBe(0);
+
+      // A genuine leak of this run's own directory must stay visible even as the
+      // concurrent run's directory disappears, or the two would cancel out.
+      ownedDirectory = mkdtempSync(join(tmpdir(), `${mine}missing-`));
+      rmSync(foreignDirectory, { recursive: true, force: true });
+      expect(probeScratchCount(mine)).toBe(1);
+    } finally {
+      rmSync(foreignDirectory, { recursive: true, force: true });
+      if (ownedDirectory !== null) {
+        rmSync(ownedDirectory, { recursive: true, force: true });
       }
     }
   });
