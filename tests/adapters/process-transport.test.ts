@@ -1,7 +1,9 @@
-import { ChildProcess } from 'node:child_process';
+import { ChildProcess, spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { readdirSync, existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import { describe, expect, it, vi } from 'vitest';
 
@@ -29,6 +31,233 @@ import {
 } from './transport-fixtures.js';
 
 const onPosix = it.skipIf(process.platform === 'win32');
+const onWindows = it.skipIf(process.platform !== 'win32');
+
+/** The transport source an isolated probe loads, relative to this test file. */
+const TRANSPORT_SOURCE_URL = new URL(
+  '../../src/adapters/process-transport.ts',
+  import.meta.url,
+).href;
+
+/**
+ * Let a probe subprocess run the TypeScript sources directly.
+ *
+ * Node strips types but does not rewrite a `./x.js` specifier to `./x.ts`, so
+ * the probe registers this resolver before importing the transport.
+ */
+const PROBE_HOOK = `
+import { registerHooks } from 'node:module';
+import { existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+
+registerHooks({
+  resolve(specifier, context, nextResolve) {
+    if (specifier.startsWith('.') && specifier.endsWith('.js') && context.parentURL !== undefined) {
+      const candidate = new URL(specifier.slice(0, -3) + '.ts', context.parentURL);
+      if (existsSync(fileURLToPath(candidate))) {
+        return { url: candidate.href, shortCircuit: true };
+      }
+    }
+    return nextResolve(specifier, context);
+  },
+});
+`;
+
+/**
+ * One exchange under a forced post-spawn hardening failure.
+ *
+ * An unhandled child \`error\` terminates its whole process, so this runs in a
+ * subprocess: the vitest worker survives to report the failure either way, and
+ * the exit code is the evidence. Hardening is forced to throw without replacing
+ * \`emit\` or disturbing Node's internals, so the asynchronous spawn failure
+ * behaves exactly as it would in production.
+ */
+const PROBE_SCRIPT = `
+import { ChildProcess } from 'node:child_process';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+const [transportUrl, mode] = process.argv.slice(2);
+const realSystemRoot = process.env.SystemRoot;
+const { invokeAgentProcess } = await import(transportUrl);
+
+// Every directory this probe creates, so none outlives the probe.
+const scratch = [];
+function scratchDirectory(prefix) {
+  const created = mkdtempSync(join(tmpdir(), prefix));
+  scratch.push(created);
+  return created;
+}
+function removeScratch() {
+  while (scratch.length > 0) {
+    rmSync(scratch.pop(), { recursive: true, force: true });
+  }
+}
+// Backstop for abrupt termination: an unhandled asynchronous error would end
+// the probe without unwinding the try/finally below, and exit listeners still
+// run in that case. Bounded to the directories recorded above, never a sweep.
+process.on('exit', removeScratch);
+
+function environment() {
+  const env = {};
+  for (const name of ['HOMEDRIVE', 'HOMEPATH', 'LOGONSERVER', 'PATH', 'SYSTEMDRIVE',
+    'SYSTEMROOT', 'TEMP', 'USERDOMAIN', 'USERNAME', 'USERPROFILE', 'WINDIR']) {
+    env[name] = '';
+  }
+  if (realSystemRoot !== undefined) {
+    env.SYSTEMROOT = realSystemRoot;
+  }
+  return env;
+}
+
+const limits = { timeoutMs: 5000, graceMs: 200, maxStdoutBytes: 65536, maxStderrBytes: 16384 };
+let spec;
+
+if (mode === 'helper') {
+  // Point taskkill resolution at a directory that holds no taskkill executable,
+  // so the helper spawn reports ENOENT asynchronously.
+  process.env.SystemRoot = scratchDirectory('probe-fakeroot-');
+  let helpers = 0;
+  let wouldThrow = false;
+  const realSpawnMethod = ChildProcess.prototype.spawn;
+  ChildProcess.prototype.spawn = function patched(...args) {
+    const result = Reflect.apply(realSpawnMethod, this, args);
+    // Only the stdio 'ignore' helper has no pipes at all.
+    if (this.stdin === null && this.stdout === null && this.stderr === null) {
+      helpers += 1;
+      Object.preventExtensions(this);
+      try {
+        Object.defineProperty(this, 'emit', {
+          configurable: false, enumerable: false, writable: false,
+          value() { return false; },
+        });
+      } catch {
+        // Proves the transport's own hardening must throw for this helper,
+        // while leaving the genuine emit intrinsic in place.
+        wouldThrow = true;
+      }
+    }
+    return result;
+  };
+  process.on('exit', () => {
+    console.log('HELPER_COUNT=' + helpers);
+    console.log('HELPER_HARDENING_WOULD_THROW=' + wouldThrow);
+  });
+  spec = {
+    executablePath: process.execPath,
+    args: ['-e', 'process.on("SIGTERM",()=>{});setInterval(()=>{},1000);'],
+    workingDirectory: tmpdir(),
+    environment: environment(),
+    stdin: '',
+  };
+  limits.timeoutMs = 400;
+} else {
+  if (mode === 'primary') {
+    // Keep Node's real Sockets, but pre-claim emit with a conflicting
+    // non-configurable value so dispatch hardening must throw.
+    const stash = new WeakMap();
+    function decoy() { return false; }
+    for (const key of ['stdin', 'stdout', 'stderr']) {
+      Object.defineProperty(ChildProcess.prototype, key, {
+        configurable: true,
+        get() {
+          const slot = stash.get(this);
+          return slot === undefined ? null : (slot[key] ?? null);
+        },
+        set(value) {
+          let slot = stash.get(this);
+          if (slot === undefined) {
+            slot = {};
+            stash.set(this, slot);
+          }
+          if (key === 'stderr' && value !== null && typeof value === 'object') {
+            try {
+              Object.defineProperty(value, 'emit', {
+                configurable: false, enumerable: false, writable: false, value: decoy,
+              });
+            } catch {
+              // Already claimed; the conflict is what matters.
+            }
+          }
+          slot[key] = value;
+        },
+      });
+    }
+  }
+  const missing = join(scratchDirectory('probe-missing-'), 'no-such-binary');
+  spec = {
+    executablePath: missing,
+    args: [],
+    workingDirectory: tmpdir(),
+    environment: environment(),
+    stdin: '',
+  };
+}
+
+try {
+  try {
+    const exchange = await invokeAgentProcess(spec, limits);
+    console.log('RESOLVED=' + exchange.outcome + ' scope=' + exchange.terminationScope);
+  } catch (error) {
+    console.log('REJECTED=' + (error && error.message));
+  }
+
+  // Give any queued asynchronous spawn failure time to surface before exiting.
+  await new Promise((resolve) => setTimeout(resolve, 1500));
+  console.log('SURVIVED');
+} finally {
+  // process.exit skips finally blocks, so clean up before reaching it.
+  removeScratch();
+}
+process.exit(0);
+`;
+
+interface ProbeResult {
+  readonly code: number | null;
+  readonly stdout: string;
+  readonly stderr: string;
+}
+
+/** Count the scratch directories a probe subprocess owns, by its own prefix. */
+function probeScratchCount(): number {
+  return readdirSync(tmpdir()).filter((entry) => entry.startsWith('probe-')).length;
+}
+
+/** Run one probe mode in its own process so a host crash cannot kill vitest. */
+async function runIsolatedProbe(mode: string): Promise<ProbeResult> {
+  const directory = makeTempDirectory();
+  const scratchBefore = probeScratchCount();
+  try {
+    const hook = join(directory, 'hook.mjs');
+    const script = join(directory, 'probe.mjs');
+    writeFileSync(hook, PROBE_HOOK);
+    writeFileSync(script, PROBE_SCRIPT);
+    const result = await new Promise<ProbeResult>((resolve) => {
+      const probe = spawn(
+        process.execPath,
+        ['--import', pathToFileURL(hook).href, script, TRANSPORT_SOURCE_URL, mode],
+        { stdio: ['ignore', 'pipe', 'pipe'] },
+      );
+      let stdout = '';
+      let stderr = '';
+      probe.stdout.on('data', (chunk: Buffer) => {
+        stdout += chunk.toString('utf8');
+      });
+      probe.stderr.on('data', (chunk: Buffer) => {
+        stderr += chunk.toString('utf8');
+      });
+      probe.on('close', (code: number | null) => {
+        resolve({ code, stdout, stderr });
+      });
+    });
+    // The probe owns every directory it creates and must leave none behind.
+    expect(probeScratchCount()).toBe(scratchBefore);
+    return result;
+  } finally {
+    removeTempDirectory(directory);
+  }
+}
 
 /** Wait for a child-created synchronization file without racing its startup. */
 async function waitForFile(path: string): Promise<void> {
@@ -497,6 +726,41 @@ describe('invokeAgentProcess — adversarial', () => {
       }
     }
   });
+
+  it('contains an asynchronous spawn failure when child hardening throws', async () => {
+    const probe = await runIsolatedProbe('primary');
+
+    // The hardening failure is real, not a probe that quietly succeeded.
+    expect(probe.stdout).toContain('REJECTED=');
+    expect(probe.stdout).toContain('Cannot redefine property');
+    // The queued ENOENT never became an unhandled EventEmitter error.
+    expect(probe.stderr).not.toContain("Unhandled 'error' event");
+    expect(probe.stdout).toContain('SURVIVED');
+    expect(probe.code).toBe(0);
+  }, 30_000);
+
+  onWindows('contains an asynchronous helper failure when helper hardening throws', async () => {
+    const probe = await runIsolatedProbe('helper');
+
+    // The helper really was spawned and its hardening really would have thrown.
+    expect(probe.stdout).toMatch(/HELPER_COUNT=[1-9]/);
+    expect(probe.stdout).toContain('HELPER_HARDENING_WOULD_THROW=true');
+    // Termination stayed bounded and the host survived taskkill's own ENOENT.
+    expect(probe.stdout).toContain('RESOLVED=TIMED_OUT');
+    expect(probe.stderr).not.toContain("Unhandled 'error' event");
+    expect(probe.stdout).toContain('SURVIVED');
+    expect(probe.code).toBe(0);
+  }, 30_000);
+
+  it('still reports an ordinary asynchronous spawn failure as SPAWN_FAILED', async () => {
+    const probe = await runIsolatedProbe('control');
+
+    expect(probe.stdout).toContain('RESOLVED=SPAWN_FAILED');
+    expect(probe.stdout).toContain('scope=NOT_REQUIRED');
+    expect(probe.stderr).not.toContain("Unhandled 'error' event");
+    expect(probe.stdout).toContain('SURVIVED');
+    expect(probe.code).toBe(0);
+  }, 30_000);
 
   it('reaps best effort without masking a failure or leaking the directory', async () => {
     // A child terminated before its exit handler runs never writes the file,

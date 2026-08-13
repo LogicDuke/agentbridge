@@ -176,6 +176,26 @@ function onReadableData(readable: Readable, listener: (chunk: unknown) => void):
   reflectApply(readableOn, readable, ['data', listener]);
 }
 
+/**
+ * Absorb an asynchronous spawn failure so it can never go unhandled.
+ *
+ * `spawn` can return a ChildProcess whose failure is reported later through an
+ * `error` event — ENOENT is the common case — and an `error` with no listener
+ * makes EventEmitter rethrow, which terminates the host process rather than
+ * this exchange. From the moment `spawn` returns there must therefore always be
+ * at least one `error` listener, including while dispatch hardening runs and on
+ * every path that fails it. Presence is the whole guarantee: the outcome is
+ * still decided by the transport's own handlers, so this one does nothing.
+ */
+function absorbSpawnFailure(): void {
+  // Intentionally empty; see the doc comment.
+}
+
+/** Keep a spawned process covered after its listeners have been cleared. */
+function rearmSpawnFailureAbsorber(child: ChildProcess): void {
+  onEvent(child, 'error', absorbSpawnFailure);
+}
+
 /** Release a child output pipe through the intrinsic captured at module load. */
 function destroyReadable(readable: Readable | null): void {
   if (readable !== null) {
@@ -366,6 +386,9 @@ async function reapUnprotectedHelper(child: ChildProcess): Promise<void> {
   killDirectChild(child);
   await waitForExit(child, TASKKILL_TIMEOUT_MS);
   removeAllEvents(child);
+  // Clearing the listeners also cleared the absorber, and this helper's own
+  // spawn failure may still be queued, so cover the handle again.
+  rearmSpawnFailureAbsorber(child);
 }
 
 /**
@@ -426,6 +449,9 @@ function runTaskkill(
       resolve(false);
       return;
     }
+    // Before anything else can throw: taskkill's own failure to start arrives
+    // asynchronously, and hardening runs before this helper's error handler.
+    rearmSpawnFailureAbsorber(killer);
     try {
       protectChildDispatch(killer);
     } catch {
@@ -676,6 +702,10 @@ export function invokeAgentProcess(
       resolve(unspawnedExchange(TRANSPORT_OUTCOME.SPAWN_FAILED, null));
       return;
     }
+    // Before anything else can throw: an asynchronous spawn failure is already
+    // queued by now, and the real handler below is not installed until hardening
+    // has succeeded.
+    rearmSpawnFailureAbsorber(child);
     try {
       protectChildDispatch(child);
     } catch (error: unknown) {
@@ -686,6 +716,9 @@ export function invokeAgentProcess(
         destroyReadable(child.stdout);
         destroyReadable(child.stderr);
         removeAllEvents(child);
+        // Clearing the listeners also cleared the absorber; the child's own
+        // spawn failure may still be queued, so cover the handle again.
+        rearmSpawnFailureAbsorber(child);
         reject(
           error instanceof Error
             ? error
