@@ -361,6 +361,13 @@ function waitForExit(child: ChildProcess, ms: number): Promise<boolean> {
   });
 }
 
+/** Kill and reap a helper whose post-spawn dispatch hardening failed. */
+async function reapUnprotectedHelper(child: ChildProcess): Promise<void> {
+  killDirectChild(child);
+  await waitForExit(child, TASKKILL_TIMEOUT_MS);
+  removeAllEvents(child);
+}
+
 /**
  * Locate `taskkill.exe` from the Windows system directory.
  *
@@ -415,9 +422,16 @@ function runTaskkill(
         windowsVerbatimArguments: false,
         env: { SystemRoot: taskkill.systemRoot },
       });
-      protectChildDispatch(killer);
     } catch {
       resolve(false);
+      return;
+    }
+    try {
+      protectChildDispatch(killer);
+    } catch {
+      void reapUnprotectedHelper(killer).then(() => {
+        resolve(false);
+      });
       return;
     }
 
@@ -640,7 +654,7 @@ export function invokeAgentProcess(
     }
   }
 
-  return new NativePromise<AgentExchange>((resolve) => {
+  return new NativePromise<AgentExchange>((resolve, reject) => {
     let child: ChildProcess;
     try {
       child = spawn(invocation.executablePath, invocation.args, {
@@ -655,12 +669,29 @@ export function invokeAgentProcess(
         // allocate a new console instead, which does not help termination.
         detached: platform === 'posix',
       });
-      protectChildDispatch(child);
     } catch {
       if (invocation.signal !== null) {
         removeAbortListener(invocation.signal, onAbort);
       }
       resolve(unspawnedExchange(TRANSPORT_OUTCOME.SPAWN_FAILED, null));
+      return;
+    }
+    try {
+      protectChildDispatch(child);
+    } catch (error: unknown) {
+      if (invocation.signal !== null) {
+        removeAbortListener(invocation.signal, onAbort);
+      }
+      void terminate(child, platform, invocation.graceMs).then(() => {
+        destroyReadable(child.stdout);
+        destroyReadable(child.stderr);
+        removeAllEvents(child);
+        reject(
+          error instanceof Error
+            ? error
+            : new Error('Process dispatch hardening failed', { cause: error }),
+        );
+      });
       return;
     }
 

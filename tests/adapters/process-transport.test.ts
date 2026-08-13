@@ -411,6 +411,72 @@ describe('invokeAgentProcess — failure', () => {
 });
 
 describe('invokeAgentProcess — adversarial', () => {
+  it('does not report post-spawn hardening failure as SPAWN_FAILED or abandon the child', async () => {
+    const missing = await invokeAgentProcess(
+      makeSpec({ executablePath: join(process.cwd(), 'missing-agentbridge-executable') }),
+      makeLimits(),
+    );
+    expect(missing.outcome).toBe('SPAWN_FAILED');
+
+    const descriptor = Object.getOwnPropertyDescriptor(Object, 'defineProperty');
+    const originalDefine: unknown = descriptor?.value;
+    if (typeof originalDefine !== 'function') {
+      throw new Error('Object.defineProperty intrinsic unavailable');
+    }
+    const spawned: { child: ChildProcess | null } = { child: null };
+    let failed = false;
+    Object.defineProperty(Object, 'defineProperty', {
+      configurable: true,
+      writable: true,
+      value(target: object, key: PropertyKey, value: PropertyDescriptor): object {
+        if (key === 'emit' && target instanceof ChildProcess) {
+          spawned.child = target;
+        } else if (key === 'emit' && spawned.child !== null && !failed) {
+          failed = true;
+          throw new Error('forced post-spawn hardening failure');
+        }
+        return Reflect.apply(originalDefine, Object, [target, key, value]) as object;
+      },
+    });
+    let isolated: typeof import('../../src/adapters/process-transport.js');
+    try {
+      vi.resetModules();
+      isolated = await import('../../src/adapters/process-transport.js');
+    } finally {
+      if (descriptor !== undefined) {
+        Object.defineProperty(Object, 'defineProperty', descriptor);
+      }
+    }
+
+    try {
+      await expect(
+        isolated.invokeAgentProcess(
+          makeSpec({ args: ['-e', 'setInterval(()=>{},1000);'] }),
+          makeLimits({ timeoutMs: 15_000, graceMs: 200 }),
+        ),
+      ).rejects.toThrow('forced post-spawn hardening failure');
+
+      expect(failed).toBe(true);
+      const terminalChild = spawned.child;
+      expect(terminalChild).not.toBeNull();
+      if (terminalChild === null) {
+        throw new Error('spawned child was not captured');
+      }
+      expect(
+        terminalChild.exitCode !== null || terminalChild.signalCode !== null,
+      ).toBe(true);
+    } finally {
+      const child = spawned.child;
+      if (child?.pid !== undefined && child.exitCode === null && child.signalCode === null) {
+        try {
+          process.kill(child.pid, 'SIGKILL');
+        } catch {
+          // The repair may have reaped the child between the check and cleanup.
+        }
+      }
+    }
+  });
+
   it('ignores a prototype poison that fabricates close from spawn', async () => {
     const descriptor = Object.getOwnPropertyDescriptor(EventEmitter.prototype, 'emit');
     const originalEmit: unknown = descriptor?.value;
