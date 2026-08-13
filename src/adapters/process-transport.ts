@@ -95,6 +95,7 @@ const stringCharCodeAt = String.prototype.charCodeAt;
 const numberToString = Number.prototype.toString;
 const eventTargetAddEventListener = EventTarget.prototype.addEventListener;
 const eventTargetRemoveEventListener = EventTarget.prototype.removeEventListener;
+const eventEmitterEmit = EventEmitter.prototype.emit;
 const eventEmitterOn = EventEmitter.prototype.on;
 const eventEmitterRemoveListener = EventEmitter.prototype.removeListener;
 const eventEmitterRemoveAllListeners = EventEmitter.prototype.removeAllListeners;
@@ -114,6 +115,35 @@ const abortSignalAborted: ((this: AbortSignal) => boolean) | undefined =
  * large one, and cannot make it unreliable by supplying zero.
  */
 const TASKKILL_TIMEOUT_MS = 5_000;
+
+/**
+ * Keep Node's own lifecycle dispatch on the intrinsic captured at module load.
+ *
+ * ChildProcess and its stdio streams inherit EventEmitter.prototype.emit; Node
+ * does not provide a more-specific override for any of them. Giving each
+ * transport-owned object an immutable own data property therefore preserves
+ * Node's normal dispatch while preventing a later prototype replacement from
+ * fabricating, suppressing, or reordering its lifecycle events.
+ */
+function protectEventDispatch(emitter: EventEmitter | null): void {
+  if (emitter === null) {
+    return;
+  }
+  objectDefineProperty(emitter, 'emit', {
+    configurable: false,
+    enumerable: false,
+    value: eventEmitterEmit,
+    writable: false,
+  });
+}
+
+/** Protect a spawned process and every transport-owned pipe it exposes. */
+function protectChildDispatch(child: ChildProcess): void {
+  protectEventDispatch(child);
+  protectEventDispatch(child.stdin);
+  protectEventDispatch(child.stdout);
+  protectEventDispatch(child.stderr);
+}
 
 function resolved<T>(value: T): Promise<T> {
   return new NativePromise<T>((resolve) => {
@@ -385,6 +415,7 @@ function runTaskkill(
         windowsVerbatimArguments: false,
         env: { SystemRoot: taskkill.systemRoot },
       });
+      protectChildDispatch(killer);
     } catch {
       resolve(false);
       return;
@@ -624,6 +655,7 @@ export function invokeAgentProcess(
         // allocate a new console instead, which does not help termination.
         detached: platform === 'posix',
       });
+      protectChildDispatch(child);
     } catch {
       if (invocation.signal !== null) {
         removeAbortListener(invocation.signal, onAbort);

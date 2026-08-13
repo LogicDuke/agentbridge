@@ -1,6 +1,6 @@
 import { ChildProcess } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { readdirSync, existsSync, readFileSync, statSync } from 'node:fs';
+import { readdirSync, existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { describe, expect, it, vi } from 'vitest';
@@ -30,41 +30,56 @@ import {
 
 const onPosix = it.skipIf(process.platform === 'win32');
 
-/** Observe the next direct child without changing the transport's spawn seam. */
-function observeNextChild(): {
+/** Wait for a child-created synchronization file without racing its startup. */
+async function waitForFile(path: string): Promise<void> {
+  for (let attempts = 0; attempts < 500; attempts += 1) {
+    if (existsSync(path)) {
+      return;
+    }
+    await delay(10);
+  }
+  throw new Error(`Timed out waiting for child synchronization file: ${path}`);
+}
+
+/** Import a transport whose captured listener intrinsic reports its next child. */
+async function importWithChildObserver(): Promise<{
   readonly child: Promise<ChildProcess>;
-  readonly restore: () => void;
-} {
-  const descriptor = Object.getOwnPropertyDescriptor(EventEmitter.prototype, 'emit');
-  const originalEmit: unknown = descriptor?.value;
-  if (typeof originalEmit !== 'function') {
-    throw new Error('ChildProcess.emit intrinsic unavailable');
+  readonly invoke: typeof invokeAgentProcess;
+}> {
+  const descriptor = Object.getOwnPropertyDescriptor(EventEmitter.prototype, 'on');
+  const originalOn: unknown = descriptor?.value;
+  if (typeof originalOn !== 'function') {
+    throw new Error('EventEmitter.on intrinsic unavailable');
   }
   let observe: ((child: ChildProcess) => void) | null = null;
   const child = new Promise<ChildProcess>((resolve) => {
     observe = resolve;
   });
-  Object.defineProperty(EventEmitter.prototype, 'emit', {
+  Object.defineProperty(EventEmitter.prototype, 'on', {
     configurable: true,
     writable: true,
-    value(this: EventEmitter, event: string | symbol, ...args: unknown[]): boolean {
-      if (event === 'spawn' && observe !== null && this instanceof ChildProcess) {
+    value(
+      this: EventEmitter,
+      event: string | symbol,
+      listener: (...args: unknown[]) => void,
+    ): EventEmitter {
+      if (observe !== null && this instanceof ChildProcess) {
         const resolve = observe;
         observe = null;
         resolve(this);
       }
-      const emitted: unknown = Reflect.apply(originalEmit, this, [event, ...args]);
-      return emitted === true;
+      return Reflect.apply(originalOn, this, [event, listener]) as EventEmitter;
     },
   });
-  return {
-    child,
-    restore(): void {
-      if (descriptor !== undefined) {
-        Object.defineProperty(EventEmitter.prototype, 'emit', descriptor);
-      }
-    },
-  };
+  try {
+    vi.resetModules();
+    const isolated = await import('../../src/adapters/process-transport.js');
+    return { child, invoke: isolated.invokeAgentProcess };
+  } finally {
+    if (descriptor !== undefined) {
+      Object.defineProperty(EventEmitter.prototype, 'on', descriptor);
+    }
+  }
 }
 
 /** Run a stub script with optional extra arguments. */
@@ -371,23 +386,16 @@ describe('invokeAgentProcess — failure', () => {
   }, 20_000);
 
   it('destroys both inherited output pipes before forced settlement', async () => {
-    const observed = observeNextChild();
-    try {
-      const pending = runStub(
-        STUB.LEAK_STDIO_THEN_EXIT,
-        [],
-        {},
-        makeLimits({ timeoutMs: 700, graceMs: 300 }),
-      );
-      const child = await observed.child;
-      observed.restore();
-      await pending;
+    const observed = await importWithChildObserver();
+    const pending = observed.invoke(
+      makeSpec({ args: ['-e', STUB.LEAK_STDIO_THEN_EXIT] }),
+      makeLimits({ timeoutMs: 700, graceMs: 300 }),
+    );
+    const child = await observed.child;
+    await pending;
 
-      expect(child.stdout?.destroyed).toBe(true);
-      expect(child.stderr?.destroyed).toBe(true);
-    } finally {
-      observed.restore();
-    }
+    expect(child.stdout?.destroyed).toBe(true);
+    expect(child.stderr?.destroyed).toBe(true);
   }, 20_000);
 
   it('still enforces the deadline when the child closes stdout early', async () => {
@@ -403,18 +411,137 @@ describe('invokeAgentProcess — failure', () => {
 });
 
 describe('invokeAgentProcess — adversarial', () => {
-  it('does not target a numeric identity after the child handle reports ended', async () => {
-    const observed = observeNextChild();
-    let child: ChildProcess | null = null;
+  it('ignores a prototype poison that fabricates close from spawn', async () => {
+    const descriptor = Object.getOwnPropertyDescriptor(EventEmitter.prototype, 'emit');
+    const originalEmit: unknown = descriptor?.value;
+    if (typeof originalEmit !== 'function') {
+      throw new Error('EventEmitter.emit intrinsic unavailable');
+    }
+    const directory = makeTempDirectory();
+    const ready = join(directory, 'ready');
+    const release = join(directory, 'release');
+    const exited = join(directory, 'exited');
+    let pending: Promise<AgentExchange> | null = null;
+    let poisonInvoked = false;
     try {
-      const pending = runStub(
-        STUB.SLEEP,
+      Object.defineProperty(EventEmitter.prototype, 'emit', {
+        configurable: true,
+        writable: true,
+        value(this: EventEmitter, event: string | symbol, ...args: unknown[]): boolean {
+          if (event === 'spawn' && this instanceof ChildProcess) {
+            poisonInvoked = true;
+            const emitted: unknown = Reflect.apply(originalEmit, this, ['close']);
+            return emitted === true;
+          }
+          const emitted: unknown = Reflect.apply(originalEmit, this, [event, ...args]);
+          return emitted === true;
+        },
+      });
+
+      pending = invokeAgentProcess(
+        makeSpec({
+          args: [
+            '-e',
+            'const fs=require("node:fs");' +
+              'const [ready,release,exited]=process.argv.slice(1);' +
+              'process.on("exit",()=>fs.writeFileSync(exited,"exited"));' +
+              'fs.writeFileSync(ready,"ready");' +
+              'const poll=setInterval(()=>{' +
+              'if(fs.existsSync(release)){' +
+              'clearInterval(poll);process.stdout.write("legitimate");process.exit(23);' +
+              '}},10);',
+            ready,
+            release,
+            exited,
+          ],
+        }),
+        makeLimits({ timeoutMs: 5_000, graceMs: 200 }),
+      );
+      let settled = false;
+      void pending.then(() => {
+        settled = true;
+      });
+
+      await waitForFile(ready);
+      await delay(0);
+      expect(poisonInvoked).toBe(false);
+      expect(settled).toBe(false);
+      expect(existsSync(exited)).toBe(false);
+
+      writeFileSync(release, 'release');
+      const exchange = await pending;
+
+      expect(exchange.outcome).toBe('EXITED');
+      expect(exchange.exitCode).toBe(23);
+      expect(exchange.stdout).toBe('legitimate');
+      expect(existsSync(exited)).toBe(true);
+    } finally {
+      if (descriptor !== undefined) {
+        Object.defineProperty(EventEmitter.prototype, 'emit', descriptor);
+      }
+      if (!existsSync(release)) {
+        writeFileSync(release, 'release');
+      }
+      if (pending !== null) {
+        await pending;
+      }
+      if (!existsSync(exited)) {
+        await waitForFile(exited);
+      }
+      removeTempDirectory(directory);
+    }
+  }, 15_000);
+
+  it('ignores a prototype poison that suppresses legitimate close', async () => {
+    const descriptor = Object.getOwnPropertyDescriptor(EventEmitter.prototype, 'emit');
+    const originalEmit: unknown = descriptor?.value;
+    if (typeof originalEmit !== 'function') {
+      throw new Error('EventEmitter.emit intrinsic unavailable');
+    }
+    let poisonInvoked = false;
+    let exchange: AgentExchange;
+    try {
+      Object.defineProperty(EventEmitter.prototype, 'emit', {
+        configurable: true,
+        writable: true,
+        value(this: EventEmitter, event: string | symbol, ...args: unknown[]): boolean {
+          if (event === 'close' && this instanceof ChildProcess) {
+            poisonInvoked = true;
+            return true;
+          }
+          const emitted: unknown = Reflect.apply(originalEmit, this, [event, ...args]);
+          return emitted === true;
+        },
+      });
+
+      exchange = await runStub(
+        'process.stdout.write("complete");process.exit(7);',
         [],
         {},
+        makeLimits({ timeoutMs: 500, graceMs: 100 }),
+      );
+    } finally {
+      if (descriptor !== undefined) {
+        Object.defineProperty(EventEmitter.prototype, 'emit', descriptor);
+      }
+    }
+
+    expect(poisonInvoked).toBe(false);
+    expect(exchange.outcome).toBe('EXITED');
+    expect(exchange.exitCode).toBe(7);
+    expect(exchange.stdout).toBe('complete');
+    expect(exchange.terminationScope).toBe('NOT_REQUIRED');
+  });
+
+  it('does not target a numeric identity after the child handle reports ended', async () => {
+    const observed = await importWithChildObserver();
+    let child: ChildProcess | null = null;
+    try {
+      const pending = observed.invoke(
+        makeSpec({ args: ['-e', STUB.SLEEP] }),
         makeLimits({ timeoutMs: 300, graceMs: 50 }),
       );
       child = await observed.child;
-      observed.restore();
       Object.defineProperty(child, 'exitCode', {
         configurable: true,
         writable: true,
@@ -426,7 +553,6 @@ describe('invokeAgentProcess — adversarial', () => {
       expect(exchange.outcome).toBe('TIMED_OUT');
       expect(exchange.terminationScope).toBe('DIRECT_CHILD_ONLY');
     } finally {
-      observed.restore();
       if (child?.pid !== undefined) {
         try {
           process.kill(child.pid, 'SIGKILL');
@@ -466,17 +592,15 @@ describe('invokeAgentProcess — adversarial', () => {
           return killed === true;
         },
       });
-      vi.resetModules();
+      const observed = await importWithChildObserver();
       // The isolated module captures the patched process.kill during initialization;
       // restore the global function before invoking through that captured reference.
-      const isolated = await import('../../src/adapters/process-transport.js');
       if (killDescriptor !== undefined) {
         Object.defineProperty(process, 'kill', killDescriptor);
       }
 
-      const observed = observeNextChild();
       try {
-        const pending = isolated.invokeAgentProcess(
+        const pending = observed.invoke(
           makeSpec({
             args: [
               '-e',
@@ -487,13 +611,11 @@ describe('invokeAgentProcess — adversarial', () => {
           makeLimits({ timeoutMs: 15_000, graceMs: 50, maxStdoutBytes: 1_024 }),
         );
         trackedChild = await observed.child;
-        observed.restore();
         const exchange = await pending;
 
         expect(exchange.outcome).toBe('OUTPUT_LIMIT_EXCEEDED');
         expect(signals).toEqual(['SIGTERM']);
       } finally {
-        observed.restore();
         if (trackedChild?.pid !== undefined) {
           try {
             Reflect.apply(originalKill, process, [trackedChild.pid, 'SIGKILL']);
@@ -516,28 +638,29 @@ describe('invokeAgentProcess — adversarial', () => {
     _name,
     streamIndex,
   ) => {
-    const observed = observeNextChild();
-    try {
-      const pending = runStub(
-        'process.stdout.write("out");process.stderr.write("err");' +
-          'setTimeout(()=>{process.exit(0);},100);',
-      );
-      const child = await observed.child;
-      observed.restore();
-      const stream = child.stdio[streamIndex];
-      expect(stream).not.toBeNull();
-      if (stream !== null) {
-        stream.emit('error', new Error(`injected-${_name}-failure`));
-      }
-      const exchange = await pending;
-
-      expect(exchange.outcome).toBe('EXITED');
-      expect(exchange.stdout).toBe('out');
-      expect(exchange.stderr).toBe('err');
-      expect(Object.isFrozen(exchange)).toBe(true);
-    } finally {
-      observed.restore();
+    const observed = await importWithChildObserver();
+    const pending = observed.invoke(
+      makeSpec({
+        args: [
+          '-e',
+          'process.stdout.write("out");process.stderr.write("err");' +
+            'setTimeout(()=>{process.exit(0);},100);',
+        ],
+      }),
+      makeLimits(),
+    );
+    const child = await observed.child;
+    const stream = child.stdio[streamIndex];
+    expect(stream).not.toBeNull();
+    if (stream !== null) {
+      stream.emit('error', new Error(`injected-${_name}-failure`));
     }
+    const exchange = await pending;
+
+    expect(exchange.outcome).toBe('EXITED');
+    expect(exchange.stdout).toBe('out');
+    expect(exchange.stderr).toBe('err');
+    expect(Object.isFrozen(exchange)).toBe(true);
   });
 
   it('promotes an asynchronous spawn failure above cancellation', async () => {
