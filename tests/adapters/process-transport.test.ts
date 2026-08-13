@@ -41,6 +41,27 @@ async function waitForFile(path: string): Promise<void> {
   throw new Error(`Timed out waiting for child synchronization file: ${path}`);
 }
 
+/**
+ * Wait for a child to be reaped, then remove its directory unconditionally.
+ *
+ * The wait keeps a force-killed child from outliving the test, but it is only
+ * best effort: a child that is terminated before its exit handler runs never
+ * writes the file. Letting that timeout escape would replace the assertion
+ * actually under audit and strand the temporary directory on disk, so the
+ * failure is contained here and cleanup always runs.
+ */
+async function reapThenRemove(exited: string, directory: string): Promise<void> {
+  try {
+    if (!existsSync(exited)) {
+      await waitForFile(exited);
+    }
+  } catch {
+    // Best-effort only; the failure under test must remain the surfaced one.
+  } finally {
+    removeTempDirectory(directory);
+  }
+}
+
 /** Import a transport whose captured listener intrinsic reports its next child. */
 async function importWithChildObserver(): Promise<{
   readonly child: Promise<ChildProcess>;
@@ -477,6 +498,42 @@ describe('invokeAgentProcess — adversarial', () => {
     }
   });
 
+  it('reaps best effort without masking a failure or leaking the directory', async () => {
+    // A child terminated before its exit handler runs never writes the file,
+    // so the wait times out. The assertion under audit must still be the one
+    // that surfaces, and the directory must not survive the failure.
+    const stranded = makeTempDirectory();
+    const neverWritten = join(stranded, 'exited');
+    const underAudit = new Error('assertion under audit');
+    await expect(
+      (async () => {
+        try {
+          throw underAudit;
+        } finally {
+          await reapThenRemove(neverWritten, stranded);
+        }
+      })(),
+    ).rejects.toBe(underAudit);
+    expect(existsSync(stranded)).toBe(false);
+
+    // The wait itself is still performed: a file that lands late is observed
+    // before cleanup returns, so containing the timeout did not disable it.
+    const reaped = makeTempDirectory();
+    const late = join(reaped, 'exited');
+    let written = false;
+    const writer = setTimeout(() => {
+      written = true;
+      writeFileSync(late, 'exited');
+    }, 100);
+    try {
+      await reapThenRemove(late, reaped);
+    } finally {
+      clearTimeout(writer);
+    }
+    expect(written).toBe(true);
+    expect(existsSync(reaped)).toBe(false);
+  }, 20_000);
+
   it('ignores a prototype poison that fabricates close from spawn', async () => {
     const descriptor = Object.getOwnPropertyDescriptor(EventEmitter.prototype, 'emit');
     const originalEmit: unknown = descriptor?.value;
@@ -551,10 +608,7 @@ describe('invokeAgentProcess — adversarial', () => {
       if (pending !== null) {
         await pending;
       }
-      if (!existsSync(exited)) {
-        await waitForFile(exited);
-      }
-      removeTempDirectory(directory);
+      await reapThenRemove(exited, directory);
     }
   }, 15_000);
 
