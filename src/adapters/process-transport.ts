@@ -95,6 +95,7 @@ const stringCharCodeAt = String.prototype.charCodeAt;
 const numberToString = Number.prototype.toString;
 const eventTargetAddEventListener = EventTarget.prototype.addEventListener;
 const eventTargetRemoveEventListener = EventTarget.prototype.removeEventListener;
+const eventEmitterEmit = EventEmitter.prototype.emit;
 const eventEmitterOn = EventEmitter.prototype.on;
 const eventEmitterRemoveListener = EventEmitter.prototype.removeListener;
 const eventEmitterRemoveAllListeners = EventEmitter.prototype.removeAllListeners;
@@ -114,6 +115,35 @@ const abortSignalAborted: ((this: AbortSignal) => boolean) | undefined =
  * large one, and cannot make it unreliable by supplying zero.
  */
 const TASKKILL_TIMEOUT_MS = 5_000;
+
+/**
+ * Keep Node's own lifecycle dispatch on the intrinsic captured at module load.
+ *
+ * ChildProcess and its stdio streams inherit EventEmitter.prototype.emit; Node
+ * does not provide a more-specific override for any of them. Giving each
+ * transport-owned object an immutable own data property therefore preserves
+ * Node's normal dispatch while preventing a later prototype replacement from
+ * fabricating, suppressing, or reordering its lifecycle events.
+ */
+function protectEventDispatch(emitter: EventEmitter | null): void {
+  if (emitter === null) {
+    return;
+  }
+  objectDefineProperty(emitter, 'emit', {
+    configurable: false,
+    enumerable: false,
+    value: eventEmitterEmit,
+    writable: false,
+  });
+}
+
+/** Protect a spawned process and every transport-owned pipe it exposes. */
+function protectChildDispatch(child: ChildProcess): void {
+  protectEventDispatch(child);
+  protectEventDispatch(child.stdin);
+  protectEventDispatch(child.stdout);
+  protectEventDispatch(child.stderr);
+}
 
 function resolved<T>(value: T): Promise<T> {
   return new NativePromise<T>((resolve) => {
@@ -144,6 +174,26 @@ function removeAllEvents(emitter: EventEmitter): void {
 function onReadableData(readable: Readable, listener: (chunk: unknown) => void): void {
   // Readable overrides EventEmitter.on to enter flowing mode for `data`.
   reflectApply(readableOn, readable, ['data', listener]);
+}
+
+/**
+ * Absorb an asynchronous spawn failure so it can never go unhandled.
+ *
+ * `spawn` can return a ChildProcess whose failure is reported later through an
+ * `error` event — ENOENT is the common case — and an `error` with no listener
+ * makes EventEmitter rethrow, which terminates the host process rather than
+ * this exchange. From the moment `spawn` returns there must therefore always be
+ * at least one `error` listener, including while dispatch hardening runs and on
+ * every path that fails it. Presence is the whole guarantee: the outcome is
+ * still decided by the transport's own handlers, so this one does nothing.
+ */
+function absorbSpawnFailure(): void {
+  // Intentionally empty; see the doc comment.
+}
+
+/** Keep a spawned process covered after its listeners have been cleared. */
+function rearmSpawnFailureAbsorber(child: ChildProcess): void {
+  onEvent(child, 'error', absorbSpawnFailure);
 }
 
 /** Release a child output pipe through the intrinsic captured at module load. */
@@ -331,6 +381,16 @@ function waitForExit(child: ChildProcess, ms: number): Promise<boolean> {
   });
 }
 
+/** Kill and reap a helper whose post-spawn dispatch hardening failed. */
+async function reapUnprotectedHelper(child: ChildProcess): Promise<void> {
+  killDirectChild(child);
+  await waitForExit(child, TASKKILL_TIMEOUT_MS);
+  removeAllEvents(child);
+  // Clearing the listeners also cleared the absorber, and this helper's own
+  // spawn failure may still be queued, so cover the handle again.
+  rearmSpawnFailureAbsorber(child);
+}
+
 /**
  * Locate `taskkill.exe` from the Windows system directory.
  *
@@ -387,6 +447,17 @@ function runTaskkill(
       });
     } catch {
       resolve(false);
+      return;
+    }
+    // Before anything else can throw: taskkill's own failure to start arrives
+    // asynchronously, and hardening runs before this helper's error handler.
+    rearmSpawnFailureAbsorber(killer);
+    try {
+      protectChildDispatch(killer);
+    } catch {
+      void reapUnprotectedHelper(killer).then(() => {
+        resolve(false);
+      });
       return;
     }
 
@@ -609,7 +680,7 @@ export function invokeAgentProcess(
     }
   }
 
-  return new NativePromise<AgentExchange>((resolve) => {
+  return new NativePromise<AgentExchange>((resolve, reject) => {
     let child: ChildProcess;
     try {
       child = spawn(invocation.executablePath, invocation.args, {
@@ -629,6 +700,31 @@ export function invokeAgentProcess(
         removeAbortListener(invocation.signal, onAbort);
       }
       resolve(unspawnedExchange(TRANSPORT_OUTCOME.SPAWN_FAILED, null));
+      return;
+    }
+    // Before anything else can throw: an asynchronous spawn failure is already
+    // queued by now, and the real handler below is not installed until hardening
+    // has succeeded.
+    rearmSpawnFailureAbsorber(child);
+    try {
+      protectChildDispatch(child);
+    } catch (error: unknown) {
+      if (invocation.signal !== null) {
+        removeAbortListener(invocation.signal, onAbort);
+      }
+      void terminate(child, platform, invocation.graceMs).then(() => {
+        destroyReadable(child.stdout);
+        destroyReadable(child.stderr);
+        removeAllEvents(child);
+        // Clearing the listeners also cleared the absorber; the child's own
+        // spawn failure may still be queued, so cover the handle again.
+        rearmSpawnFailureAbsorber(child);
+        reject(
+          error instanceof Error
+            ? error
+            : new Error('Process dispatch hardening failed', { cause: error }),
+        );
+      });
       return;
     }
 

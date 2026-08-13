@@ -1,7 +1,17 @@
-import { ChildProcess } from 'node:child_process';
+import { ChildProcess, spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { readdirSync, existsSync, readFileSync, statSync } from 'node:fs';
+import {
+  readdirSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import { describe, expect, it, vi } from 'vitest';
 
@@ -29,42 +39,329 @@ import {
 } from './transport-fixtures.js';
 
 const onPosix = it.skipIf(process.platform === 'win32');
+const onWindows = it.skipIf(process.platform !== 'win32');
 
-/** Observe the next direct child without changing the transport's spawn seam. */
-function observeNextChild(): {
+/** The transport source an isolated probe loads, relative to this test file. */
+const TRANSPORT_SOURCE_URL = new URL(
+  '../../src/adapters/process-transport.ts',
+  import.meta.url,
+).href;
+
+/**
+ * Let a probe subprocess run the TypeScript sources directly.
+ *
+ * Node strips types but does not rewrite a `./x.js` specifier to `./x.ts`, so
+ * the probe registers this resolver before importing the transport.
+ */
+const PROBE_HOOK = `
+import { registerHooks } from 'node:module';
+import { existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+
+registerHooks({
+  resolve(specifier, context, nextResolve) {
+    if (specifier.startsWith('.') && specifier.endsWith('.js') && context.parentURL !== undefined) {
+      const candidate = new URL(specifier.slice(0, -3) + '.ts', context.parentURL);
+      if (existsSync(fileURLToPath(candidate))) {
+        return { url: candidate.href, shortCircuit: true };
+      }
+    }
+    return nextResolve(specifier, context);
+  },
+});
+`;
+
+/**
+ * One exchange under a forced post-spawn hardening failure.
+ *
+ * An unhandled child \`error\` terminates its whole process, so this runs in a
+ * subprocess: the vitest worker survives to report the failure either way, and
+ * the exit code is the evidence. Hardening is forced to throw without replacing
+ * \`emit\` or disturbing Node's internals, so the asynchronous spawn failure
+ * behaves exactly as it would in production.
+ */
+const PROBE_SCRIPT = `
+import { ChildProcess } from 'node:child_process';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+const [transportUrl, mode, scratchPrefix] = process.argv.slice(2);
+const realSystemRoot = process.env.SystemRoot;
+const { invokeAgentProcess } = await import(transportUrl);
+
+// Every directory this probe creates, so none outlives the probe.
+const scratch = [];
+function scratchDirectory(prefix) {
+  const created = mkdtempSync(join(tmpdir(), prefix));
+  scratch.push(created);
+  return created;
+}
+function removeScratch() {
+  while (scratch.length > 0) {
+    rmSync(scratch.pop(), { recursive: true, force: true });
+  }
+}
+// Backstop for abrupt termination: an unhandled asynchronous error would end
+// the probe without unwinding the try/finally below, and exit listeners still
+// run in that case. Bounded to the directories recorded above, never a sweep.
+process.on('exit', removeScratch);
+
+function environment() {
+  const env = {};
+  for (const name of ['HOMEDRIVE', 'HOMEPATH', 'LOGONSERVER', 'PATH', 'SYSTEMDRIVE',
+    'SYSTEMROOT', 'TEMP', 'USERDOMAIN', 'USERNAME', 'USERPROFILE', 'WINDIR']) {
+    env[name] = '';
+  }
+  if (realSystemRoot !== undefined) {
+    env.SYSTEMROOT = realSystemRoot;
+  }
+  return env;
+}
+
+const limits = { timeoutMs: 5000, graceMs: 200, maxStdoutBytes: 65536, maxStderrBytes: 16384 };
+let spec;
+
+if (mode === 'helper') {
+  // Point taskkill resolution at a directory that holds no taskkill executable,
+  // so the helper spawn reports ENOENT asynchronously.
+  process.env.SystemRoot = scratchDirectory(scratchPrefix + 'fakeroot-');
+  let helpers = 0;
+  let wouldThrow = false;
+  const realSpawnMethod = ChildProcess.prototype.spawn;
+  ChildProcess.prototype.spawn = function patched(...args) {
+    const result = Reflect.apply(realSpawnMethod, this, args);
+    // Only the stdio 'ignore' helper has no pipes at all.
+    if (this.stdin === null && this.stdout === null && this.stderr === null) {
+      helpers += 1;
+      Object.preventExtensions(this);
+      try {
+        Object.defineProperty(this, 'emit', {
+          configurable: false, enumerable: false, writable: false,
+          value() { return false; },
+        });
+      } catch {
+        // Proves the transport's own hardening must throw for this helper,
+        // while leaving the genuine emit intrinsic in place.
+        wouldThrow = true;
+      }
+    }
+    return result;
+  };
+  process.on('exit', () => {
+    console.log('HELPER_COUNT=' + helpers);
+    console.log('HELPER_HARDENING_WOULD_THROW=' + wouldThrow);
+  });
+  spec = {
+    executablePath: process.execPath,
+    args: ['-e', 'process.on("SIGTERM",()=>{});setInterval(()=>{},1000);'],
+    workingDirectory: tmpdir(),
+    environment: environment(),
+    stdin: '',
+  };
+  limits.timeoutMs = 400;
+} else {
+  if (mode === 'primary') {
+    // Keep Node's real Sockets, but pre-claim emit with a conflicting
+    // non-configurable value so dispatch hardening must throw.
+    const stash = new WeakMap();
+    function decoy() { return false; }
+    for (const key of ['stdin', 'stdout', 'stderr']) {
+      Object.defineProperty(ChildProcess.prototype, key, {
+        configurable: true,
+        get() {
+          const slot = stash.get(this);
+          return slot === undefined ? null : (slot[key] ?? null);
+        },
+        set(value) {
+          let slot = stash.get(this);
+          if (slot === undefined) {
+            slot = {};
+            stash.set(this, slot);
+          }
+          if (key === 'stderr' && value !== null && typeof value === 'object') {
+            try {
+              Object.defineProperty(value, 'emit', {
+                configurable: false, enumerable: false, writable: false, value: decoy,
+              });
+            } catch {
+              // Already claimed; the conflict is what matters.
+            }
+          }
+          slot[key] = value;
+        },
+      });
+    }
+  }
+  const missing = join(scratchDirectory(scratchPrefix + 'missing-'), 'no-such-binary');
+  spec = {
+    executablePath: missing,
+    args: [],
+    workingDirectory: tmpdir(),
+    environment: environment(),
+    stdin: '',
+  };
+}
+
+try {
+  try {
+    const exchange = await invokeAgentProcess(spec, limits);
+    console.log('RESOLVED=' + exchange.outcome + ' scope=' + exchange.terminationScope);
+  } catch (error) {
+    console.log('REJECTED=' + (error && error.message));
+  }
+
+  // Give any queued asynchronous spawn failure time to surface before exiting.
+  await new Promise((resolve) => setTimeout(resolve, 1500));
+  console.log('SURVIVED');
+} finally {
+  // process.exit skips finally blocks, so clean up before reaching it.
+  removeScratch();
+}
+process.exit(0);
+`;
+
+interface ProbeResult {
+  readonly code: number | null;
+  readonly stdout: string;
+  readonly stderr: string;
+}
+
+let probeRuns = 0;
+
+/**
+ * A scratch namespace owned by exactly one probe run.
+ *
+ * The system temp directory is shared, so a concurrent test run — vitest runs
+ * files in parallel, and a second `vitest run` can overlap this one entirely —
+ * would otherwise add to or remove from the same namespace and make the leak
+ * assertion below both falsely fail and falsely pass. The process id separates
+ * concurrent runners; the counter separates invocations within one runner.
+ */
+function nextProbePrefix(): string {
+  probeRuns += 1;
+  return `probe-${String(process.pid)}-${String(probeRuns)}-`;
+}
+
+/** Count the scratch directories owned by one probe run, and no others. */
+function probeScratchCount(prefix: string): number {
+  return readdirSync(tmpdir()).filter((entry) => entry.startsWith(prefix)).length;
+}
+
+/** Run one probe mode in its own process so a host crash cannot kill vitest. */
+async function runIsolatedProbe(mode: string): Promise<ProbeResult> {
+  const directory = makeTempDirectory();
+  const scratchPrefix = nextProbePrefix();
+  const scratchBefore = probeScratchCount(scratchPrefix);
+  try {
+    const hook = join(directory, 'hook.mjs');
+    const script = join(directory, 'probe.mjs');
+    writeFileSync(hook, PROBE_HOOK);
+    writeFileSync(script, PROBE_SCRIPT);
+    const result = await new Promise<ProbeResult>((resolve) => {
+      const probe = spawn(
+        process.execPath,
+        [
+          '--import',
+          pathToFileURL(hook).href,
+          script,
+          TRANSPORT_SOURCE_URL,
+          mode,
+          scratchPrefix,
+        ],
+        { stdio: ['ignore', 'pipe', 'pipe'] },
+      );
+      let stdout = '';
+      let stderr = '';
+      probe.stdout.on('data', (chunk: Buffer) => {
+        stdout += chunk.toString('utf8');
+      });
+      probe.stderr.on('data', (chunk: Buffer) => {
+        stderr += chunk.toString('utf8');
+      });
+      probe.on('close', (code: number | null) => {
+        resolve({ code, stdout, stderr });
+      });
+    });
+    // The probe owns every directory it creates and must leave none behind.
+    expect(probeScratchCount(scratchPrefix)).toBe(scratchBefore);
+    return result;
+  } finally {
+    removeTempDirectory(directory);
+  }
+}
+
+/** Wait for a child-created synchronization file without racing its startup. */
+async function waitForFile(path: string): Promise<void> {
+  for (let attempts = 0; attempts < 500; attempts += 1) {
+    if (existsSync(path)) {
+      return;
+    }
+    await delay(10);
+  }
+  throw new Error(`Timed out waiting for child synchronization file: ${path}`);
+}
+
+/**
+ * Wait for a child to be reaped, then remove its directory unconditionally.
+ *
+ * The wait keeps a force-killed child from outliving the test, but it is only
+ * best effort: a child that is terminated before its exit handler runs never
+ * writes the file. Letting that timeout escape would replace the assertion
+ * actually under audit and strand the temporary directory on disk, so the
+ * failure is contained here and cleanup always runs.
+ */
+async function reapThenRemove(exited: string, directory: string): Promise<void> {
+  try {
+    if (!existsSync(exited)) {
+      await waitForFile(exited);
+    }
+  } catch {
+    // Best-effort only; the failure under test must remain the surfaced one.
+  } finally {
+    removeTempDirectory(directory);
+  }
+}
+
+/** Import a transport whose captured listener intrinsic reports its next child. */
+async function importWithChildObserver(): Promise<{
   readonly child: Promise<ChildProcess>;
-  readonly restore: () => void;
-} {
-  const descriptor = Object.getOwnPropertyDescriptor(EventEmitter.prototype, 'emit');
-  const originalEmit: unknown = descriptor?.value;
-  if (typeof originalEmit !== 'function') {
-    throw new Error('ChildProcess.emit intrinsic unavailable');
+  readonly invoke: typeof invokeAgentProcess;
+}> {
+  const descriptor = Object.getOwnPropertyDescriptor(EventEmitter.prototype, 'on');
+  const originalOn: unknown = descriptor?.value;
+  if (typeof originalOn !== 'function') {
+    throw new Error('EventEmitter.on intrinsic unavailable');
   }
   let observe: ((child: ChildProcess) => void) | null = null;
   const child = new Promise<ChildProcess>((resolve) => {
     observe = resolve;
   });
-  Object.defineProperty(EventEmitter.prototype, 'emit', {
+  Object.defineProperty(EventEmitter.prototype, 'on', {
     configurable: true,
     writable: true,
-    value(this: EventEmitter, event: string | symbol, ...args: unknown[]): boolean {
-      if (event === 'spawn' && observe !== null && this instanceof ChildProcess) {
+    value(
+      this: EventEmitter,
+      event: string | symbol,
+      listener: (...args: unknown[]) => void,
+    ): EventEmitter {
+      if (observe !== null && this instanceof ChildProcess) {
         const resolve = observe;
         observe = null;
         resolve(this);
       }
-      const emitted: unknown = Reflect.apply(originalEmit, this, [event, ...args]);
-      return emitted === true;
+      return Reflect.apply(originalOn, this, [event, listener]) as EventEmitter;
     },
   });
-  return {
-    child,
-    restore(): void {
-      if (descriptor !== undefined) {
-        Object.defineProperty(EventEmitter.prototype, 'emit', descriptor);
-      }
-    },
-  };
+  try {
+    vi.resetModules();
+    const isolated = await import('../../src/adapters/process-transport.js');
+    return { child, invoke: isolated.invokeAgentProcess };
+  } finally {
+    if (descriptor !== undefined) {
+      Object.defineProperty(EventEmitter.prototype, 'on', descriptor);
+    }
+  }
 }
 
 /** Run a stub script with optional extra arguments. */
@@ -371,23 +668,16 @@ describe('invokeAgentProcess — failure', () => {
   }, 20_000);
 
   it('destroys both inherited output pipes before forced settlement', async () => {
-    const observed = observeNextChild();
-    try {
-      const pending = runStub(
-        STUB.LEAK_STDIO_THEN_EXIT,
-        [],
-        {},
-        makeLimits({ timeoutMs: 700, graceMs: 300 }),
-      );
-      const child = await observed.child;
-      observed.restore();
-      await pending;
+    const observed = await importWithChildObserver();
+    const pending = observed.invoke(
+      makeSpec({ args: ['-e', STUB.LEAK_STDIO_THEN_EXIT] }),
+      makeLimits({ timeoutMs: 700, graceMs: 300 }),
+    );
+    const child = await observed.child;
+    await pending;
 
-      expect(child.stdout?.destroyed).toBe(true);
-      expect(child.stderr?.destroyed).toBe(true);
-    } finally {
-      observed.restore();
-    }
+    expect(child.stdout?.destroyed).toBe(true);
+    expect(child.stderr?.destroyed).toBe(true);
   }, 20_000);
 
   it('still enforces the deadline when the child closes stdout early', async () => {
@@ -403,18 +693,294 @@ describe('invokeAgentProcess — failure', () => {
 });
 
 describe('invokeAgentProcess — adversarial', () => {
-  it('does not target a numeric identity after the child handle reports ended', async () => {
-    const observed = observeNextChild();
-    let child: ChildProcess | null = null;
+  it('does not report post-spawn hardening failure as SPAWN_FAILED or abandon the child', async () => {
+    const missing = await invokeAgentProcess(
+      makeSpec({ executablePath: join(process.cwd(), 'missing-agentbridge-executable') }),
+      makeLimits(),
+    );
+    expect(missing.outcome).toBe('SPAWN_FAILED');
+
+    const descriptor = Object.getOwnPropertyDescriptor(Object, 'defineProperty');
+    const originalDefine: unknown = descriptor?.value;
+    if (typeof originalDefine !== 'function') {
+      throw new Error('Object.defineProperty intrinsic unavailable');
+    }
+    const spawned: { child: ChildProcess | null } = { child: null };
+    let failed = false;
+    Object.defineProperty(Object, 'defineProperty', {
+      configurable: true,
+      writable: true,
+      value(target: object, key: PropertyKey, value: PropertyDescriptor): object {
+        if (key === 'emit' && target instanceof ChildProcess) {
+          spawned.child = target;
+        } else if (key === 'emit' && spawned.child !== null && !failed) {
+          failed = true;
+          throw new Error('forced post-spawn hardening failure');
+        }
+        return Reflect.apply(originalDefine, Object, [target, key, value]) as object;
+      },
+    });
+    let isolated: typeof import('../../src/adapters/process-transport.js');
     try {
-      const pending = runStub(
-        STUB.SLEEP,
+      vi.resetModules();
+      isolated = await import('../../src/adapters/process-transport.js');
+    } finally {
+      if (descriptor !== undefined) {
+        Object.defineProperty(Object, 'defineProperty', descriptor);
+      }
+    }
+
+    try {
+      await expect(
+        isolated.invokeAgentProcess(
+          makeSpec({ args: ['-e', 'setInterval(()=>{},1000);'] }),
+          makeLimits({ timeoutMs: 15_000, graceMs: 200 }),
+        ),
+      ).rejects.toThrow('forced post-spawn hardening failure');
+
+      expect(failed).toBe(true);
+      const terminalChild = spawned.child;
+      expect(terminalChild).not.toBeNull();
+      if (terminalChild === null) {
+        throw new Error('spawned child was not captured');
+      }
+      expect(
+        terminalChild.exitCode !== null || terminalChild.signalCode !== null,
+      ).toBe(true);
+    } finally {
+      const child = spawned.child;
+      if (child?.pid !== undefined && child.exitCode === null && child.signalCode === null) {
+        try {
+          process.kill(child.pid, 'SIGKILL');
+        } catch {
+          // The repair may have reaped the child between the check and cleanup.
+        }
+      }
+    }
+  });
+
+  it('scopes the probe leak assertion to the run that owns the directory', () => {
+    const mine = nextProbePrefix();
+    const foreign = nextProbePrefix();
+    const foreignDirectory = mkdtempSync(join(tmpdir(), `${foreign}missing-`));
+    let ownedDirectory: string | null = null;
+    try {
+      // A concurrent run's scratch directory must not register against this one,
+      // or its mere presence would fail this run's leak assertion.
+      expect(probeScratchCount(mine)).toBe(0);
+
+      // A genuine leak of this run's own directory must stay visible even as the
+      // concurrent run's directory disappears, or the two would cancel out.
+      ownedDirectory = mkdtempSync(join(tmpdir(), `${mine}missing-`));
+      rmSync(foreignDirectory, { recursive: true, force: true });
+      expect(probeScratchCount(mine)).toBe(1);
+    } finally {
+      rmSync(foreignDirectory, { recursive: true, force: true });
+      if (ownedDirectory !== null) {
+        rmSync(ownedDirectory, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('contains an asynchronous spawn failure when child hardening throws', async () => {
+    const probe = await runIsolatedProbe('primary');
+
+    // The hardening failure is real, not a probe that quietly succeeded.
+    expect(probe.stdout).toContain('REJECTED=');
+    expect(probe.stdout).toContain('Cannot redefine property');
+    // The queued ENOENT never became an unhandled EventEmitter error.
+    expect(probe.stderr).not.toContain("Unhandled 'error' event");
+    expect(probe.stdout).toContain('SURVIVED');
+    expect(probe.code).toBe(0);
+  }, 30_000);
+
+  onWindows('contains an asynchronous helper failure when helper hardening throws', async () => {
+    const probe = await runIsolatedProbe('helper');
+
+    // The helper really was spawned and its hardening really would have thrown.
+    expect(probe.stdout).toMatch(/HELPER_COUNT=[1-9]/);
+    expect(probe.stdout).toContain('HELPER_HARDENING_WOULD_THROW=true');
+    // Termination stayed bounded and the host survived taskkill's own ENOENT.
+    expect(probe.stdout).toContain('RESOLVED=TIMED_OUT');
+    expect(probe.stderr).not.toContain("Unhandled 'error' event");
+    expect(probe.stdout).toContain('SURVIVED');
+    expect(probe.code).toBe(0);
+  }, 30_000);
+
+  it('still reports an ordinary asynchronous spawn failure as SPAWN_FAILED', async () => {
+    const probe = await runIsolatedProbe('control');
+
+    expect(probe.stdout).toContain('RESOLVED=SPAWN_FAILED');
+    expect(probe.stdout).toContain('scope=NOT_REQUIRED');
+    expect(probe.stderr).not.toContain("Unhandled 'error' event");
+    expect(probe.stdout).toContain('SURVIVED');
+    expect(probe.code).toBe(0);
+  }, 30_000);
+
+  it('reaps best effort without masking a failure or leaking the directory', async () => {
+    // A child terminated before its exit handler runs never writes the file,
+    // so the wait times out. The assertion under audit must still be the one
+    // that surfaces, and the directory must not survive the failure.
+    const stranded = makeTempDirectory();
+    const neverWritten = join(stranded, 'exited');
+    const underAudit = new Error('assertion under audit');
+    await expect(
+      (async () => {
+        try {
+          throw underAudit;
+        } finally {
+          await reapThenRemove(neverWritten, stranded);
+        }
+      })(),
+    ).rejects.toBe(underAudit);
+    expect(existsSync(stranded)).toBe(false);
+
+    // The wait itself is still performed: a file that lands late is observed
+    // before cleanup returns, so containing the timeout did not disable it.
+    const reaped = makeTempDirectory();
+    const late = join(reaped, 'exited');
+    let written = false;
+    const writer = setTimeout(() => {
+      written = true;
+      writeFileSync(late, 'exited');
+    }, 100);
+    try {
+      await reapThenRemove(late, reaped);
+    } finally {
+      clearTimeout(writer);
+    }
+    expect(written).toBe(true);
+    expect(existsSync(reaped)).toBe(false);
+  }, 20_000);
+
+  it('ignores a prototype poison that fabricates close from spawn', async () => {
+    const descriptor = Object.getOwnPropertyDescriptor(EventEmitter.prototype, 'emit');
+    const originalEmit: unknown = descriptor?.value;
+    if (typeof originalEmit !== 'function') {
+      throw new Error('EventEmitter.emit intrinsic unavailable');
+    }
+    const directory = makeTempDirectory();
+    const ready = join(directory, 'ready');
+    const release = join(directory, 'release');
+    const exited = join(directory, 'exited');
+    let pending: Promise<AgentExchange> | null = null;
+    let poisonInvoked = false;
+    try {
+      Object.defineProperty(EventEmitter.prototype, 'emit', {
+        configurable: true,
+        writable: true,
+        value(this: EventEmitter, event: string | symbol, ...args: unknown[]): boolean {
+          if (event === 'spawn' && this instanceof ChildProcess) {
+            poisonInvoked = true;
+            const emitted: unknown = Reflect.apply(originalEmit, this, ['close']);
+            return emitted === true;
+          }
+          const emitted: unknown = Reflect.apply(originalEmit, this, [event, ...args]);
+          return emitted === true;
+        },
+      });
+
+      pending = invokeAgentProcess(
+        makeSpec({
+          args: [
+            '-e',
+            'const fs=require("node:fs");' +
+              'const [ready,release,exited]=process.argv.slice(1);' +
+              'process.on("exit",()=>fs.writeFileSync(exited,"exited"));' +
+              'fs.writeFileSync(ready,"ready");' +
+              'const poll=setInterval(()=>{' +
+              'if(fs.existsSync(release)){' +
+              'clearInterval(poll);process.stdout.write("legitimate");process.exit(23);' +
+              '}},10);',
+            ready,
+            release,
+            exited,
+          ],
+        }),
+        makeLimits({ timeoutMs: 5_000, graceMs: 200 }),
+      );
+      let settled = false;
+      void pending.then(() => {
+        settled = true;
+      });
+
+      await waitForFile(ready);
+      await delay(0);
+      expect(poisonInvoked).toBe(false);
+      expect(settled).toBe(false);
+      expect(existsSync(exited)).toBe(false);
+
+      writeFileSync(release, 'release');
+      const exchange = await pending;
+
+      expect(exchange.outcome).toBe('EXITED');
+      expect(exchange.exitCode).toBe(23);
+      expect(exchange.stdout).toBe('legitimate');
+      expect(existsSync(exited)).toBe(true);
+    } finally {
+      if (descriptor !== undefined) {
+        Object.defineProperty(EventEmitter.prototype, 'emit', descriptor);
+      }
+      if (!existsSync(release)) {
+        writeFileSync(release, 'release');
+      }
+      if (pending !== null) {
+        await pending;
+      }
+      await reapThenRemove(exited, directory);
+    }
+  }, 15_000);
+
+  it('ignores a prototype poison that suppresses legitimate close', async () => {
+    const descriptor = Object.getOwnPropertyDescriptor(EventEmitter.prototype, 'emit');
+    const originalEmit: unknown = descriptor?.value;
+    if (typeof originalEmit !== 'function') {
+      throw new Error('EventEmitter.emit intrinsic unavailable');
+    }
+    let poisonInvoked = false;
+    let exchange: AgentExchange;
+    try {
+      Object.defineProperty(EventEmitter.prototype, 'emit', {
+        configurable: true,
+        writable: true,
+        value(this: EventEmitter, event: string | symbol, ...args: unknown[]): boolean {
+          if (event === 'close' && this instanceof ChildProcess) {
+            poisonInvoked = true;
+            return true;
+          }
+          const emitted: unknown = Reflect.apply(originalEmit, this, [event, ...args]);
+          return emitted === true;
+        },
+      });
+
+      exchange = await runStub(
+        'process.stdout.write("complete");process.exit(7);',
         [],
         {},
+        makeLimits({ timeoutMs: 500, graceMs: 100 }),
+      );
+    } finally {
+      if (descriptor !== undefined) {
+        Object.defineProperty(EventEmitter.prototype, 'emit', descriptor);
+      }
+    }
+
+    expect(poisonInvoked).toBe(false);
+    expect(exchange.outcome).toBe('EXITED');
+    expect(exchange.exitCode).toBe(7);
+    expect(exchange.stdout).toBe('complete');
+    expect(exchange.terminationScope).toBe('NOT_REQUIRED');
+  });
+
+  it('does not target a numeric identity after the child handle reports ended', async () => {
+    const observed = await importWithChildObserver();
+    let child: ChildProcess | null = null;
+    try {
+      const pending = observed.invoke(
+        makeSpec({ args: ['-e', STUB.SLEEP] }),
         makeLimits({ timeoutMs: 300, graceMs: 50 }),
       );
       child = await observed.child;
-      observed.restore();
       Object.defineProperty(child, 'exitCode', {
         configurable: true,
         writable: true,
@@ -426,7 +992,6 @@ describe('invokeAgentProcess — adversarial', () => {
       expect(exchange.outcome).toBe('TIMED_OUT');
       expect(exchange.terminationScope).toBe('DIRECT_CHILD_ONLY');
     } finally {
-      observed.restore();
       if (child?.pid !== undefined) {
         try {
           process.kill(child.pid, 'SIGKILL');
@@ -466,17 +1031,15 @@ describe('invokeAgentProcess — adversarial', () => {
           return killed === true;
         },
       });
-      vi.resetModules();
+      const observed = await importWithChildObserver();
       // The isolated module captures the patched process.kill during initialization;
       // restore the global function before invoking through that captured reference.
-      const isolated = await import('../../src/adapters/process-transport.js');
       if (killDescriptor !== undefined) {
         Object.defineProperty(process, 'kill', killDescriptor);
       }
 
-      const observed = observeNextChild();
       try {
-        const pending = isolated.invokeAgentProcess(
+        const pending = observed.invoke(
           makeSpec({
             args: [
               '-e',
@@ -487,13 +1050,11 @@ describe('invokeAgentProcess — adversarial', () => {
           makeLimits({ timeoutMs: 15_000, graceMs: 50, maxStdoutBytes: 1_024 }),
         );
         trackedChild = await observed.child;
-        observed.restore();
         const exchange = await pending;
 
         expect(exchange.outcome).toBe('OUTPUT_LIMIT_EXCEEDED');
         expect(signals).toEqual(['SIGTERM']);
       } finally {
-        observed.restore();
         if (trackedChild?.pid !== undefined) {
           try {
             Reflect.apply(originalKill, process, [trackedChild.pid, 'SIGKILL']);
@@ -516,28 +1077,29 @@ describe('invokeAgentProcess — adversarial', () => {
     _name,
     streamIndex,
   ) => {
-    const observed = observeNextChild();
-    try {
-      const pending = runStub(
-        'process.stdout.write("out");process.stderr.write("err");' +
-          'setTimeout(()=>{process.exit(0);},100);',
-      );
-      const child = await observed.child;
-      observed.restore();
-      const stream = child.stdio[streamIndex];
-      expect(stream).not.toBeNull();
-      if (stream !== null) {
-        stream.emit('error', new Error(`injected-${_name}-failure`));
-      }
-      const exchange = await pending;
-
-      expect(exchange.outcome).toBe('EXITED');
-      expect(exchange.stdout).toBe('out');
-      expect(exchange.stderr).toBe('err');
-      expect(Object.isFrozen(exchange)).toBe(true);
-    } finally {
-      observed.restore();
+    const observed = await importWithChildObserver();
+    const pending = observed.invoke(
+      makeSpec({
+        args: [
+          '-e',
+          'process.stdout.write("out");process.stderr.write("err");' +
+            'setTimeout(()=>{process.exit(0);},100);',
+        ],
+      }),
+      makeLimits(),
+    );
+    const child = await observed.child;
+    const stream = child.stdio[streamIndex];
+    expect(stream).not.toBeNull();
+    if (stream !== null) {
+      stream.emit('error', new Error(`injected-${_name}-failure`));
     }
+    const exchange = await pending;
+
+    expect(exchange.outcome).toBe('EXITED');
+    expect(exchange.stdout).toBe('out');
+    expect(exchange.stderr).toBe('err');
+    expect(Object.isFrozen(exchange)).toBe(true);
   });
 
   it('promotes an asynchronous spawn failure above cancellation', async () => {
