@@ -16,6 +16,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   type AgentProcessSpec,
+  containsLoneSurrogate,
   DEGRADED_TERMINATION_SCOPES,
   isAbsolutePath,
   readInvocation,
@@ -41,12 +42,14 @@ import {
   EXPECTED_PRECEDENCE,
   FORBIDDEN_FIELD_NAMES,
   FORBIDDEN_VALUES,
+  LONE_SURROGATE_STRINGS,
   makeLimits,
   makeSpec,
   MALFORMED_VALUES,
   NON_OBJECTS,
   SHELL_ONLY_EXECUTABLES,
   STUB,
+  WELL_FORMED_STRINGS,
   WINDOWS_REQUIRED_ENVIRONMENT_VARIABLES,
 } from './transport-fixtures.js';
 
@@ -912,7 +915,9 @@ describe('structural validation is bounded, non-coercing and fail-closed', () =>
           [ascii(TRANSPORT_BOUNDS.MAX_ENV_KEY_BYTES + 1)]: 'v',
         }),
       ),
+      rejectionForSpec(withRawSpecField('args', ['-e', '\uD800'])),
       rejectionForSpec(withRawSpecField('stdin', 42)),
+      rejectionForSpec(withRawSpecField('stdin', '\uD800')),
       rejectionForSpec(withRawSpecField('stdin', ascii(TRANSPORT_BOUNDS.MAX_STDIN_BYTES + 1))),
       rejectionFor(makeSpec(), withRawLimitField('timeoutMs', 0)),
       rejectionFor(makeSpec(), withRawLimitField('graceMs', -1)),
@@ -934,6 +939,131 @@ describe('structural validation is bounded, non-coercing and fail-closed', () =>
     // dedicated getter and revoked-Proxy cases above.
     expect(unreachable.sort()).toEqual(
       ['ARGUMENT_UNREADABLE', 'ENVIRONMENT_UNREADABLE'].sort(),
+    );
+  });
+});
+
+/**
+ * Well-formedness of the two strings this transport promises to carry verbatim.
+ *
+ * argv and stdin are both encoded as UTF-8 on the way to the child, and UTF-8
+ * cannot represent an unpaired surrogate. Accepting one would mean validating
+ * one value and delivering another, so both are refused before spawn. The
+ * corresponding process-level proof — that the child really did receive U+FFFD
+ * before this rule existed, and receives the exact character now — lives in
+ * `process-transport.test.ts`.
+ */
+describe('well-formed UTF-16 on the exactly-transmitted fields', () => {
+  it.each(LONE_SURROGATE_STRINGS)('refuses an argument holding %s', (_label, value) => {
+    expect(rejectionForSpec(withRawSpecField('args', ['-e', value]))).toBe(
+      'ARGUMENT_LONE_SURROGATE',
+    );
+  });
+
+  it.each(LONE_SURROGATE_STRINGS)('refuses a stdin payload holding %s', (_label, value) => {
+    expect(rejectionForSpec(withRawSpecField('stdin', value))).toBe('STDIN_LONE_SURROGATE');
+  });
+
+  it.each(WELL_FORMED_STRINGS)('accepts %s as an argument', (_label, value) => {
+    const result = readInvocation(
+      makeSpec({ args: ['-e', value] }),
+      makeLimits(),
+      PLATFORM,
+    );
+
+    expect(result.rejection).toBeNull();
+    // Accepted means unchanged: no normalization, no substitution, no reordering.
+    expect(result.value?.args).toEqual(['-e', value]);
+  });
+
+  it.each(WELL_FORMED_STRINGS)('accepts %s as a stdin payload', (_label, value) => {
+    const result = readInvocation(makeSpec({ stdin: value }), makeLimits(), PLATFORM);
+
+    expect(result.rejection).toBeNull();
+    expect(result.value?.stdin).toBe(value);
+  });
+
+  it('rejects exactly the strings the UTF-8 boundary would alter', () => {
+    // The oracle is the boundary itself rather than a restatement of the
+    // implementation: a string survives a UTF-8 round trip if and only if it is
+    // well-formed, and that round trip is what argv and the stdin pipe perform
+    // on the way to the child.
+    const corpus = [
+      ...LONE_SURROGATE_STRINGS.map(([, value]) => value),
+      ...WELL_FORMED_STRINGS.map(([, value]) => value),
+    ];
+
+    for (const value of corpus) {
+      const roundTripped = Buffer.from(value, 'utf8').toString('utf8');
+
+      expect(containsLoneSurrogate(value)).toBe(roundTripped !== value);
+    }
+  });
+
+  it('reads through captured intrinsics after charCodeAt is poisoned', () => {
+    const descriptor = Object.getOwnPropertyDescriptor(String.prototype, 'charCodeAt');
+    Object.defineProperty(String.prototype, 'charCodeAt', {
+      configurable: true,
+      writable: true,
+      value: (): number => 0x41,
+    });
+    try {
+      expect(containsLoneSurrogate('\uD800')).toBe(true);
+      expect(containsLoneSurrogate('\u{1F600}')).toBe(false);
+      expect(rejectionForSpec(withRawSpecField('args', ['-e', '\uDC00']))).toBe(
+        'ARGUMENT_LONE_SURROGATE',
+      );
+    } finally {
+      if (descriptor !== undefined) {
+        Object.defineProperty(String.prototype, 'charCodeAt', descriptor);
+      }
+    }
+  });
+
+  it.each(LONE_SURROGATE_STRINGS)(
+    'refuses an environment value holding %s',
+    (_label, value) => {
+      const environment = { ...baseEnvironment(), AGENTBRIDGE_SURROGATE: value };
+
+      expect(rejectionForSpec(withRawSpecField('environment', environment))).toBe(
+        'ENVIRONMENT_ENTRY_INVALID',
+      );
+    },
+  );
+
+  it.each(LONE_SURROGATE_STRINGS)(
+    'refuses an environment name holding %s',
+    (_label, value) => {
+      const environment = { ...baseEnvironment(), [`AGENTBRIDGE_${value}`]: 'ordinary' };
+
+      expect(rejectionForSpec(withRawSpecField('environment', environment))).toBe(
+        'ENVIRONMENT_ENTRY_INVALID',
+      );
+    },
+  );
+
+  it.each(WELL_FORMED_STRINGS)('accepts %s as an environment value', (_label, value) => {
+    const environment = { ...baseEnvironment(), AGENTBRIDGE_WELL_FORMED: value };
+    const result = readInvocation(makeSpec({ environment }), makeLimits(), PLATFORM);
+
+    expect(result.rejection).toBeNull();
+    expect(result.value?.environment['AGENTBRIDGE_WELL_FORMED']).toBe(value);
+  });
+
+  it.each(WELL_FORMED_STRINGS)('accepts %s inside an environment name', (_label, value) => {
+    const name = `AGENTBRIDGE_${value}`;
+    const environment = { ...baseEnvironment(), [name]: 'ordinary' };
+    const result = readInvocation(makeSpec({ environment }), makeLimits(), PLATFORM);
+
+    expect(result.rejection).toBeNull();
+    // The snapshot carries the name through unchanged, byte for byte.
+    expect(Object.keys(result.value?.environment ?? {})).toContain(name);
+  });
+
+  it('keeps the pre-existing rules reporting themselves', () => {
+    expect(rejectionForSpec(withRawSpecField('args', ['-e', 42]))).toBe('ARGUMENT_NOT_STRING');
+    expect(rejectionForSpec(withRawSpecField('args', ['-e', 'a b']))).toBe(
+      'ARGUMENT_CONTAINS_NUL',
     );
   });
 });

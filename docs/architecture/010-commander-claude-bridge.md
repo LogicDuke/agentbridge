@@ -93,8 +93,19 @@ provider-neutral transport. argv arrives fully constructed by a caller that owns
 that decision, and this layer checks only shape:
 
 exact array shape · maximum argument count · maximum UTF-8 bytes per argument ·
-maximum total argv bytes · no NUL · own **data** properties only · no coercion of
-non-strings · no shell interpretation.
+maximum total argv bytes · no NUL · no unpaired UTF-16 surrogate · own **data**
+properties only · no coercion of non-strings · no shell interpretation.
+
+The surrogate rule is a transmission check, not a text policy. An argument
+holding a surrogate with no partner cannot be encoded as UTF-8, so the child
+would receive U+FFFD in its place and the exact argument vector this transport
+promises would silently not be the one that was validated. It is refused before
+spawn, and so is every other string this transport promises to carry exactly and
+that crosses the same UTF-8 boundary: the stdin payload, and both the names and
+the values of the environment record — an ill-formed name reaches the child as a
+*different* name, which is the same defect wearing a different hat. Valid
+supplementary-plane characters are ordinary well-formed pairs and pass through
+unchanged; nothing is normalized or substituted.
 
 Accessors are never invoked. An argv element supplied through a getter, an
 inherited numeric property, a hole, a throwing Proxy trap, or a revoked Proxy is
@@ -222,6 +233,11 @@ supplied. This transport never merges it with `process.env` and never reads
 `process.env` to populate it; the only two `process.env` reads in the module are
 `SystemRoot` and `windir`, used solely to locate `taskkill.exe`, and a test pins
 that count at two.
+
+Names and values are held to the same exact-transmission rule as argv and stdin:
+each must be well-formed UTF-16, because an unpaired surrogate would reach the
+child as U+FFFD and the record it read back would not be the record the caller
+supplied. Both are refused before spawn, as `ENVIRONMENT_ENTRY_INVALID`.
 
 Node itself otherwise copies a parent `NODE_V8_COVERAGE` value into a supplied
 environment that omits that key. The validated record contains a non-enumerable

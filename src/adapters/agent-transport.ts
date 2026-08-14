@@ -238,6 +238,7 @@ export const TRANSPORT_REJECTION = objectFreeze({
   ARGUMENT_UNREADABLE: 'ARGUMENT_UNREADABLE',
   ARGUMENT_NOT_STRING: 'ARGUMENT_NOT_STRING',
   ARGUMENT_CONTAINS_NUL: 'ARGUMENT_CONTAINS_NUL',
+  ARGUMENT_LONE_SURROGATE: 'ARGUMENT_LONE_SURROGATE',
   ARGUMENT_BYTES_EXCEEDED: 'ARGUMENT_BYTES_EXCEEDED',
   ARGV_TOTAL_BYTES_EXCEEDED: 'ARGV_TOTAL_BYTES_EXCEEDED',
 
@@ -250,6 +251,7 @@ export const TRANSPORT_REJECTION = objectFreeze({
   ENVIRONMENT_BYTES_EXCEEDED: 'ENVIRONMENT_BYTES_EXCEEDED',
 
   STDIN_NOT_STRING: 'STDIN_NOT_STRING',
+  STDIN_LONE_SURROGATE: 'STDIN_LONE_SURROGATE',
   STDIN_BYTES_EXCEEDED: 'STDIN_BYTES_EXCEEDED',
 
   TIMEOUT_OUT_OF_RANGE: 'TIMEOUT_OUT_OF_RANGE',
@@ -481,6 +483,47 @@ export function containsNul(value: string): boolean {
   return typeof index !== 'number' || index !== -1;
 }
 
+/**
+ * True when the string holds an unpaired UTF-16 surrogate.
+ *
+ * A JavaScript string is a sequence of UTF-16 code units and may contain a
+ * surrogate with no partner, which UTF-8 cannot represent. Both boundaries this
+ * transport promises to carry verbatim — the argument vector and the stdin
+ * payload — are encoded as UTF-8 on the way to the child, and that encoding
+ * silently substitutes U+FFFD for such a code unit. The child would then receive
+ * a value different from the one that was validated, which is exactly what the
+ * single-read snapshot exists to prevent. Refusing before spawn is the only
+ * answer that keeps the promise honest.
+ *
+ * This asks one question and nothing more. Ordinary characters, valid surrogate
+ * pairs — every supplementary-plane character is one — mixed strings, and the
+ * empty string are all well-formed and pass through untouched. Nothing here
+ * normalizes, substitutes, reorders, or reinterprets any text.
+ */
+export function containsLoneSurrogate(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const unit = reflectApply(stringCharCodeAt, value, [index]);
+    if (unit < 0xd800 || unit > 0xdfff) {
+      continue;
+    }
+    if (unit > 0xdbff) {
+      // A low surrogate seen on its own. One that completes a pair is consumed
+      // by the branch below and is never inspected here.
+      return true;
+    }
+    // A high surrogate must be *immediately* followed by a low one. Reading past
+    // the end yields NaN, so this is written as a negated in-range test: every
+    // comparison against NaN is false, and the loose form would accept a
+    // trailing high surrogate.
+    const low = reflectApply(stringCharCodeAt, value, [index + 1]);
+    if (!(low >= 0xdc00 && low <= 0xdfff)) {
+      return true;
+    }
+    index += 1;
+  }
+  return false;
+}
+
 /** CreateProcess command-line capacity in UTF-16 code units, including NUL. */
 const WINDOWS_COMMAND_LINE_LIMIT = 32_767;
 
@@ -685,6 +728,12 @@ function readArgs(raw: unknown): {
     if (containsNul(element)) {
       return { rejection: TRANSPORT_REJECTION.ARGUMENT_CONTAINS_NUL, value: [] };
     }
+    // Checked before the byte measurement, because the measurement of an
+    // ill-formed argument is already the length of the substitution the child
+    // would have received rather than of the argument the caller supplied.
+    if (containsLoneSurrogate(element)) {
+      return { rejection: TRANSPORT_REJECTION.ARGUMENT_LONE_SURROGATE, value: [] };
+    }
     const bytes = utf8ByteLength(element);
     if (bytes > TRANSPORT_BOUNDS.MAX_ARG_BYTES) {
       return { rejection: TRANSPORT_REJECTION.ARGUMENT_BYTES_EXCEEDED, value: [] };
@@ -744,6 +793,13 @@ function readEnvironment(raw: unknown, platform: TransportPlatform): {
     if (containsNul(key) || reflectApply(stringIndexOf, key, ['=']) !== -1) {
       return { rejection: TRANSPORT_REJECTION.ENVIRONMENT_ENTRY_INVALID, value: empty };
     }
+    // The environment crosses the same UTF-8 boundary as argv and stdin, so an
+    // ill-formed name would reach the child as a *different* name. Checked with
+    // the other content rules and before the byte measurement, for the reason
+    // given in `readArgs`.
+    if (containsLoneSurrogate(key)) {
+      return { rejection: TRANSPORT_REJECTION.ENVIRONMENT_ENTRY_INVALID, value: empty };
+    }
     if (utf8ByteLength(key) > TRANSPORT_BOUNDS.MAX_ENV_KEY_BYTES) {
       return { rejection: TRANSPORT_REJECTION.ENVIRONMENT_BYTES_EXCEEDED, value: empty };
     }
@@ -778,6 +834,11 @@ function readEnvironment(raw: unknown, platform: TransportPlatform): {
       return { rejection: TRANSPORT_REJECTION.ENVIRONMENT_ENTRY_INVALID, value: empty };
     }
     if (containsNul(value)) {
+      return { rejection: TRANSPORT_REJECTION.ENVIRONMENT_ENTRY_INVALID, value: empty };
+    }
+    // Same rule as the name above: what the child reads back must be what the
+    // caller supplied, and an unpaired surrogate cannot survive the encoding.
+    if (containsLoneSurrogate(value)) {
       return { rejection: TRANSPORT_REJECTION.ENVIRONMENT_ENTRY_INVALID, value: empty };
     }
     if (utf8ByteLength(value) > TRANSPORT_BOUNDS.MAX_ENV_VALUE_BYTES) {
@@ -937,6 +998,11 @@ export function readInvocation(
   const rawStdin: unknown = readOwnData(rawSpec, 'stdin');
   if (typeof rawStdin !== 'string') {
     return refuse(TRANSPORT_REJECTION.STDIN_NOT_STRING);
+  }
+  // Same reason as argv: the payload is written to the pipe as UTF-8, so an
+  // ill-formed code unit would reach the child as a substitution instead.
+  if (containsLoneSurrogate(rawStdin)) {
+    return refuse(TRANSPORT_REJECTION.STDIN_LONE_SURROGATE);
   }
   if (utf8ByteLength(rawStdin) > TRANSPORT_BOUNDS.MAX_STDIN_BYTES) {
     return refuse(TRANSPORT_REJECTION.STDIN_BYTES_EXCEEDED);

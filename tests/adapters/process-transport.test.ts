@@ -1,4 +1,4 @@
-import { ChildProcess, spawn } from 'node:child_process';
+import { ChildProcess, spawn, spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import {
   readdirSync,
@@ -1619,6 +1619,228 @@ describe('invokeAgentProcess — boundary', () => {
     expect(exchange.outcome).toBe('SPEC_REJECTED');
     expect(exchange.rejection).toBe('ENVIRONMENT_BYTES_EXCEEDED');
     expect(exchange.terminationScope).toBe('NOT_REQUIRED');
+  });
+
+  /**
+   * An absolute path that does not exist, so a request reaching the operating
+   * system would report `SPAWN_FAILED`. `SPEC_REJECTED` therefore proves the
+   * refusal happened first.
+   */
+  const NEVER_SPAWNED = join(tmpdir(), 'agentbridge-must-not-be-spawned');
+
+  const ILL_FORMED: readonly (readonly [string, string])[] = [
+    ['a lone high surrogate', '\uD800'],
+    ['a lone low surrogate', '\uDC00'],
+  ];
+
+  it.each(ILL_FORMED)(
+    'refuses an argument holding %s before process creation',
+    async (_label, value) => {
+      const exchange = await invokeAgentProcess(
+        makeSpec({
+          executablePath: NEVER_SPAWNED,
+          args: ['-e', STUB.WRITE_OK, value],
+        }),
+        makeLimits(),
+      );
+
+      expect(exchange.outcome).toBe('SPEC_REJECTED');
+      expect(exchange.rejection).toBe('ARGUMENT_LONE_SURROGATE');
+      expect(exchange.terminationScope).toBe('NOT_REQUIRED');
+      expect(exchange.stdout).toBe('');
+    },
+  );
+
+  it.each(ILL_FORMED)(
+    'refuses a stdin payload holding %s before process creation',
+    async (_label, value) => {
+      const exchange = await invokeAgentProcess(
+        makeSpec({ executablePath: NEVER_SPAWNED, stdin: value }),
+        makeLimits(),
+      );
+
+      expect(exchange.outcome).toBe('SPEC_REJECTED');
+      expect(exchange.rejection).toBe('STDIN_LONE_SURROGATE');
+      expect(exchange.terminationScope).toBe('NOT_REQUIRED');
+      expect(exchange.stdout).toBe('');
+    },
+  );
+
+  it('starts no process at all when an argument is ill-formed', async () => {
+    const directory = makeTempDirectory();
+    try {
+      const marker = join(directory, 'ran');
+      const script = `require("node:fs").writeFileSync(${JSON.stringify(marker)},"ran");`;
+
+      // Run the identical stub once with a well-formed argument, so the marker
+      // is known to be a real signal rather than a script that never worked.
+      const accepted = await invokeAgentProcess(
+        makeSpec({ args: ['-e', script, 'well-formed'] }),
+        makeLimits(),
+      );
+      expect(accepted.outcome).toBe('EXITED');
+      expect(existsSync(marker)).toBe(true);
+      rmSync(marker);
+
+      const refused = await invokeAgentProcess(
+        makeSpec({ args: ['-e', script, '\uD800'] }),
+        makeLimits(),
+      );
+
+      expect(refused.outcome).toBe('SPEC_REJECTED');
+      expect(refused.rejection).toBe('ARGUMENT_LONE_SURROGATE');
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      removeTempDirectory(directory);
+    }
+  });
+
+  it.each(ILL_FORMED)(
+    'refuses an environment value holding %s before process creation',
+    async (_label, value) => {
+      const exchange = await invokeAgentProcess(
+        makeSpec({
+          executablePath: NEVER_SPAWNED,
+          environment: { ...baseEnvironment(), AGENTBRIDGE_SURROGATE: value },
+        }),
+        makeLimits(),
+      );
+
+      expect(exchange.outcome).toBe('SPEC_REJECTED');
+      expect(exchange.rejection).toBe('ENVIRONMENT_ENTRY_INVALID');
+      expect(exchange.terminationScope).toBe('NOT_REQUIRED');
+      expect(exchange.stdout).toBe('');
+    },
+  );
+
+  it.each(ILL_FORMED)(
+    'refuses an environment name holding %s before process creation',
+    async (_label, value) => {
+      const exchange = await invokeAgentProcess(
+        makeSpec({
+          executablePath: NEVER_SPAWNED,
+          environment: { ...baseEnvironment(), [`AGENTBRIDGE_${value}`]: 'ordinary' },
+        }),
+        makeLimits(),
+      );
+
+      expect(exchange.outcome).toBe('SPEC_REJECTED');
+      expect(exchange.rejection).toBe('ENVIRONMENT_ENTRY_INVALID');
+      expect(exchange.terminationScope).toBe('NOT_REQUIRED');
+      expect(exchange.stdout).toBe('');
+    },
+  );
+
+  it('starts no process at all when the environment is ill-formed', async () => {
+    const directory = makeTempDirectory();
+    try {
+      const marker = join(directory, 'ran');
+      const script = `require("node:fs").writeFileSync(${JSON.stringify(marker)},"ran");`;
+
+      // The same stub with a well-formed environment, so the marker is known to
+      // be a real signal rather than a script that never worked.
+      const accepted = await invokeAgentProcess(
+        makeSpec({
+          args: ['-e', script],
+          environment: { ...baseEnvironment(), AGENTBRIDGE_SURROGATE: 'well-formed' },
+        }),
+        makeLimits(),
+      );
+      expect(accepted.outcome).toBe('EXITED');
+      expect(existsSync(marker)).toBe(true);
+      rmSync(marker);
+
+      const refusedValue = await invokeAgentProcess(
+        makeSpec({
+          args: ['-e', script],
+          environment: { ...baseEnvironment(), AGENTBRIDGE_SURROGATE: '\uD800' },
+        }),
+        makeLimits(),
+      );
+
+      expect(refusedValue.outcome).toBe('SPEC_REJECTED');
+      expect(refusedValue.rejection).toBe('ENVIRONMENT_ENTRY_INVALID');
+      expect(existsSync(marker)).toBe(false);
+
+      const refusedName = await invokeAgentProcess(
+        makeSpec({
+          args: ['-e', script],
+          environment: { ...baseEnvironment(), 'AGENTBRIDGE_\uDC00': 'ordinary' },
+        }),
+        makeLimits(),
+      );
+
+      expect(refusedName.outcome).toBe('SPEC_REJECTED');
+      expect(refusedName.rejection).toBe('ENVIRONMENT_ENTRY_INVALID');
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      removeTempDirectory(directory);
+    }
+  });
+
+  it('delivers a well-formed environment name and value to the child exactly', async () => {
+    const name = 'AGENTBRIDGE_\u{1F600}';
+    const value = 'before \u{1F600} after \u{10000}';
+    const exchange = await runStub(STUB.PRINT_ENV, [], {
+      environment: { ...baseEnvironment(), [name]: value },
+    });
+
+    expect(exchange.outcome).toBe('EXITED');
+    const childEnv = JSON.parse(exchange.stdout) as Record<string, string>;
+    expect(childEnv[name]).toBe(value);
+    // Not the substitution an ill-formed environment would have produced.
+    expect(exchange.stdout).not.toContain('�');
+  });
+
+  it('delivers a supplementary-plane argument to the child exactly', async () => {
+    const character = '\u{1F600}';
+    const exchange = await runStub(STUB.PRINT_ARGV, ['ARGV0', character]);
+
+    expect(exchange.outcome).toBe('EXITED');
+    expect(JSON.parse(exchange.stdout)).toEqual(['ARGV0', character]);
+    // Not the substitution an ill-formed value would have produced.
+    expect(exchange.stdout).not.toContain('�');
+  });
+
+  it('delivers a supplementary-plane stdin payload to the child exactly', async () => {
+    const payload = 'before \u{1F600} after \u{10000}';
+    const exchange = await runStub(STUB.ECHO_STDIN, [], { stdin: payload });
+
+    expect(exchange.outcome).toBe('EXITED');
+    expect(exchange.stdout).toBe(payload);
+  });
+
+  it('reproduces the child-boundary transformation the rule prevents', () => {
+    // The defect itself, reproduced outside the transport. Node encodes an
+    // argument vector, an environment record, and a pipe write all as UTF-8, and
+    // UTF-8 cannot carry an unpaired surrogate, so the child observes U+FFFD.
+    // Validating such a value and then spawning would mean the child never
+    // received what was validated, which is precisely why the transport now
+    // refuses instead of spawning.
+    const child = spawnSync(NODE_EXECUTABLE, ['-e', STUB.PRINT_ARGV, 'ARGV0', '\uD800'], {
+      env: baseEnvironment(),
+      encoding: 'utf8',
+      shell: false,
+    });
+
+    expect(child.status).toBe(0);
+    expect(JSON.parse(child.stdout)).toEqual(['ARGV0', '�']);
+
+    // The environment record is transformed the same way, in both name and value.
+    const withEnvironment = spawnSync(NODE_EXECUTABLE, ['-e', STUB.PRINT_ENV], {
+      env: { ...baseEnvironment(), 'AGENTBRIDGE_\uD800': '\uDC00' },
+      encoding: 'utf8',
+      shell: false,
+    });
+
+    expect(withEnvironment.status).toBe(0);
+    const childEnv = JSON.parse(withEnvironment.stdout) as Record<string, string>;
+    expect(childEnv['AGENTBRIDGE_\uD800']).toBeUndefined();
+    expect(childEnv['AGENTBRIDGE_�']).toBe('�');
+    // The stdin payload is written through the same encoder, with the same loss.
+    expect([...Buffer.from('\uD800', 'utf8')]).toEqual([0xef, 0xbf, 0xbd]);
+    // A well-formed pair survives both, which is why it is still accepted.
+    expect([...Buffer.from('\u{1F600}', 'utf8')]).toEqual([0xf0, 0x9f, 0x98, 0x80]);
   });
 
   it('reports the executable path used by the fixtures as spawnable', () => {

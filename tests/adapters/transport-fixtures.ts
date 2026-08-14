@@ -313,6 +313,44 @@ export const SHELL_METACHARACTER_ARGUMENTS: readonly string[] = Object.freeze([
 ]);
 
 /**
+ * Strings holding an unpaired UTF-16 surrogate.
+ *
+ * None can be encoded as UTF-8, so every one would reach the child as U+FFFD
+ * instead of as itself. Written with explicit `\uXXXX` escapes so the corpus
+ * survives any re-encoding of this file.
+ */
+export const LONE_SURROGATE_STRINGS: readonly (readonly [string, string])[] = Object.freeze([
+  ['a bare high surrogate', '\uD800'],
+  ['a bare low surrogate', '\uDC00'],
+  ['the last high surrogate alone', '\uDBFF'],
+  ['the last low surrogate alone', '\uDFFF'],
+  ['a high surrogate before ordinary text', '\uD83Dx'],
+  ['a high surrogate at the very end', 'x\uD83D'],
+  ['a low surrogate before ordinary text', '\uDE00x'],
+  ['a reversed pair', '\uDE00\uD83D'],
+  ['two high surrogates in a row', '\uD83D\uD83D'],
+  ['a lone surrogate between two valid pairs', '\u{1F600}\uD800\u{1F600}'],
+]);
+
+/**
+ * Well-formed strings that must keep validating, supplementary plane included.
+ *
+ * The point of the astral entries is that rejecting ill-formed UTF-16 must not
+ * become a rejection of ordinary Unicode: every one of these *is* a surrogate
+ * pair at the code-unit level.
+ */
+export const WELL_FORMED_STRINGS: readonly (readonly [string, string])[] = Object.freeze([
+  ['an empty string', ''],
+  ['plain ASCII', 'ordinary'],
+  ['BMP text outside ASCII', 'é中文'],
+  ['a supplementary-plane character', '\u{1F600}'],
+  ['the first supplementary code point', '\u{10000}'],
+  ['the last supplementary code point', '\u{10FFFF}'],
+  ['a valid pair mixed with BMP text', 'a\u{1F600}b中'],
+  ['adjacent valid pairs', '\u{1F600}\u{1F600}'],
+]);
+
+/**
  * Field names that must never appear on an exchange.
  *
  * The termination group is the point of this correction: no field may assert
