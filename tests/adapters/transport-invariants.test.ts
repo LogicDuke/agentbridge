@@ -613,6 +613,69 @@ describe('structural validation is bounded, non-coercing and fail-closed', () =>
     expect(invoked).toBe(false);
   });
 
+  it('refuses an environment whose own-property reflection fails, before any spawn', async () => {
+    let invoked = false;
+    const enumerable = {};
+    Object.defineProperty(enumerable, 'TOKEN', {
+      get() {
+        invoked = true;
+        return 'secret';
+      },
+      enumerable: true,
+      configurable: true,
+    });
+    // Key enumeration itself fails, so no entry is ever inspected.
+    const keysDenied = new Proxy(enumerable, {
+      ownKeys(): never {
+        throw new Error('key enumeration denied');
+      },
+    });
+    // Enumeration succeeds and the per-entry descriptor read fails instead,
+    // which is the second, separately guarded reflection step.
+    const descriptorDenied = new Proxy(
+      { PATH: '/usr/bin' },
+      {
+        getOwnPropertyDescriptor(): never {
+          throw new Error('descriptor read denied');
+        },
+      },
+    );
+
+    expect(rejectionForSpec(withRawSpecField('environment', keysDenied))).toBe(
+      'ENVIRONMENT_UNREADABLE',
+    );
+    expect(rejectionForSpec(withRawSpecField('environment', descriptorDenied))).toBe(
+      'ENVIRONMENT_UNREADABLE',
+    );
+    expect(invoked).toBe(false);
+
+    // A revoked Proxy fails the earlier record gate, and a plain non-string
+    // entry fails the per-entry content rules; neither is reported as an
+    // unreadable environment.
+    const revocable = Proxy.revocable({}, {});
+    revocable.revoke();
+
+    expect(rejectionForSpec(withRawSpecField('environment', revocable.proxy))).toBe(
+      'ENVIRONMENT_NOT_RECORD',
+    );
+    expect(rejectionForSpec(withRawSpecField('environment', { PATH: 7 }))).toBe(
+      'ENVIRONMENT_ENTRY_INVALID',
+    );
+
+    const exchange = await invokeAgentProcess(
+      withRawSpecField('environment', keysDenied),
+      makeLimits(),
+    );
+
+    expect(exchange.outcome).toBe('SPEC_REJECTED');
+    expect(exchange.rejection).toBe('ENVIRONMENT_UNREADABLE');
+    expect(exchange.exitCode).toBeNull();
+    expect(exchange.terminatingSignal).toBeNull();
+    expect(exchange.stdout).toBe('');
+    expect(exchange.stderr).toBe('');
+    expect(invoked).toBe(false);
+  });
+
   it('refuses an environment carrying a symbol key', () => {
     const hostile: Record<string | symbol, unknown> = { PATH: '/usr/bin' };
     hostile[Symbol('hidden')] = 'value';
