@@ -221,6 +221,177 @@ try {
 process.exit(0);
 `;
 
+/**
+ * One ordinary exchange, run from an interpreter the test chooses the flags for.
+ *
+ * Node's permission model can only be switched on at process start, so the
+ * difference between a normal invocation and one under `--permission` cannot be
+ * observed inside the vitest worker at all. This probe is the same script in
+ * both cases; only the flags differ.
+ *
+ * It first reports, independently of the transport, whether this interpreter
+ * really does write `NODE_OPTIONS` into a supplied frozen environment. That
+ * keeps the comparison honest: without it a build or platform where the flags
+ * are inert would make the permission case pass by simply not being the
+ * permission case. The check spawns nothing — `normalizeSpawnArguments` throws
+ * before the executable is ever looked up, and the name is one that cannot
+ * exist.
+ */
+const PERMISSION_PROBE_SCRIPT = `
+import { spawnSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
+
+const [transportUrl] = process.argv.slice(2);
+const realSystemRoot = process.env.SystemRoot;
+
+let writesNodeOptions = false;
+try {
+  // Carries the names Node *copies*, so only the name Node *assigns* is left to
+  // fail on. Copies consult an own-property guard and this object satisfies it.
+  const bare = Object.create(null);
+  bare.PATH = '';
+  for (const name of ['NODE_V8_COVERAGE', '_BPXK_AUTOCVT', '_CEE_RUNOPTS', '_TAG_REDIR_ERR',
+    '_TAG_REDIR_IN', '_TAG_REDIR_OUT', 'STEPLIB', 'LIBPATH', '_EDC_SIG_DFLT', '_EDC_SUSV3']) {
+    bare[name] = '';
+  }
+  spawnSync('agentbridge-no-such-executable', [], { env: Object.freeze(bare) });
+} catch (error) {
+  writesNodeOptions = String(error && error.message).includes('NODE_OPTIONS');
+}
+console.log('WRITES_NODE_OPTIONS=' + String(writesNodeOptions));
+
+const { invokeAgentProcess } = await import(transportUrl);
+
+const environment = {};
+for (const name of ['HOMEDRIVE', 'HOMEPATH', 'LOGONSERVER', 'PATH', 'SYSTEMDRIVE',
+  'SYSTEMROOT', 'TEMP', 'USERDOMAIN', 'USERNAME', 'USERPROFILE', 'WINDIR']) {
+  environment[name] = '';
+}
+if (realSystemRoot !== undefined) {
+  environment.SYSTEMROOT = realSystemRoot;
+}
+environment.AGENTBRIDGE_SUPPLIED = 'supplied-value';
+
+const exchange = await invokeAgentProcess({
+  executablePath: process.execPath,
+  args: ['-e', 'process.stdout.write(JSON.stringify(process.env));'],
+  workingDirectory: tmpdir(),
+  environment,
+  stdin: '',
+}, { timeoutMs: 20000, graceMs: 200, maxStdoutBytes: 65536, maxStderrBytes: 16384 });
+
+console.log('RESULT=' + JSON.stringify({
+  outcome: exchange.outcome,
+  supplied: Object.keys(environment),
+  childEnv: exchange.stdout,
+}));
+process.exit(0);
+`;
+
+/** Parent values the child must never receive, whichever mechanism Node uses. */
+const PARENT_ONLY_VALUES = Object.freeze({
+  /** Valid as a `NODE_OPTIONS` payload, so the probe interpreter still starts. */
+  NODE_OPTIONS: '--max-old-space-size=4096',
+  /** One of the z/OS names Node copies from the parent when it is set. */
+  LIBPATH: 'agentbridge-zos-libpath-must-not-leak',
+});
+
+/** What one permission probe run reported. */
+interface PermissionProbeResult {
+  readonly writesNodeOptions: boolean;
+  readonly outcome: string;
+  readonly supplied: readonly string[];
+  readonly childEnv: Record<string, string>;
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly code: number | null;
+}
+
+/**
+ * Run one exchange in a real interpreter, with or without the permission flags.
+ *
+ * `--allow-child-process` is what makes the permission model relevant here at
+ * all: it is the flag a deployment would need for AgentBridge to spawn anything,
+ * and it is exactly the configuration under which Node then tries to pass its
+ * own permission flags down through `NODE_OPTIONS`. The filesystem grants are
+ * only there so the probe can load the transport and write its coverage
+ * directory; nothing in this test depends on them.
+ */
+async function runPermissionProbe(enabled: boolean): Promise<PermissionProbeResult> {
+  const directory = makeTempDirectory();
+  try {
+    const hook = join(directory, 'hook.mjs');
+    const script = join(directory, 'permission-probe.mjs');
+    writeFileSync(hook, PROBE_HOOK);
+    writeFileSync(script, PERMISSION_PROBE_SCRIPT);
+    const flags = enabled
+      ? ['--permission', '--allow-child-process', '--allow-fs-read=*', '--allow-fs-write=*']
+      : [];
+    const result = await new Promise<ProbeResult>((resolve) => {
+      const probe = spawn(
+        process.execPath,
+        [...flags, '--import', pathToFileURL(hook).href, script, TRANSPORT_SOURCE_URL],
+        {
+          stdio: ['ignore', 'pipe', 'pipe'],
+          env: {
+            ...process.env,
+            ...PARENT_ONLY_VALUES,
+            NODE_V8_COVERAGE: join(directory, COVERAGE_SENTINEL),
+          },
+        },
+      );
+      let stdout = '';
+      let stderr = '';
+      probe.stdout.on('data', (chunk: Buffer) => {
+        stdout += chunk.toString('utf8');
+      });
+      probe.stderr.on('data', (chunk: Buffer) => {
+        stderr += chunk.toString('utf8');
+      });
+      probe.on('close', (code: number | null) => {
+        resolve({ code, stdout, stderr });
+      });
+    });
+    const reported = /^RESULT=(.*)$/m.exec(result.stdout);
+    const payload =
+      reported === null
+        ? { outcome: 'PROBE_PRODUCED_NO_RESULT', supplied: [], childEnv: '{}' }
+        : (JSON.parse(reported[1] ?? '') as {
+            outcome: string;
+            supplied: string[];
+            childEnv: string;
+          });
+    return {
+      writesNodeOptions: result.stdout.includes('WRITES_NODE_OPTIONS=true'),
+      outcome: payload.outcome,
+      supplied: payload.supplied,
+      childEnv:
+        payload.childEnv === '' ? {} : (JSON.parse(payload.childEnv) as Record<string, string>),
+      stdout: result.stdout,
+      stderr: result.stderr,
+      code: result.code,
+    };
+  } finally {
+    removeTempDirectory(directory);
+  }
+}
+
+/** Distinctive enough that its appearance anywhere in the child is a leak. */
+const COVERAGE_SENTINEL = 'agentbridge-coverage-must-not-leak';
+
+/**
+ * The names a child actually received, in a stable order.
+ *
+ * Windows injects a per-drive `=C:` pseudo-variable into every environment
+ * block. Those are not inherited values and are excluded, exactly as the
+ * supplied-environment test above excludes them.
+ */
+function childNames(childEnv: Record<string, string>): readonly string[] {
+  return Object.keys(childEnv)
+    .filter((key) => !key.startsWith('='))
+    .sort();
+}
+
 interface ProbeResult {
   readonly code: number | null;
   readonly stdout: string;
@@ -1484,6 +1655,51 @@ describe('invokeAgentProcess — adversarial', () => {
         process.env.NODE_V8_COVERAGE = previous;
       }
     }
+  });
+
+  it('runs an ordinary invocation when the permission model is not enabled', async () => {
+    const probe = await runPermissionProbe(false);
+
+    expect(probe.stderr).toBe('');
+    expect(probe.code).toBe(0);
+    // The baseline half of the comparison: this interpreter has no reason to
+    // touch NODE_OPTIONS at all, and the exchange succeeds.
+    expect(probe.writesNodeOptions).toBe(false);
+    expect(probe.outcome).toBe('EXITED');
+    expect(childNames(probe.childEnv)).toEqual([...probe.supplied].sort());
+  });
+
+  it('still runs a valid invocation when Node propagates permission-model flags', async () => {
+    const probe = await runPermissionProbe(true);
+
+    // Without this the test would pass by simply not being the permission case.
+    expect(probe.writesNodeOptions).toBe(true);
+    expect(probe.code).toBe(0);
+    // The defect: Node's write against the frozen snapshot threw, and a
+    // structurally valid invocation was reported as SPAWN_FAILED.
+    expect(probe.outcome).toBe('EXITED');
+    // The child still sees exactly what the caller asked for, and the synthetic
+    // entry that absorbs Node's write stays out of its environment.
+    expect(childNames(probe.childEnv)).toEqual([...probe.supplied].sort());
+    expect(probe.childEnv.NODE_OPTIONS).toBeUndefined();
+    expect(probe.childEnv.AGENTBRIDGE_SUPPLIED).toBe('supplied-value');
+  });
+
+  it('leaks neither the parent permission flags nor its blocked variables', async () => {
+    const probe = await runPermissionProbe(true);
+
+    expect(probe.writesNodeOptions).toBe(true);
+    expect(probe.outcome).toBe('EXITED');
+    const serialized = JSON.stringify(probe.childEnv);
+    expect(serialized).not.toContain('--permission');
+    expect(serialized).not.toContain('--allow-child-process');
+    // Every parent value the transport is required to withhold, checked in the
+    // one run where Node is actively trying to push something down.
+    expect(serialized).not.toContain(PARENT_ONLY_VALUES.NODE_OPTIONS);
+    expect(serialized).not.toContain(PARENT_ONLY_VALUES.LIBPATH);
+    expect(serialized).not.toContain(COVERAGE_SENTINEL);
+    expect(probe.childEnv.LIBPATH).toBeUndefined();
+    expect(probe.childEnv.NODE_V8_COVERAGE).toBeUndefined();
   });
 
   it('keeps a secret in the supplied environment out of the exchange record', async () => {

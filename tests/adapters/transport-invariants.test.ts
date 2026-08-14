@@ -1106,6 +1106,145 @@ describe('runtime variables Node would otherwise copy from the parent', () => {
 });
 
 /**
+ * `copyPermissionModelFlagsToEnv` from `lib/child_process.js`, with the parent's
+ * `execArgv` and flag list injected so the assertion never depends on how this
+ * test run happened to be launched.
+ *
+ * The difference from `copyProcessEnvToEnv` above is the entire finding. That
+ * one asks whether the supplied object already owns the name and skips the copy
+ * when it does, which is what a blocker exploits. This one asks no such
+ * question: when the parent runs under `--permission` it simply assigns, and a
+ * plain strict-mode assignment against a frozen record throws.
+ */
+function copyPermissionModelFlagsToEnv(
+  env: Record<string, string>,
+  key: string,
+  args: readonly string[],
+  execArgv: readonly string[],
+  flagsToCopy: readonly string[],
+): void {
+  if (args.includes('--permission') || (env[key] ?? '').includes('--permission')) {
+    return;
+  }
+  for (const arg of execArgv) {
+    for (const flag of flagsToCopy) {
+      if (arg.startsWith(flag)) {
+        const existing = env[key] ?? '';
+        env[key] = existing === '' ? arg : `${existing} ${arg}`;
+      }
+    }
+  }
+}
+
+/**
+ * The variable Node writes to, rather than copies into, under the permission
+ * model.
+ *
+ * A deployment that runs AgentBridge under `--permission` must pass
+ * `--allow-child-process` for this transport to spawn anything at all, and that
+ * is exactly the configuration in which Node tries to hand its own permission
+ * flags down through `NODE_OPTIONS`. The snapshot has to absorb that write:
+ * refusing it would turn a structurally valid invocation into a spawn failure,
+ * and accepting it into the child would put the parent's flags in front of an
+ * agent that was never told about them.
+ */
+describe('the variable Node assigns under the permission model', () => {
+  const NAME = 'NODE_OPTIONS';
+  /** What `process.execArgv` holds when the model is on. Never read from here. */
+  const PERMISSION_EXEC_ARGV: readonly string[] = Object.freeze([
+    '--permission',
+    '--allow-child-process',
+    '--allow-fs-read=*',
+  ]);
+  /** `permission.availableFlags()` plus `--permission`, declared independently. */
+  const PERMISSION_FLAGS: readonly string[] = Object.freeze([
+    '--allow-addons',
+    '--allow-child-process',
+    '--allow-fs-read',
+    '--allow-fs-write',
+    '--allow-net',
+    '--allow-wasi',
+    '--allow-worker',
+    '--permission',
+  ]);
+  /** argv as Node builds it: the file, then the caller's arguments. */
+  const CHILD_ARGS: readonly string[] = Object.freeze(['/usr/bin/node', '-e', '']);
+
+  it('absorbs the assignment against the frozen record when the caller omits it', () => {
+    const snapshot = validatedEnvironment(baseEnvironment());
+    const before = envPairsFor(snapshot);
+
+    expect(Object.isFrozen(snapshot)).toBe(true);
+    expect(() => {
+      copyPermissionModelFlagsToEnv(
+        snapshot,
+        NAME,
+        CHILD_ARGS,
+        PERMISSION_EXEC_ARGV,
+        PERMISSION_FLAGS,
+      );
+    }).not.toThrow();
+
+    expect(envPairsFor(snapshot)).toEqual(before);
+  });
+
+  it('keeps the absorbing entry out of the child environment', () => {
+    const snapshot = validatedEnvironment(baseEnvironment());
+    copyPermissionModelFlagsToEnv(
+      snapshot,
+      NAME,
+      CHILD_ARGS,
+      PERMISSION_EXEC_ARGV,
+      PERMISSION_FLAGS,
+    );
+
+    expect(Object.prototype.hasOwnProperty.call(snapshot, NAME)).toBe(true);
+    expect(Object.keys(snapshot)).not.toContain(NAME);
+    expect(envPairsFor(snapshot).some((pair) => pair.startsWith(`${NAME}=`))).toBe(false);
+    expect(snapshot[NAME]).toBe('');
+  });
+
+  it('preserves a caller-supplied value exactly through the assignment', () => {
+    const supplied = '--max-old-space-size=256';
+    const snapshot = validatedEnvironment({ ...baseEnvironment(), [NAME]: supplied });
+
+    expect(envPairsFor(snapshot)).toContain(`${NAME}=${supplied}`);
+    expect(() => {
+      copyPermissionModelFlagsToEnv(
+        snapshot,
+        NAME,
+        CHILD_ARGS,
+        PERMISSION_EXEC_ARGV,
+        PERMISSION_FLAGS,
+      );
+    }).not.toThrow();
+
+    expect(snapshot[NAME]).toBe(supplied);
+    expect(envPairsFor(snapshot)).toContain(`${NAME}=${supplied}`);
+  });
+
+  it('leaves the variables Node copies blocked exactly as they were', () => {
+    const snapshot = validatedEnvironment(baseEnvironment());
+    copyPermissionModelFlagsToEnv(
+      snapshot,
+      NAME,
+      CHILD_ARGS,
+      PERMISSION_EXEC_ARGV,
+      PERMISSION_FLAGS,
+    );
+
+    for (const name of RUNTIME_PROPAGATED_NAMES) {
+      expect(Object.getOwnPropertyDescriptor(snapshot, name)).toEqual({
+        value: '',
+        writable: false,
+        enumerable: false,
+        configurable: false,
+      });
+    }
+  });
+});
+
+/**
  * Well-formedness of the two strings this transport promises to carry verbatim.
  *
  * argv and stdin are both encoded as UTF-8 on the way to the child, and UTF-8

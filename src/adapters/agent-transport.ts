@@ -361,6 +361,68 @@ const RUNTIME_PROPAGATED_ENVIRONMENT_NAMES: readonly string[] = objectFreeze([
 ]);
 
 /**
+ * The one variable Node *assigns* into a supplied `options.env` rather than
+ * copying into it.
+ *
+ * When the parent runs under the permission model,
+ * `copyPermissionModelFlagsToEnv` in `node:child_process` appends every
+ * permission flag it finds in `process.execArgv` to `env.NODE_OPTIONS`. Unlike
+ * `copyProcessEnvToEnv` it consults no `hasOwnProperty` guard on the supplied
+ * object, so the non-enumerable blocker that stops the copies above cannot stop
+ * this write. Against the frozen record the assignment throws — "Cannot add
+ * property NODE_OPTIONS, object is not extensible" when the name is absent,
+ * "Cannot assign to read only property" when the caller supplied it — and
+ * `invokeAgentProcess` reports the resulting `TypeError` as `SPAWN_FAILED`. A
+ * structurally valid invocation then fails for a reason that has nothing to do
+ * with the specification, the executable, or the caller.
+ *
+ * The entry is therefore defined as an accessor whose setter discards. A setter
+ * survives `Object.freeze` — freezing an accessor only clears `configurable` —
+ * so the snapshot stays frozen while the write becomes a no-op, and it absorbs
+ * the write however Node arrives at it rather than only in the shape Node
+ * currently uses. What the child reads is unchanged in both directions: exactly
+ * the caller's value when one was supplied, and nothing at all when none was,
+ * because the synthetic entry is left out of the `for...in` walk that builds
+ * the child environment. The parent's own `NODE_OPTIONS` is never read, and the
+ * parent's permission flags reach neither the record nor the child.
+ */
+const RUNTIME_ASSIGNED_ENVIRONMENT_NAME = 'NODE_OPTIONS';
+
+/**
+ * Define one entry of the environment snapshot.
+ *
+ * Every entry is an own, non-configurable property of a null-prototype record,
+ * and `visible` decides whether the child sees it at all. Data properties
+ * throughout, except {@link RUNTIME_ASSIGNED_ENVIRONMENT_NAME}, which needs a
+ * discarding setter for the reason documented there.
+ */
+function defineEnvironmentEntry(
+  environment: Record<string, string>,
+  key: string,
+  value: string,
+  visible: boolean,
+): void {
+  if (key === RUNTIME_ASSIGNED_ENVIRONMENT_NAME) {
+    objectDefineProperty(environment, key, {
+      get: (): string => value,
+      set: (): void => {
+        // Absorbs Node's permission-model write; see the constant above. The
+        // snapshot is what the caller supplied, and it stays that way.
+      },
+      enumerable: visible,
+      configurable: false,
+    });
+    return;
+  }
+  objectDefineProperty(environment, key, {
+    value,
+    writable: false,
+    enumerable: visible,
+    configurable: false,
+  });
+}
+
+/**
  * One process to run. Every field is required; nothing has a default.
  *
  * `workingDirectory` is whatever absolute path the caller assigns, and this
@@ -869,12 +931,7 @@ function readEnvironment(raw: unknown, platform: TransportPlatform): {
       return { rejection: TRANSPORT_REJECTION.ENVIRONMENT_BYTES_EXCEEDED, value: empty };
     }
 
-    objectDefineProperty(environment, key, {
-      value,
-      writable: false,
-      enumerable: true,
-      configurable: false,
-    });
+    defineEnvironmentEntry(environment, key, value, true);
   }
 
   if (platform === 'win32') {
@@ -913,12 +970,20 @@ function readEnvironment(raw: unknown, platform: TransportPlatform): {
     if (objectGetOwnPropertyDescriptor(environment, blocked) !== undefined) {
       continue;
     }
-    objectDefineProperty(environment, blocked, {
-      value: '',
-      writable: false,
-      enumerable: false,
-      configurable: false,
-    });
+    defineEnvironmentEntry(environment, blocked, '', false);
+  }
+
+  // The permission model assigns instead of copying, so no blocker can turn the
+  // write off; it can only be given somewhere harmless to land. A caller that
+  // supplied the name already has its discarding accessor from the loop above,
+  // and this covers the far commoner case of a caller that did not: an entry
+  // the child never sees, holding a value it never receives, whose only purpose
+  // is to exist so that Node's assignment neither extends nor throws against
+  // the frozen record.
+  if (
+    objectGetOwnPropertyDescriptor(environment, RUNTIME_ASSIGNED_ENVIRONMENT_NAME) === undefined
+  ) {
+    defineEnvironmentEntry(environment, RUNTIME_ASSIGNED_ENVIRONMENT_NAME, '', false);
   }
 
   return { rejection: null, value: objectFreeze(environment) };
