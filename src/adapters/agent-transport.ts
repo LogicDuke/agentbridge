@@ -337,6 +337,30 @@ const WINDOWS_REQUIRED_ENVIRONMENT_NAMES: readonly string[] = objectFreeze([
 ]);
 
 /**
+ * Variables Node copies from the parent into a supplied `options.env`.
+ *
+ * `normalizeSpawnArguments` in `node:child_process` calls `copyProcessEnvToEnv`
+ * for each of these names and assigns the parent value whenever the supplied
+ * environment has no *own* property under that exact name: `NODE_V8_COVERAGE`
+ * on every platform, and the nine z/OS runtime variables when
+ * `process.platform === 'os390'`. `TransportPlatform` collapses z/OS into
+ * `posix`, and the copy is keyed on Node's own platform rather than on anything
+ * this module is told, so every name is blocked unconditionally.
+ */
+const RUNTIME_PROPAGATED_ENVIRONMENT_NAMES: readonly string[] = objectFreeze([
+  'NODE_V8_COVERAGE',
+  '_BPXK_AUTOCVT',
+  '_CEE_RUNOPTS',
+  '_TAG_REDIR_ERR',
+  '_TAG_REDIR_IN',
+  '_TAG_REDIR_OUT',
+  'STEPLIB',
+  'LIBPATH',
+  '_EDC_SIG_DFLT',
+  '_EDC_SUSV3',
+]);
+
+/**
  * One process to run. Every field is required; nothing has a default.
  *
  * `workingDirectory` is whatever absolute path the caller assigns, and this
@@ -875,11 +899,21 @@ function readEnvironment(raw: unknown, platform: TransportPlatform): {
     }
   }
 
-  // Node copies a parent NODE_V8_COVERAGE value into an options.env object
-  // that lacks this exact own key. A non-enumerable own value blocks that
-  // runtime mutation without adding anything to the child's environment.
-  if (objectGetOwnPropertyDescriptor(environment, 'NODE_V8_COVERAGE') === undefined) {
-    objectDefineProperty(environment, 'NODE_V8_COVERAGE', {
+  // Node copies each of these parent values into an options.env object that
+  // lacks that exact own key. A non-enumerable own value satisfies the
+  // `hasOwnProperty` guard, so the copy is skipped: the parent value never
+  // arrives, and the blocker itself is absent from the `for...in` walk that
+  // builds the child's environment. Without it the assignment would instead hit
+  // the frozen record and throw, failing an otherwise valid invocation.
+  for (let index = 0; index < RUNTIME_PROPAGATED_ENVIRONMENT_NAMES.length; index += 1) {
+    const blocked = RUNTIME_PROPAGATED_ENVIRONMENT_NAMES[index];
+    if (blocked === undefined) {
+      continue;
+    }
+    if (objectGetOwnPropertyDescriptor(environment, blocked) !== undefined) {
+      continue;
+    }
+    objectDefineProperty(environment, blocked, {
       value: '',
       writable: false,
       enumerable: false,

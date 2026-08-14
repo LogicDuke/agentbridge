@@ -944,6 +944,168 @@ describe('structural validation is bounded, non-coercing and fail-closed', () =>
 });
 
 /**
+ * Names `node:child_process` copies out of the parent into a supplied
+ * `options.env`, in the order `normalizeSpawnArguments` copies them.
+ *
+ * `NODE_V8_COVERAGE` is copied on every platform; the nine that follow are
+ * copied when Node's own `process.platform` is `os390`. That platform check is
+ * Node's, not this transport's, and `TransportPlatform` has no z/OS member, so
+ * the snapshot must be safe against all ten regardless of where it was built.
+ */
+const RUNTIME_PROPAGATED_NAMES: readonly string[] = Object.freeze([
+  'NODE_V8_COVERAGE',
+  '_BPXK_AUTOCVT',
+  '_CEE_RUNOPTS',
+  '_TAG_REDIR_ERR',
+  '_TAG_REDIR_IN',
+  '_TAG_REDIR_OUT',
+  'STEPLIB',
+  'LIBPATH',
+  '_EDC_SIG_DFLT',
+  '_EDC_SUSV3',
+]);
+
+/**
+ * `copyProcessEnvToEnv` from `lib/child_process.js`, with the parent read
+ * injected so the assertion never depends on this host's real environment.
+ *
+ * Node's copy is a plain assignment inside a strict-mode module, so it throws
+ * rather than failing silently when the target is frozen. Reproducing the
+ * assignment — instead of asserting a property descriptor and calling it done —
+ * is what makes these tests a proof about the spawn path.
+ */
+function copyProcessEnvToEnv(
+  env: Record<string, string>,
+  name: string,
+  optionEnv: Record<string, string> | undefined,
+  parentEnv: Readonly<Record<string, string>>,
+): void {
+  const parentValue = parentEnv[name];
+  if (
+    parentValue !== undefined &&
+    parentValue !== '' &&
+    (optionEnv === undefined || !Object.prototype.hasOwnProperty.call(optionEnv, name))
+  ) {
+    env[name] = parentValue;
+  }
+}
+
+/** The `for...in` walk `normalizeSpawnArguments` uses to build `envPairs`. */
+function envPairsFor(env: Readonly<Record<string, string>>): readonly string[] {
+  const keys: string[] = [];
+  for (const key in env) {
+    keys.push(key);
+  }
+  const pairs: string[] = [];
+  for (const key of keys) {
+    const value = env[key];
+    if (value !== undefined) {
+      pairs.push(`${key}=${value}`);
+    }
+  }
+  return pairs;
+}
+
+/** The validated, frozen snapshot for an environment this host accepts. */
+function validatedEnvironment(
+  environment: Readonly<Record<string, string>>,
+): Record<string, string> {
+  const result = readInvocation(makeSpec({ environment }), makeLimits(), PLATFORM);
+
+  expect(result.rejection).toBeNull();
+
+  return (result.value?.environment ?? {}) as Record<string, string>;
+}
+
+/**
+ * Runtime variables Node propagates into a supplied environment.
+ *
+ * Every name here is one Node would otherwise lift out of the parent process
+ * and hand to the child behind the caller's back. The snapshot carries a
+ * non-enumerable own blocker for each, which satisfies Node's own-property
+ * guard so the copy is skipped, keeps the parent value out of the child, and
+ * stays out of the enumeration that builds `envPairs`. Without the blocker the
+ * assignment lands on a frozen record and throws, turning a valid invocation
+ * into a spawn failure.
+ */
+describe('runtime variables Node would otherwise copy from the parent', () => {
+  it.each(RUNTIME_PROPAGATED_NAMES)(
+    'blocks %s with a non-enumerable own property when the caller omits it',
+    (name) => {
+      const snapshot = validatedEnvironment(baseEnvironment());
+      const descriptor = Object.getOwnPropertyDescriptor(snapshot, name);
+
+      expect(descriptor).toEqual({
+        value: '',
+        writable: false,
+        enumerable: false,
+        configurable: false,
+      });
+      expect(Object.prototype.hasOwnProperty.call(snapshot, name)).toBe(true);
+    },
+  );
+
+  it.each(RUNTIME_PROPAGATED_NAMES)(
+    'refuses Node the chance to copy a parent %s into the child',
+    (name) => {
+      const snapshot = validatedEnvironment(baseEnvironment());
+      const before = envPairsFor(snapshot);
+
+      expect(() => {
+        copyProcessEnvToEnv(snapshot, name, snapshot, { [name]: 'PARENT_VALUE' });
+      }).not.toThrow();
+
+      expect(snapshot[name]).not.toBe('PARENT_VALUE');
+      expect(envPairsFor(snapshot)).toEqual(before);
+    },
+  );
+
+  it.each(RUNTIME_PROPAGATED_NAMES)('keeps %s out of the child environment', (name) => {
+    const snapshot = validatedEnvironment(baseEnvironment());
+
+    expect(Object.keys(snapshot)).not.toContain(name);
+    expect(envPairsFor(snapshot)).not.toContain(`${name}=`);
+    expect(envPairsFor(snapshot).some((pair) => pair.startsWith(`${name}=`))).toBe(false);
+  });
+
+  it.each(RUNTIME_PROPAGATED_NAMES)(
+    'preserves a caller-supplied %s exactly and does not shadow it',
+    (name) => {
+      const snapshot = validatedEnvironment({ ...baseEnvironment(), [name]: 'CALLER_VALUE' });
+
+      expect(snapshot[name]).toBe('CALLER_VALUE');
+      expect(Object.getOwnPropertyDescriptor(snapshot, name)?.enumerable).toBe(true);
+      expect(Object.keys(snapshot)).toContain(name);
+      expect(envPairsFor(snapshot)).toContain(`${name}=CALLER_VALUE`);
+
+      copyProcessEnvToEnv(snapshot, name, snapshot, { [name]: 'PARENT_VALUE' });
+
+      expect(snapshot[name]).toBe('CALLER_VALUE');
+    },
+  );
+
+  it('survives the whole propagation sequence against the frozen record', () => {
+    const caller = baseEnvironment();
+    const snapshot = validatedEnvironment(caller);
+    const parent: Record<string, string> = {};
+    for (const name of RUNTIME_PROPAGATED_NAMES) {
+      parent[name] = 'PARENT_VALUE';
+    }
+
+    expect(Object.isFrozen(snapshot)).toBe(true);
+    expect(() => {
+      for (const name of RUNTIME_PROPAGATED_NAMES) {
+        copyProcessEnvToEnv(snapshot, name, snapshot, parent);
+      }
+    }).not.toThrow();
+
+    expect(envPairsFor(snapshot)).toEqual(
+      Object.entries(caller).map(([key, value]) => `${key}=${value}`),
+    );
+  });
+});
+
+/**
  * Well-formedness of the two strings this transport promises to carry verbatim.
  *
  * argv and stdin are both encoded as UTF-8 on the way to the child, and UTF-8
