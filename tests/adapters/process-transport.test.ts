@@ -364,6 +364,171 @@ async function importWithChildObserver(): Promise<{
   }
 }
 
+/** One timer the isolated transport scheduled, and what became of it. */
+interface RecordedTimer {
+  readonly delayMs: number;
+  cleared: boolean;
+  fired: boolean;
+}
+
+/** An isolated transport whose child, timers, and kill attempts are visible. */
+interface TerminationProbe {
+  readonly child: Promise<ChildProcess>;
+  readonly invoke: typeof invokeAgentProcess;
+  readonly timers: readonly RecordedTimer[];
+  readonly kills: readonly string[];
+  readonly onTimerCreated: (hook: (timer: RecordedTimer) => void) => void;
+}
+
+/**
+ * Import a transport that reports its own scheduling and signalling.
+ *
+ * The transport captures `setTimeout`, `clearTimeout`, `process.kill`, and
+ * `ChildProcess.prototype.kill` as intrinsics at module load, so instrumenting
+ * those globals across one isolated import — and restoring them immediately
+ * afterwards — observes exactly one module instance and leaves the rest of the
+ * worker on the genuine functions. Signals are recorded and withheld rather than
+ * delivered, so the child stays alive for as long as a test needs it and every
+ * kill the transport issues is counted instead of raced.
+ */
+async function importWithTerminationProbe(): Promise<TerminationProbe> {
+  const onDescriptor = Object.getOwnPropertyDescriptor(EventEmitter.prototype, 'on');
+  const childKillDescriptor = Object.getOwnPropertyDescriptor(ChildProcess.prototype, 'kill');
+  const processKillDescriptor = Object.getOwnPropertyDescriptor(process, 'kill');
+  const setTimeoutDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'setTimeout');
+  const clearTimeoutDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'clearTimeout');
+  const originalOn: unknown = onDescriptor?.value;
+  const originalProcessKill: unknown = processKillDescriptor?.value;
+  if (
+    typeof originalOn !== 'function' ||
+    typeof originalProcessKill !== 'function' ||
+    childKillDescriptor === undefined ||
+    setTimeoutDescriptor === undefined ||
+    clearTimeoutDescriptor === undefined
+  ) {
+    throw new Error('An intrinsic the termination probe instruments is unavailable');
+  }
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+
+  const timers: RecordedTimer[] = [];
+  const kills: string[] = [];
+  const records = new Map<NodeJS.Timeout, RecordedTimer>();
+  let hook: ((timer: RecordedTimer) => void) | null = null;
+  let observe: ((child: ChildProcess) => void) | null = null;
+  const child = new Promise<ChildProcess>((resolve) => {
+    observe = resolve;
+  });
+
+  Object.defineProperty(globalThis, 'setTimeout', {
+    configurable: true,
+    writable: true,
+    value(
+      callback: (...callbackArgs: readonly unknown[]) => void,
+      delayMs?: number,
+      ...callbackArgs: readonly unknown[]
+    ): NodeJS.Timeout {
+      const record: RecordedTimer = { delayMs: delayMs ?? 0, cleared: false, fired: false };
+      const handle = realSetTimeout(() => {
+        record.fired = true;
+        callback(...callbackArgs);
+      }, delayMs);
+      records.set(handle, record);
+      timers.push(record);
+      if (hook !== null) {
+        hook(record);
+      }
+      return handle;
+    },
+  });
+  Object.defineProperty(globalThis, 'clearTimeout', {
+    configurable: true,
+    writable: true,
+    value(handle?: NodeJS.Timeout): void {
+      if (handle !== undefined) {
+        const record = records.get(handle);
+        if (record !== undefined) {
+          record.cleared = true;
+        }
+      }
+      realClearTimeout(handle);
+    },
+  });
+  Object.defineProperty(ChildProcess.prototype, 'kill', {
+    configurable: true,
+    writable: true,
+    value(this: ChildProcess, signal?: NodeJS.Signals | number): boolean {
+      kills.push(`child:${String(signal ?? 'default')}`);
+      return true;
+    },
+  });
+  Object.defineProperty(process, 'kill', {
+    configurable: true,
+    writable: true,
+    value(pid: number, signal?: string | number): boolean {
+      if (pid < 0) {
+        kills.push(`group:${String(signal ?? 'default')}`);
+        return true;
+      }
+      const killed: unknown = Reflect.apply(originalProcessKill, process, [pid, signal]);
+      return killed === true;
+    },
+  });
+  Object.defineProperty(EventEmitter.prototype, 'on', {
+    configurable: true,
+    writable: true,
+    value(
+      this: EventEmitter,
+      event: string | symbol,
+      listener: (...args: unknown[]) => void,
+    ): EventEmitter {
+      if (observe !== null && this instanceof ChildProcess) {
+        const resolve = observe;
+        observe = null;
+        resolve(this);
+      }
+      return Reflect.apply(originalOn, this, [event, listener]) as EventEmitter;
+    },
+  });
+
+  try {
+    vi.resetModules();
+    const isolated = await import('../../src/adapters/process-transport.js');
+    return {
+      child,
+      invoke: isolated.invokeAgentProcess,
+      timers,
+      kills,
+      onTimerCreated(next: (timer: RecordedTimer) => void): void {
+        hook = next;
+      },
+    };
+  } finally {
+    if (onDescriptor !== undefined) {
+      Object.defineProperty(EventEmitter.prototype, 'on', onDescriptor);
+    }
+    Object.defineProperty(ChildProcess.prototype, 'kill', childKillDescriptor);
+    if (processKillDescriptor !== undefined) {
+      Object.defineProperty(process, 'kill', processKillDescriptor);
+    }
+    Object.defineProperty(globalThis, 'setTimeout', setTimeoutDescriptor);
+    Object.defineProperty(globalThis, 'clearTimeout', clearTimeoutDescriptor);
+    // Only the isolated module keeps the instrumented globals, so anything the
+    // import itself scheduled is noise from before the exchange under test.
+    timers.length = 0;
+    kills.length = 0;
+  }
+}
+
+/** Restore an environment variable, distinguishing empty from absent. */
+function restoreEnvironmentVariable(name: string, value: string | undefined): void {
+  if (value === undefined) {
+    Reflect.deleteProperty(process.env, name);
+    return;
+  }
+  process.env[name] = value;
+}
+
 /** Run a stub script with optional extra arguments. */
 function runStub(
   script: string,
@@ -1457,6 +1622,176 @@ describe('invokeAgentProcess — adversarial', () => {
     },
     25_000,
   );
+
+  it('does not re-enter termination when a stronger cause arrives mid-lifecycle', async () => {
+    const probe = await importWithTerminationProbe();
+    const graceMs = 400;
+    const controller = new AbortController();
+    let observed: ChildProcess | null = null;
+    let injected = false;
+
+    /**
+     * Claim a stronger terminal cause from inside the bounded close wait.
+     *
+     * Everything here is synchronous, so the injected state is visible to a
+     * second termination lifecycle and to nothing else in the worker.
+     */
+    const injectStrongerCause = (child: ChildProcess): void => {
+      // The process really is still alive. Withdrawing the ended report gives a
+      // second lifecycle genuine work to do, so its arrival becomes countable.
+      Object.defineProperty(child, 'exitCode', {
+        configurable: true,
+        writable: true,
+        value: null,
+      });
+      const systemRoot = process.env['SystemRoot'];
+      const windir = process.env['windir'];
+      // Deny the Windows tree-kill helper for the length of this injection, so
+      // both platforms take the same bounded direct-child route and a second
+      // lifecycle is equally visible on either.
+      process.env['SystemRoot'] = '';
+      process.env['windir'] = '';
+      try {
+        const stdout = child.stdout;
+        expect(stdout).not.toBeNull();
+        if (stdout !== null) {
+          // Overflow outranks the cancellation already reported.
+          stdout.emit('data', Buffer.alloc(4_096, 0x78));
+        }
+        // A second lifecycle would now be waiting on the child; report an exit
+        // so it would finish inside this close wait, where its overwrite of the
+        // reported scope lands in the settled exchange rather than after it.
+        child.emit('exit', 0, null);
+      } finally {
+        restoreEnvironmentVariable('SystemRoot', systemRoot);
+        restoreEnvironmentVariable('windir', windir);
+      }
+    };
+
+    try {
+      const pending = probe.invoke(
+        makeSpec({ args: ['-e', STUB.SLEEP] }),
+        withSignal(
+          makeLimits({ timeoutMs: 15_000, graceMs, maxStdoutBytes: 1_024 }),
+          controller.signal,
+        ),
+      );
+      const child = await probe.child;
+      observed = child;
+      // The handle reports ended, so the first termination has nothing to
+      // signal and reaches its bounded close wait at once. `close` never
+      // arrives, because the process itself is alive and still holds its pipes.
+      Object.defineProperty(child, 'exitCode', {
+        configurable: true,
+        writable: true,
+        value: 0,
+      });
+      probe.onTimerCreated((timer) => {
+        // The close wait is the only thing this exchange schedules for the
+        // grace period; the deadline uses the timeout instead.
+        if (injected || timer.delayMs !== graceMs) {
+          return;
+        }
+        injected = true;
+        // One microtask later, so the close wait is fully armed: the transport
+        // installs its release hook after scheduling this timer.
+        queueMicrotask(() => {
+          injectStrongerCause(child);
+        });
+      });
+
+      controller.abort();
+      const exchange = await pending;
+
+      expect(injected).toBe(true);
+      // The stronger cause still promotes, exactly as the precedence requires.
+      expect(exchange.outcome).toBe('OUTPUT_LIMIT_EXCEEDED');
+      expect(exchange.stdoutTruncated).toBe(true);
+      expect(exchange.stdoutBytes).toBe(1_024);
+      // One termination lifecycle ran, and its report survived the promotion.
+      // A second would have re-read the handle and downgraded this to
+      // ESCALATION_FAILED, because by then the child was reporting alive again.
+      expect(exchange.terminationScope).toBe('DIRECT_CHILD_ONLY');
+      // A second lifecycle would have signalled the process it believed alive.
+      expect(probe.kills).toEqual([]);
+      // Exactly one bounded close wait was ever armed. A second would have
+      // replaced the release hook of the first, stranding its timer.
+      expect(probe.timers.filter((timer) => timer.delayMs === graceMs)).toHaveLength(1);
+      // Nothing this exchange scheduled is still running after settlement.
+      expect(probe.timers.filter((timer) => !timer.cleared && !timer.fired)).toEqual([]);
+      // Settlement is final: no listener of the transport's survived it, so a
+      // later close cannot produce a second exchange.
+      expect(child.listenerCount('close')).toBe(0);
+      expect(child.listenerCount('exit')).toBe(0);
+      expect(child.listenerCount('error')).toBe(0);
+      child.emit('close', 0, null);
+      await delay(0);
+      expect(await pending).toBe(exchange);
+      expect(Object.isFrozen(exchange)).toBe(true);
+    } finally {
+      if (observed?.pid !== undefined) {
+        try {
+          process.kill(observed.pid, 'SIGKILL');
+        } catch {
+          // The child may already have gone; the assertions above are the point.
+        }
+      }
+    }
+  }, 15_000);
+
+  it('lets a close during termination release the bounded wait, not outlast it', async () => {
+    const probe = await importWithTerminationProbe();
+    const graceMs = 5_000;
+    const controller = new AbortController();
+    let observed: ChildProcess | null = null;
+    let released = false;
+
+    try {
+      const pending = probe.invoke(
+        makeSpec({ args: ['-e', STUB.SLEEP] }),
+        withSignal(makeLimits({ timeoutMs: 15_000, graceMs }), controller.signal),
+      );
+      const child = await probe.child;
+      observed = child;
+      Object.defineProperty(child, 'exitCode', {
+        configurable: true,
+        writable: true,
+        value: 0,
+      });
+      probe.onTimerCreated((timer) => {
+        if (released || timer.delayMs !== graceMs) {
+          return;
+        }
+        released = true;
+        queueMicrotask(() => {
+          child.emit('close', 0, null);
+        });
+      });
+
+      controller.abort();
+      const exchange = await pending;
+
+      expect(released).toBe(true);
+      // Cancellation still outranks the exit the close reports.
+      expect(exchange.outcome).toBe('CANCELLED');
+      expect(exchange.terminationScope).toBe('DIRECT_CHILD_ONLY');
+      const closeWaits = probe.timers.filter((timer) => timer.delayMs === graceMs);
+      expect(closeWaits).toHaveLength(1);
+      // Released by the close rather than abandoned at the bound: the exchange
+      // settled through the termination lifecycle that was still running.
+      expect(closeWaits[0]?.cleared).toBe(true);
+      expect(closeWaits[0]?.fired).toBe(false);
+      expect(probe.timers.filter((timer) => !timer.cleared && !timer.fired)).toEqual([]);
+    } finally {
+      if (observed?.pid !== undefined) {
+        try {
+          process.kill(observed.pid, 'SIGKILL');
+        } catch {
+          // The child may already have gone; the assertions above are the point.
+        }
+      }
+    }
+  }, 15_000);
 });
 
 describe('invokeAgentProcess — boundary', () => {

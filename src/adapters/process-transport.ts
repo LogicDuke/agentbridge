@@ -734,6 +734,7 @@ export function invokeAgentProcess(
     let cause: TransportOutcome | null = null;
     let settled = false;
     let closed = false;
+    /** Set once a termination lifecycle begins, and never cleared thereafter. */
     let terminating = false;
     let exitCode: number | null = null;
     let terminatingSignal: string | null = null;
@@ -839,6 +840,15 @@ export function invokeAgentProcess(
      * bounded chance to close and the exchange resolves regardless. Totality
      * outranks a complete transcript, and the transcript is already known to be
      * partial whenever this path runs.
+     *
+     * **Entered at most once.** The guard covers the whole lifecycle — the kill
+     * itself, the bounded close wait, and settlement — not just the kill. A
+     * stronger terminal cause arriving mid-flight still promotes the reported
+     * cause through {@link claim}, because that decision is independent of this
+     * function; what it must not do is start a second lifecycle, which would
+     * overwrite an already-reported {@link TerminationScope}, arm a second
+     * close-wait timer whose predecessor can then no longer be released, and
+     * leave that timer running after the exchange has settled.
      */
     async function runTermination(): Promise<void> {
       if (terminating) {
@@ -846,7 +856,6 @@ export function invokeAgentProcess(
       }
       terminating = true;
       terminationScope = await terminate(child, platform, invocation.graceMs);
-      terminating = false;
 
       if (!closed) {
         if (!hasEnded(child)) {
@@ -925,6 +934,9 @@ export function invokeAgentProcess(
         notifyClosed = null;
         notify();
       }
+      // A termination lifecycle that has begun owns settlement for the rest of
+      // its run: the notification above releases its bounded close wait, and it
+      // settles from there. Settling here as well would only race that lifecycle.
       if (!terminating) {
         settle();
       }
