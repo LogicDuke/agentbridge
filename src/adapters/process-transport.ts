@@ -849,6 +849,16 @@ export function invokeAgentProcess(
      * overwrite an already-reported {@link TerminationScope}, arm a second
      * close-wait timer whose predecessor can then no longer be released, and
      * leave that timer running after the exchange has settled.
+     *
+     * **Nothing is allocated after settlement.** The kill is an asynchronous
+     * suspension point, and a stronger cause can settle the exchange while it is
+     * in flight — an asynchronous spawn failure racing a cancellation is the
+     * reachable case. {@link cleanup} has then already run and released every
+     * handler that could report a close, so arming the bounded close wait past
+     * that point would create a timer nothing is left to release, keeping the
+     * host alive for a further grace period after the caller's exchange has
+     * resolved. Once settled there is also nothing left to wait for, so this
+     * lifecycle simply stops.
      */
     async function runTermination(): Promise<void> {
       if (terminating) {
@@ -856,6 +866,10 @@ export function invokeAgentProcess(
       }
       terminating = true;
       terminationScope = await terminate(child, platform, invocation.graceMs);
+
+      if (settled) {
+        return;
+      }
 
       if (!closed) {
         if (!hasEnded(child)) {

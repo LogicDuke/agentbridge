@@ -1451,6 +1451,86 @@ describe('invokeAgentProcess — adversarial', () => {
     expect(exchange.outcome).toBe('SPAWN_FAILED');
   });
 
+  it('arms no close wait when an asynchronous spawn failure settles a cancelled exchange', async () => {
+    // Distinct so a recorded delay identifies which timer the transport made.
+    const timeoutMs = 30_000;
+    const graceMs = 5_000;
+    const directory = makeTempDirectory();
+    const missing = join(directory, 'no-such-agent-binary');
+    const probe = await importWithTerminationProbe();
+    const controller = new AbortController();
+
+    // `cleanup` clears the deadline exactly once, from `settle`. A timer created
+    // while that record already reads cleared is therefore one an asynchronous
+    // continuation allocated after the exchange had resolved — the defect under
+    // test, observed directly rather than inferred from elapsed time.
+    const deadlines: RecordedTimer[] = [];
+    const afterSettlement: RecordedTimer[] = [];
+    probe.onTimerCreated((timer) => {
+      if (deadlines.length === 0 && timer.delayMs === timeoutMs) {
+        deadlines.push(timer);
+        return;
+      }
+      if (deadlines[0]?.cleared === true) {
+        afterSettlement.push(timer);
+      }
+    });
+
+    // Both must share one macrotask. The spawn's asynchronous ENOENT is queued
+    // as a tick callback while `runTermination`'s continuation is queued as a
+    // microtask, and Node drains ticks first only when the turn is not itself a
+    // microtask drain — which an `async` test body is. Running them from a timer
+    // callback makes the settle-before-resume ordering deterministic instead of
+    // leaving it to whichever context the caller happened to invoke from.
+    let startedAt = 0;
+    // Wrapped, because awaiting a promise of a promise would unwrap both and
+    // resolve the exchange in the timer's own turn rather than in this one.
+    const started = await new Promise<{ readonly pending: Promise<AgentExchange> }>((ready) => {
+      setTimeout(() => {
+        startedAt = Date.now();
+        const invoked = probe.invoke(
+          makeSpec({ executablePath: missing }),
+          withSignal(makeLimits({ timeoutMs, graceMs }), controller.signal),
+        );
+        controller.abort();
+        ready({ pending: invoked });
+      }, 0);
+    });
+
+    const exchange = await started.pending;
+    const settledMs = Date.now() - startedAt;
+    // Let any post-settlement continuation run before the resources are judged.
+    await delay(50);
+    removeTempDirectory(directory);
+
+    // The failure really was asynchronous: `spawn` returned a handle, and that
+    // handle never received a process identifier.
+    const child = await probe.child;
+    expect(child.pid).toBeUndefined();
+
+    // Precedence is unchanged: SPAWN_FAILED still outranks the CANCELLED that
+    // was claimed first and started the termination lifecycle.
+    expect(exchange.outcome).toBe('SPAWN_FAILED');
+    // Settlement happened while `runTermination` was suspended in `terminate`,
+    // before it could report a scope. This is the race window itself, so the
+    // assertions below are about the state the defect actually reached.
+    expect(exchange.terminationScope).toBe('NOT_REQUIRED');
+    expect(Object.isFrozen(exchange)).toBe(true);
+
+    // Cleanup ran to completion: the deadline was created and released.
+    expect(deadlines).toHaveLength(1);
+    expect(deadlines[0]?.cleared).toBe(true);
+
+    // Nothing was allocated after that cleanup, and the bounded close wait —
+    // the only timer this path could still have armed — was never created.
+    expect(afterSettlement).toEqual([]);
+    expect(probe.timers.filter((timer) => timer.delayMs === graceMs)).toEqual([]);
+    // No timer of any kind outlived the exchange, so the host is not pinned.
+    expect(probe.timers.filter((timer) => !timer.cleared && !timer.fired)).toEqual([]);
+    // Supporting evidence only; the resource assertions above are the subject.
+    expect(settledMs).toBeLessThan(graceMs);
+  });
+
   onPosix.each([
     ['stdout', 'process.stdout', 'stdoutTruncated'],
     ['stderr', 'process.stderr', 'stderrTruncated'],
