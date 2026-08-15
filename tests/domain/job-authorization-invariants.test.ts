@@ -11,10 +11,13 @@ import {
   JOB_AUTHORIZATION,
   JOB_AUTHORIZATION_REASON,
   JOB_BOUNDS,
+  JOB_OPERATION,
   operatorMergeAuthorizes,
   readJobOperation,
   REPAIR_AUTHORIZABLE_OPERATIONS,
+  resolveJobOperation,
   satisfiesIndependentValidator,
+  UNKNOWN_JOB_OPERATION,
   type ApprovalRecord,
   type JobOperationRequest,
   type OperatorMergeAuthorization,
@@ -710,6 +713,149 @@ describe('prototype pollution and inherited properties create no authority', () 
 
       expect(JSON.stringify(decision), key).toBe(JSON.stringify(baseline));
     }
+  });
+});
+
+/* -------------------------------------------------------------------------
+ * Hostile mutation of the runtime itself
+ * ------------------------------------------------------------------------- */
+
+/**
+ * Run `body` with `Map.prototype.get` replaced by one that answers
+ * `'source.edit'` to everything, then restore the captured descriptor.
+ *
+ * `source.edit` is the payload precisely because it is the canonical *allowed*
+ * operation: if operation resolution consults a poisonable container method,
+ * every forbidden and unmodeled name collapses onto the one operation an
+ * ordinary repair job is authorized to perform.
+ *
+ * The original descriptor is captured and restored in a `finally`, so a failing
+ * assertion inside `body` cannot leave the runtime poisoned for another test.
+ */
+function withPoisonedMapGet<T>(body: () => T): T {
+  const saved = Object.getOwnPropertyDescriptor(Map.prototype, 'get');
+  Object.defineProperty(Map.prototype, 'get', {
+    value: function poisonedGet(): string {
+      return JOB_OPERATION.SOURCE_EDIT;
+    },
+    writable: true,
+    configurable: true,
+  });
+  try {
+    return body();
+  } finally {
+    if (saved === undefined) {
+      Reflect.deleteProperty(Map.prototype, 'get');
+    } else {
+      Object.defineProperty(Map.prototype, 'get', saved);
+    }
+  }
+}
+
+describe('poisoning Map.prototype.get cannot re-resolve an operation', () => {
+  it('proves the poisoning is actually in effect', () => {
+    // Without this the whole section could pass vacuously, on a runtime that
+    // was never hostile in the first place.
+    const observed = withPoisonedMapGet(() => new Map<string, string>().get('anything'));
+
+    expect(observed).toBe(JOB_OPERATION.SOURCE_EDIT);
+  });
+
+  it('keeps merge resolving to merge', () => {
+    const resolved = withPoisonedMapGet(() => resolveJobOperation(FORBIDDEN_OPERATION.MERGE));
+
+    expect(resolved).toBe(FORBIDDEN_OPERATION.MERGE);
+  });
+
+  it('keeps auto_merge.enable resolving to auto_merge.enable', () => {
+    const resolved = withPoisonedMapGet(() =>
+      resolveJobOperation(FORBIDDEN_OPERATION.AUTO_MERGE_ENABLE),
+    );
+
+    expect(resolved).toBe(FORBIDDEN_OPERATION.AUTO_MERGE_ENABLE);
+  });
+
+  it('keeps an unmodeled operation resolving to unknown', () => {
+    const resolved = withPoisonedMapGet(() => resolveJobOperation('shell.exec'));
+
+    expect(resolved).toBe(UNKNOWN_JOB_OPERATION);
+  });
+
+  it('keeps source.edit resolving to source.edit', () => {
+    const resolved = withPoisonedMapGet(() => resolveJobOperation(JOB_OPERATION.SOURCE_EDIT));
+
+    expect(resolved).toBe(JOB_OPERATION.SOURCE_EDIT);
+  });
+
+  it('resolves every modeled operation to itself and nothing else', () => {
+    const modeled = [...REPAIR_AUTHORIZABLE_OPERATIONS, ...FORBIDDEN_OPERATIONS];
+
+    const resolved = withPoisonedMapGet(() => modeled.map((o) => resolveJobOperation(o)));
+
+    expect(resolved).toStrictEqual(modeled);
+  });
+
+  it('does not let a merge request reach ALLOW_ONCE', () => {
+    // The request carries valid `source.edit` operands, so nothing earlier in
+    // the evaluator can refuse it on an operand ground. The only thing standing
+    // between it and a permit is that `merge` still resolves as `merge`.
+    const decision = withPoisonedMapGet(() =>
+      authorizeJobOperation(
+        buildJob(),
+        buildEdit({ operation: FORBIDDEN_OPERATION.MERGE }),
+      ),
+    );
+
+    expect(decision.operation).toBe(FORBIDDEN_OPERATION.MERGE);
+    expect(decision.decision).toBe(JOB_AUTHORIZATION.OPERATOR_REQUIRED);
+    expect(decision.reason).toBe(JOB_AUTHORIZATION_REASON.MERGE_IS_OPERATOR_ONLY);
+    expect(decision.mayExecuteOnce).toBe(false);
+    expect(decision.permit).toBeNull();
+  });
+
+  it('does not let an auto-merge request reach ALLOW_ONCE', () => {
+    const decision = withPoisonedMapGet(() =>
+      authorizeJobOperation(
+        buildJob(),
+        buildEdit({ operation: FORBIDDEN_OPERATION.AUTO_MERGE_ENABLE }),
+      ),
+    );
+
+    expect(decision.operation).toBe(FORBIDDEN_OPERATION.AUTO_MERGE_ENABLE);
+    expect(decision.decision).toBe(JOB_AUTHORIZATION.DENY);
+    expect(decision.reason).toBe(JOB_AUTHORIZATION_REASON.OPERATION_FORBIDDEN);
+    expect(decision.mayExecuteOnce).toBe(false);
+    expect(decision.permit).toBeNull();
+  });
+
+  it('does not let an unmodeled request reach ALLOW_ONCE', () => {
+    const decision = withPoisonedMapGet(() =>
+      authorizeJobOperation(buildJob(), buildEdit({ operation: 'shell.exec' })),
+    );
+
+    expect(decision.operation).toBe(UNKNOWN_JOB_OPERATION);
+    expect(decision.decision).toBe(JOB_AUTHORIZATION.DENY);
+    expect(decision.reason).toBe(JOB_AUTHORIZATION_REASON.OPERATION_UNKNOWN);
+    expect(decision.mayExecuteOnce).toBe(false);
+    expect(decision.permit).toBeNull();
+  });
+
+  it('still authorizes a legitimate source.edit under the same poisoning', () => {
+    // Fail-closed is not enough on its own: a repair that refused everything
+    // would satisfy every assertion above and break the boundary instead.
+    const baseline = authorizeJobOperation(buildJob(), buildEdit());
+    const poisoned = withPoisonedMapGet(() => authorizeJobOperation(buildJob(), buildEdit()));
+
+    expect(poisoned.decision).toBe(JOB_AUTHORIZATION.ALLOW_ONCE);
+    expect(poisoned.reason).toBe(JOB_AUTHORIZATION_REASON.WITHIN_JOB_ENVELOPE);
+    expect(poisoned.mayExecuteOnce).toBe(true);
+    expect(JSON.stringify(poisoned)).toBe(JSON.stringify(baseline));
+  });
+
+  it('restores Map.prototype.get afterwards', () => {
+    withPoisonedMapGet(() => undefined);
+
+    expect(new Map<string, string>([['k', 'v']]).get('k')).toBe('v');
   });
 });
 
