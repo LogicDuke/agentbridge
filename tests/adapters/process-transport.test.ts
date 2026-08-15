@@ -2409,6 +2409,105 @@ describe('invokeAgentProcess — boundary', () => {
     }
   });
 
+  it.each(ILL_FORMED)(
+    'refuses an executable path holding %s before process creation',
+    async (_label, value) => {
+      const exchange = await invokeAgentProcess(
+        makeSpec({ executablePath: `${NEVER_SPAWNED}${value}` }),
+        makeLimits(),
+      );
+
+      expect(exchange.outcome).toBe('SPEC_REJECTED');
+      expect(exchange.rejection).toBe('EXECUTABLE_INVALID');
+      expect(exchange.terminationScope).toBe('NOT_REQUIRED');
+      expect(exchange.exitCode).toBeNull();
+      expect(exchange.terminatingSignal).toBeNull();
+      expect(exchange.stdout).toBe('');
+      expect(exchange.stderr).toBe('');
+    },
+  );
+
+  it.each(ILL_FORMED)(
+    'refuses a working directory holding %s before process creation',
+    async (_label, value) => {
+      // The executable is the real, spawnable stub interpreter, so nothing but a
+      // refusal that precedes spawn can produce `SPEC_REJECTED` here.
+      const exchange = await invokeAgentProcess(
+        makeSpec({ workingDirectory: `${NEVER_SPAWNED}${value}` }),
+        makeLimits(),
+      );
+
+      expect(exchange.outcome).toBe('SPEC_REJECTED');
+      expect(exchange.rejection).toBe('WORKING_DIRECTORY_INVALID');
+      expect(exchange.terminationScope).toBe('NOT_REQUIRED');
+      expect(exchange.exitCode).toBeNull();
+      expect(exchange.terminatingSignal).toBeNull();
+      expect(exchange.stdout).toBe('');
+      expect(exchange.stderr).toBe('');
+    },
+  );
+
+  it('starts no process at all when a path is ill-formed', async () => {
+    const directory = makeTempDirectory();
+    try {
+      const marker = join(directory, 'ran');
+      const script = `require("node:fs").writeFileSync(${JSON.stringify(marker)},"ran");`;
+
+      // The identical stub with a well-formed working directory, so the marker is
+      // known to be a real signal rather than a script that never worked.
+      const accepted = await invokeAgentProcess(
+        makeSpec({ args: ['-e', script], workingDirectory: directory }),
+        makeLimits(),
+      );
+      expect(accepted.outcome).toBe('EXITED');
+      expect(existsSync(marker)).toBe(true);
+      rmSync(marker);
+
+      const refusedDirectory = await invokeAgentProcess(
+        makeSpec({ args: ['-e', script], workingDirectory: `${directory}\uD800` }),
+        makeLimits(),
+      );
+
+      expect(refusedDirectory.outcome).toBe('SPEC_REJECTED');
+      expect(refusedDirectory.rejection).toBe('WORKING_DIRECTORY_INVALID');
+      expect(existsSync(marker)).toBe(false);
+
+      const refusedExecutable = await invokeAgentProcess(
+        makeSpec({
+          executablePath: `${NODE_EXECUTABLE}\uDC00`,
+          args: ['-e', script],
+          workingDirectory: directory,
+        }),
+        makeLimits(),
+      );
+
+      expect(refusedExecutable.outcome).toBe('SPEC_REJECTED');
+      expect(refusedExecutable.rejection).toBe('EXECUTABLE_INVALID');
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      removeTempDirectory(directory);
+    }
+  });
+
+  it('accepts a working directory holding a supplementary-plane character', async () => {
+    // The control for the rule above: a valid pair is two UTF-16 code units and
+    // must still pass path validation, and the child must actually run there.
+    const directory = mkdtempSync(join(tmpdir(), 'agentbridge-pr010-\u{1F600}-'));
+    try {
+      const exchange = await runStub(STUB.PRINT_CWD, [], { workingDirectory: directory });
+
+      expect(exchange.outcome).toBe('EXITED');
+      // Compared as the suite compares any reported working directory, because
+      // Windows may report a different case than it was given. The pair itself
+      // has no case mapping, so it is still compared exactly.
+      expect(exchange.stdout.toLowerCase()).toBe(directory.toLowerCase());
+      // Not the substitution an ill-formed path would have produced.
+      expect(exchange.stdout).not.toContain('�');
+    } finally {
+      removeTempDirectory(directory);
+    }
+  });
+
   it('delivers a well-formed environment name and value to the child exactly', async () => {
     const name = 'AGENTBRIDGE_\u{1F600}';
     const value = 'before \u{1F600} after \u{10000}';
