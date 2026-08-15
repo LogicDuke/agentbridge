@@ -262,12 +262,49 @@ turns a human decision into a record of this shape does not exist yet, and
 building it is an explicit later decision rather than an implementation detail of
 whichever layer needs it first.
 
-`operatorMergeAuthorizes` enforces every required property: operator-originated,
-repository-bound, pull-request-bound, exact-HEAD-SHA-bound, structurally
-single-use, invalid the moment HEAD changes, and incapable of authorizing another
-pull request or a future SHA.
+`operatorMergeAuthorizes` checks **binding, and only binding**. The distinction
+between what C1 proves and what a later layer must enforce is stated exactly,
+because overclaiming here would be worse than not checking.
+
+**Proved by a `true` result.** The candidate record carries the required
+structural fields as readable identifiers; its `singleUse` is literally `true`;
+and its `repositoryId`, `pullRequestId`, and `headSha` are exactly equal to the
+target repository, target pull request, and the repository's *current* HEAD. Every
+comparison is exact string equality, so the record is invalid the moment HEAD
+changes and can never cover another pull request, another repository, or a future
+SHA. There is no path that widens, refreshes, or re-binds it.
+
+**Not proved, and not claimed.**
+
+| Property | C1 |
+| --- | --- |
+| operator origin | **not proved** — the argument is untrusted data; a plain object literal written by any caller passes |
+| human identity / authentication | **not proved** — `operatorId` is a readable string; C1 reads no credential and authenticates nothing |
+| trusted minting, signature, possession | **not proved** — C1 has no issuing boundary and no secret material, so it cannot distinguish a minted record from an assembled one |
+| uniqueness / one-time consumption | **not proved** — C1 has no consumed-capability store |
+| replay prevention | **not proved** — the identical record returns `true` on every call while HEAD is unchanged |
+
+`singleUse: true` is a **structural intent marker**: it records that the shape is
+that of a single-use capability. It is *not* enforced single consumption, and
+this document does not claim the record is replay-proof or that it cannot be
+reused. Likewise, a non-empty `operatorId` is descriptive data; it does not make
+the record operator-originated, authenticated, or human-authorized.
+
+**A `true` result is therefore not sufficient proof that a merge is
+operator-authorized.** It is a necessary binding check. A future trusted operator
+boundary — the merge broker, an explicitly reviewed later Cockpit layer — is
+responsible for authenticating the operator, establishing that the record was
+minted by that boundary rather than supplied by a caller, and consuming the
+record so it cannot authorize a second merge. C1 deliberately implements none of
+that: no authentication, no signatures, no token issuance, no secret material, no
+replay or consumed-capability store, no operator session, and no endpoint.
 
 **No merge executor and no GitHub merge API call exists in this PR.**
+
+None of this weakens the merge barrier above. `OperatorMergeAuthorization` is not
+wired into `authorizeJobOperation`, and ordinary repair-job authority still
+receives `OPERATOR_REQUIRED` with no permit for `merge`, regardless of what any
+record of this shape says.
 
 ## Execution permits
 
