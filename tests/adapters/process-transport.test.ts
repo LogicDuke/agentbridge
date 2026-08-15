@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events';
 import {
   readdirSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -2449,7 +2450,14 @@ describe('invokeAgentProcess — boundary', () => {
 
   it('starts no process at all when a path is ill-formed', async () => {
     const directory = makeTempDirectory();
+    // The path Node substitutes for the ill-formed one at the native boundary.
+    // It must exist, or a regression that dropped the validation would still
+    // leave the marker absent — because `spawn` failed on a missing directory,
+    // not because the transport refused. Creating it makes the marker the only
+    // thing standing between a regression and a passing test.
+    const replacementDirectory = `${directory}\uFFFD`;
     try {
+      mkdirSync(replacementDirectory);
       const marker = join(directory, 'ran');
       const script = `require("node:fs").writeFileSync(${JSON.stringify(marker)},"ran");`;
 
@@ -2485,6 +2493,7 @@ describe('invokeAgentProcess — boundary', () => {
       expect(refusedExecutable.rejection).toBe('EXECUTABLE_INVALID');
       expect(existsSync(marker)).toBe(false);
     } finally {
+      removeTempDirectory(replacementDirectory);
       removeTempDirectory(directory);
     }
   });
