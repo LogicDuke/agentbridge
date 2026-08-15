@@ -749,6 +749,16 @@ function checkPath(
   if (containsNul(value)) {
     return invalid;
   }
+  // A path is an exact-transmission string like argv and stdin: it crosses the
+  // native string boundary on its way to `spawn`, and an unpaired code unit is
+  // substituted with U+FFFD there. The executable actually launched, or the
+  // directory the child actually runs in, would then be a *different* path than
+  // the one validated here. Checked before the byte measurement, because the
+  // measurement of an ill-formed path already describes the substitution rather
+  // than the path the caller supplied.
+  if (containsLoneSurrogate(value)) {
+    return invalid;
+  }
   if (utf8ByteLength(value) > TRANSPORT_BOUNDS.MAX_PATH_BYTES) {
     return invalid;
   }
