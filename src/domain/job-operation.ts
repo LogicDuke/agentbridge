@@ -155,21 +155,6 @@ export type JobOperation =
   | UnknownJobOperation;
 
 /**
- * Membership is backed by a `Map`, not a plain object.
- *
- * A plain-object lookup inherits `Object.prototype`, so `'toString'`,
- * `'constructor'`, and `'__proto__'` would resolve to a truthy entry. A `Map`
- * has no prototype chain for keys. Same reasoning as PR 002's taxonomy.
- */
-const OPERATION_LOOKUP: ReadonlyMap<string, RepairAuthorizableOperation | ForbiddenJobOperation> =
-  new Map<string, RepairAuthorizableOperation | ForbiddenJobOperation>([
-    ...REPAIR_AUTHORIZABLE_OPERATIONS.map(
-      (operation) => [operation, operation] as const,
-    ),
-    ...FORBIDDEN_OPERATIONS.map((operation) => [operation, operation] as const),
-  ]);
-
-/**
  * Resolve an untrusted operation name to a modeled member.
  *
  * Matching is exact and case-sensitive. No trimming, case folding, aliasing, or
@@ -179,12 +164,36 @@ const OPERATION_LOOKUP: ReadonlyMap<string, RepairAuthorizableOperation | Forbid
  * Anything unrecognised resolves to {@link UNKNOWN_JOB_OPERATION}, including
  * the literal string `'unknown'` — the sentinel names the absence of a model,
  * so requesting it by name is still an unmodeled request. Never throws.
+ *
+ * ## Resolution is a membership test, never a lookup
+ *
+ * This is deliberately *not* backed by a keyed container. A plain object would
+ * inherit `Object.prototype`, so `'toString'` and `'constructor'` would resolve
+ * to a truthy entry; a `Map` fixes that but reintroduces the same class of
+ * problem one level down, because `Map.prototype.get` is resolved at call time
+ * and is replaceable by anything that runs after this module is initialized. A
+ * poisoned `get` returning `'source.edit'` would turn `'merge'` and
+ * `'shell.exec'` into a repair-authorizable operation, and the merge barrier
+ * would be evaluated against the substituted name rather than the requested one.
+ *
+ * {@link containsValue} touches no prototype method at all: it reads `length`
+ * and own indices of a frozen array. And the value returned on a hit is the
+ * caller's own `value`, never a value produced by the container. So this
+ * function can only ever return the exact string it was given or the unknown
+ * sentinel — there is no mechanism, poisoned or otherwise, by which one
+ * operation name can be resolved as a different one.
  */
 export function resolveJobOperation(value: unknown): JobOperation {
   if (typeof value !== 'string') {
     return UNKNOWN_JOB_OPERATION;
   }
-  return OPERATION_LOOKUP.get(value) ?? UNKNOWN_JOB_OPERATION;
+  if (containsValue(REPAIR_AUTHORIZABLE_OPERATIONS, value)) {
+    return value as RepairAuthorizableOperation;
+  }
+  if (containsValue(FORBIDDEN_OPERATIONS, value)) {
+    return value as ForbiddenJobOperation;
+  }
+  return UNKNOWN_JOB_OPERATION;
 }
 
 /** Type guard: is this a modeled operation a repair job may be authorized for? */
