@@ -29,6 +29,7 @@
 import {
   append,
   containsValue,
+  readCanonicalBranchRef,
   readExactIdentifier,
   readOwnProperty,
   readRepositoryRelativePath,
@@ -246,11 +247,17 @@ export interface JobOperationRequest {
   readonly path?: string;
   /** Verification class operand, for `verification.run`. */
   readonly commandClass?: string;
-  /** Ref operand, for `repair.commit` and `repair.push`. */
+  /**
+   * Ref operand, for `repair.commit` and `repair.push`.
+   *
+   * Read through the same canonical branch-ref reader the job envelope uses, so
+   * an alternate spelling of a configured ref cannot be compared against it as
+   * if it were a different branch.
+   */
   readonly ref?: string;
-  /** Change-request source ref operand. */
+  /** Change-request source ref operand. Canonical branch ref. */
   readonly sourceRef?: string;
-  /** Change-request target ref operand. */
+  /** Change-request target ref operand. Canonical branch ref. */
   readonly targetRef?: string;
   /** Force flag for a push. Anything that is not exactly absent or `false` is force. */
   readonly force?: boolean;
@@ -279,8 +286,14 @@ export interface NormalizedJobOperation {
   readonly pathMalformed: boolean;
   readonly commandClass: string | null;
   readonly ref: string | null;
+  /** True when a `ref` was supplied but is not a canonical branch ref. */
+  readonly refMalformed: boolean;
   readonly sourceRef: string | null;
+  /** True when a `sourceRef` was supplied but is not a canonical branch ref. */
+  readonly sourceRefMalformed: boolean;
   readonly targetRef: string | null;
+  /** True when a `targetRef` was supplied but is not a canonical branch ref. */
+  readonly targetRefMalformed: boolean;
   /** Fails closed: only an absent or literally `false` value is not force. */
   readonly force: boolean;
 }
@@ -298,8 +311,11 @@ const UNREADABLE_OPERATION: NormalizedJobOperation = objectFreeze({
   pathMalformed: false,
   commandClass: null,
   ref: null,
+  refMalformed: false,
   sourceRef: null,
+  sourceRefMalformed: false,
   targetRef: null,
+  targetRefMalformed: false,
   force: true,
 });
 
@@ -331,6 +347,17 @@ export function readJobOperation(request: JobOperationRequest): NormalizedJobOpe
   const rawPath = readOwnProperty(record, 'path');
   const path = readRepositoryRelativePath(rawPath);
 
+  // Each ref operand is read once, own-only, and narrowed to the one canonical
+  // branch-ref spelling. A supplied value that is not canonical becomes `null`
+  // and is flagged, so it is refused for being unusable rather than compared —
+  // as a distinct string — against a canonical value it may in fact alias.
+  const rawRef = readOwnProperty(record, 'ref');
+  const ref = readCanonicalBranchRef(rawRef);
+  const rawSourceRef = readOwnProperty(record, 'sourceRef');
+  const sourceRef = readCanonicalBranchRef(rawSourceRef);
+  const rawTargetRef = readOwnProperty(record, 'targetRef');
+  const targetRef = readCanonicalBranchRef(rawTargetRef);
+
   return objectFreeze({
     readable: true,
     requestId: readExactIdentifier(readOwnProperty(record, 'requestId')),
@@ -343,9 +370,12 @@ export function readJobOperation(request: JobOperationRequest): NormalizedJobOpe
     path,
     pathMalformed: path === null && rawPath !== undefined,
     commandClass: readExactIdentifier(readOwnProperty(record, 'commandClass')),
-    ref: readExactIdentifier(readOwnProperty(record, 'ref')),
-    sourceRef: readExactIdentifier(readOwnProperty(record, 'sourceRef')),
-    targetRef: readExactIdentifier(readOwnProperty(record, 'targetRef')),
+    ref,
+    refMalformed: ref === null && rawRef !== undefined,
+    sourceRef,
+    sourceRefMalformed: sourceRef === null && rawSourceRef !== undefined,
+    targetRef,
+    targetRefMalformed: targetRef === null && rawTargetRef !== undefined,
     force: readForceFlag(readOwnProperty(record, 'force')),
   });
 }

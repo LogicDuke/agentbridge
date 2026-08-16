@@ -136,6 +136,8 @@ export const JOB_AUTHORIZATION_REASON = objectFreeze({
   WORKTREE_NOT_AUTHORIZED: 'WORKTREE_NOT_AUTHORIZED',
   /** The verification class is unmodeled or not in the job's authorized set. */
   COMMAND_CLASS_NOT_AUTHORIZED: 'COMMAND_CLASS_NOT_AUTHORIZED',
+  /** A ref operand was supplied but is not a canonical `refs/heads/<name>` ref. */
+  REF_MALFORMED: 'REF_MALFORMED',
   /** The operation names the protected parent ref as a write target. */
   PROTECTED_REF_MUTATION: 'PROTECTED_REF_MUTATION',
   /** The ref operand is not the job's isolated repair branch. */
@@ -264,6 +266,12 @@ function checkOperands(
       if (request.worktreeId !== job.repairWorktreeId) {
         return JOB_AUTHORIZATION_REASON.WORKTREE_NOT_AUTHORIZED;
       }
+      // A non-canonical spelling is refused for being unusable, before any
+      // comparison: `main` and `heads/main` may both denote `refs/heads/main`,
+      // so comparing either as a distinct string is exactly the bypass.
+      if (request.refMalformed) {
+        return JOB_AUTHORIZATION_REASON.REF_MALFORMED;
+      }
       if (request.ref === null) {
         return JOB_AUTHORIZATION_REASON.OPERAND_MISSING;
       }
@@ -281,6 +289,9 @@ function checkOperands(
       if (request.force) {
         return JOB_AUTHORIZATION_REASON.FORCE_PUSH_FORBIDDEN;
       }
+      if (request.refMalformed) {
+        return JOB_AUTHORIZATION_REASON.REF_MALFORMED;
+      }
       if (request.ref === null) {
         return JOB_AUTHORIZATION_REASON.OPERAND_MISSING;
       }
@@ -293,6 +304,13 @@ function checkOperands(
       return null;
     }
     case JOB_OPERATION.REPAIR_CHANGE_REQUEST: {
+      // Both ends are narrowed to the canonical spelling before either is
+      // compared, so source/target separation is separation of branches rather
+      // than of strings: an alias of the protected parent cannot be presented
+      // as the source, and an alias of the repair branch cannot be the target.
+      if (request.sourceRefMalformed || request.targetRefMalformed) {
+        return JOB_AUTHORIZATION_REASON.REF_MALFORMED;
+      }
       if (request.sourceRef === null || request.targetRef === null) {
         return JOB_AUTHORIZATION_REASON.OPERAND_MISSING;
       }

@@ -312,7 +312,12 @@ describe('refs: the repair branch is not the protected parent', () => {
   });
 
   it('denies a push to any third ref', () => {
-    for (const ref of ['main', 'develop', 'release/1.0', 'repair/job-0002']) {
+    for (const ref of [
+      'refs/heads/main',
+      'refs/heads/develop',
+      'refs/heads/release/1.0',
+      'refs/heads/repair/job-0002',
+    ]) {
       const decision = authorizeJobOperation(buildJob(), buildPush({ ref }));
       expect(decision.reason, ref).toBe(JOB_AUTHORIZATION_REASON.REF_NOT_REPAIR_BRANCH);
     }
@@ -389,7 +394,7 @@ describe('refs: the repair branch is not the protected parent', () => {
         buildRequest({
           operation: 'repair.change_request',
           sourceRef: REPAIR_BRANCH,
-          targetRef: 'main',
+          targetRef: 'refs/heads/main',
         }),
       ),
       JOB_AUTHORIZATION_REASON.CHANGE_REQUEST_TARGET_INVALID,

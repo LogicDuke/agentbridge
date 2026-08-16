@@ -176,9 +176,9 @@ describe('cross-operation replay', () => {
 
   it('does not verify for a different ref', () => {
     const permit = issue(buildJob(), buildPush());
-    const job = buildJob({ repairBranch: 'repair/job-0001-b' });
+    const job = buildJob({ repairBranch: 'refs/heads/repair/job-0001-b' });
 
-    expect(permitAuthorizes(permit, job, buildPush({ ref: 'repair/job-0001-b' }))).toBe(false);
+    expect(permitAuthorizes(permit, job, buildPush({ ref: 'refs/heads/repair/job-0001-b' }))).toBe(false);
   });
 
   it('does not verify for a different verification class', () => {

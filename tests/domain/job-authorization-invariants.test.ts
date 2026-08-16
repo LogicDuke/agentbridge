@@ -13,6 +13,7 @@ import {
   JOB_BOUNDS,
   JOB_OPERATION,
   operatorMergeAuthorizes,
+  readCanonicalBranchRef,
   readJobOperation,
   REPAIR_AUTHORIZABLE_OPERATIONS,
   resolveJobOperation,
@@ -39,6 +40,7 @@ import {
   NON_OBJECTS,
   PARENT_PR_A,
   PARENT_REF,
+  PARENT_REF_ALIASES,
   PRIVILEGED_LABELS,
   REPAIR_BRANCH,
   REPAIR_WORKTREE,
@@ -86,8 +88,8 @@ describe('merge is operator-only, permanently', () => {
       buildJob({ repairAgentId: 'root', independentValidatorId: 'system' }),
       buildJob({ findingSource: 'agentbridge-internal' }),
       buildJob({ authorizedPaths: [], authorizedCommandClasses: [] }),
-      buildJob({ protectedParentRef: 'main' }),
-      buildJob({ repairBranch: 'main', protectedParentRef: 'main' }),
+      buildJob({ protectedParentRef: 'refs/heads/main' }),
+      buildJob({ repairBranch: 'refs/heads/main', protectedParentRef: 'refs/heads/main' }),
     ];
     const operands: readonly Partial<JobOperationRequest>[] = [
       {},
@@ -1233,5 +1235,349 @@ describe('bounds stay aligned with the neighbouring boundaries', () => {
     // The prefix never reaches the output, so two ids sharing a 256-character
     // prefix can never collapse into one.
     expect(readJobOperation({ requestId: overLimit }).requestId).not.toBe(atLimit);
+  });
+});
+
+/* -------------------------------------------------------------------------
+ * C1-A04: Git-equivalent branch-ref spellings
+ *
+ * Git resolves `main`, `heads/main`, and `refs/heads/main` to one ref. A
+ * boundary that compares ref *strings* therefore has three names for one
+ * authority target unless it fixes the spelling first, and the quarantine
+ * invariant — "the repair branch and the protected parent are distinct actual
+ * branches" — degrades into "the two strings are unequal".
+ * ------------------------------------------------------------------------- */
+
+/** Spellings of one and the same branch. One simple, one nested. */
+const ALIAS_FAMILIES: readonly {
+  readonly branch: string;
+  readonly spellings: readonly string[];
+}[] = [
+  {
+    branch: 'refs/heads/main',
+    spellings: ['main', 'heads/main', 'refs/heads/main'],
+  },
+  {
+    branch: 'refs/heads/feature/pr-042-parent',
+    spellings: [
+      'feature/pr-042-parent',
+      'heads/feature/pr-042-parent',
+      'refs/heads/feature/pr-042-parent',
+    ],
+  },
+];
+
+/** The operations that mutate a ref, and so must never accept an alias. */
+const REF_WRITE_OPERATIONS: readonly string[] = [
+  JOB_OPERATION.REPAIR_COMMIT,
+  JOB_OPERATION.REPAIR_PUSH,
+];
+
+/** Alias spellings of the fixture repair branch. */
+const REPAIR_BRANCH_ALIASES: readonly string[] = ['repair/job-0001', 'heads/repair/job-0001'];
+
+function refRequest(operation: string, ref: string): JobOperationRequest {
+  return buildRequest({ operation, worktreeId: REPAIR_WORKTREE, ref, force: false });
+}
+
+describe('the canonical branch-ref reader', () => {
+  it('accepts only the fully qualified refs/heads/<name> spelling', () => {
+    expect(readCanonicalBranchRef('refs/heads/main')).toBe('refs/heads/main');
+    expect(readCanonicalBranchRef(PARENT_REF)).toBe(PARENT_REF);
+    expect(readCanonicalBranchRef('refs/heads/repair/c1-a04_ref.alias-1')).toBe(
+      'refs/heads/repair/c1-a04_ref.alias-1',
+    );
+  });
+
+  it('refuses every other spelling of the same branch', () => {
+    for (const family of ALIAS_FAMILIES) {
+      for (const spelling of family.spellings) {
+        if (spelling === family.branch) {
+          expect(readCanonicalBranchRef(spelling), spelling).toBe(spelling);
+          continue;
+        }
+        expect(readCanonicalBranchRef(spelling), spelling).toBeNull();
+      }
+    }
+    for (const alias of [...PARENT_REF_ALIASES, ...REPAIR_BRANCH_ALIASES]) {
+      expect(readCanonicalBranchRef(alias), alias).toBeNull();
+    }
+  });
+
+  it('refuses partially qualified, differently rooted, and mis-cased prefixes', () => {
+    for (const value of [
+      'refs/heads/',
+      'refs/head/main',
+      'refs/tags/main',
+      'refs/remotes/origin/main',
+      'Refs/Heads/main',
+      'REFS/HEADS/main',
+      '/refs/heads/main',
+      'refs/heads//main',
+      'refs/heads/main/',
+      ' refs/heads/main',
+      'refs/heads/main ',
+      'refs/heads/main\n',
+    ]) {
+      expect(readCanonicalBranchRef(value), JSON.stringify(value)).toBeNull();
+    }
+  });
+
+  it('refuses the ref-name forms git itself refuses, and the revision operators', () => {
+    for (const value of [
+      'refs/heads/.hidden',
+      'refs/heads/main.',
+      'refs/heads/feature/.x',
+      'refs/heads/a..b',
+      'refs/heads/../../etc/passwd',
+      'refs/heads/main.lock',
+      'refs/heads/main.LOCK',
+      'refs/heads/feature/x.lock',
+      'refs/heads/main@{1}',
+      'refs/heads/main^{}',
+      'refs/heads/main~1',
+      'refs/heads/ma in',
+      'refs/heads/ma:in',
+      'refs/heads/ma?in',
+      'refs/heads/ma*in',
+      'refs/heads/ma[in',
+      'refs/heads/ma\\in',
+      // Non-ASCII is refused outright: the precomposed and decomposed spellings
+      // below are unequal strings that a loose ref can resolve to a single ref.
+      'refs/heads/café',
+      'refs/heads/café',
+    ]) {
+      expect(readCanonicalBranchRef(value), JSON.stringify(value)).toBeNull();
+    }
+  });
+
+  it('fails closed on hostile values without throwing', () => {
+    for (const value of NON_OBJECTS) {
+      expect(() => readCanonicalBranchRef(value)).not.toThrow();
+      expect(readCanonicalBranchRef(value)).toBeNull();
+    }
+    expect(readCanonicalBranchRef({ toString: () => 'refs/heads/main' })).toBeNull();
+    expect(readCanonicalBranchRef(['refs/heads/main'])).toBeNull();
+    expect(readCanonicalBranchRef(revokedProxy())).toBeNull();
+    // The identifier bound applies, and rejects rather than truncating.
+    expect(
+      readCanonicalBranchRef('refs/heads/' + 'a'.repeat(JOB_BOUNDS.MAX_IDENTIFIER_LENGTH)),
+    ).toBeNull();
+  });
+});
+
+describe('an alias spelling can never separate a repair branch from its parent', () => {
+  it('rejects the verified A04 configuration outright', () => {
+    // The reported exploit exactly: two spellings, one branch.
+    const job = buildJob({ protectedParentRef: 'refs/heads/main', repairBranch: 'main' });
+
+    expect(findInvalidRepairJobFields(job)).toContain('repairBranch');
+    expect(readRepairJobAuthorization(job).snapshot).toBeNull();
+
+    for (const operation of REF_WRITE_OPERATIONS) {
+      const decision = authorizeJobOperation(job, refRequest(operation, 'main'));
+
+      expect(decision.decision, operation).toBe(JOB_AUTHORIZATION.DENY);
+      expect(decision.reason, operation).toBe(JOB_AUTHORIZATION_REASON.JOB_ENVELOPE_INVALID);
+      expect(decision.mayExecuteOnce, operation).toBe(false);
+      expect(decision.permit, operation).toBeNull();
+    }
+  });
+
+  it('rejects every alias pairing of one branch, for every ref-writing operation', () => {
+    for (const family of ALIAS_FAMILIES) {
+      for (const protectedParentRef of family.spellings) {
+        for (const repairBranch of family.spellings) {
+          const job = buildJob({ protectedParentRef, repairBranch });
+          const label = `${protectedParentRef} | ${repairBranch}`;
+
+          // The two refs denote one branch, so this is never a quarantined job.
+          // Whichever field is the offending one — a non-canonical spelling is
+          // reported against itself, a canonical collision against
+          // `repairBranch` — the envelope is refused and nothing is snapshotted.
+          expect(readRepairJobAuthorization(job).snapshot, label).toBeNull();
+          if (protectedParentRef === family.branch) {
+            expect(findInvalidRepairJobFields(job), label).toContain('repairBranch');
+          } else {
+            expect(findInvalidRepairJobFields(job), label).toContain('protectedParentRef');
+          }
+
+          for (const operation of REF_WRITE_OPERATIONS) {
+            for (const ref of family.spellings) {
+              const decision = authorizeJobOperation(job, refRequest(operation, ref));
+              const attempt = `${label} -> ${operation} ${ref}`;
+
+              expect(decision.decision, attempt).not.toBe(JOB_AUTHORIZATION.ALLOW_ONCE);
+              expect(decision.mayExecuteOnce, attempt).toBe(false);
+              expect(decision.permit, attempt).toBeNull();
+            }
+          }
+        }
+      }
+    }
+  });
+
+  it('rejects a repair branch that differs from the parent only by ASCII case', () => {
+    // Git stores loose refs as files, so on a case-insensitive filesystem these
+    // pairs can be one ref. C1 observes no filesystem, so it refuses the pair.
+    const pairs: readonly (readonly [string, string])[] = [
+      ['refs/heads/main', 'refs/heads/Main'],
+      ['refs/heads/Main', 'refs/heads/main'],
+      ['refs/heads/feature/pr-042-parent', 'refs/heads/Feature/PR-042-Parent'],
+    ];
+
+    for (const [protectedParentRef, repairBranch] of pairs) {
+      const job = buildJob({ protectedParentRef, repairBranch });
+      const label = `${protectedParentRef} | ${repairBranch}`;
+
+      expect(findInvalidRepairJobFields(job), label).toContain('repairBranch');
+      for (const operation of REF_WRITE_OPERATIONS) {
+        const decision = authorizeJobOperation(job, refRequest(operation, repairBranch));
+
+        expect(decision.mayExecuteOnce, label).toBe(false);
+        expect(decision.permit, label).toBeNull();
+      }
+    }
+  });
+});
+
+describe('an alias spelling in a request is refused, never compared', () => {
+  it('denies a commit or push naming an alias of the repair branch', () => {
+    for (const alias of REPAIR_BRANCH_ALIASES) {
+      for (const operation of REF_WRITE_OPERATIONS) {
+        const decision = authorizeJobOperation(buildJob(), refRequest(operation, alias));
+        const label = `${operation} ${alias}`;
+
+        expect(decision.reason, label).toBe(JOB_AUTHORIZATION_REASON.REF_MALFORMED);
+        expect(decision.decision, label).toBe(JOB_AUTHORIZATION.DENY);
+        expect(decision.mayExecuteOnce, label).toBe(false);
+        expect(decision.permit, label).toBeNull();
+      }
+    }
+  });
+
+  it('denies a commit or push naming an alias of the protected parent', () => {
+    for (const alias of PARENT_REF_ALIASES) {
+      for (const operation of REF_WRITE_OPERATIONS) {
+        const decision = authorizeJobOperation(buildJob(), refRequest(operation, alias));
+        const label = `${operation} ${alias}`;
+
+        expect(decision.reason, label).toBe(JOB_AUTHORIZATION_REASON.REF_MALFORMED);
+        expect(decision.mayExecuteOnce, label).toBe(false);
+        expect(decision.permit, label).toBeNull();
+      }
+    }
+
+    // The canonical spelling of the parent is still refused, and still refused
+    // as an escape attempt rather than as a malformed operand.
+    for (const operation of REF_WRITE_OPERATIONS) {
+      expect(
+        authorizeJobOperation(buildJob(), refRequest(operation, PARENT_REF)).reason,
+        operation,
+      ).toBe(JOB_AUTHORIZATION_REASON.PROTECTED_REF_MUTATION);
+    }
+  });
+
+  it('never carries an alias operand into a normalized request', () => {
+    for (const alias of [...PARENT_REF_ALIASES, ...REPAIR_BRANCH_ALIASES]) {
+      const normalized = readJobOperation(refRequest(JOB_OPERATION.REPAIR_PUSH, alias));
+
+      expect(normalized.ref, alias).toBeNull();
+      expect(normalized.refMalformed, alias).toBe(true);
+    }
+  });
+});
+
+describe('change-request source and target separation survives aliasing', () => {
+  it('refuses an alias on either end', () => {
+    const job = buildJob();
+    const cases: readonly (readonly [string, string])[] = [
+      ['repair/job-0001', PARENT_REF],
+      ['heads/repair/job-0001', PARENT_REF],
+      [REPAIR_BRANCH, 'feature/pr-042-parent'],
+      [REPAIR_BRANCH, 'heads/feature/pr-042-parent'],
+      ['repair/job-0001', 'feature/pr-042-parent'],
+    ];
+
+    for (const [sourceRef, targetRef] of cases) {
+      const decision = authorizeJobOperation(
+        job,
+        buildRequest({ operation: JOB_OPERATION.REPAIR_CHANGE_REQUEST, sourceRef, targetRef }),
+      );
+      const label = `${sourceRef} -> ${targetRef}`;
+
+      expect(decision.reason, label).toBe(JOB_AUTHORIZATION_REASON.REF_MALFORMED);
+      expect(decision.decision, label).toBe(JOB_AUTHORIZATION.DENY);
+      expect(decision.permit, label).toBeNull();
+    }
+  });
+
+  it('never models a change request whose source and target are one branch', () => {
+    for (const family of ALIAS_FAMILIES) {
+      for (const sourceRef of family.spellings) {
+        for (const targetRef of family.spellings) {
+          const decision = authorizeJobOperation(
+            buildJob({ protectedParentRef: family.branch, repairBranch: sourceRef }),
+            buildRequest({
+              operation: JOB_OPERATION.REPAIR_CHANGE_REQUEST,
+              sourceRef,
+              targetRef,
+            }),
+          );
+          const label = `${sourceRef} -> ${targetRef}`;
+
+          expect(decision.decision, label).not.toBe(JOB_AUTHORIZATION.ALLOW_ONCE);
+          expect(decision.mayExecuteOnce, label).toBe(false);
+          expect(decision.permit, label).toBeNull();
+        }
+      }
+    }
+  });
+});
+
+describe('legitimate distinct canonical refs still authorize the bounded operations', () => {
+  it('allows a push, a commit, and a stacked change request', () => {
+    const job = buildJob();
+
+    const push = authorizeJobOperation(job, refRequest(JOB_OPERATION.REPAIR_PUSH, REPAIR_BRANCH));
+    expect(push.decision).toBe(JOB_AUTHORIZATION.ALLOW_ONCE);
+    expect(push.reason).toBe(JOB_AUTHORIZATION_REASON.WITHIN_JOB_ENVELOPE);
+    expect(push.permit?.operands.ref).toBe(REPAIR_BRANCH);
+
+    const commit = authorizeJobOperation(
+      job,
+      refRequest(JOB_OPERATION.REPAIR_COMMIT, REPAIR_BRANCH),
+    );
+    expect(commit.decision).toBe(JOB_AUTHORIZATION.ALLOW_ONCE);
+    expect(commit.permit?.operands.ref).toBe(REPAIR_BRANCH);
+
+    const changeRequest = authorizeJobOperation(
+      job,
+      buildRequest({
+        operation: JOB_OPERATION.REPAIR_CHANGE_REQUEST,
+        sourceRef: REPAIR_BRANCH,
+        targetRef: PARENT_REF,
+      }),
+    );
+    expect(changeRequest.decision).toBe(JOB_AUTHORIZATION.ALLOW_ONCE);
+    expect(changeRequest.permit?.operands.sourceRef).toBe(REPAIR_BRANCH);
+    expect(changeRequest.permit?.operands.targetRef).toBe(PARENT_REF);
+  });
+
+  it('allows a nested repair branch stacked under a nested protected parent', () => {
+    const repairBranch = 'refs/heads/repair/c1-a04-ref-alias';
+    const job = buildJob({
+      protectedParentRef: 'refs/heads/feature/pr-042-parent',
+      repairBranch,
+    });
+
+    expect(findInvalidRepairJobFields(job)).toHaveLength(0);
+    const decision = authorizeJobOperation(
+      job,
+      refRequest(JOB_OPERATION.REPAIR_PUSH, repairBranch),
+    );
+
+    expect(decision.decision).toBe(JOB_AUTHORIZATION.ALLOW_ONCE);
+    expect(decision.permit?.operands.ref).toBe(repairBranch);
   });
 });

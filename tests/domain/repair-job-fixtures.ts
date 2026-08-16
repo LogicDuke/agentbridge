@@ -19,9 +19,26 @@ export const JOB_B = 'job-0002';
 
 export const POLICY_VERSION = 'cockpit-policy-v1';
 
-export const PARENT_REF = 'feature/pr-042-parent';
-export const REPAIR_BRANCH = 'repair/job-0001';
+/**
+ * Refs are canonical `refs/heads/<name>` spellings everywhere in these fixtures.
+ * That is the only spelling C1 accepts, so a fixture in any other spelling would
+ * be testing an invalid envelope rather than a configured job.
+ */
+export const PARENT_REF = 'refs/heads/feature/pr-042-parent';
+export const REPAIR_BRANCH = 'refs/heads/repair/job-0001';
 export const REPAIR_WORKTREE = 'worktree-job-0001';
+
+/**
+ * Alternate spellings git resolves to the same ref as {@link PARENT_REF}.
+ *
+ * None of these may ever be accepted as a repair branch or a ref operand: each
+ * one denotes the protected parent, and C1 must not be able to mistake it for a
+ * different branch merely because the strings differ.
+ */
+export const PARENT_REF_ALIASES: readonly string[] = [
+  'feature/pr-042-parent',
+  'heads/feature/pr-042-parent',
+];
 
 export const AUTHORIZED_PATH = 'src/domain/policy-gate.ts';
 export const SECOND_AUTHORIZED_PATH = 'tests/domain/policy-gate.test.ts';

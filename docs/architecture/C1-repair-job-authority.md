@@ -101,12 +101,12 @@ care.
 | `policyVersion` | which policy authorized the envelope; part of permit identity |
 | `repositoryId` | the one repository this job may ever touch |
 | `parentPullRequestId` | the protected parent feature pull request |
-| `protectedParentRef` | the parent integration ref, which no operation may write |
+| `protectedParentRef` | the parent integration ref, which no operation may write; canonical `refs/heads/<name>` |
 | `parentHeadSha` | the exact commit the job is bound to |
 | `findingSource` | where the finding came from; a provider-neutral label, inert |
 | `findingId` | the finding being repaired |
 | `findingHeadSha` | the commit the finding was verified against |
-| `repairBranch` | the isolated repair branch |
+| `repairBranch` | the isolated repair branch; canonical `refs/heads/<name>` |
 | `repairWorktreeId` | the isolated repair worktree |
 | `authorizedPaths` | exact repository-relative paths, not a prefix or glob |
 | `authorizedCommandClasses` | verification classes, never command strings |
@@ -121,11 +121,57 @@ offending names in declaration order.
 Two structural invariants are enforced as configuration validity rather than as
 a runtime check that could be forgotten:
 
-- `repairBranch !== protectedParentRef`. A job whose repair branch *is* the
-  protected parent is not a quarantined repair; it is a direct write to
-  protected history wearing a repair job's name.
+- `repairBranch` and `protectedParentRef` denote **different branches**. A job
+  whose repair branch *is* the protected parent is not a quarantined repair; it
+  is a direct write to protected history wearing a repair job's name.
 - `independentValidatorId !== repairAgentId`. A repair agent that is its own
   validator defeats the quarantine the whole pipeline exists to enforce.
+
+### Branch refs have exactly one accepted spelling
+
+"Different branches", not "different strings". Git resolves `main`,
+`heads/main`, and `refs/heads/main` to one and the same ref, so a boundary that
+compares ref strings has three names for one authority target. Configuring
+`protectedParentRef: 'refs/heads/main'` beside `repairBranch: 'main'` would
+otherwise read as a quarantined repair, and a `repair.push` naming `main` would
+pass every check and produce an `ExecutionPermit` whose ref denotes the protected
+branch.
+
+C1 cannot ask git which ref a shorthand resolves to — it runs no git, spawns no
+subprocess, opens no file, and observes no repository, and the answer depends on
+what exists in a repository at the moment the name is used. So C1 does not
+resolve; it **narrows**. `readCanonicalBranchRef` accepts exactly one spelling
+and refuses every other spelling of the same branch as malformed:
+
+- the literal, case-sensitive prefix `refs/heads/`, followed by a non-empty name
+- name segments separated by single `/`, each non-empty
+- segment characters drawn only from `A-Z`, `a-z`, `0-9`, `-`, `_`, and `.`
+- no segment beginning or ending with `.`, no `..` anywhere, and no segment
+  ending in `.lock` in any ASCII case
+
+The property that buys: **two accepted refs denote the same branch if and only if
+they are equal strings.** That is what makes the distinctness invariant mean
+something. The conservative ASCII character set is part of the guarantee, not a
+convenience — it removes Unicode normalisation, under which an NFC and an NFD
+spelling of one name are unequal strings a filesystem-backed loose ref can
+resolve to a single ref, and it removes `~`, `^`, `:`, `?`, `*`, `[`, `\`, `@{`,
+and whitespace in one rule. Nothing is normalised, prefixed, or case-folded on
+the way in: a value is accepted exactly as supplied or refused.
+
+The same reader is applied to **every** security-relevant ref position — the two
+job fields, and the `ref`, `sourceRef`, and `targetRef` request operands — so
+validation can never compare a canonical configured value against an
+uncanonical request operand. A supplied operand that is not canonical is refused
+`REF_MALFORMED` before any comparison, rather than compared as though it were a
+different branch.
+
+**What this does not prove**, and must not be claimed to: that two unequal
+accepted refs are two distinct refs on every filesystem. Git stores loose refs as
+files, so on a case-insensitive filesystem `refs/heads/Main` and
+`refs/heads/main` can be one ref while comparing unequal. C1 observes no
+filesystem, so it refuses the ambiguous case instead of pretending it away: the
+job's two configured refs are additionally compared with ASCII case folded, and a
+pair that differs only by case is rejected as malformed configuration.
 
 One relationship is enforced at authorization time, because it is about
 freshness rather than shape: `findingHeadSha` must equal `parentHeadSha`, or
@@ -149,6 +195,10 @@ authority cannot be checked against an exact operand has no place in the model.
 | `repair.commit` | worktree, ref | ref is exactly the repair branch |
 | `repair.push` | ref, non-force | ref is exactly the repair branch and the push is not forced |
 | `repair.change_request` | source ref, target ref | repair branch → protected parent ref |
+
+Every ref operand is read through the same canonical branch-ref reader the job
+envelope uses, so "exactly the repair branch" is a claim about a branch and not
+about a spelling.
 
 `repair.change_request` is the **only** operation that may name the protected
 parent ref, and only as a change-request *target*. Opening a change request
@@ -188,7 +238,7 @@ Every refusal carries a stable, machine-readable reason:
 `OPERATION_UNREADABLE`, `JOB_ENVELOPE_INVALID`, `JOB_MISMATCH`,
 `REPOSITORY_MISMATCH`, `PARENT_PULL_REQUEST_MISMATCH`, `PARENT_HEAD_MISMATCH`,
 `FINDING_SHA_STALE`, `OPERAND_MISSING`, `PATH_MALFORMED`, `PATH_NOT_AUTHORIZED`,
-`WORKTREE_NOT_AUTHORIZED`, `COMMAND_CLASS_NOT_AUTHORIZED`,
+`WORKTREE_NOT_AUTHORIZED`, `COMMAND_CLASS_NOT_AUTHORIZED`, `REF_MALFORMED`,
 `PROTECTED_REF_MUTATION`, `REF_NOT_REPAIR_BRANCH`,
 `CHANGE_REQUEST_TARGET_INVALID`, `FORCE_PUSH_FORBIDDEN`.
 
@@ -474,7 +524,9 @@ The mandatory AgentBridge pattern is preserved:
 C1 implements none of that workflow. It encodes only the minimal authority
 invariants that stop a later layer from bypassing the quarantine by accident:
 
-- The protected parent ref is never a write target of any operation.
+- The protected parent ref is never a write target of any operation, under any
+  spelling: refs are canonical everywhere, so an alias of the parent cannot be
+  presented as a different branch.
 - Filesystem-shaped operations are bound to the repair worktree, so an edit
   cannot land in the parent's checkout.
 - The stacked change request must run from the repair branch to the protected
@@ -522,6 +574,12 @@ patterns PR 004, PR 005, and PR 006 established:
   real object and a cut branch name can name a different ref. **C1 truncates
   nothing at all, because C1 has no prose field.** An oversized list is likewise
   rejected, not shortened.
+- **Refs are narrowed, never repaired.** A non-canonical branch ref is refused,
+  not rewritten into the canonical spelling. Repairing a spelling would be
+  choosing an authority target on the caller's behalf, which is exactly the
+  decision the boundary exists to refuse. The reader is a pure function of a
+  primitive string captured by a single own-property read, so it introduces no
+  second observation of untrusted state and no validation TOCTOU.
 - **List entries are own elements.** Every entry of an authorization list is
   read as an **own** indexed property, so only an element the supplied object
   reports as its own can become an authorized path or command class. For any
