@@ -599,17 +599,18 @@ async function terminate(
 /**
  * Run one process exchange.
  *
- * **Defined operational results.** Resolves to exactly one frozen
- * {@link AgentExchange} on every validation, spawn, I/O, timeout,
- * cancellation, overflow, termination, and close path. Deliberate fail-closed
- * rejection: when mandatory post-spawn child-dispatch hardening cannot be
- * established, the transport runs its bounded, platform-qualified termination
- * procedure, tears down its pipes and listeners, and then rejects. That
- * rejection is not `SPAWN_FAILED` and is not an `AgentExchange` outcome at
- * all. Catches are placed only around defined operational failures — `spawn`,
- * `kill`, a broken stdin pipe, a hostile `AbortSignal` getter — so a
- * programmer or security-boundary defect still surfaces as a defect rather
- * than being laundered into a failure code.
+ * **Defined operational results.** For the defined operational results this
+ * transport represents as exchange outcomes — validation, spawn, I/O,
+ * timeout, cancellation, overflow, termination, and close — resolves to
+ * exactly one frozen {@link AgentExchange}. Nothing outside that handled set
+ * is promised to resolve. Deliberate fail-closed rejection: when mandatory
+ * post-spawn child-dispatch hardening cannot be established, the transport
+ * runs its bounded, platform-qualified termination procedure, tears down its
+ * pipes and listeners, and then rejects. That rejection is not `SPAWN_FAILED`
+ * and is not an `AgentExchange` outcome at all. Catches are placed only around
+ * defined operational failures — `spawn`, `kill`, a broken stdin pipe, a
+ * hostile `AbortSignal` getter — so a programmer or security-boundary defect
+ * still surfaces as a defect rather than being laundered into a failure code.
  *
  * **Deterministic precedence.** Every detected terminal cause is compared with
  * `TERMINAL_CAUSE_PRECEDENCE`; callback arrival order cannot demote a stronger
