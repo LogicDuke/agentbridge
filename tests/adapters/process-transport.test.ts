@@ -398,6 +398,44 @@ async function runPermissionProbe(enabled: boolean): Promise<PermissionProbeResu
   }
 }
 
+/**
+ * The one block Node itself writes to a probe's stderr, matched literally.
+ *
+ * The process id varies, the line ending may be either form, and the
+ * `--trace-warnings` line Node prints immediately after the warning is part of
+ * the same block. Every other byte of the pattern is fixed text, so no other
+ * `ExperimentalWarning`, no differently worded notice about type stripping, and
+ * no companion line standing on its own can satisfy it.
+ */
+const KNOWN_TYPE_STRIPPING_WARNING = new RegExp(
+  [
+    /^\(node:\d+\) ExperimentalWarning: Type Stripping is an experimental /,
+    /feature and might change at any time\r?\n/,
+    /\(Use `node --trace-warnings \.\.\.` to show where the warning was created\)\r?\n/,
+  ]
+    .map((part) => part.source)
+    .join(''),
+  'm',
+);
+
+/**
+ * A probe's stderr with Node's own type-stripping announcement removed, and
+ * nothing else.
+ *
+ * The permission probe imports the transport's TypeScript source directly, so
+ * Node 24.0–24.2 — releases this repository supports — announce type stripping
+ * before the transport has done anything at all. Node 24.3.0 stopped emitting
+ * it, which makes the block's presence purely a fact about the interpreter and
+ * never a fact about the transport.
+ *
+ * Only the first such block goes: Node emits this warning once per process, so
+ * a second copy would itself be unexpected and is left in place to fail on,
+ * exactly like any other stderr the probe was not supposed to produce.
+ */
+function stripKnownTypeStrippingWarning(stderr: string): string {
+  return stderr.replace(KNOWN_TYPE_STRIPPING_WARNING, '');
+}
+
 /** Distinctive enough that its appearance anywhere in the child is a leak. */
 const COVERAGE_SENTINEL = 'agentbridge-coverage-must-not-leak';
 
@@ -743,6 +781,35 @@ function runStub(
     limits,
   );
 }
+
+describe('stripKnownTypeStrippingWarning', () => {
+  const WARNING_LINE =
+    '(node:1234) ExperimentalWarning: Type Stripping is an experimental feature' +
+    ' and might change at any time';
+  const COMPANION_LINE = '(Use `node --trace-warnings ...` to show where the warning was created)';
+  const KNOWN = `${WARNING_LINE}\n${COMPANION_LINE}\n`;
+  const KNOWN_CRLF = `${WARNING_LINE}\r\n${COMPANION_LINE}\r\n`;
+  const OTHER_WARNING =
+    '(node:1234) ExperimentalWarning: WASI is an experimental feature' +
+    ' and might change at any time\n';
+  const LOOKALIKE = `(node:1234) ExperimentalWarning: Type Stripping is now stable\n${COMPANION_LINE}\n`;
+  const STACK = 'Error: boom\n    at Object.<anonymous> (/agent/index.js:1:1)\n';
+
+  it.each([
+    ['the exact block Node emits', KNOWN, ''],
+    ['the same block with CRLF endings', KNOWN_CRLF, ''],
+    ['an unrelated ExperimentalWarning', OTHER_WARNING, OTHER_WARNING],
+    ['a differently worded type-stripping notice', LOOKALIKE, LOOKALIKE],
+    ['arbitrary stderr carrying a stack trace', STACK, STACK],
+    ['the block ahead of unrelated stderr', `${KNOWN}${STACK}`, STACK],
+    ['the block ahead of a second warning', `${KNOWN}${OTHER_WARNING}`, OTHER_WARNING],
+    ['the companion line with no warning above it', `${COMPANION_LINE}\n`, `${COMPANION_LINE}\n`],
+    ['unrelated stderr ahead of the block', `${STACK}${KNOWN}`, STACK],
+    ['a second copy of the block', `${KNOWN}${KNOWN}`, KNOWN],
+  ])('leaves exactly the unexpected bytes of %s', (_label, stderr, remaining) => {
+    expect(stripKnownTypeStrippingWarning(stderr)).toBe(remaining);
+  });
+});
 
 describe('invokeAgentProcess — success', () => {
   it('runs a process to completion and captures stdout exactly', async () => {
@@ -1762,7 +1829,9 @@ describe('invokeAgentProcess — adversarial', () => {
   it('runs an ordinary invocation when the permission model is not enabled', async () => {
     const probe = await runPermissionProbe(false);
 
-    expect(probe.stderr).toBe('');
+    // Node 24.0–24.2 announce type stripping to a probe that loads the
+    // TypeScript source. Past that one block, the probe stays silent.
+    expect(stripKnownTypeStrippingWarning(probe.stderr)).toBe('');
     expect(probe.code).toBe(0);
     // The baseline half of the comparison: this interpreter has no reason to
     // touch NODE_OPTIONS at all, and the exchange succeeds.
