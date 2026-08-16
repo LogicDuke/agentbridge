@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   APPROVAL_STATE,
@@ -18,11 +18,14 @@ import {
   resolveJobOperation,
   satisfiesIndependentValidator,
   UNKNOWN_JOB_OPERATION,
+  findInvalidRepairJobFields,
+  readRepairJobAuthorization,
   type ApprovalRecord,
   type JobOperationRequest,
   type OperatorMergeAuthorization,
   type RepairJobAuthorization,
   type ValidatorClaim,
+  type VerificationCommandClass,
 } from '../../src/domain/index.js';
 import {
   AUTHORIZED_PATH,
@@ -895,6 +898,318 @@ describe('poisoning Map.prototype.get cannot re-resolve an operation', () => {
     withPoisonedMapGet(() => undefined);
 
     expect(new Map<string, string>([['k', 'v']]).get('k')).toBe('v');
+  });
+});
+
+/**
+ * Build a length-2 array holding `own` at index 0 and a genuine **hole** at 1.
+ *
+ * `Array.isArray` still answers `true` and `length` is still 2, so every bound
+ * and shape check upstream is satisfied; the only thing wrong with index 1 is
+ * that nothing ever put an own element there.
+ */
+function withHoleAtOne(own: string): string[] {
+  const sparse: string[] = [];
+  sparse[0] = own;
+  sparse.length = 2;
+  return sparse;
+}
+
+/** The same hole, with `victim` reachable at index 1 through a custom prototype. */
+function sparseWithInheritedElement(own: string, victim: string): string[] {
+  const sparse = withHoleAtOne(own);
+  Object.setPrototypeOf(sparse, { 1: victim });
+  return sparse;
+}
+
+/** Run `body` with `victim` planted at `Array.prototype[1]`, then restore. */
+function withArrayPrototypeElement<T>(victim: string, body: () => T): T {
+  const saved = Object.getOwnPropertyDescriptor(Array.prototype, 1);
+  Object.defineProperty(Array.prototype, 1, {
+    value: victim,
+    writable: true,
+    configurable: true,
+    enumerable: false,
+  });
+  try {
+    return body();
+  } finally {
+    if (saved === undefined) {
+      Reflect.deleteProperty(Array.prototype, 1);
+    } else {
+      Object.defineProperty(Array.prototype, 1, saved);
+    }
+  }
+}
+
+describe('an inherited numeric property cannot become an authorization entry', () => {
+  it('proves the custom-prototype setup is actually active', () => {
+    // Without this the section could pass vacuously, on an array that was never
+    // hostile: the hole must be a hole, and the inherited value must be there.
+    const sparse = sparseWithInheritedElement(AUTHORIZED_PATH, UNAUTHORIZED_PATH);
+
+    expect(Array.isArray(sparse)).toBe(true);
+    expect(sparse.length).toBe(2);
+    expect(Object.hasOwn(sparse, 1)).toBe(false);
+    // An ordinary indexed read — the thing the reader must not do — resolves it.
+    expect(sparse[1]).toBe(UNAUTHORIZED_PATH);
+  });
+
+  it('rejects an authorized-path list whose hole is filled by a custom prototype', () => {
+    const job = buildJob({
+      authorizedPaths: sparseWithInheritedElement(AUTHORIZED_PATH, UNAUTHORIZED_PATH),
+    });
+
+    expect(readRepairJobAuthorization(job).snapshot).toBeNull();
+    expect(findInvalidRepairJobFields(job)).toContain('authorizedPaths');
+  });
+
+  it('does not let a custom-prototype path reach ALLOW_ONCE or a permit', () => {
+    const job = buildJob({
+      authorizedPaths: sparseWithInheritedElement(AUTHORIZED_PATH, UNAUTHORIZED_PATH),
+    });
+
+    const decision = authorizeJobOperation(job, buildEdit({ path: UNAUTHORIZED_PATH }));
+
+    expect(decision.decision).toBe(JOB_AUTHORIZATION.DENY);
+    expect(decision.reason).toBe(JOB_AUTHORIZATION_REASON.JOB_ENVELOPE_INVALID);
+    expect(decision.mayExecuteOnce).toBe(false);
+    expect(decision.permit).toBeNull();
+    // The fabricated path is nowhere in the answer, not even as an echo.
+    expect(JSON.stringify(decision)).not.toContain(UNAUTHORIZED_PATH);
+  });
+
+  it('proves the Array.prototype pollution is actually active', () => {
+    const observed = withArrayPrototypeElement(UNAUTHORIZED_PATH, () => {
+      const sparse = withHoleAtOne(AUTHORIZED_PATH);
+      return { own: Object.hasOwn(sparse, 1), read: sparse[1], length: sparse.length };
+    });
+
+    expect(observed.own).toBe(false);
+    expect(observed.read).toBe(UNAUTHORIZED_PATH);
+    expect(observed.length).toBe(2);
+  });
+
+  it('rejects an authorized-path list whose hole is filled by Array.prototype', () => {
+    const outcome = withArrayPrototypeElement(UNAUTHORIZED_PATH, () => {
+      const job = buildJob({ authorizedPaths: withHoleAtOne(AUTHORIZED_PATH) });
+
+      return {
+        snapshot: readRepairJobAuthorization(job).snapshot,
+        invalidFields: findInvalidRepairJobFields(job),
+        decision: authorizeJobOperation(job, buildEdit({ path: UNAUTHORIZED_PATH })),
+      };
+    });
+
+    expect(outcome.snapshot).toBeNull();
+    expect(outcome.invalidFields).toContain('authorizedPaths');
+    expect(outcome.decision.decision).toBe(JOB_AUTHORIZATION.DENY);
+    expect(outcome.decision.reason).toBe(JOB_AUTHORIZATION_REASON.JOB_ENVELOPE_INVALID);
+    expect(outcome.decision.mayExecuteOnce).toBe(false);
+    expect(outcome.decision.permit).toBeNull();
+  });
+
+  it('restores Array.prototype afterwards', () => {
+    withArrayPrototypeElement(UNAUTHORIZED_PATH, () => undefined);
+
+    expect(Object.hasOwn(Array.prototype, 1)).toBe(false);
+    expect(withHoleAtOne(AUTHORIZED_PATH)[1]).toBeUndefined();
+  });
+
+  it('does not let an inherited command class enter the trusted snapshot', () => {
+    // `test` is a genuine, well-formed verification class. Shape is not the
+    // question; nobody put it in this job's list.
+    const sparse = sparseWithInheritedElement('lint', 'test');
+    const job = buildJob({
+      authorizedCommandClasses: sparse as unknown as readonly VerificationCommandClass[],
+    });
+
+    expect(Object.hasOwn(sparse, 1)).toBe(false);
+    expect(readRepairJobAuthorization(job).snapshot).toBeNull();
+    expect(findInvalidRepairJobFields(job)).toContain('authorizedCommandClasses');
+  });
+
+  it('does not let an inherited command class gain command-class authority', () => {
+    const job = buildJob({
+      authorizedCommandClasses: sparseWithInheritedElement(
+        'lint',
+        'test',
+      ) as unknown as readonly VerificationCommandClass[],
+    });
+
+    const decision = authorizeJobOperation(
+      job,
+      buildRequest({
+        operation: 'verification.run',
+        worktreeId: REPAIR_WORKTREE,
+        commandClass: 'test',
+      }),
+    );
+
+    expect(decision.decision).toBe(JOB_AUTHORIZATION.DENY);
+    expect(decision.mayExecuteOnce).toBe(false);
+    expect(decision.permit).toBeNull();
+  });
+
+  it('still accepts dense own lists, and still reaches ALLOW_ONCE inside them', () => {
+    const job = buildJob({
+      authorizedPaths: [AUTHORIZED_PATH, UNAUTHORIZED_PATH],
+      authorizedCommandClasses: ['lint', 'test'],
+    });
+
+    expect(findInvalidRepairJobFields(job)).toEqual([]);
+    expect(readRepairJobAuthorization(job).snapshot?.authorizedPaths).toEqual([
+      AUTHORIZED_PATH,
+      UNAUTHORIZED_PATH,
+    ]);
+
+    // The same path that had to be refused when it was merely inherited is
+    // authorized the moment an operator actually puts it in the list.
+    const edit = authorizeJobOperation(job, buildEdit({ path: UNAUTHORIZED_PATH }));
+    expect(edit.decision).toBe(JOB_AUTHORIZATION.ALLOW_ONCE);
+    expect(edit.reason).toBe(JOB_AUTHORIZATION_REASON.WITHIN_JOB_ENVELOPE);
+    expect(edit.mayExecuteOnce).toBe(true);
+    expect(edit.permit).not.toBeNull();
+
+    const verify = authorizeJobOperation(
+      job,
+      buildRequest({
+        operation: 'verification.run',
+        worktreeId: REPAIR_WORKTREE,
+        commandClass: 'test',
+      }),
+    );
+    expect(verify.decision).toBe(JOB_AUTHORIZATION.ALLOW_ONCE);
+    expect(verify.mayExecuteOnce).toBe(true);
+  });
+
+  it('keeps a plain sparse hole failing closed with nothing inherited at all', () => {
+    const job = buildJob({ authorizedPaths: withHoleAtOne(AUTHORIZED_PATH) });
+
+    expect(findInvalidRepairJobFields(job)).toContain('authorizedPaths');
+    expect(authorizeJobOperation(job, buildEdit()).mayExecuteOnce).toBe(false);
+  });
+
+  it('rejects rather than throws when the own check itself is hostile', () => {
+    // A Proxy whose `getOwnPropertyDescriptor` trap throws: the own-only read
+    // must fail closed, and the entry point must stay total.
+    const hostile = new Proxy([AUTHORIZED_PATH, AUTHORIZED_PATH], {
+      getOwnPropertyDescriptor(): PropertyDescriptor {
+        throw new Error('hostile own-property trap');
+      },
+    });
+    const job = buildJob({ authorizedPaths: hostile });
+
+    expect(() => findInvalidRepairJobFields(job)).not.toThrow();
+    expect(findInvalidRepairJobFields(job)).toContain('authorizedPaths');
+    expect(authorizeJobOperation(job, buildEdit()).mayExecuteOnce).toBe(false);
+  });
+
+  it('rejects rather than throws when an element getter is hostile', () => {
+    const hostile: string[] = [AUTHORIZED_PATH, AUTHORIZED_PATH];
+    Object.defineProperty(hostile, 1, {
+      get(): string {
+        throw new Error('hostile element getter');
+      },
+      configurable: true,
+      enumerable: true,
+    });
+    const job = buildJob({ authorizedPaths: hostile });
+
+    expect(() => authorizeJobOperation(job, buildEdit())).not.toThrow();
+    expect(findInvalidRepairJobFields(job)).toContain('authorizedPaths');
+    expect(authorizeJobOperation(job, buildEdit()).mayExecuteOnce).toBe(false);
+  });
+
+  it('pins the documented limit: a Proxy that misreports ownership widens nothing', () => {
+    // The honest boundary, recorded so the guarantee is not read as stronger
+    // than it is. A Proxy *defines* the observable result of `Object.hasOwn`
+    // and of the read, so one that claims a hole is own while the read forwards
+    // through the target's prototype passes the inherited value through. No
+    // reader can tell it apart from a truthful object, and this test does not
+    // pretend otherwise — it pins the *consequence*, which is that nothing is
+    // widened.
+    const target = withHoleAtOne(AUTHORIZED_PATH);
+    Object.setPrototypeOf(target, { 1: UNAUTHORIZED_PATH });
+    const liar = new Proxy(target, {
+      getOwnPropertyDescriptor(t, key): PropertyDescriptor | undefined {
+        if (key === '1') {
+          return { value: UNAUTHORIZED_PATH, writable: true, enumerable: true, configurable: true };
+        }
+        return Reflect.getOwnPropertyDescriptor(t, key);
+      },
+    });
+
+    // The lie is in effect: the object reports the hole as its own.
+    expect(Object.hasOwn(target, 1)).toBe(false);
+    expect(Object.hasOwn(liar, 1)).toBe(true);
+
+    const viaProxy = authorizeJobOperation(
+      buildJob({ authorizedPaths: liar }),
+      buildEdit({ path: UNAUTHORIZED_PATH }),
+    );
+    // The same caller, supplying the same value as a plain dense own element —
+    // which needs no Proxy and no lie at all.
+    const viaDenseArray = authorizeJobOperation(
+      buildJob({ authorizedPaths: [AUTHORIZED_PATH, UNAUTHORIZED_PATH] }),
+      buildEdit({ path: UNAUTHORIZED_PATH }),
+    );
+
+    // Byte-identical: the Proxy reaches exactly what configuration already
+    // reaches, so it is not an escalation, and the documentation says so.
+    expect(JSON.stringify(viaProxy)).toBe(JSON.stringify(viaDenseArray));
+  });
+
+  it('needs no global Symbol call to evaluate, so the sentinel depends on no mutable global', async () => {
+    // The absence marker is a bare object literal. A module that built it with
+    // `Symbol(...)` would call the global factory during evaluation; this
+    // module must not, so a replaced `Symbol` is not on its load path at all.
+    const saved = globalThis.Symbol;
+    let calls = 0;
+    // A Proxy over the real Symbol keeps every own property — `Symbol.iterator`
+    // and friends — so the module loader itself is unaffected.
+    const counting = new Proxy(saved, {
+      apply(target, thisArg, args: readonly unknown[]): unknown {
+        calls += 1;
+        return Reflect.apply(target as (...a: readonly unknown[]) => unknown, thisArg, args);
+      },
+    });
+
+    let fresh: typeof import('../../src/domain/repair-job.js');
+    try {
+      globalThis.Symbol = counting;
+      vi.resetModules();
+      // Awaited inside the try, so the module actually evaluates while the
+      // counting Symbol is installed.
+      fresh = await import('../../src/domain/repair-job.js');
+    } finally {
+      globalThis.Symbol = saved;
+    }
+
+    expect(calls).toBe(0);
+    // And the freshly evaluated module still behaves.
+    expect(fresh.findInvalidRepairJobFields(buildJob())).toEqual([]);
+    expect(
+      fresh.findInvalidRepairJobFields(buildJob({ authorizedPaths: withHoleAtOne(AUTHORIZED_PATH) })),
+    ).toContain('authorizedPaths');
+  });
+
+  it('leaves the merge and auto-merge barriers exactly where they were', () => {
+    // The A03 repair touches list-element provenance and nothing else.
+    const job = buildJob({
+      authorizedPaths: sparseWithInheritedElement(AUTHORIZED_PATH, UNAUTHORIZED_PATH),
+    });
+
+    const merge = authorizeJobOperation(job, buildRequest({ operation: 'merge' }));
+    expect(merge.decision).toBe(JOB_AUTHORIZATION.OPERATOR_REQUIRED);
+    expect(merge.reason).toBe(JOB_AUTHORIZATION_REASON.MERGE_IS_OPERATOR_ONLY);
+    expect(merge.mayExecuteOnce).toBe(false);
+    expect(merge.permit).toBeNull();
+
+    const auto = authorizeJobOperation(job, buildRequest({ operation: 'auto_merge.enable' }));
+    expect(auto.decision).toBe(JOB_AUTHORIZATION.DENY);
+    expect(auto.reason).toBe(JOB_AUTHORIZATION_REASON.OPERATION_FORBIDDEN);
+    expect(auto.permit).toBeNull();
   });
 });
 

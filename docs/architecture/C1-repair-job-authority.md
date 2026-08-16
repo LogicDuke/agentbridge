@@ -522,8 +522,29 @@ patterns PR 004, PR 005, and PR 006 established:
   real object and a cut branch name can name a different ref. **C1 truncates
   nothing at all, because C1 has no prose field.** An oversized list is likewise
   rejected, not shortened.
-- **Sparse arrays reject.** A hole reads as `undefined`, which no reader accepts,
-  so sparseness rejects rather than collapsing.
+- **List entries are own elements.** Every entry of an authorization list is
+  read as an **own** indexed property, so only an element the supplied object
+  reports as its own can become an authorized path or command class. For any
+  array whose own-property introspection is truthful — every ordinary array,
+  however its prototype chain is arranged — that is exactly the elements the job
+  configuration supplied: an index with no own element is a sparse hole, and a
+  hole rejects the whole list rather than collapsing, shortening, or taking a
+  default, so an inherited numeric property planted on a custom array prototype
+  or on `Array.prototype` is refused however well-formed its value looks.
+  Provenance decides, not shape. A hole is not authorization, and prototype
+  state is not authorization.
+
+  The guarantee stops where the runtime's own-property report does, and the
+  boundary is documented rather than papered over. A Proxy *defines* the
+  observable result of `Object.hasOwn` and of the subsequent read, so one whose
+  `getOwnPropertyDescriptor` trap claims a hole is own while the read forwards
+  through the target's prototype will pass an inherited value through. The
+  reader performs one own check and one guarded read and re-validates nothing
+  afterwards, but those are two observations rather than one atomic one, and a
+  Proxy may answer them inconsistently. C1 establishes provenance no further
+  than the supplied object's own report, and claims no more. This widens no
+  authority: a caller able to supply such a Proxy can supply the same value as a
+  dense own element instead, which is configuration, not an attack.
 - **Array building avoids the prototype.** Appends define an own indexed
   property rather than using `push` or indexed assignment, so an inherited index
   setter is not on the path.
