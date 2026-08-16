@@ -165,11 +165,14 @@ cancellation, overflow, termination, and close — the function resolves exactly
 one frozen record. Nothing outside that handled set is promised to resolve. It
 rejects deliberately, rather than reporting an outcome, when mandatory
 post-spawn child-dispatch hardening cannot be established: the transport runs
-its bounded, platform-qualified termination procedure, tears down its pipes and
-listeners, and then rejects. That rejection is not `SPAWN_FAILED` and is not an
-exchange outcome at all. Catches wrap only defined operational failures, so a
-programmer or security-boundary defect still surfaces as a defect rather than
-being laundered into a failure code.
+its bounded, platform-qualified termination procedure, destroys the local
+stdout and stderr ends, clears the child's listeners, re-arms the spawn-failure
+absorber over the cleared handle, and then rejects. The local stdin end is left
+as it is, and termination stays a request rather than a completion guarantee.
+That rejection is not `SPAWN_FAILED` and is not an exchange outcome at all.
+Catches wrap only defined operational failures, so a programmer or
+security-boundary defect still surfaces as a defect rather than being laundered
+into a failure code.
 
 ## Termination is qualified, and the limit is disclosed
 
