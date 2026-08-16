@@ -269,20 +269,29 @@ because overclaiming here would be worse than not checking.
 **Proved by a `true` result.** The candidate record carries the required
 structural fields as readable identifiers; its `singleUse` is literally `true`;
 and its `repositoryId`, `pullRequestId`, and `headSha` are exactly equal to the
-target repository, target pull request, and the repository's *current* HEAD. Every
-comparison is exact string equality, so the record is invalid the moment HEAD
-changes and can never cover another pull request, another repository, or a future
-SHA. There is no path that widens, refreshes, or re-binds it.
+corresponding fields of the **supplied** `MergeTarget` — including
+`MergeTarget.currentHeadSha`. Every comparison is exact string equality, so a
+candidate can never cover a target naming another pull request, another
+repository, or a different SHA, and there is no path that widens, refreshes, or
+re-binds it.
+
+`MergeTarget` is caller-supplied input. `operatorMergeAuthorizes` performs no
+repository read, no GitHub API call, no adapter call, and no network access, so
+**the binding guarantee is only ever as fresh and as authoritative as the target
+handed to it.** C1 compares against a value; it does not observe a repository.
 
 **Not proved, and not claimed.**
 
 | Property | C1 |
 | --- | --- |
+| target SHA is authoritative | **not proved** — `MergeTarget.currentHeadSha` is an input; C1 cannot distinguish a live HEAD from a stale or invented one |
+| target SHA is fresh | **not proved** — C1 cannot know whether the repository moved after the target was built |
 | operator origin | **not proved** — the argument is untrusted data; a plain object literal written by any caller passes |
 | human identity / authentication | **not proved** — `operatorId` is a readable string; C1 reads no credential and authenticates nothing |
 | trusted minting, signature, possession | **not proved** — C1 has no issuing boundary and no secret material, so it cannot distinguish a minted record from an assembled one |
+| a changed SHA means a new operator decision | **not proved** — see below |
 | uniqueness / one-time consumption | **not proved** — C1 has no consumed-capability store |
-| replay prevention | **not proved** — the identical record returns `true` on every call while HEAD is unchanged |
+| replay prevention | **not proved** — the identical record returns `true` on every call while the same target is supplied |
 
 `singleUse: true` is a **structural intent marker**: it records that the shape is
 that of a single-use capability. It is *not* enforced single consumption, and
@@ -290,14 +299,35 @@ this document does not claim the record is replay-proof or that it cannot be
 reused. Likewise, a non-empty `operatorId` is descriptive data; it does not make
 the record operator-originated, authenticated, or human-authorized.
 
-**A `true` result is therefore not sufficient proof that a merge is
-operator-authorized.** It is a necessary binding check. A future trusted operator
-boundary — the merge broker, an explicitly reviewed later Cockpit layer — is
-responsible for authenticating the operator, establishing that the record was
-minted by that boundary rather than supplied by a caller, and consuming the
-record so it cannot authorize a second merge. C1 deliberately implements none of
-that: no authentication, no signatures, no token issuance, no secret material, no
-replay or consumed-capability store, no operator session, and no endpoint.
+On a changed SHA, C1 requires only a **newly matching candidate record**: if the
+supplied target SHA changes, the previous candidate stops matching, and some
+candidate whose `headSha` equals the newly supplied target SHA would be required.
+This document does **not** claim that a new SHA requires a new operator decision.
+C1 cannot tell whether such a candidate is a fresh human decision or the same
+untrusted caller assembling another literal; the future trusted boundary must
+establish that.
+
+**A `true` result is therefore not sufficient proof that a merge may execute.**
+It is a necessary binding check.
+
+### What the future trusted Merge Broker must do
+
+An explicitly reviewed later Cockpit layer, not implemented here, must:
+
+1. authenticate the operator;
+2. establish trusted capability minting and origin, so the record cannot have
+   been assembled by a caller;
+3. obtain the authoritative pull-request/repository HEAD immediately before the
+   merge attempt;
+4. require that exact HEAD to match the operator capability;
+5. enforce single-use consumption atomically;
+6. reject if HEAD changed;
+7. perform or request the merge only after all gates still pass.
+
+C1 performs **none** of those steps and claims none of them: no authentication,
+no signatures, no token issuance, no secret material, no repository or live-HEAD
+lookup, no replay or consumed-capability store, no operator session, and no
+endpoint.
 
 **No merge executor and no GitHub merge API call exists in this PR.**
 

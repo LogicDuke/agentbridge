@@ -235,7 +235,7 @@ describe('operator merge authorization is separate, exact, and structurally sing
     ).toBe(true);
   });
 
-  it('becomes invalid the moment HEAD moves', () => {
+  it('stops matching once a different target SHA is supplied', () => {
     expect(
       operatorMergeAuthorizes(authorization, {
         repositoryId: REPO_A,
