@@ -161,9 +161,13 @@ forced settlement also destroys the local stdout and stderr pipe ends, and
 stdout or stderr read errors are contained until the child close path reports
 the provider-neutral outcome. The function resolves exactly one frozen record
 on every validation, spawn, I/O, timeout, cancellation, overflow, termination,
-and close path. It never rejects. Catches wrap only defined operational
-failures, so a programmer defect still surfaces as a defect rather than being
-laundered into a failure code.
+and close path. It rejects deliberately, rather than reporting an outcome, when
+mandatory post-spawn child-dispatch hardening cannot be established: the
+transport runs its bounded, platform-qualified termination procedure, tears
+down its pipes and listeners, and then rejects. That rejection is not
+`SPAWN_FAILED` and is not an exchange outcome at all. Catches wrap only defined
+operational failures, so a programmer or security-boundary defect still
+surfaces as a defect rather than being laundered into a failure code.
 
 ## Termination is qualified, and the limit is disclosed
 
