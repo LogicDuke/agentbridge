@@ -297,6 +297,27 @@ const PARENT_ONLY_VALUES = Object.freeze({
   LIBPATH: 'agentbridge-zos-libpath-must-not-leak',
 });
 
+/**
+ * Whether the interpreter running these tests propagates its own permission-model
+ * flags to a child through `NODE_OPTIONS`.
+ *
+ * Node only began writing those flags into a spawn's environment in v24.4.0
+ * (nodejs/node#58853). The earlier Node 24 releases this repository supports have
+ * no such feature, so a probe under `--permission` legitimately reports no write
+ * there, and demanding one would require an implementation detail that did not
+ * exist yet. The probe spawns `process.execPath`, so this process's version is
+ * the one that decides.
+ *
+ * Only the *observation* of Node's write is version-dependent. That the
+ * transport's absorbing environment entry safely receives such a write, without
+ * turning a valid invocation into `SPAWN_FAILED`, is proven deterministically on
+ * every runtime by the simulation in `transport-invariants.test.ts`.
+ */
+const PROPAGATES_PERMISSION_FLAGS = ((): boolean => {
+  const [major = 0, minor = 0] = process.versions.node.split('.').map(Number);
+  return major === 24 ? minor >= 4 : major > 24;
+})();
+
 /** What one permission probe run reported. */
 interface PermissionProbeResult {
   readonly writesNodeOptions: boolean;
@@ -1754,7 +1775,7 @@ describe('invokeAgentProcess — adversarial', () => {
     const probe = await runPermissionProbe(true);
 
     // Without this the test would pass by simply not being the permission case.
-    expect(probe.writesNodeOptions).toBe(true);
+    expect(probe.writesNodeOptions).toBe(PROPAGATES_PERMISSION_FLAGS);
     expect(probe.code).toBe(0);
     // The defect: Node's write against the frozen snapshot threw, and a
     // structurally valid invocation was reported as SPAWN_FAILED.
@@ -1769,7 +1790,7 @@ describe('invokeAgentProcess — adversarial', () => {
   it('leaks neither the parent permission flags nor its blocked variables', async () => {
     const probe = await runPermissionProbe(true);
 
-    expect(probe.writesNodeOptions).toBe(true);
+    expect(probe.writesNodeOptions).toBe(PROPAGATES_PERMISSION_FLAGS);
     expect(probe.outcome).toBe('EXITED');
     const serialized = JSON.stringify(probe.childEnv);
     expect(serialized).not.toContain('--permission');
