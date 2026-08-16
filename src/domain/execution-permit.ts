@@ -1,5 +1,5 @@
 /**
- * One-time execution permits, and the separate operator merge authority
+ * One-time execution permits, and the separate operator merge authority *shape*
  * (Cockpit C1).
  *
  * ## A permit is not a bearer token
@@ -242,7 +242,8 @@ export function permitsEqual(candidate: ExecutionPermit, issued: ExecutionPermit
 }
 
 /**
- * A merge authorization that originated from a human operator.
+ * The structural shape a merge authorization must have. **Not proof that one
+ * exists.**
  *
  * **This is not job authority and is not reachable from job authority.** No
  * function in AgentBridge produces one: there is no factory, no builder, and no
@@ -258,54 +259,131 @@ export function permitsEqual(candidate: ExecutionPermit, issued: ExecutionPermit
  * data about an `ActionRequest` at PR 003's gate; reusing it here would make
  * every existing approval a candidate merge authority.
  *
- * The required properties, all of which {@link operatorMergeAuthorizes}
- * enforces:
+ * ## A value of this type is untrusted data, not authority
  *
- * - operator-originated — `operatorId` names a human, and nothing in the
- *   domain mints one
- * - repository-bound, pull-request-bound, and bound to an exact HEAD SHA
- * - single-use, and invalid the moment HEAD changes
- * - incapable of authorizing another pull request or a future SHA
+ * Nothing in C1 establishes where such a value came from. There is no minting
+ * boundary, so a caller can write the object literal by hand and C1 will read it
+ * exactly as it reads any other untrusted record. What this layer models is the
+ * *binding* a merge authority must carry:
+ *
+ * - repository-bound, pull-request-bound, and bound to one exact HEAD SHA
+ * - carrying the structural `singleUse: true` marker
+ * - incapable of covering another pull request or a different SHA
+ *
+ * {@link operatorMergeAuthorizes} checks exactly that binding, and nothing more.
+ * It compares the record against a caller-supplied {@link MergeTarget}, so it
+ * does **not** establish that the target SHA is authoritative or fresh, nor
+ * operator origin, human identity, authentication, trusted minting, uniqueness,
+ * one-time consumption, or replay prevention.
+ *
+ * A future trusted operator boundary — the merge broker — owns those properties:
+ * it must authenticate the operator, guarantee that the record was minted by
+ * that boundary rather than assembled by a caller, obtain the authoritative
+ * pull-request HEAD immediately before merging and require the record to match
+ * it, and consume the record so it cannot authorize a second merge. Until that
+ * boundary exists, a record of this shape proves nothing about a human.
  */
 export interface OperatorMergeAuthorization {
   /** Caller-minted identity of this one operator decision. */
   readonly authorizationId: string;
-  /** The human who decided. Never an agent, and never inferred from a label. */
+  /**
+   * Identifier of the operator a future trusted boundary must authenticate.
+   * Descriptive data here: C1 checks only that it is a readable identifier, and
+   * never establishes that it names a human rather than an agent or a caller.
+   */
   readonly operatorId: string;
   /** The one repository this authorization is valid in. */
   readonly repositoryId: string;
   /** The one pull request this authorization is valid for. */
   readonly pullRequestId: string;
-  /** The exact HEAD the operator approved. A different HEAD is a different merge. */
+  /** The one HEAD SHA this record names. A different SHA is a different merge. */
   readonly headSha: string;
   /** Caller-supplied timestamp. Data; no clock is read here. */
   readonly authorizedAt: string;
-  /** Structural: one merge, then nothing. */
+  /**
+   * Structural intent: this record is *shaped* as a single-use capability. C1
+   * has no consumed-capability store, so single consumption is not enforced
+   * here — a later trusted boundary must enforce it.
+   */
   readonly singleUse: true;
 }
 
-/** The exact merge an operator authorization is being checked against. */
+/**
+ * The merge a candidate authorization is being checked against.
+ *
+ * Every field is **caller-supplied input**. C1 reads no repository, no API, and
+ * no adapter, so it cannot check any of these values against reality. They
+ * define what the candidate is compared *to*, and nothing more.
+ */
 export interface MergeTarget {
   readonly repositoryId: string;
   readonly pullRequestId: string;
-  /** The repository's HEAD *now*, supplied by a trusted adapter. */
+  /**
+   * The HEAD SHA supplied for this merge target. **C1 does not establish that
+   * this value is authoritative or current** — it performs no repository, API,
+   * or adapter observation, so a stale, invented, or caller-constructed SHA is
+   * indistinguishable from a live one here. The future trusted merge boundary
+   * must obtain the authoritative repository/pull-request HEAD immediately
+   * before the merge attempt and supply and enforce that exact value.
+   */
   readonly currentHeadSha: string;
 }
 
 /**
- * Does this operator authorization cover exactly this merge, right now?
+ * Is this candidate record *structurally bound* to exactly this **supplied**
+ * merge target?
  *
  * Pure, total, and deterministic; never throws. Both arguments are read
  * defensively, own-only, and exactly once.
  *
- * Every comparison is exact string equality, so a HEAD that moved by one commit
- * invalidates the authorization, and an authorization for pull request 41 can
- * never cover pull request 42. There is no path that widens, refreshes, or
- * re-binds an authorization to a newer SHA: a new HEAD requires a new operator
- * decision.
+ * ## What a `true` result proves
  *
- * C1 executes no merge. This predicate exists so that the merge barrier is
- * defined by something more precise than a comment.
+ * Only that the candidate carries the required structural fields as readable
+ * identifiers, that its `singleUse` is literally `true`, and that its
+ * `repositoryId`, `pullRequestId`, and `headSha` are exactly equal to the
+ * corresponding fields of the supplied {@link MergeTarget} — including
+ * `target.currentHeadSha`, which is an **input value, not an observation**.
+ * Every comparison is exact string equality, so a candidate naming pull request
+ * 41 can never cover a target naming pull request 42, and a candidate whose
+ * `headSha` differs from the supplied target SHA never matches. There is no path
+ * that widens, refreshes, or re-binds a candidate to a different SHA.
+ *
+ * ## What a `true` result does not prove
+ *
+ * Stated explicitly, because overclaiming here would be worse than not checking:
+ *
+ * - **That the target SHA is authoritative or fresh.** C1 fetches nothing and
+ *   observes no repository, so it cannot tell a live HEAD from a stale or
+ *   invented one, and cannot know whether the repository moved after the target
+ *   was built. The binding is only ever as good as the supplied target.
+ * - **Operator origin.** The first argument is untrusted data. A plain object
+ *   literal, written by any caller with the right field names, satisfies this
+ *   predicate.
+ * - **Human identity or authentication.** `operatorId` is a readable string and
+ *   nothing more. C1 performs no authentication and reads no credential.
+ * - **Trusted minting or possession.** There is no signature, no secret, and no
+ *   issuing boundary, so this predicate cannot distinguish a record a trusted
+ *   boundary minted from one a caller assembled.
+ * - **That a changed SHA reflects a new operator decision.** If the supplied
+ *   target SHA changes, the previous candidate simply stops matching, and *some*
+ *   candidate whose `headSha` equals the newly supplied target SHA would be
+ *   required. C1 cannot tell whether such a candidate is a fresh human decision
+ *   or the same untrusted caller assembling another literal.
+ * - **Uniqueness, one-time consumption, or replay prevention.** C1 stores
+ *   nothing and consumes nothing. The identical record returns `true` on every
+ *   call for as long as the same target is supplied. `singleUse: true` is a
+ *   structural intent marker, not enforcement.
+ *
+ * **A `true` result is therefore not sufficient proof that a merge may
+ * execute.** It is a necessary binding check that a future trusted operator
+ * boundary / merge broker must run *in addition to* authenticating the operator,
+ * verifying that it minted the record itself, obtaining the authoritative
+ * pull-request HEAD at merge time and requiring the candidate to match that
+ * value, and consuming the record atomically. Those properties belong to that
+ * later, explicitly reviewed layer.
+ *
+ * C1 executes no merge. This predicate exists so that the binding half of the
+ * merge barrier is defined by something more precise than a comment.
  */
 export function operatorMergeAuthorizes(
   authorization: OperatorMergeAuthorization,

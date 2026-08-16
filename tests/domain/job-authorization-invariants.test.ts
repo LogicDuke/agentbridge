@@ -214,7 +214,7 @@ describe('merge is operator-only, permanently', () => {
   });
 });
 
-describe('operator merge authorization is separate, exact, and single-use', () => {
+describe('operator merge authorization is separate, exact, and structurally single-use', () => {
   const authorization: OperatorMergeAuthorization = {
     authorizationId: 'op-merge-1',
     operatorId: 'human-operator-1',
@@ -235,7 +235,7 @@ describe('operator merge authorization is separate, exact, and single-use', () =
     ).toBe(true);
   });
 
-  it('becomes invalid the moment HEAD moves', () => {
+  it('stops matching once a different target SHA is supplied', () => {
     expect(
       operatorMergeAuthorizes(authorization, {
         repositoryId: REPO_A,
@@ -272,6 +272,45 @@ describe('operator merge authorization is separate, exact, and single-use', () =
         currentHeadSha: HEAD_A,
       }),
     ).toBe(false);
+  });
+
+  // The next two tests pin what C1 deliberately does NOT prove, so that the
+  // documented limitation cannot drift away from the implementation. They are
+  // not a statement that this behaviour is desirable forever: the future trusted
+  // operator boundary / merge broker must supersede both, and when it does these
+  // tests are expected to be replaced rather than preserved.
+  it('accepts a plain caller-written literal: it proves binding, not operator origin', () => {
+    const callerWritten = {
+      authorizationId: 'assembled-by-any-caller',
+      operatorId: 'not-authenticated-just-a-string',
+      repositoryId: REPO_A,
+      pullRequestId: PARENT_PR_A,
+      headSha: HEAD_A,
+      authorizedAt: 'caller-supplied',
+      singleUse: true,
+    } as const;
+
+    expect(
+      operatorMergeAuthorizes(callerWritten, {
+        repositoryId: REPO_A,
+        pullRequestId: PARENT_PR_A,
+        currentHeadSha: HEAD_A,
+      }),
+    ).toBe(true);
+  });
+
+  it('returns true repeatedly for the same record: C1 has no consumed-capability store', () => {
+    const target = {
+      repositoryId: REPO_A,
+      pullRequestId: PARENT_PR_A,
+      currentHeadSha: HEAD_A,
+    };
+
+    expect([
+      operatorMergeAuthorizes(authorization, target),
+      operatorMergeAuthorizes(authorization, target),
+      operatorMergeAuthorizes(authorization, target),
+    ]).toEqual([true, true, true]);
   });
 
   it('fails closed on hostile input without throwing', () => {
