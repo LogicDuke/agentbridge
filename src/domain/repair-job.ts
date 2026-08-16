@@ -106,6 +106,70 @@ export function readOwnProperty(target: object, key: string): unknown {
   }
 }
 
+/**
+ * Absence marker for {@link readOwnElement}.
+ *
+ * A bare object literal, so producing it calls no global function: this module
+ * captures every intrinsic it relies on at load, and a sentinel is not a reason
+ * to add a fresh dependency on a mutable global. It is used only through
+ * reference identity, never inspected, and never frozen because nothing reads
+ * it.
+ *
+ * The claim is exactly this and no more: **the reference is module-private.**
+ * It is not exported and no entry point returns it, so it is not among the
+ * values a caller ordinarily has to hand. That is why `undefined` was not used
+ * instead — `undefined` is also a legitimate, and rejected, element *value*,
+ * and an authorization list must refuse a missing element on its own rather
+ * than depend on the element reader to refuse whatever turned up.
+ */
+const NO_OWN_ELEMENT = {};
+
+/**
+ * Read one **own** indexed element of an untrusted array.
+ *
+ * The same own-only discipline as {@link readOwnProperty}, through the same
+ * captured `Object.hasOwn`, except that absence is reported as
+ * {@link NO_OWN_ELEMENT} instead of collapsing into `undefined`.
+ *
+ * An ordinary `elements[index]` walks the prototype chain, so at a sparse hole
+ * it resolves whatever a custom array prototype — or `Array.prototype` itself —
+ * carries at that numeric key. Provenance is what decides authority here, not
+ * the value's shape: an inherited entry can be a perfectly well-formed
+ * repository path or a genuine command class, and a value nobody put in the
+ * operator's array is still not authorization.
+ *
+ * **What this proves, exactly:** for any array whose own-property introspection
+ * is truthful — every ordinary array, however its prototype chain is arranged —
+ * a sparse hole and an inherited numeric property are both refused, because
+ * `Object.hasOwn` answers `false` and the index is never read at all.
+ *
+ * **What it does not prove**, and must not be claimed to: that a value which
+ * survives came from a real own element. A Proxy *defines* the observable
+ * result of both operations, so one whose `getOwnPropertyDescriptor` trap
+ * claims an index is own while the read forwards through the target's
+ * prototype will pass an inherited value through. There is one own check and
+ * one read, and nothing re-validates afterwards — but they are two separate
+ * observations, not one atomic one, and a Proxy may answer them
+ * inconsistently. C1 takes an object's own-property report at face value and
+ * establishes provenance no further than that report. This grants no authority
+ * a caller did not already have: anyone able to supply such a Proxy can supply
+ * the same value as a dense own element instead, which is not an attack but a
+ * configuration.
+ *
+ * Both operations are guarded, because a getter or a Proxy trap may throw.
+ * Either way the answer is absence, never an exception.
+ */
+function readOwnElement(elements: object, index: number): unknown {
+  try {
+    if (!objectHasOwn(elements, index)) {
+      return NO_OWN_ELEMENT;
+    }
+    return (elements as Record<number, unknown>)[index];
+  } catch {
+    return NO_OWN_ELEMENT;
+  }
+}
+
 /** V1 bounds. Every unbounded dimension is capped before iteration. */
 export const JOB_BOUNDS = objectFreeze({
   /**
@@ -331,8 +395,15 @@ export function readRepositoryRelativePath(value: unknown): string | null {
  * wrote, and silently keeping a prefix of a list an operator got wrong is not
  * an improvement on refusing it.
  *
- * A sparse array yields `undefined` at the holes, which no reader accepts, so
- * sparseness rejects rather than collapsing.
+ * Every entry is obtained through {@link readOwnElement}, so a list entry can
+ * only ever be one the supplied object reports as its **own**. For an ordinary
+ * array that is exactly the elements the job configuration actually supplied:
+ * an index with no own element is a sparse hole, and a hole rejects the whole
+ * list — it is never skipped, defaulted, or filled from the prototype chain —
+ * so an inherited numeric property planted on a custom array prototype or on
+ * `Array.prototype` is refused however well-formed its value looks. A Proxy
+ * that misreports ownership is the documented limit of that guarantee, and it
+ * widens nothing; see {@link readOwnElement}.
  */
 function readList<T>(
   value: unknown,
@@ -367,10 +438,10 @@ function readList<T>(
 
   const parsed: T[] = [];
   for (let index = 0; index < rawLength; index += 1) {
-    let element: unknown;
-    try {
-      element = elements[index];
-    } catch {
+    const element = readOwnElement(elements, index);
+    if (element === NO_OWN_ELEMENT) {
+      // A sparse hole, or an own-check or read that threw. Either way this
+      // index carries no own element, so the whole list is refused.
       return null;
     }
     const value_ = read(element);
