@@ -660,7 +660,10 @@ async function terminate(
  *
  * Nothing here strengthens any guarantee. Termination stays a bounded
  * *attempt*, a failed kill stays a failed kill, and cleanup stays best effort;
- * only the obligation to settle is absolute.
+ * only the obligation to settle is absolute. The one thing this does insist on
+ * is that the attempt is actually *made*: when the platform strategy faults
+ * before it can signal, a single non-ignorable direct-child signal follows, and
+ * no process group, tree, or descendant is claimed on that path.
  */
 async function releaseUnprotectedChild(
   child: ChildProcess,
@@ -672,6 +675,33 @@ async function releaseUnprotectedChild(
   } catch {
     // A bounded termination attempt that fails is still only an attempt. The
     // exchange's obligation is to settle, not to prove the child is gone.
+    //
+    // *No* attempt is a different thing. Termination consults the handle's own
+    // `exitCode`/`signalCode` before it signals anything, so a hostile accessor
+    // can abort the attempt on its very first observation — before any signal
+    // has been delivered, and on Windows before the helper that would deliver
+    // one has even been started. Releasing responsibility there would abandon a
+    // live direct child, so exactly one guarded direct-child signal is
+    // delivered here first. {@link killDirectChild} is the same primitive
+    // {@link reapUnprotectedHelper} already relies on: it goes through the
+    // captured `kill` intrinsic, reads no property of the handle, and absorbs
+    // its own failure. Nothing is waited on and nothing beyond the direct child
+    // is attempted, so this can neither re-enter a hostile accessor nor defer
+    // the rejection the caller is owed, and a fallback that fails stays a
+    // failure rather than becoming a claim.
+    //
+    // The signal is named rather than left to the default because this attempt
+    // gets exactly one shot. The graceful path is an *escalating* one — signal,
+    // wait out the grace window, escalate — and waiting is precisely what this
+    // fallback may not do. A lone `SIGTERM` is a request a POSIX child may
+    // catch or ignore outright, so a child that does would predictably outlive
+    // the one attempt on offer here; `SIGKILL` is the signal POSIX does not
+    // allow the target to handle, block, or ignore. On Windows the choice
+    // changes nothing: every signal Node accepts there terminates the target
+    // unconditionally, so this is the same operation the default already was.
+    // It is still only the direct child — `SIGKILL` is delivered to one
+    // process, is not inherited by descendants, and claims nothing about them.
+    killDirectChild(child, 'SIGKILL');
   }
   attemptCleanup(() => {
     destroyReadable(child.stdout);
