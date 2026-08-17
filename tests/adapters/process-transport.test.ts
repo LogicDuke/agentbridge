@@ -247,10 +247,18 @@ process.exit(0);
  * targeted cleanup then failed to reap what it started. Measuring in the other
  * order would let the cleanup destroy the very evidence being collected, and a
  * transport that settles by abandoning a live child would read as clean.
+ *
+ * The child it asks the transport to run depends on the mode. Every mode needs
+ * one that will not exit on its own; the `terminate-fault-sigterm-ignored` mode
+ * needs one that additionally survives the graceful POSIX signal, so that
+ * `ABANDONED` answers whether the transport's single fallback attempt was
+ * strong enough rather than merely whether one was made.
  */
 const HARDENING_SETTLEMENT_PROBE_SCRIPT = `
 import { ChildProcess } from 'node:child_process';
+import { existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const [transportUrl, mode] = process.argv.slice(2);
 
@@ -281,9 +289,53 @@ const POISON = new Proxy({}, {
   },
 });
 
+// Both termination-fault modes stage the identical transport-side condition and
+// differ only in the child they ask for, so every branch below keys off this
+// rather than off one mode name.
+const TERMINATE_FAULT = mode === 'terminate-fault' || mode === 'terminate-fault-sigterm-ignored';
+
 const TARGET = mode === 'stderr-accessor' ? 'stderr'
-  : mode === 'terminate-fault' ? 'stdin' : 'stdout';
+  : TERMINATE_FAULT ? 'stdin' : 'stdout';
 const ACCESSOR_THROWS = mode === 'stdout-accessor' || mode === 'stderr-accessor';
+
+// The adversarial mode's child must already be ignoring the graceful signal by
+// the time the fallback fires, and a child that has only just been forked is
+// still in its interpreter's bootstrap. Left to chance the case would sometimes
+// stage itself and sometimes not, and the run where it did not would pass
+// against a defective transport. The child therefore announces readiness with a
+// file, the probe blocks for it at the one point that orders correctly against
+// the fallback, and whether it was ever observed is reported rather than
+// assumed.
+const WAITS_FOR_CHILD = mode === 'terminate-fault-sigterm-ignored';
+const READY_PATH = join(tmpdir(), 'ab-fallback-ready-' + process.pid);
+
+// Anything already at that path is left over from an earlier run, and it is
+// removed before anything here can wait on it. The path is derived from this
+// probe's own process ID, which no *live* process can be sharing, so a marker
+// present at startup can only have been written by a previous probe whose tail
+// cleanup never ran and whose ID the operating system has since handed out
+// again. \`waitForChildReady\` accepts existence alone, so such a file would
+// answer the readiness question with an earlier run's evidence and report
+// \`CHILD_READY=true\` before this run's child had installed anything — which is
+// exactly the ordering the wait exists to establish. Removing it first makes
+// the answer necessarily about this execution. The removal is deliberately not
+// guarded: a marker that cannot be cleared must fail this probe loudly rather
+// than be quietly accepted as proof of readiness.
+rmSync(READY_PATH, { force: true });
+
+let childReady = null;
+
+const SLEEP_SLOT = new Int32Array(new SharedArrayBuffer(4));
+function waitForChildReady() {
+  const deadline = Date.now() + 10000;
+  while (Date.now() < deadline) {
+    if (existsSync(READY_PATH)) return true;
+    // Idles the thread instead of spinning it; the wait must be synchronous
+    // because the transport is mid-call and there is no turn to yield to.
+    Atomics.wait(SLEEP_SLOT, 0, 0, 5);
+  }
+  return false;
+}
 
 const stash = new WeakMap();
 function slotFor(self) {
@@ -306,13 +358,20 @@ for (const key of ['stdin', 'stdout', 'stderr']) {
       if (!disarmed && key === TARGET && slot[key] !== null) {
         slot.reads += 1;
         armed = true;
-        if (slot.reads === 1) return POISON;
+        if (slot.reads === 1) {
+          // This read is the transport's first, and the hardening failure it
+          // yields leads directly to the release path, so blocking here is what
+          // places the fallback signal after the child is ready. It is a
+          // synchronization point, not padding.
+          if (WAITS_FOR_CHILD) childReady = waitForChildReady();
+          return POISON;
+        }
         if (ACCESSOR_THROWS) {
           cleanupFaults += 1;
           throw new Error('hostile ' + key + ' accessor');
         }
         // The termination-fault case needs Node's own internals left intact.
-        return mode === 'terminate-fault' ? slot[key] : POISON;
+        return TERMINATE_FAULT ? slot[key] : POISON;
       }
       return slot[key];
     },
@@ -320,7 +379,7 @@ for (const key of ['stdin', 'stdout', 'stderr']) {
   });
 }
 
-if (mode === 'terminate-fault') {
+if (TERMINATE_FAULT) {
   // Termination consults these before it signals anything, so making them
   // throw is what fails the bounded termination attempt itself.
   for (const key of ['exitCode', 'signalCode']) {
@@ -350,6 +409,10 @@ let directChildSignals = 0;
 const realKillMethod = ChildProcess.prototype.kill;
 ChildProcess.prototype.kill = function countedKill(...args) {
   directChildSignals += 1;
+  // The signal each attempt carried. A default-signalled attempt is reported as
+  // such rather than resolved to a name here, because what the default *means*
+  // is the operating system's business and this probe should not restate it.
+  console.log('KILL_SIGNAL=' + String(args.length === 0 ? '(default)' : args[0]));
   return Reflect.apply(realKillMethod, this, args);
 };
 
@@ -401,9 +464,21 @@ if (process.env.SystemRoot !== undefined) {
   environment.SYSTEMROOT = process.env.SystemRoot;
 }
 
+// The child the transport is asked to run. Every mode needs one that will not
+// exit on its own, so that a process still alive later is evidence rather than
+// a race. The adversarial mode additionally installs a POSIX handler for the
+// graceful signal and keeps running, and only announces itself once that
+// handler is in place: a termination fallback that delivers nothing stronger
+// than \`SIGTERM\` leaves this child alive, which is the whole case.
+const CHILD_SOURCE = WAITS_FOR_CHILD
+  ? "process.on('SIGTERM', () => {}); require('node:fs').writeFileSync(" +
+    JSON.stringify(READY_PATH) +
+    ", 'ready'); setInterval(()=>{},1000);"
+  : 'setInterval(()=>{},1000);';
+
 const spec = {
   executablePath: process.execPath,
-  args: ['-e', 'setInterval(()=>{},1000);'],
+  args: ['-e', CHILD_SOURCE],
   workingDirectory: tmpdir(),
   environment,
   stdin: '',
@@ -425,6 +500,7 @@ console.log('CLEANUP_FAULTS=' + cleanupFaults);
 console.log('TERMINATION_FAULTS=' + terminationFaults);
 console.log('DIRECT_CHILD_SIGNALS=' + directChildSignals);
 console.log('SPAWNED=' + spawned.length);
+console.log('CHILD_READY=' + String(childReady));
 
 disarmed = true;
 
@@ -471,6 +547,10 @@ for (const child of spawned) {
   if (!(await awaitExit(child, 3000))) leaked += 1;
 }
 console.log('LEAKED=' + leaked);
+
+// The probe owns the readiness file too, and process.exit below skips finally.
+try { rmSync(READY_PATH, { force: true }); } catch { /* nothing to remove */ }
+console.log('READY_FILE_LEFT=' + String(existsSync(READY_PATH)));
 
 // Give any discarded internal rejection time to be reported before exiting.
 await new Promise((r) => setTimeout(r, 1000));
@@ -835,6 +915,7 @@ function expectHardeningFailureSettles(probe: ProbeResult): void {
   expect(probe.stdout).toMatch(/^ABANDONED=0$/m);
   expect(probe.stdout).not.toContain('MEASUREMENT_FAULT=');
   expect(probe.stdout).toMatch(/^LEAKED=0$/m);
+  expect(probe.stdout).toMatch(/^READY_FILE_LEFT=false$/m);
   expect(probe.stderr).not.toContain("Unhandled 'error' event");
   expect(probe.stdout).toContain('SURVIVED');
   expect(probe.code).toBe(0);
@@ -1537,8 +1618,68 @@ describe('invokeAgentProcess — adversarial', () => {
     // direct child was abandoned. One guarded direct-child attempt must still
     // follow, and it must stay a direct-child attempt: no second process is
     // started, so no process-tree helper is reached for on this path.
-    expect(probe.stdout).toMatch(/^DIRECT_CHILD_SIGNALS=[1-9]/m);
+    //
+    // Counted exactly, not merely as non-zero. On this staged path termination
+    // faults on the first handle observation it makes, before either platform
+    // strategy can signal anything, so every signal the count can contain is
+    // the fallback's own — and the fallback is specified to make one attempt
+    // and not to wait. A count of one is therefore the whole claim: an attempt
+    // was made, and the path did not quietly become the escalating termination
+    // it is not allowed to be. The bound is asserted only for this mode, where
+    // it is exact; paths that legitimately signal more than once are not
+    // constrained from here.
+    expect(probe.stdout).toMatch(/^DIRECT_CHILD_SIGNALS=1$/m);
     expect(probe.stdout).toMatch(/^SPAWNED=1$/m);
+    // What that attempt carried, asserted on every platform. This is a claim
+    // about the transport's own mechanism and nothing more: it says which
+    // signal is delivered, not what any operating system does with it. The
+    // POSIX consequence — that a child may decline the graceful signal and so
+    // survive an attempt that gets only one shot — is proven by outcome in the
+    // POSIX-gated case below, not asserted from here.
+    expect(probe.stdout).toMatch(/^KILL_SIGNAL=SIGKILL$/m);
+    expectHardeningFailureSettles(probe);
+  }, 40_000);
+
+  /**
+   * The same faulting-termination path, against a child that declines the
+   * graceful signal.
+   *
+   * POSIX lets a process catch or ignore `SIGTERM`, and `ChildProcess.kill()`
+   * with no argument sends exactly that. On the ordinary termination path the
+   * graceful signal is only an opening move — the strategy waits out the grace
+   * window and escalates — but the fallback here gets one attempt and cannot
+   * wait, because the caller's rejection is owed on the same turn. A fallback
+   * that spent that one attempt on an ignorable signal would leave this child
+   * running while the transport released responsibility for it, so the outcome
+   * is what is asserted: the child the transport owned is gone, measured before
+   * this harness signals anything of its own.
+   *
+   * POSIX-only, and deliberately not restated for Windows. Windows has no
+   * ignorable termination to defeat: every signal Node accepts there ends the
+   * target unconditionally, so an equivalent child cannot be written and no
+   * claim about Windows is made from this test. The Windows side of the same
+   * fallback stays covered by the mode above.
+   */
+  onPosix('kills a child that ignores SIGTERM when termination faults', async () => {
+    const probe = await runHardeningSettlementProbe('terminate-fault-sigterm-ignored');
+
+    // The adversarial condition really was staged: the child had installed its
+    // SIGTERM handler before the transport's fallback could signal it.
+    expect(probe.stdout).toMatch(/^CHILD_READY=true$/m);
+    // And the path under test is still the faulting one, with exactly one
+    // guarded direct-child attempt and no process-tree helper reached for. The
+    // count is the same exact one the mode above asserts, for the same reason:
+    // this mode stages the identical transport-side fault and differs only in
+    // the child it asks for, so a single attempt is what the outcome below is
+    // being read against.
+    expect(probe.stdout).toMatch(/TERMINATION_FAULTS=[1-9]/);
+    expect(probe.stdout).toMatch(/^DIRECT_CHILD_SIGNALS=1$/m);
+    expect(probe.stdout).toMatch(/^SPAWNED=1$/m);
+    // The signal that attempt carried, recorded for the reader; the assertion
+    // that matters is the ABANDONED=0 inside the shared expectation below,
+    // which is what a lone SIGTERM cannot satisfy against this child.
+    expect(probe.stdout).toMatch(/^KILL_SIGNAL=SIGKILL$/m);
+    expect(probe.stdout).not.toMatch(/^ABANDONED_PID=/m);
     expectHardeningFailureSettles(probe);
   }, 40_000);
 
