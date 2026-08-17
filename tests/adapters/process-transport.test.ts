@@ -223,6 +223,183 @@ process.exit(0);
 `;
 
 /**
+ * One exchange whose mandatory hardening failure must still settle, under a
+ * hostile runtime that makes the failure path's own cleanup fail as well.
+ *
+ * The scenario is the reachable one: a `ChildProcess` stdio accessor that
+ * yields a value dispatch hardening cannot protect, and then either throws on
+ * the *next* read or yields a value a stream destroy cannot operate on. The
+ * cleanup that follows the mandatory failure therefore throws before the
+ * exchange's rejection is delivered. What must survive that is the liveness
+ * invariant: `invokeAgentProcess` still rejects, with the original hardening
+ * error, and no discarded internal promise is left rejecting unhandled.
+ *
+ * This runs in a subprocess for three separate reasons: it mutates
+ * `ChildProcess.prototype` accessors, it needs a private
+ * `unhandledRejection` listener to count internal rejections, and a queued
+ * child \`error\` with no listener would end the host process rather than this
+ * exchange. The probe reaps every process it started and reports the count that
+ * outlived the attempt, so a repair that settles by abandoning a child cannot
+ * pass either.
+ */
+const HARDENING_SETTLEMENT_PROBE_SCRIPT = `
+import { ChildProcess } from 'node:child_process';
+import { tmpdir } from 'node:os';
+
+const [transportUrl, mode] = process.argv.slice(2);
+
+const unhandled = [];
+process.on('unhandledRejection', (reason) => {
+  unhandled.push(String(reason && reason.message ? reason.message : reason));
+});
+
+const HARDENING_MARKER = 'forced post-spawn hardening failure';
+let cleanupFaults = 0;
+let terminationFaults = 0;
+let armed = false;
+let disarmed = false;
+
+// The value a hostile stdio accessor yields. Defining a property on it throws
+// the marker, which is what forces the transport's own mandatory post-spawn
+// dispatch hardening to fail without replacing Node's emit intrinsic. Reading
+// the state a stream destroy consults throws too, which is the second half of
+// the condition: the cleanup that follows the mandatory failure faults on it.
+const POISON = new Proxy({}, {
+  defineProperty() { throw new Error(HARDENING_MARKER); },
+  get(target, key) {
+    if (key === '_readableState' || key === '_writableState' || key === 'destroy') {
+      cleanupFaults += 1;
+      throw new Error('hostile pipe value read');
+    }
+    return Reflect.get(target, key);
+  },
+});
+
+const TARGET = mode === 'stderr-accessor' ? 'stderr'
+  : mode === 'terminate-fault' ? 'stdin' : 'stdout';
+const ACCESSOR_THROWS = mode === 'stdout-accessor' || mode === 'stderr-accessor';
+
+const stash = new WeakMap();
+function slotFor(self) {
+  let slot = stash.get(self);
+  if (slot === undefined) {
+    slot = { stdin: null, stdout: null, stderr: null, exitCode: null, signalCode: null, reads: 0 };
+    stash.set(self, slot);
+  }
+  return slot;
+}
+
+// Real Sockets are kept behind the accessors, so only the reads the transport
+// performs are hostile and Node's own lifecycle is otherwise untouched.
+for (const key of ['stdin', 'stdout', 'stderr']) {
+  Object.defineProperty(ChildProcess.prototype, key, {
+    configurable: true,
+    get() {
+      const slot = stash.get(this);
+      if (slot === undefined) return null;
+      if (!disarmed && key === TARGET && slot[key] !== null) {
+        slot.reads += 1;
+        armed = true;
+        if (slot.reads === 1) return POISON;
+        if (ACCESSOR_THROWS) {
+          cleanupFaults += 1;
+          throw new Error('hostile ' + key + ' accessor');
+        }
+        // The termination-fault case needs Node's own internals left intact.
+        return mode === 'terminate-fault' ? slot[key] : POISON;
+      }
+      return slot[key];
+    },
+    set(value) { slotFor(this)[key] = value; },
+  });
+}
+
+if (mode === 'terminate-fault') {
+  // Termination consults these before it signals anything, so making them
+  // throw is what fails the bounded termination attempt itself.
+  for (const key of ['exitCode', 'signalCode']) {
+    Object.defineProperty(ChildProcess.prototype, key, {
+      configurable: true,
+      get() {
+        if (armed && !disarmed) {
+          terminationFaults += 1;
+          throw new Error('hostile ' + key + ' accessor');
+        }
+        const slot = stash.get(this);
+        return slot === undefined ? null : slot[key];
+      },
+      set(value) { slotFor(this)[key] = value; },
+    });
+  }
+}
+
+const spawned = [];
+const realSpawnMethod = ChildProcess.prototype.spawn;
+ChildProcess.prototype.spawn = function patched(...args) {
+  spawned.push(this);
+  return Reflect.apply(realSpawnMethod, this, args);
+};
+
+const { invokeAgentProcess } = await import(transportUrl);
+
+const environment = {};
+for (const name of ['HOMEDRIVE', 'HOMEPATH', 'LOGONSERVER', 'PATH', 'SYSTEMDRIVE',
+  'SYSTEMROOT', 'TEMP', 'USERDOMAIN', 'USERNAME', 'USERPROFILE', 'WINDIR']) {
+  environment[name] = '';
+}
+if (process.env.SystemRoot !== undefined) {
+  environment.SYSTEMROOT = process.env.SystemRoot;
+}
+
+const spec = {
+  executablePath: process.execPath,
+  args: ['-e', 'setInterval(()=>{},1000);'],
+  workingDirectory: tmpdir(),
+  environment,
+  stdin: '',
+};
+const limits = { timeoutMs: 5000, graceMs: 200, maxStdoutBytes: 65536, maxStderrBytes: 16384 };
+
+// A bounded deadline, so a pending exchange is reported as pending instead of
+// hanging this probe until the runner's own timeout.
+const settlement = await Promise.race([
+  invokeAgentProcess(spec, limits).then(
+    (exchange) => ({ kind: 'resolved', detail: String(exchange && exchange.outcome) }),
+    (error) => ({ kind: 'rejected', detail: String(error && error.message ? error.message : error) }),
+  ),
+  new Promise((r) => setTimeout(() => { r({ kind: 'pending', detail: 'deadline' }); }, 8000)),
+]);
+console.log('SETTLEMENT=' + settlement.kind);
+console.log('DETAIL=' + settlement.detail);
+console.log('CLEANUP_FAULTS=' + cleanupFaults);
+console.log('TERMINATION_FAULTS=' + terminationFaults);
+
+// The probe owns every process it started, so none may outlive it.
+disarmed = true;
+let leaked = 0;
+for (const child of spawned) {
+  if (child.exitCode !== null || child.signalCode !== null) continue;
+  const pid = child.pid;
+  if (pid === undefined) continue;
+  try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+  const ended = await new Promise((r) => {
+    const timer = setTimeout(() => { r(false); }, 3000);
+    child.on('exit', () => { clearTimeout(timer); r(true); });
+    if (child.exitCode !== null || child.signalCode !== null) { clearTimeout(timer); r(true); }
+  });
+  if (!ended) leaked += 1;
+}
+console.log('LEAKED=' + leaked);
+
+// Give any discarded internal rejection time to be reported before exiting.
+await new Promise((r) => setTimeout(r, 1000));
+console.log('UNHANDLED=' + unhandled.length);
+for (const message of unhandled) console.log('UNHANDLED_REASON=' + message);
+console.log('SURVIVED');
+process.exit(0);
+`;
+
+/**
  * One ordinary exchange, run from an interpreter the test chooses the flags for.
  *
  * Node's permission model can only be switched on at process start, so the
@@ -520,6 +697,61 @@ async function runIsolatedProbe(mode: string): Promise<ProbeResult> {
   } finally {
     removeTempDirectory(directory);
   }
+}
+
+/** Run one hardening-settlement probe mode in its own process. */
+async function runHardeningSettlementProbe(mode: string): Promise<ProbeResult> {
+  const directory = makeTempDirectory();
+  try {
+    const hook = join(directory, 'hook.mjs');
+    const script = join(directory, 'settlement-probe.mjs');
+    writeFileSync(hook, PROBE_HOOK);
+    writeFileSync(script, HARDENING_SETTLEMENT_PROBE_SCRIPT);
+    return await new Promise<ProbeResult>((resolve) => {
+      const probe = spawn(
+        process.execPath,
+        ['--import', pathToFileURL(hook).href, script, TRANSPORT_SOURCE_URL, mode],
+        { stdio: ['ignore', 'pipe', 'pipe'] },
+      );
+      let stdout = '';
+      let stderr = '';
+      probe.stdout.on('data', (chunk: Buffer) => {
+        stdout += chunk.toString('utf8');
+      });
+      probe.stderr.on('data', (chunk: Buffer) => {
+        stderr += chunk.toString('utf8');
+      });
+      probe.on('close', (code: number | null) => {
+        resolve({ code, stdout, stderr });
+      });
+    });
+  } finally {
+    removeTempDirectory(directory);
+  }
+}
+
+/**
+ * Every guarantee one hardening-failure probe must demonstrate.
+ *
+ * The exchange settles inside the probe's own deadline, settles by *rejection*
+ * rather than by producing an exchange, carries the original mandatory
+ * hardening failure rather than a laundered outcome, leaves no discarded
+ * internal rejection unhandled, and leaves no process behind.
+ */
+function expectHardeningFailureSettles(probe: ProbeResult): void {
+  expect(probe.stdout).toContain('SETTLEMENT=rejected');
+  expect(probe.stdout).not.toContain('SETTLEMENT=pending');
+  expect(probe.stdout).not.toContain('SETTLEMENT=resolved');
+  expect(probe.stdout).toContain('DETAIL=forced post-spawn hardening failure');
+  // No outcome vocabulary at all: a rejection is not an AgentExchange, and the
+  // mandatory failure must never be reported as a failure to spawn.
+  expect(probe.stdout).not.toContain('SPAWN_FAILED');
+  expect(probe.stdout).not.toContain('EXITED');
+  expect(probe.stdout).toContain('UNHANDLED=0');
+  expect(probe.stdout).toContain('LEAKED=0');
+  expect(probe.stderr).not.toContain("Unhandled 'error' event");
+  expect(probe.stdout).toContain('SURVIVED');
+  expect(probe.code).toBe(0);
 }
 
 /** Wait for a child-created synchronization file without racing its startup. */
@@ -1183,6 +1415,40 @@ describe('invokeAgentProcess — adversarial', () => {
       }
     }
   });
+
+  it('settles a hardening failure whose cleanup throws reading stdout', async () => {
+    const probe = await runHardeningSettlementProbe('stdout-accessor');
+
+    // The cleanup that follows the mandatory failure really did fault, so this
+    // is the defective path and not one that quietly took an ordinary route.
+    expect(probe.stdout).toMatch(/CLEANUP_FAULTS=[1-9]/);
+    expectHardeningFailureSettles(probe);
+  }, 40_000);
+
+  it('settles a hardening failure whose cleanup throws reading stderr', async () => {
+    const probe = await runHardeningSettlementProbe('stderr-accessor');
+
+    expect(probe.stdout).toMatch(/CLEANUP_FAULTS=[1-9]/);
+    expectHardeningFailureSettles(probe);
+  }, 40_000);
+
+  it('settles a hardening failure whose cleanup throws on a poisoned pipe value', async () => {
+    const probe = await runHardeningSettlementProbe('stdout-value');
+
+    // Here the accessor answers; it is the value it yields that a stream
+    // destroy cannot operate on, which is the second half of the condition.
+    expect(probe.stdout).toMatch(/CLEANUP_FAULTS=[1-9]/);
+    expectHardeningFailureSettles(probe);
+  }, 40_000);
+
+  it('settles a hardening failure whose bounded termination attempt itself fails', async () => {
+    const probe = await runHardeningSettlementProbe('terminate-fault');
+
+    // Termination faulted before it could signal anything, which is the case
+    // that used to strand the exchange without reaching cleanup at all.
+    expect(probe.stdout).toMatch(/TERMINATION_FAULTS=[1-9]/);
+    expectHardeningFailureSettles(probe);
+  }, 40_000);
 
   it('scopes the probe leak assertion to the run that owns the directory', () => {
     const mine = nextProbePrefix();

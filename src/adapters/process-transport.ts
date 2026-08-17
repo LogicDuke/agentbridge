@@ -381,6 +381,49 @@ function waitForExit(child: ChildProcess, ms: number): Promise<boolean> {
   });
 }
 
+/**
+ * Run one best-effort cleanup step after a mandatory hardening failure.
+ *
+ * Cleanup on that path is best effort by definition. The handle it operates on
+ * has already been observed to be hostile, so reading `stdout`, destroying a
+ * pipe, or clearing listeners can each throw. None of those secondary failures
+ * may displace the hardening error the caller is owed, and none of them may
+ * abandon the steps that follow, so every step is isolated here.
+ */
+function attemptCleanup(step: () => void): void {
+  try {
+    step();
+  } catch {
+    // Deliberately absorbed; see the doc comment. The mandatory hardening
+    // failure is still what the scheduling path reports to the caller.
+  }
+}
+
+/**
+ * Clear a failed exchange's listeners without leaving the handle uncovered.
+ *
+ * {@link removeAllEvents} also removes the spawn-failure absorber, so restoring
+ * it belongs to the same synchronous step: nothing can be dispatched between
+ * the two calls, and the handle is therefore never observably uncovered. A
+ * hostile handle can make the restore itself throw, which would leave a queued
+ * spawn failure with no listener and take the host process down with it, so the
+ * absorber is installed once *before* the clear as well. That first call is the
+ * evidence that the captured `on` intrinsic still works on this handle; when it
+ * does not, the listeners are left exactly as they are, because a handle that
+ * kept its absorber is strictly safer than one left uncovered.
+ */
+function clearEventsKeepingAbsorber(child: ChildProcess): void {
+  try {
+    rearmSpawnFailureAbsorber(child);
+  } catch {
+    return;
+  }
+  attemptCleanup(() => {
+    removeAllEvents(child);
+    rearmSpawnFailureAbsorber(child);
+  });
+}
+
 /** Kill and reap a helper whose post-spawn dispatch hardening failed. */
 async function reapUnprotectedHelper(child: ChildProcess): Promise<void> {
   killDirectChild(child);
@@ -455,9 +498,18 @@ function runTaskkill(
     try {
       protectChildDispatch(killer);
     } catch {
-      void reapUnprotectedHelper(killer).then(() => {
-        resolve(false);
-      });
+      // The reap operates on a handle whose hardening already failed, so its
+      // own steps can throw. Resolving from both settlement paths keeps this
+      // helper's promise — and therefore every termination that awaits it —
+      // total, and leaves no discarded rejection unhandled.
+      void reapUnprotectedHelper(killer).then(
+        () => {
+          resolve(false);
+        },
+        () => {
+          resolve(false);
+        },
+      );
       return;
     }
 
@@ -597,6 +649,40 @@ async function terminate(
 }
 
 /**
+ * Release a child whose mandatory post-spawn dispatch hardening failed.
+ *
+ * Both halves of this operate on a handle already observed to be hostile:
+ * {@link terminate} can reject when an accessor it consults throws, and each
+ * cleanup step can throw either while reading `stdout`/`stderr` or on the value
+ * such an accessor yields. This function therefore **never rejects and never
+ * abandons a later step**, which is what lets its caller reach the one
+ * rejection the exchange owes on every hostile path.
+ *
+ * Nothing here strengthens any guarantee. Termination stays a bounded
+ * *attempt*, a failed kill stays a failed kill, and cleanup stays best effort;
+ * only the obligation to settle is absolute.
+ */
+async function releaseUnprotectedChild(
+  child: ChildProcess,
+  platform: TransportPlatform,
+  graceMs: number,
+): Promise<void> {
+  try {
+    await terminate(child, platform, graceMs);
+  } catch {
+    // A bounded termination attempt that fails is still only an attempt. The
+    // exchange's obligation is to settle, not to prove the child is gone.
+  }
+  attemptCleanup(() => {
+    destroyReadable(child.stdout);
+  });
+  attemptCleanup(() => {
+    destroyReadable(child.stderr);
+  });
+  clearEventsKeepingAbsorber(child);
+}
+
+/**
  * Run one process exchange.
  *
  * **Total.** Resolves to exactly one frozen {@link AgentExchange} on every
@@ -712,19 +798,27 @@ export function invokeAgentProcess(
       if (invocation.signal !== null) {
         removeAbortListener(invocation.signal, onAbort);
       }
-      void terminate(child, platform, invocation.graceMs).then(() => {
-        destroyReadable(child.stdout);
-        destroyReadable(child.stderr);
-        removeAllEvents(child);
-        // Clearing the listeners also cleared the absorber; the child's own
-        // spawn failure may still be queued, so cover the handle again.
-        rearmSpawnFailureAbsorber(child);
-        reject(
-          error instanceof Error
-            ? error
-            : new Error('Process dispatch hardening failed', { cause: error }),
-        );
-      });
+      // Normalised here, before the asynchronous release, so the reason this
+      // exchange rejects with is already fixed and cannot itself be lost to a
+      // later hostile read.
+      const hardeningFailure =
+        error instanceof Error
+          ? error
+          : new Error('Process dispatch hardening failed', { cause: error });
+      // `releaseUnprotectedChild` runs every step and never rejects, and the
+      // rejection is scheduled on *both* settlement paths of the chain anyway,
+      // so neither a termination failure nor a cleanup step that throws on a
+      // poisoned `stdout`/`stderr` value can leave this exchange pending or
+      // leave an internal rejection unhandled. The mandatory hardening failure
+      // stays the externally visible reason on every one of those paths.
+      void releaseUnprotectedChild(child, platform, invocation.graceMs).then(
+        () => {
+          reject(hardeningFailure);
+        },
+        () => {
+          reject(hardeningFailure);
+        },
+      );
       return;
     }
 
