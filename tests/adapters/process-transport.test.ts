@@ -238,9 +238,15 @@ process.exit(0);
  * `ChildProcess.prototype` accessors, it needs a private
  * `unhandledRejection` listener to count internal rejections, and a queued
  * child \`error\` with no listener would end the host process rather than this
- * exchange. The probe reaps every process it started and reports the count that
- * outlived the attempt, so a repair that settles by abandoning a child cannot
- * pass either.
+ * exchange.
+ *
+ * The probe reports two counts, and keeping them apart is the whole point.
+ * \`ABANDONED\` is the *transport's* result: whether a child it owned was still
+ * alive once the exchange had settled, observed before this probe signals
+ * anything. \`LEAKED\` is the *harness's* own result: whether the probe's
+ * targeted cleanup then failed to reap what it started. Measuring in the other
+ * order would let the cleanup destroy the very evidence being collected, and a
+ * transport that settles by abandoning a live child would read as clean.
  */
 const HARDENING_SETTLEMENT_PROBE_SCRIPT = `
 import { ChildProcess } from 'node:child_process';
@@ -333,12 +339,56 @@ if (mode === 'terminate-fault') {
   }
 }
 
+// Direct-child termination signals the transport delivers. It captures this
+// intrinsic when its module initializes, so patching it here — before that
+// import — makes every such signal observable. The terminate-fault case needs
+// that count: the platform strategy faults there before signalling anything, so
+// a non-zero count is the evidence that a fallback attempt was still made, and
+// the spawn count below is the evidence that it stayed a direct-child attempt
+// rather than reaching for a process-tree helper.
+let directChildSignals = 0;
+const realKillMethod = ChildProcess.prototype.kill;
+ChildProcess.prototype.kill = function countedKill(...args) {
+  directChildSignals += 1;
+  return Reflect.apply(realKillMethod, this, args);
+};
+
 const spawned = [];
+// PIDs are recorded at spawn time, so identifying a process later never depends
+// on a read this probe has arranged to be hostile.
+const pidAtSpawn = new WeakMap();
 const realSpawnMethod = ChildProcess.prototype.spawn;
 ChildProcess.prototype.spawn = function patched(...args) {
   spawned.push(this);
-  return Reflect.apply(realSpawnMethod, this, args);
+  const result = Reflect.apply(realSpawnMethod, this, args);
+  if (typeof this.pid === 'number') pidAtSpawn.set(this, this.pid);
+  return result;
 };
+
+// True only for a PID this probe started, whose handle Node has not reaped, and
+// which the OS still reports as present. Because the handle is unreaped, that
+// PID cannot yet have been recycled onto an unrelated process.
+function identifyLiveOwnPid(child) {
+  const pid = pidAtSpawn.get(child);
+  if (pid === undefined || pid !== child.pid) return null;
+  if (child.exitCode !== null || child.signalCode !== null) return null;
+  try {
+    process.kill(pid, 0);
+  } catch (error) {
+    // Present but not signallable still means present.
+    if (!error || error.code !== 'EPERM') return null;
+  }
+  return pid;
+}
+
+/** Resolve true when this child ends within \`ms\`, without signalling it. */
+function awaitExit(child, ms) {
+  return new Promise((r) => {
+    const timer = setTimeout(() => { r(false); }, ms);
+    child.on('exit', () => { clearTimeout(timer); r(true); });
+    if (child.exitCode !== null || child.signalCode !== null) { clearTimeout(timer); r(true); }
+  });
+}
 
 const { invokeAgentProcess } = await import(transportUrl);
 
@@ -373,21 +423,52 @@ console.log('SETTLEMENT=' + settlement.kind);
 console.log('DETAIL=' + settlement.detail);
 console.log('CLEANUP_FAULTS=' + cleanupFaults);
 console.log('TERMINATION_FAULTS=' + terminationFaults);
+console.log('DIRECT_CHILD_SIGNALS=' + directChildSignals);
+console.log('SPAWNED=' + spawned.length);
 
-// The probe owns every process it started, so none may outlive it.
 disarmed = true;
+
+// ---------------------------------------------------------------------------
+// TRANSPORT RESULT, measured before this harness signals anything.
+//
+// Killing a child and then asking whether it is gone measures the harness, not
+// the transport, so nothing is signalled from here. A child the transport did
+// signal dies asynchronously, so each one is given a bounded window to finish
+// exiting on the strength of the transport's own signals alone; the child this
+// probe asks for never exits by itself, so no window can excuse an abandonment.
+// A child still present when its window closes was left alive by the transport.
+// ---------------------------------------------------------------------------
+let abandoned = 0;
+try {
+  for (const child of spawned) {
+    const ended = await awaitExit(child, 3000);
+    const pid = identifyLiveOwnPid(child);
+    if (!ended && pid !== null) {
+      console.log('ABANDONED_PID=' + pid);
+      abandoned += 1;
+    }
+  }
+} catch (error) {
+  // Evidence that cannot be collected is not evidence of a clean transport, and
+  // it must never cost this probe the cleanup below.
+  console.log('MEASUREMENT_FAULT=' + String(error && error.message ? error.message : error));
+  abandoned += 1;
+}
+console.log('ABANDONED=' + abandoned);
+
+// ---------------------------------------------------------------------------
+// HARNESS SELF-CLEANUP, only now that the evidence is recorded.
+//
+// The probe owns every process it started, so none may outlive it even when the
+// measurement above just failed the regression. Each target is a PID this probe
+// spawned and positively re-identified; no broad or name-matching kill is used.
+// ---------------------------------------------------------------------------
 let leaked = 0;
 for (const child of spawned) {
-  if (child.exitCode !== null || child.signalCode !== null) continue;
-  const pid = child.pid;
-  if (pid === undefined) continue;
+  const pid = identifyLiveOwnPid(child);
+  if (pid === null) continue;
   try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
-  const ended = await new Promise((r) => {
-    const timer = setTimeout(() => { r(false); }, 3000);
-    child.on('exit', () => { clearTimeout(timer); r(true); });
-    if (child.exitCode !== null || child.signalCode !== null) { clearTimeout(timer); r(true); }
-  });
-  if (!ended) leaked += 1;
+  if (!(await awaitExit(child, 3000))) leaked += 1;
 }
 console.log('LEAKED=' + leaked);
 
@@ -736,7 +817,8 @@ async function runHardeningSettlementProbe(mode: string): Promise<ProbeResult> {
  * The exchange settles inside the probe's own deadline, settles by *rejection*
  * rather than by producing an exchange, carries the original mandatory
  * hardening failure rather than a laundered outcome, leaves no discarded
- * internal rejection unhandled, and leaves no process behind.
+ * internal rejection unhandled, does not abandon a child it owned, and leaves
+ * no process behind.
  */
 function expectHardeningFailureSettles(probe: ProbeResult): void {
   expect(probe.stdout).toContain('SETTLEMENT=rejected');
@@ -748,7 +830,11 @@ function expectHardeningFailureSettles(probe: ProbeResult): void {
   expect(probe.stdout).not.toContain('SPAWN_FAILED');
   expect(probe.stdout).not.toContain('EXITED');
   expect(probe.stdout).toContain('UNHANDLED=0');
-  expect(probe.stdout).toContain('LEAKED=0');
+  // The transport's own result, recorded before the harness cleaned up after
+  // itself, and the harness's result afterwards. Both are required.
+  expect(probe.stdout).toMatch(/^ABANDONED=0$/m);
+  expect(probe.stdout).not.toContain('MEASUREMENT_FAULT=');
+  expect(probe.stdout).toMatch(/^LEAKED=0$/m);
   expect(probe.stderr).not.toContain("Unhandled 'error' event");
   expect(probe.stdout).toContain('SURVIVED');
   expect(probe.code).toBe(0);
@@ -1447,6 +1533,12 @@ describe('invokeAgentProcess — adversarial', () => {
     // Termination faulted before it could signal anything, which is the case
     // that used to strand the exchange without reaching cleanup at all.
     expect(probe.stdout).toMatch(/TERMINATION_FAULTS=[1-9]/);
+    // Faulting there once meant *no* signal was ever delivered and the live
+    // direct child was abandoned. One guarded direct-child attempt must still
+    // follow, and it must stay a direct-child attempt: no second process is
+    // started, so no process-tree helper is reached for on this path.
+    expect(probe.stdout).toMatch(/^DIRECT_CHILD_SIGNALS=[1-9]/m);
+    expect(probe.stdout).toMatch(/^SPAWNED=1$/m);
     expectHardeningFailureSettles(probe);
   }, 40_000);
 
