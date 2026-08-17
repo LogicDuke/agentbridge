@@ -308,6 +308,21 @@ const ACCESSOR_THROWS = mode === 'stdout-accessor' || mode === 'stderr-accessor'
 // assumed.
 const WAITS_FOR_CHILD = mode === 'terminate-fault-sigterm-ignored';
 const READY_PATH = join(tmpdir(), 'ab-fallback-ready-' + process.pid);
+
+// Anything already at that path is left over from an earlier run, and it is
+// removed before anything here can wait on it. The path is derived from this
+// probe's own process ID, which no *live* process can be sharing, so a marker
+// present at startup can only have been written by a previous probe whose tail
+// cleanup never ran and whose ID the operating system has since handed out
+// again. \`waitForChildReady\` accepts existence alone, so such a file would
+// answer the readiness question with an earlier run's evidence and report
+// \`CHILD_READY=true\` before this run's child had installed anything — which is
+// exactly the ordering the wait exists to establish. Removing it first makes
+// the answer necessarily about this execution. The removal is deliberately not
+// guarded: a marker that cannot be cleared must fail this probe loudly rather
+// than be quietly accepted as proof of readiness.
+rmSync(READY_PATH, { force: true });
+
 let childReady = null;
 
 const SLEEP_SLOT = new Int32Array(new SharedArrayBuffer(4));
@@ -1603,7 +1618,17 @@ describe('invokeAgentProcess — adversarial', () => {
     // direct child was abandoned. One guarded direct-child attempt must still
     // follow, and it must stay a direct-child attempt: no second process is
     // started, so no process-tree helper is reached for on this path.
-    expect(probe.stdout).toMatch(/^DIRECT_CHILD_SIGNALS=[1-9]/m);
+    //
+    // Counted exactly, not merely as non-zero. On this staged path termination
+    // faults on the first handle observation it makes, before either platform
+    // strategy can signal anything, so every signal the count can contain is
+    // the fallback's own — and the fallback is specified to make one attempt
+    // and not to wait. A count of one is therefore the whole claim: an attempt
+    // was made, and the path did not quietly become the escalating termination
+    // it is not allowed to be. The bound is asserted only for this mode, where
+    // it is exact; paths that legitimately signal more than once are not
+    // constrained from here.
+    expect(probe.stdout).toMatch(/^DIRECT_CHILD_SIGNALS=1$/m);
     expect(probe.stdout).toMatch(/^SPAWNED=1$/m);
     // What that attempt carried, asserted on every platform. This is a claim
     // about the transport's own mechanism and nothing more: it says which
@@ -1641,10 +1666,14 @@ describe('invokeAgentProcess — adversarial', () => {
     // The adversarial condition really was staged: the child had installed its
     // SIGTERM handler before the transport's fallback could signal it.
     expect(probe.stdout).toMatch(/^CHILD_READY=true$/m);
-    // And the path under test is still the faulting one, with one guarded
-    // direct-child attempt and no process-tree helper reached for.
+    // And the path under test is still the faulting one, with exactly one
+    // guarded direct-child attempt and no process-tree helper reached for. The
+    // count is the same exact one the mode above asserts, for the same reason:
+    // this mode stages the identical transport-side fault and differs only in
+    // the child it asks for, so a single attempt is what the outcome below is
+    // being read against.
     expect(probe.stdout).toMatch(/TERMINATION_FAULTS=[1-9]/);
-    expect(probe.stdout).toMatch(/^DIRECT_CHILD_SIGNALS=[1-9]/m);
+    expect(probe.stdout).toMatch(/^DIRECT_CHILD_SIGNALS=1$/m);
     expect(probe.stdout).toMatch(/^SPAWNED=1$/m);
     // The signal that attempt carried, recorded for the reader; the assertion
     // that matters is the ABANDONED=0 inside the shared expectation below,
