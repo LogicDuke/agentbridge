@@ -262,6 +262,23 @@ import { join } from 'node:path';
 
 const [transportUrl, mode] = process.argv.slice(2);
 
+// Every mode this probe implements. An unrecognised name would otherwise fall
+// through to the default branches below, stage a different scenario than the
+// test asked for, and report a pass for a case that was never run. A probe that
+// cannot honour its own configuration must say so and stop.
+const MODES = [
+  'stdout-accessor',
+  'stderr-accessor',
+  'stdout-value',
+  'terminate-fault',
+  'terminate-fault-sigterm-ignored',
+  'unclassifiable-throw',
+];
+if (!MODES.includes(mode)) {
+  console.log('MODE_INVALID=' + String(mode));
+  process.exit(3);
+}
+
 const unhandled = [];
 process.on('unhandledRejection', (reason) => {
   unhandled.push(String(reason && reason.message ? reason.message : reason));
@@ -273,13 +290,37 @@ let terminationFaults = 0;
 let armed = false;
 let disarmed = false;
 
+// What the forced hardening failure throws.
+//
+// Ordinarily a plain Error carrying the marker, which is the value the
+// transport owes the caller back unchanged. The \`unclassifiable-throw\` mode
+// throws the proxy instead: a value whose own JavaScript classification faults,
+// because \`instanceof\` walks the operand's prototype chain and this one
+// refuses to be walked. The child is already created and the mandatory
+// hardening has already failed by the time that value is examined, so what the
+// mode asks is whether the bounded release still begins, and whether the
+// hardening failure still reaches the caller, once *classifying* the thrown
+// value is itself the thing that throws.
+const UNCLASSIFIABLE = mode === 'unclassifiable-throw';
+let classificationFaults = 0;
+const UNCLASSIFIABLE_VALUE = new Proxy({}, {
+  getPrototypeOf() {
+    classificationFaults += 1;
+    throw new Error('hostile classification');
+  },
+});
+function hardeningThrow() {
+  return UNCLASSIFIABLE ? UNCLASSIFIABLE_VALUE : new Error(HARDENING_MARKER);
+}
+
 // The value a hostile stdio accessor yields. Defining a property on it throws
-// the marker, which is what forces the transport's own mandatory post-spawn
-// dispatch hardening to fail without replacing Node's emit intrinsic. Reading
-// the state a stream destroy consults throws too, which is the second half of
-// the condition: the cleanup that follows the mandatory failure faults on it.
+// the forced failure above, which is what makes the transport's own mandatory
+// post-spawn dispatch hardening fail without replacing Node's emit intrinsic.
+// Reading the state a stream destroy consults throws too, which is the second
+// half of the condition: the cleanup that follows the mandatory failure faults
+// on it.
 const POISON = new Proxy({}, {
-  defineProperty() { throw new Error(HARDENING_MARKER); },
+  defineProperty() { throw hardeningThrow(); },
   get(target, key) {
     if (key === '_readableState' || key === '_writableState' || key === 'destroy') {
       cleanupFaults += 1;
@@ -497,6 +538,7 @@ const settlement = await Promise.race([
 console.log('SETTLEMENT=' + settlement.kind);
 console.log('DETAIL=' + settlement.detail);
 console.log('CLEANUP_FAULTS=' + cleanupFaults);
+console.log('CLASSIFICATION_FAULTS=' + classificationFaults);
 console.log('TERMINATION_FAULTS=' + terminationFaults);
 console.log('DIRECT_CHILD_SIGNALS=' + directChildSignals);
 console.log('SPAWNED=' + spawned.length);
@@ -947,12 +989,20 @@ async function runHardeningSettlementProbe(
  * hardening failure rather than a laundered outcome, leaves no discarded
  * internal rejection unhandled, does not abandon a child it owned, and leaves
  * no process behind.
+ *
+ * `reason` is the message that rejection must carry. It defaults to the marker
+ * the forced failure throws, because on every mode whose thrown value is an
+ * ordinary Error the transport is required to hand that same Error back. Only a
+ * mode whose thrown value is not an Error at all supplies anything else.
  */
-function expectHardeningFailureSettles(probe: ProbeResult): void {
+function expectHardeningFailureSettles(
+  probe: ProbeResult,
+  reason: string = 'forced post-spawn hardening failure',
+): void {
   expect(probe.stdout).toContain('SETTLEMENT=rejected');
   expect(probe.stdout).not.toContain('SETTLEMENT=pending');
   expect(probe.stdout).not.toContain('SETTLEMENT=resolved');
-  expect(probe.stdout).toContain('DETAIL=forced post-spawn hardening failure');
+  expect(probe.stdout).toContain(`DETAIL=${reason}`);
   // No outcome vocabulary at all: a rejection is not an AgentExchange, and the
   // mandatory failure must never be reported as a failure to spawn.
   expect(probe.stdout).not.toContain('SPAWN_FAILED');
@@ -1654,6 +1704,43 @@ describe('invokeAgentProcess — adversarial', () => {
     // destroy cannot operate on, which is the second half of the condition.
     expect(probe.stdout).toMatch(/CLEANUP_FAULTS=[1-9]/);
     expectHardeningFailureSettles(probe);
+  }, 40_000);
+
+  /**
+   * The same mandatory failure, thrown as a value that cannot be classified.
+   *
+   * Deciding what to reject with means asking whether the caught value is an
+   * Error, and `instanceof` answers that by walking the value's own prototype
+   * chain — an operation the value itself can refuse. Ordering that question
+   * before the release made the answer a precondition for cleanup: a value that
+   * refused it left an already-created child unreleased and put the secondary
+   * classification error in front of the caller as the terminal cause. Neither
+   * is allowed, so the release must already be under way before the caught
+   * value is examined at all.
+   */
+  it('settles a hardening failure whose thrown value cannot be classified', async () => {
+    const probe = await runHardeningSettlementProbe('unclassifiable-throw');
+
+    // The staged condition really was reached: classifying the caught value
+    // threw, where every other mode's value is merely tested. Counted exactly —
+    // the transport asks the question once, and a repair that asked it again
+    // would be re-entering a hostile operation it already knows faults.
+    expect(probe.stdout).toMatch(/^CLASSIFICATION_FAULTS=1$/m);
+    // A real child was created, and the release that follows the mandatory
+    // failure still ran far enough to reach the poisoned pipe value and fault
+    // on it — bounded and absorbed, exactly as on the ordinary modes. Before
+    // the repair the classification threw first and neither happened. The
+    // process count is only bounded from below here, because this mode reaches
+    // the ordinary termination strategy and Windows starts a tree-kill helper
+    // there; the exact-count claim belongs to the faulting-termination modes,
+    // where no helper may be reached at all.
+    expect(probe.stdout).toMatch(/^SPAWNED=[1-9][0-9]*$/m);
+    expect(probe.stdout).toMatch(/CLEANUP_FAULTS=[1-9]/);
+    // And the secondary classification error is not what the caller is told.
+    expect(probe.stdout).not.toContain('DETAIL=hostile classification');
+    // The stable hardening failure is, rather than the original Error the other
+    // modes get back, because here there was no Error to preserve.
+    expectHardeningFailureSettles(probe, 'Process dispatch hardening failed');
   }, 40_000);
 
   it('settles a hardening failure whose bounded termination attempt itself fails', async () => {

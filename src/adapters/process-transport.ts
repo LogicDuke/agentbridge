@@ -828,20 +828,40 @@ export function invokeAgentProcess(
       if (invocation.signal !== null) {
         removeAbortListener(invocation.signal, onAbort);
       }
-      // Normalised here, before the asynchronous release, so the reason this
-      // exchange rejects with is already fixed and cannot itself be lost to a
-      // later hostile read.
-      const hardeningFailure =
-        error instanceof Error
-          ? error
-          : new Error('Process dispatch hardening failed', { cause: error });
+      // Started before the thrown value is examined at all. Classifying it is
+      // not a neutral read: `instanceof` consults the value's own prototype
+      // chain, and a value engineered to refuse that makes the classification
+      // itself throw. Ordering the release first is what keeps such a fault
+      // from costing an already-created child the one bounded release attempt
+      // it is owed, and from displacing the mandatory hardening failure as the
+      // reason this exchange rejects with. Nothing below decides anything this
+      // call depends on.
+      const release = releaseUnprotectedChild(child, platform, invocation.graceMs);
+      // Total. The ordinary case keeps the original Error as the caller-visible
+      // reason; a value that is not an Error — or that faults while being
+      // classified — yields the same stable hardening failure instead, with the
+      // original value retained as `cause`. Retaining it is safe because a
+      // `cause` is only stored, never read. Neither branch can escape, so the
+      // reason is fixed here, before the release settles, and cannot itself be
+      // lost to a later hostile read.
+      let hardeningFailure: Error;
+      try {
+        hardeningFailure =
+          error instanceof Error
+            ? error
+            : new Error('Process dispatch hardening failed', { cause: error });
+      } catch {
+        hardeningFailure = new Error('Process dispatch hardening failed', {
+          cause: error,
+        });
+      }
       // `releaseUnprotectedChild` runs every step and never rejects, and the
       // rejection is scheduled on *both* settlement paths of the chain anyway,
       // so neither a termination failure nor a cleanup step that throws on a
       // poisoned `stdout`/`stderr` value can leave this exchange pending or
       // leave an internal rejection unhandled. The mandatory hardening failure
       // stays the externally visible reason on every one of those paths.
-      void releaseUnprotectedChild(child, platform, invocation.graceMs).then(
+      void release.then(
         () => {
           reject(hardeningFailure);
         },
