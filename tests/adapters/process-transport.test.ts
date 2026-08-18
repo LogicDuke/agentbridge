@@ -1751,55 +1751,70 @@ describe('invokeAgentProcess — adversarial', () => {
    * a file — executable or not — where this spawn looks.
    */
   it('settles a probe whose child never spawns instead of killing the worker', async () => {
-    const absent = join(makeTempDirectory(), 'absent-node-binary');
+    const parent = makeTempDirectory();
+    const absent = join(parent, 'absent-node-binary');
 
-    const probe = await runHardeningSettlementProbe('stdout-accessor', absent);
+    try {
+      const probe = await runHardeningSettlementProbe('stdout-accessor', absent);
 
-    // Reaching this line at all is half the claim: the promise settled and the
-    // worker survived to assert on it.
-    //
-    // The other half is that the result is this probe's, and says what went
-    // wrong. The spawn error names itself, its errno, and the executable that
-    // could not be run.
-    expect(probe.stderr).toContain('PROBE_SPAWN_ERROR: ');
-    expect(probe.stderr).toContain('ENOENT');
-    expect(probe.stderr).toContain(absent);
-    // Nothing ran, so the probe produced no evidence of its own and there is
-    // no exit code to mistake for a clean one. `null` is the 'error' event's
-    // own answer, and it is the answer that survives: a 'close' carrying a
-    // platform-specific code — negative errno on Windows — follows it, as the
-    // test below shows, and the first answer is the one the caller keeps.
-    expect(probe.stdout).toBe('');
-    expect(probe.code).toBeNull();
-    // And this reaches the assertions that own the probe as an ordinary
-    // failure, which is the whole point of converting the event: the harness
-    // fails, attributably, rather than dying.
-    expect(() => {
-      expectHardeningFailureSettles(probe);
-    }).toThrow();
+      // Reaching this line at all is half the claim: the promise settled and the
+      // worker survived to assert on it.
+      //
+      // The other half is that the result is this probe's, and says what went
+      // wrong. The spawn error names itself, its errno, and the executable that
+      // could not be run.
+      expect(probe.stderr).toContain('PROBE_SPAWN_ERROR: ');
+      expect(probe.stderr).toContain('ENOENT');
+      expect(probe.stderr).toContain(absent);
+      // Nothing ran, so the probe produced no evidence of its own and there is
+      // no exit code to mistake for a clean one. `null` is the 'error' event's
+      // own answer, and it is the answer that survives: a 'close' carrying a
+      // platform-specific code — negative errno on Windows — follows it, as the
+      // test below shows, and the first answer is the one the caller keeps.
+      expect(probe.stdout).toBe('');
+      expect(probe.code).toBeNull();
+      // And this reaches the assertions that own the probe as an ordinary
+      // failure, which is the whole point of converting the event: the harness
+      // fails, attributably, rather than dying.
+      expect(() => {
+        expectHardeningFailureSettles(probe);
+      }).toThrow();
+    } finally {
+      // The parent this test minted, removed by the test that made it. Nothing
+      // was ever created inside it: the child path is the name that must not
+      // resolve, so this leaves no directory behind on success or on failure.
+      removeTempDirectory(parent);
+    }
   }, 40_000);
 
   it('receives a close after the spawn error the probe settles on', async () => {
-    const absent = join(makeTempDirectory(), 'absent-node-binary');
+    const parent = makeTempDirectory();
+    const absent = join(parent, 'absent-node-binary');
     const events: string[] = [];
 
-    await new Promise<void>((resolve) => {
-      const child = spawn(absent, [], { stdio: ['ignore', 'pipe', 'pipe'] });
-      // Registered here for the same reason the runner registers one: without
-      // it this spawn failure would end the worker rather than be observed.
-      child.on('error', () => {
-        events.push('error');
+    try {
+      await new Promise<void>((resolve) => {
+        const child = spawn(absent, [], { stdio: ['ignore', 'pipe', 'pipe'] });
+        // Registered here for the same reason the runner registers one: without
+        // it this spawn failure would end the worker rather than be observed.
+        child.on('error', () => {
+          events.push('error');
+        });
+        child.on('close', () => {
+          events.push('close');
+          resolve();
+        });
       });
-      child.on('close', () => {
-        events.push('close');
-        resolve();
-      });
-    });
 
-    // Both events arrive, and in this order. That is what makes the runner's
-    // once-only settlement load-bearing rather than decorative: the failure it
-    // resolves with must not be overwritten by the close that follows.
-    expect(events).toEqual(['error', 'close']);
+      // Both events arrive, and in this order. That is what makes the runner's
+      // once-only settlement load-bearing rather than decorative: the failure it
+      // resolves with must not be overwritten by the close that follows.
+      expect(events).toEqual(['error', 'close']);
+    } finally {
+      // Awaited above, so the close has already arrived and nothing is still
+      // reading this directory when it goes.
+      removeTempDirectory(parent);
+    }
   }, 20_000);
 
   /**
@@ -1824,42 +1839,49 @@ describe('invokeAgentProcess — adversarial', () => {
    * what the registration has to survive.
    */
   it('settles a spawn failure that leaves no stdio handles behind', async () => {
-    const absent = join(makeTempDirectory(), 'absent-node-binary');
+    const parent = makeTempDirectory();
+    const absent = join(parent, 'absent-node-binary');
 
-    // The staged condition, asserted rather than assumed: a real ChildProcess,
-    // with neither handle to register a listener on.
-    const staged = spawn(absent, [], { stdio: ['ignore', 'ignore', 'ignore'] });
-    const stagedClosed = new Promise<void>((resolve) => {
-      staged.on('error', () => {});
-      staged.on('close', () => {
-        resolve();
+    try {
+      // The staged condition, asserted rather than assumed: a real ChildProcess,
+      // with neither handle to register a listener on.
+      const staged = spawn(absent, [], { stdio: ['ignore', 'ignore', 'ignore'] });
+      const stagedClosed = new Promise<void>((resolve) => {
+        staged.on('error', () => {});
+        staged.on('close', () => {
+          resolve();
+        });
       });
-    });
-    expect(staged.stdout).toBeNull();
-    expect(staged.stderr).toBeNull();
-    await stagedClosed;
+      expect(staged.stdout).toBeNull();
+      expect(staged.stderr).toBeNull();
+      await stagedClosed;
 
-    const probe = await runHardeningSettlementProbe('stdout-accessor', absent, [
-      'ignore',
-      'ignore',
-      'ignore',
-    ]);
+      const probe = await runHardeningSettlementProbe('stdout-accessor', absent, [
+        'ignore',
+        'ignore',
+        'ignore',
+      ]);
 
-    // Resolved rather than rejected, which is the whole of the repair: what
-    // arrives is a ProbeResult and not a TypeError about reading 'on' of null,
-    // and this worker is alive to assert on it.
-    expect(probe.stderr).toContain('PROBE_SPAWN_ERROR: ');
-    expect(probe.stderr).toContain('ENOENT');
-    expect(probe.stderr).toContain(absent);
-    // The real cause reached the caller by the same route it takes when the
-    // handles do exist, and nothing here can be read as success. `null` also
-    // shows the trailing 'close' — which the test above proves arrives, and
-    // which carries a platform-specific code — did not overwrite the answer.
-    expect(probe.stdout).toBe('');
-    expect(probe.code).toBeNull();
-    expect(() => {
-      expectHardeningFailureSettles(probe);
-    }).toThrow();
+      // Resolved rather than rejected, which is the whole of the repair: what
+      // arrives is a ProbeResult and not a TypeError about reading 'on' of null,
+      // and this worker is alive to assert on it.
+      expect(probe.stderr).toContain('PROBE_SPAWN_ERROR: ');
+      expect(probe.stderr).toContain('ENOENT');
+      expect(probe.stderr).toContain(absent);
+      // The real cause reached the caller by the same route it takes when the
+      // handles do exist, and nothing here can be read as success. `null` also
+      // shows the trailing 'close' — which the test above proves arrives, and
+      // which carries a platform-specific code — did not overwrite the answer.
+      expect(probe.stdout).toBe('');
+      expect(probe.code).toBeNull();
+      expect(() => {
+        expectHardeningFailureSettles(probe);
+      }).toThrow();
+    } finally {
+      // Both children are settled by here — the staged one awaited, the probe's
+      // resolved — so nothing holds this directory open when it is removed.
+      removeTempDirectory(parent);
+    }
   }, 40_000);
 
   it('scopes the probe leak assertion to the run that owns the directory', () => {
