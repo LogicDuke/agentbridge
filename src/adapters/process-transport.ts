@@ -828,22 +828,33 @@ export function invokeAgentProcess(
       if (invocation.signal !== null) {
         removeAbortListener(invocation.signal, onAbort);
       }
-      // Started before the thrown value is examined at all. Classifying it is
-      // not a neutral read: `instanceof` consults the value's own prototype
-      // chain, and a value engineered to refuse that makes the classification
-      // itself throw. Ordering the release first is what keeps such a fault
-      // from costing an already-created child the one bounded release attempt
-      // it is owed, and from displacing the mandatory hardening failure as the
-      // reason this exchange rejects with. Nothing below decides anything this
-      // call depends on.
-      const release = releaseUnprotectedChild(child, platform, invocation.graceMs);
-      // Total. The ordinary case keeps the original Error as the caller-visible
+      // Decided first, and decided *completely*, before anything else touches
+      // the handle. Two separate hazards meet here and only this order answers
+      // both.
+      //
+      // Classifying the caught value is not a neutral read: `instanceof`
+      // consults the value's own prototype chain, and a value engineered to
+      // refuse that makes the classification itself throw. That is what the
+      // surrounding `try` is for — the block below is total, so a
+      // classification fault cannot escape, and therefore cannot cost an
+      // already-created child the one bounded release attempt it is owed.
+      // Releasing first would answer that hazard too, but at the price of the
+      // second one: `releaseUnprotectedChild` consults `pid`, `exitCode`, and
+      // `signalCode` synchronously before its first suspension, so a hostile
+      // accessor gets to run before this line does. An ordinary Error that had
+      // its prototype chain rewritten by such an accessor would then fail
+      // `instanceof` and be replaced by the generic fallback, losing the very
+      // identity the caller is owed. Reading the value here, where nothing
+      // hostile has been invoked since it was thrown, is what makes the
+      // classification a decision about the value as it was actually raised.
+      //
+      // The ordinary case keeps the original Error as the caller-visible
       // reason; a value that is not an Error — or that faults while being
       // classified — yields the same stable hardening failure instead, with the
       // original value retained as `cause`. Retaining it is safe because a
       // `cause` is only stored, never read. Neither branch can escape, so the
-      // reason is fixed here, before the release settles, and cannot itself be
-      // lost to a later hostile read.
+      // reason is fixed before the release begins and cannot afterwards be lost
+      // to a hostile read.
       let hardeningFailure: Error;
       try {
         hardeningFailure =
@@ -855,6 +866,11 @@ export function invokeAgentProcess(
           cause: error,
         });
       }
+      // Unconditional: the block above has no escaping path, so the release is
+      // reached on every route through it. Nothing above decides anything this
+      // call depends on — it is ordered second only to keep hostile accessors
+      // away from the caught value, not because it is contingent on the result.
+      const release = releaseUnprotectedChild(child, platform, invocation.graceMs);
       // `releaseUnprotectedChild` runs every step and never rejects, and the
       // rejection is scheduled on *both* settlement paths of the chain anyway,
       // so neither a termination failure nor a cleanup step that throws on a

@@ -273,6 +273,7 @@ const MODES = [
   'terminate-fault',
   'terminate-fault-sigterm-ignored',
   'unclassifiable-throw',
+  'error-identity-mutation',
 ];
 if (!MODES.includes(mode)) {
   console.log('MODE_INVALID=' + String(mode));
@@ -309,9 +310,31 @@ const UNCLASSIFIABLE_VALUE = new Proxy({}, {
     throw new Error('hostile classification');
   },
 });
+// The exact Error object the forced failure raised, kept so the value the
+// caller is finally handed can be compared against it by identity rather than
+// by message. A message survives operations an object identity does not, so
+// message equality alone would report a pass for a substituted Error.
+let thrownError = null;
 function hardeningThrow() {
-  return UNCLASSIFIABLE ? UNCLASSIFIABLE_VALUE : new Error(HARDENING_MARKER);
+  if (UNCLASSIFIABLE) return UNCLASSIFIABLE_VALUE;
+  thrownError = new Error(HARDENING_MARKER);
+  return thrownError;
 }
+
+// Whether this mode arranges for the release to *rewrite* the already-thrown
+// Error rather than to fault.
+//
+// The release consults the handle's \`pid\`, \`exitCode\`, and \`signalCode\`
+// synchronously, before it can suspend. This mode gives one of those accessors
+// a side effect instead of a throw: it strips the thrown Error's prototype
+// chain, which is precisely what \`instanceof Error\` consults. A transport that
+// classifies the caught value only after starting the release therefore sees an
+// ordinary Error as unclassifiable and substitutes the generic fallback, and the
+// caller loses the Error that was actually raised. The accessor still runs in
+// the repaired ordering — the count below proves it — so what the mode asks is
+// whether classification already happened by then.
+const IDENTITY_MUTATION = mode === 'error-identity-mutation';
+let identityMutations = 0;
 
 // The value a hostile stdio accessor yields. Defining a property on it throws
 // the forced failure above, which is what makes the transport's own mandatory
@@ -420,16 +443,32 @@ for (const key of ['stdin', 'stdout', 'stderr']) {
   });
 }
 
-if (TERMINATE_FAULT) {
-  // Termination consults these before it signals anything, so making them
-  // throw is what fails the bounded termination attempt itself.
+if (TERMINATE_FAULT || IDENTITY_MUTATION) {
+  // Termination consults these before it signals anything, and it does so
+  // synchronously — before the release it belongs to has had any chance to
+  // suspend. That single fact is what both modes below exploit, from opposite
+  // directions: one makes the read fail the bounded termination attempt
+  // outright, the other lets it succeed but uses the moment it is granted to
+  // rewrite the Error that was already thrown.
   for (const key of ['exitCode', 'signalCode']) {
     Object.defineProperty(ChildProcess.prototype, key, {
       configurable: true,
       get() {
         if (armed && !disarmed) {
-          terminationFaults += 1;
-          throw new Error('hostile ' + key + ' accessor');
+          if (TERMINATE_FAULT) {
+            terminationFaults += 1;
+            throw new Error('hostile ' + key + ' accessor');
+          }
+          // Not a throw. Severing the prototype chain leaves the object,
+          // its message, and its stack exactly as they were, and changes only
+          // the one question \`instanceof Error\` asks about it. Nothing here
+          // is undone afterwards, so a transport that already classified the
+          // value keeps it and a transport that has not yet classified it
+          // cannot recognise it any more.
+          if (thrownError !== null) {
+            identityMutations += 1;
+            Object.setPrototypeOf(thrownError, null);
+          }
         }
         const slot = stash.get(this);
         return slot === undefined ? null : slot[key];
@@ -531,7 +570,28 @@ const limits = { timeoutMs: 5000, graceMs: 200, maxStdoutBytes: 65536, maxStderr
 const settlement = await Promise.race([
   invokeAgentProcess(spec, limits).then(
     (exchange) => ({ kind: 'resolved', detail: String(exchange && exchange.outcome) }),
-    (error) => ({ kind: 'rejected', detail: String(error && error.message ? error.message : error) }),
+    (error) => ({
+      kind: 'rejected',
+      detail: String(error && error.message ? error.message : error),
+      // Whether the caller was handed back the very Error object the forced
+      // failure threw, decided by reference. Both comparisons are guarded
+      // because this arm may not fail the probe by throwing out of it; a
+      // comparison that could not be made is reported as a failed one.
+      identity: (() => {
+        try { return thrownError !== null && error === thrownError; } catch { return false; }
+      })(),
+      // And, for the value that has no Error identity to preserve, whether the
+      // fallback retained that exact original value as its cause. Reading
+      // \`cause\` here touches an ordinary own property of an Error this probe
+      // did not create; the comparison itself is a reference test and invokes
+      // nothing on the hostile value.
+      causeIdentity: (() => {
+        try {
+          return error !== null && typeof error === 'object' &&
+            error.cause === UNCLASSIFIABLE_VALUE;
+        } catch { return false; }
+      })(),
+    }),
   ),
   new Promise((r) => setTimeout(() => { r({ kind: 'pending', detail: 'deadline' }); }, 8000)),
 ]);
@@ -539,6 +599,9 @@ console.log('SETTLEMENT=' + settlement.kind);
 console.log('DETAIL=' + settlement.detail);
 console.log('CLEANUP_FAULTS=' + cleanupFaults);
 console.log('CLASSIFICATION_FAULTS=' + classificationFaults);
+console.log('IDENTITY_MUTATIONS=' + identityMutations);
+console.log('ERROR_IDENTITY=' + String(settlement.identity === true));
+console.log('CAUSE_IDENTITY=' + String(settlement.causeIdentity === true));
 console.log('TERMINATION_FAULTS=' + terminationFaults);
 console.log('DIRECT_CHILD_SIGNALS=' + directChildSignals);
 console.log('SPAWNED=' + spawned.length);
@@ -1711,12 +1774,14 @@ describe('invokeAgentProcess — adversarial', () => {
    *
    * Deciding what to reject with means asking whether the caught value is an
    * Error, and `instanceof` answers that by walking the value's own prototype
-   * chain — an operation the value itself can refuse. Ordering that question
-   * before the release made the answer a precondition for cleanup: a value that
-   * refused it left an already-created child unreleased and put the secondary
-   * classification error in front of the caller as the terminal cause. Neither
-   * is allowed, so the release must already be under way before the caught
-   * value is examined at all.
+   * chain — an operation the value itself can refuse. Left unguarded, that
+   * question became a precondition for cleanup: a value that refused it left an
+   * already-created child unreleased and put the secondary classification error
+   * in front of the caller as the terminal cause. Neither is allowed. The
+   * question is therefore answered inside a total block, so a value that
+   * refuses it costs the exchange neither the release nor the stable reason it
+   * owes — and the original value, being the only record of what actually went
+   * wrong, is kept as that reason's `cause`.
    */
   it('settles a hardening failure whose thrown value cannot be classified', async () => {
     const probe = await runHardeningSettlementProbe('unclassifiable-throw');
@@ -1729,7 +1794,8 @@ describe('invokeAgentProcess — adversarial', () => {
     // A real child was created, and the release that follows the mandatory
     // failure still ran far enough to reach the poisoned pipe value and fault
     // on it — bounded and absorbed, exactly as on the ordinary modes. Before
-    // the repair the classification threw first and neither happened. The
+    // the repair the classification threw out of the catch and neither
+    // happened, which is what the total block above now prevents. The
     // process count is only bounded from below here, because this mode reaches
     // the ordinary termination strategy and Windows starts a tree-kill helper
     // there; the exact-count claim belongs to the faulting-termination modes,
@@ -1741,6 +1807,54 @@ describe('invokeAgentProcess — adversarial', () => {
     // The stable hardening failure is, rather than the original Error the other
     // modes get back, because here there was no Error to preserve.
     expectHardeningFailureSettles(probe, 'Process dispatch hardening failed');
+    // There was no Error identity to preserve, but there was still a *value*,
+    // and it is the only record of what actually failed. The stable message
+    // alone would read identically whether that value had been retained or
+    // silently dropped, so the reported rejection is checked to carry the exact
+    // original object as its `cause` — by reference, decided inside the probe
+    // where both are in hand.
+    expect(probe.stdout).toMatch(/^CAUSE_IDENTITY=true$/m);
+  }, 40_000);
+
+  /**
+   * An ordinary Error, thrown by the same mandatory failure, against a handle
+   * that rewrites it the moment the release reads anything.
+   *
+   * The release is not an inert operation. Before it can suspend it consults
+   * the handle's `pid`, `exitCode`, and `signalCode`, and each of those is a
+   * call into code the handle controls. Starting it before the caught value has
+   * been classified therefore hands that code the chance to act first, and the
+   * cheapest thing it can do is sever the thrown Error's prototype chain: the
+   * object, its message, and its stack are untouched, but `instanceof Error` —
+   * the one question the transport asks about it — now answers no. The Error
+   * the caller is owed is then replaced by the generic fallback, and nothing in
+   * the reported message gives that away, because the fallback the caller gets
+   * would be a *different* message and the substitution only shows up if the
+   * two objects are compared. So they are compared, by reference.
+   *
+   * The accessor is not disarmed for this mode; the release still reads it and
+   * the rewrite still happens. What the repaired ordering changes is only that
+   * classification has already been decided by then.
+   */
+  it('preserves the thrown Error identity when the release would rewrite it', async () => {
+    const probe = await runHardeningSettlementProbe('error-identity-mutation');
+
+    // The staged condition really was reached: the release read an accessor
+    // this mode had armed, and the thrown Error's prototype chain was severed.
+    // Without this the regression would pass on a transport the mutation never
+    // touched, which is every transport that simply never released the child.
+    expect(probe.stdout).toMatch(/^IDENTITY_MUTATIONS=[1-9][0-9]*$/m);
+    // And the release ran far enough past that read to reach the poisoned pipe
+    // value and fault on it — bounded and absorbed, as on the ordinary modes.
+    expect(probe.stdout).toMatch(/^SPAWNED=[1-9][0-9]*$/m);
+    expect(probe.stdout).toMatch(/CLEANUP_FAULTS=[1-9]/);
+    // Classification was decided before any of that, so it never faulted and
+    // never needed the fallback: no substitute Error was manufactured.
+    expect(probe.stdout).toMatch(/^CLASSIFICATION_FAULTS=0$/m);
+    expect(probe.stdout).not.toContain('DETAIL=Process dispatch hardening failed');
+    // The caller received the very object that was thrown — not an equal one.
+    expect(probe.stdout).toMatch(/^ERROR_IDENTITY=true$/m);
+    expectHardeningFailureSettles(probe);
   }, 40_000);
 
   it('settles a hardening failure whose bounded termination attempt itself fails', async () => {
