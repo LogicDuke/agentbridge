@@ -860,8 +860,20 @@ async function runIsolatedProbe(mode: string): Promise<ProbeResult> {
   }
 }
 
-/** Run one hardening-settlement probe mode in its own process. */
-async function runHardeningSettlementProbe(mode: string): Promise<ProbeResult> {
+/**
+ * Run one hardening-settlement probe mode in its own process.
+ *
+ * `nodeExecutable` is the interpreter that process runs under, and `stdio`
+ * the descriptors it is given. Every probe of the transport takes both
+ * defaults; the regressions below vary them to drive this runner's real
+ * asynchronous spawn-failure paths, which is the only way to reach those paths
+ * from a test without starving the machine that runs it.
+ */
+async function runHardeningSettlementProbe(
+  mode: string,
+  nodeExecutable: string = process.execPath,
+  stdio: ('ignore' | 'pipe')[] = ['ignore', 'pipe', 'pipe'],
+): Promise<ProbeResult> {
   const directory = makeTempDirectory();
   try {
     const hook = join(directory, 'hook.mjs');
@@ -870,20 +882,56 @@ async function runHardeningSettlementProbe(mode: string): Promise<ProbeResult> {
     writeFileSync(script, HARDENING_SETTLEMENT_PROBE_SCRIPT);
     return await new Promise<ProbeResult>((resolve) => {
       const probe = spawn(
-        process.execPath,
+        nodeExecutable,
         ['--import', pathToFileURL(hook).href, script, TRANSPORT_SOURCE_URL, mode],
-        { stdio: ['ignore', 'pipe', 'pipe'] },
+        { stdio },
       );
       let stdout = '';
       let stderr = '';
-      probe.stdout.on('data', (chunk: Buffer) => {
+      let settled = false;
+      /**
+       * Answer the caller once, with whichever event arrives first.
+       *
+       * A spawn that fails emits 'error' and then 'close', so the caller
+       * receives the failure rather than the platform-specific code the
+       * trailing 'close' carries. `settled` is not what makes that true —
+       * resolving a promise a second time is already a no-op. It is explicit
+       * state recording which event answered, so that first-wins is visible
+       * here rather than inferred from promise semantics.
+       */
+      const settle = (code: number | null): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        resolve({ code, stdout, stderr });
+      };
+      // Registered ahead of the stream listeners, so nothing between the spawn
+      // and this line can leave an asynchronous spawn failure — ENOENT, EMFILE,
+      // a Windows denial — as an unhandled 'error' event. Unhandled, it ends
+      // this worker and takes the probe's evidence with it. Handled, it becomes
+      // ordinary evidence: no exit code, and a stderr line naming the failure,
+      // which is what the assertions that own this probe then fail on.
+      probe.on('error', (error: Error) => {
+        stderr += `PROBE_SPAWN_ERROR: ${error.message}\n`;
+        settle(null);
+      });
+      // Optional because a failed spawn need not leave these behind. When
+      // uv_spawn reports EMFILE or ENFILE there are no descriptors left to
+      // build pipes from, so Node abandons the attempt and returns before
+      // assigning stdout and stderr at all — they are absent at exactly the
+      // moment the 'error' above is the only thing still able to report
+      // anything. A plain `.on` would throw out of this executor and reject
+      // with a TypeError naming neither the errno nor the executable, losing
+      // the failure this runner exists to surface.
+      probe.stdout?.on('data', (chunk: Buffer) => {
         stdout += chunk.toString('utf8');
       });
-      probe.stderr.on('data', (chunk: Buffer) => {
+      probe.stderr?.on('data', (chunk: Buffer) => {
         stderr += chunk.toString('utf8');
       });
       probe.on('close', (code: number | null) => {
-        resolve({ code, stdout, stderr });
+        settle(code);
       });
     });
   } finally {
@@ -1681,6 +1729,159 @@ describe('invokeAgentProcess — adversarial', () => {
     expect(probe.stdout).toMatch(/^KILL_SIGNAL=SIGKILL$/m);
     expect(probe.stdout).not.toMatch(/^ABANDONED_PID=/m);
     expectHardeningFailureSettles(probe);
+  }, 40_000);
+
+  /**
+   * The same runner, against a child that never starts.
+   *
+   * A spawn can fail asynchronously for reasons that have nothing to do with
+   * the transport under test — ENOENT, EMFILE or ENFILE, EAGAIN, ENOMEM, a
+   * Windows permission or scanner denial. Node reports every one of them as a
+   * ChildProcess 'error' event, which is not a 'close': a runner that listens
+   * only for 'close' both loses the settlement and, because an unhandled
+   * 'error' event throws, takes this worker down with it. The evidence for the
+   * probe that was running is then gone, and so is the evidence for every
+   * other test sharing the worker.
+   *
+   * Deterministic fault injection rather than real resource exhaustion: a name
+   * that was never created, inside a directory this test just made for its own
+   * use, cannot resolve to an executable on any platform, so the failure
+   * arrives on the same event by the same route. The directory is minted per
+   * test rather than fixed under the shared temp root, so no co-tenant can put
+   * a file — executable or not — where this spawn looks.
+   */
+  it('settles a probe whose child never spawns instead of killing the worker', async () => {
+    const parent = makeTempDirectory();
+    const absent = join(parent, 'absent-node-binary');
+
+    try {
+      const probe = await runHardeningSettlementProbe('stdout-accessor', absent);
+
+      // Reaching this line at all is half the claim: the promise settled and the
+      // worker survived to assert on it.
+      //
+      // The other half is that the result is this probe's, and says what went
+      // wrong. The spawn error names itself, its errno, and the executable that
+      // could not be run.
+      expect(probe.stderr).toContain('PROBE_SPAWN_ERROR: ');
+      expect(probe.stderr).toContain('ENOENT');
+      expect(probe.stderr).toContain(absent);
+      // Nothing ran, so the probe produced no evidence of its own and there is
+      // no exit code to mistake for a clean one. `null` is the 'error' event's
+      // own answer, and it is the answer that survives: a 'close' carrying a
+      // platform-specific code — negative errno on Windows — follows it, as the
+      // test below shows, and the first answer is the one the caller keeps.
+      expect(probe.stdout).toBe('');
+      expect(probe.code).toBeNull();
+      // And this reaches the assertions that own the probe as an ordinary
+      // failure, which is the whole point of converting the event: the harness
+      // fails, attributably, rather than dying.
+      expect(() => {
+        expectHardeningFailureSettles(probe);
+      }).toThrow();
+    } finally {
+      // The parent this test minted, removed by the test that made it. Nothing
+      // was ever created inside it: the child path is the name that must not
+      // resolve, so this leaves no directory behind on success or on failure.
+      removeTempDirectory(parent);
+    }
+  }, 40_000);
+
+  it('receives a close after the spawn error the probe settles on', async () => {
+    const parent = makeTempDirectory();
+    const absent = join(parent, 'absent-node-binary');
+    const events: string[] = [];
+
+    try {
+      await new Promise<void>((resolve) => {
+        const child = spawn(absent, [], { stdio: ['ignore', 'pipe', 'pipe'] });
+        // Registered here for the same reason the runner registers one: without
+        // it this spawn failure would end the worker rather than be observed.
+        child.on('error', () => {
+          events.push('error');
+        });
+        child.on('close', () => {
+          events.push('close');
+          resolve();
+        });
+      });
+
+      // Both events arrive, and in this order. That is what makes the runner's
+      // once-only settlement load-bearing rather than decorative: the failure it
+      // resolves with must not be overwritten by the close that follows.
+      expect(events).toEqual(['error', 'close']);
+    } finally {
+      // Awaited above, so the close has already arrived and nothing is still
+      // reading this directory when it goes.
+      removeTempDirectory(parent);
+    }
+  }, 20_000);
+
+  /**
+   * The same runner, against a spawn that leaves no stdio behind.
+   *
+   * EMFILE and ENFILE are the resource-exhaustion end of this same failure
+   * class, and Node treats them differently from the rest of it. They are
+   * reported as a ChildProcess 'error' like any other spawn failure, but
+   * `ChildProcess.prototype.spawn` also gives up early on them — there are no
+   * descriptors left to build pipes from, so it returns before assigning
+   * `stdout` and `stderr` at all. The handles are absent at precisely the
+   * moment the 'error' listener is the only thing that can still report the
+   * failure, and a runner that registers stream listeners unconditionally
+   * throws out of its own Promise executor before that listener can be used.
+   *
+   * Deterministic fault injection rather than real exhaustion, which would
+   * mean starving the machine running this suite of descriptors: asking for no
+   * pipes leaves the same two handles unassigned by the same statement, and an
+   * executable that cannot resolve still delivers a real asynchronous 'error'.
+   * That exhaustion yields `undefined` where this yields `null` is a
+   * distinction the runner does not draw — both are absent, and absence is
+   * what the registration has to survive.
+   */
+  it('settles a spawn failure that leaves no stdio handles behind', async () => {
+    const parent = makeTempDirectory();
+    const absent = join(parent, 'absent-node-binary');
+
+    try {
+      // The staged condition, asserted rather than assumed: a real ChildProcess,
+      // with neither handle to register a listener on.
+      const staged = spawn(absent, [], { stdio: ['ignore', 'ignore', 'ignore'] });
+      const stagedClosed = new Promise<void>((resolve) => {
+        staged.on('error', () => {});
+        staged.on('close', () => {
+          resolve();
+        });
+      });
+      expect(staged.stdout).toBeNull();
+      expect(staged.stderr).toBeNull();
+      await stagedClosed;
+
+      const probe = await runHardeningSettlementProbe('stdout-accessor', absent, [
+        'ignore',
+        'ignore',
+        'ignore',
+      ]);
+
+      // Resolved rather than rejected, which is the whole of the repair: what
+      // arrives is a ProbeResult and not a TypeError about reading 'on' of null,
+      // and this worker is alive to assert on it.
+      expect(probe.stderr).toContain('PROBE_SPAWN_ERROR: ');
+      expect(probe.stderr).toContain('ENOENT');
+      expect(probe.stderr).toContain(absent);
+      // The real cause reached the caller by the same route it takes when the
+      // handles do exist, and nothing here can be read as success. `null` also
+      // shows the trailing 'close' — which the test above proves arrives, and
+      // which carries a platform-specific code — did not overwrite the answer.
+      expect(probe.stdout).toBe('');
+      expect(probe.code).toBeNull();
+      expect(() => {
+        expectHardeningFailureSettles(probe);
+      }).toThrow();
+    } finally {
+      // Both children are settled by here — the staged one awaited, the probe's
+      // resolved — so nothing holds this directory open when it is removed.
+      removeTempDirectory(parent);
+    }
   }, 40_000);
 
   it('scopes the probe leak assertion to the run that owns the directory', () => {
