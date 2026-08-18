@@ -223,6 +223,344 @@ process.exit(0);
 `;
 
 /**
+ * One exchange whose mandatory hardening failure must still settle, under a
+ * hostile runtime that makes the failure path's own cleanup fail as well.
+ *
+ * The scenario is the reachable one: a `ChildProcess` stdio accessor that
+ * yields a value dispatch hardening cannot protect, and then either throws on
+ * the *next* read or yields a value a stream destroy cannot operate on. The
+ * cleanup that follows the mandatory failure therefore throws before the
+ * exchange's rejection is delivered. What must survive that is the liveness
+ * invariant: `invokeAgentProcess` still rejects, with the original hardening
+ * error, and no discarded internal promise is left rejecting unhandled.
+ *
+ * This runs in a subprocess for three separate reasons: it mutates
+ * `ChildProcess.prototype` accessors, it needs a private
+ * `unhandledRejection` listener to count internal rejections, and a queued
+ * child \`error\` with no listener would end the host process rather than this
+ * exchange.
+ *
+ * The probe reports two counts, and keeping them apart is the whole point.
+ * \`ABANDONED\` is the *transport's* result: whether a child it owned was still
+ * alive once the exchange had settled, observed before this probe signals
+ * anything. \`LEAKED\` is the *harness's* own result: whether the probe's
+ * targeted cleanup then failed to reap what it started. Measuring in the other
+ * order would let the cleanup destroy the very evidence being collected, and a
+ * transport that settles by abandoning a live child would read as clean.
+ *
+ * The child it asks the transport to run depends on the mode. Every mode needs
+ * one that will not exit on its own; the `terminate-fault-sigterm-ignored` mode
+ * needs one that additionally survives the graceful POSIX signal, so that
+ * `ABANDONED` answers whether the transport's single fallback attempt was
+ * strong enough rather than merely whether one was made.
+ */
+const HARDENING_SETTLEMENT_PROBE_SCRIPT = `
+import { ChildProcess } from 'node:child_process';
+import { existsSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+const [transportUrl, mode] = process.argv.slice(2);
+
+const unhandled = [];
+process.on('unhandledRejection', (reason) => {
+  unhandled.push(String(reason && reason.message ? reason.message : reason));
+});
+
+const HARDENING_MARKER = 'forced post-spawn hardening failure';
+let cleanupFaults = 0;
+let terminationFaults = 0;
+let armed = false;
+let disarmed = false;
+
+// The value a hostile stdio accessor yields. Defining a property on it throws
+// the marker, which is what forces the transport's own mandatory post-spawn
+// dispatch hardening to fail without replacing Node's emit intrinsic. Reading
+// the state a stream destroy consults throws too, which is the second half of
+// the condition: the cleanup that follows the mandatory failure faults on it.
+const POISON = new Proxy({}, {
+  defineProperty() { throw new Error(HARDENING_MARKER); },
+  get(target, key) {
+    if (key === '_readableState' || key === '_writableState' || key === 'destroy') {
+      cleanupFaults += 1;
+      throw new Error('hostile pipe value read');
+    }
+    return Reflect.get(target, key);
+  },
+});
+
+// Both termination-fault modes stage the identical transport-side condition and
+// differ only in the child they ask for, so every branch below keys off this
+// rather than off one mode name.
+const TERMINATE_FAULT = mode === 'terminate-fault' || mode === 'terminate-fault-sigterm-ignored';
+
+const TARGET = mode === 'stderr-accessor' ? 'stderr'
+  : TERMINATE_FAULT ? 'stdin' : 'stdout';
+const ACCESSOR_THROWS = mode === 'stdout-accessor' || mode === 'stderr-accessor';
+
+// The adversarial mode's child must already be ignoring the graceful signal by
+// the time the fallback fires, and a child that has only just been forked is
+// still in its interpreter's bootstrap. Left to chance the case would sometimes
+// stage itself and sometimes not, and the run where it did not would pass
+// against a defective transport. The child therefore announces readiness with a
+// file, the probe blocks for it at the one point that orders correctly against
+// the fallback, and whether it was ever observed is reported rather than
+// assumed.
+const WAITS_FOR_CHILD = mode === 'terminate-fault-sigterm-ignored';
+const READY_PATH = join(tmpdir(), 'ab-fallback-ready-' + process.pid);
+
+// Anything already at that path is left over from an earlier run, and it is
+// removed before anything here can wait on it. The path is derived from this
+// probe's own process ID, which no *live* process can be sharing, so a marker
+// present at startup can only have been written by a previous probe whose tail
+// cleanup never ran and whose ID the operating system has since handed out
+// again. \`waitForChildReady\` accepts existence alone, so such a file would
+// answer the readiness question with an earlier run's evidence and report
+// \`CHILD_READY=true\` before this run's child had installed anything — which is
+// exactly the ordering the wait exists to establish. Removing it first makes
+// the answer necessarily about this execution. The removal is deliberately not
+// guarded: a marker that cannot be cleared must fail this probe loudly rather
+// than be quietly accepted as proof of readiness.
+rmSync(READY_PATH, { force: true });
+
+let childReady = null;
+
+const SLEEP_SLOT = new Int32Array(new SharedArrayBuffer(4));
+function waitForChildReady() {
+  const deadline = Date.now() + 10000;
+  while (Date.now() < deadline) {
+    if (existsSync(READY_PATH)) return true;
+    // Idles the thread instead of spinning it; the wait must be synchronous
+    // because the transport is mid-call and there is no turn to yield to.
+    Atomics.wait(SLEEP_SLOT, 0, 0, 5);
+  }
+  return false;
+}
+
+const stash = new WeakMap();
+function slotFor(self) {
+  let slot = stash.get(self);
+  if (slot === undefined) {
+    slot = { stdin: null, stdout: null, stderr: null, exitCode: null, signalCode: null, reads: 0 };
+    stash.set(self, slot);
+  }
+  return slot;
+}
+
+// Real Sockets are kept behind the accessors, so only the reads the transport
+// performs are hostile and Node's own lifecycle is otherwise untouched.
+for (const key of ['stdin', 'stdout', 'stderr']) {
+  Object.defineProperty(ChildProcess.prototype, key, {
+    configurable: true,
+    get() {
+      const slot = stash.get(this);
+      if (slot === undefined) return null;
+      if (!disarmed && key === TARGET && slot[key] !== null) {
+        slot.reads += 1;
+        armed = true;
+        if (slot.reads === 1) {
+          // This read is the transport's first, and the hardening failure it
+          // yields leads directly to the release path, so blocking here is what
+          // places the fallback signal after the child is ready. It is a
+          // synchronization point, not padding.
+          if (WAITS_FOR_CHILD) childReady = waitForChildReady();
+          return POISON;
+        }
+        if (ACCESSOR_THROWS) {
+          cleanupFaults += 1;
+          throw new Error('hostile ' + key + ' accessor');
+        }
+        // The termination-fault case needs Node's own internals left intact.
+        return TERMINATE_FAULT ? slot[key] : POISON;
+      }
+      return slot[key];
+    },
+    set(value) { slotFor(this)[key] = value; },
+  });
+}
+
+if (TERMINATE_FAULT) {
+  // Termination consults these before it signals anything, so making them
+  // throw is what fails the bounded termination attempt itself.
+  for (const key of ['exitCode', 'signalCode']) {
+    Object.defineProperty(ChildProcess.prototype, key, {
+      configurable: true,
+      get() {
+        if (armed && !disarmed) {
+          terminationFaults += 1;
+          throw new Error('hostile ' + key + ' accessor');
+        }
+        const slot = stash.get(this);
+        return slot === undefined ? null : slot[key];
+      },
+      set(value) { slotFor(this)[key] = value; },
+    });
+  }
+}
+
+// Direct-child termination signals the transport delivers. It captures this
+// intrinsic when its module initializes, so patching it here — before that
+// import — makes every such signal observable. The terminate-fault case needs
+// that count: the platform strategy faults there before signalling anything, so
+// a non-zero count is the evidence that a fallback attempt was still made, and
+// the spawn count below is the evidence that it stayed a direct-child attempt
+// rather than reaching for a process-tree helper.
+let directChildSignals = 0;
+const realKillMethod = ChildProcess.prototype.kill;
+ChildProcess.prototype.kill = function countedKill(...args) {
+  directChildSignals += 1;
+  // The signal each attempt carried. A default-signalled attempt is reported as
+  // such rather than resolved to a name here, because what the default *means*
+  // is the operating system's business and this probe should not restate it.
+  console.log('KILL_SIGNAL=' + String(args.length === 0 ? '(default)' : args[0]));
+  return Reflect.apply(realKillMethod, this, args);
+};
+
+const spawned = [];
+// PIDs are recorded at spawn time, so identifying a process later never depends
+// on a read this probe has arranged to be hostile.
+const pidAtSpawn = new WeakMap();
+const realSpawnMethod = ChildProcess.prototype.spawn;
+ChildProcess.prototype.spawn = function patched(...args) {
+  spawned.push(this);
+  const result = Reflect.apply(realSpawnMethod, this, args);
+  if (typeof this.pid === 'number') pidAtSpawn.set(this, this.pid);
+  return result;
+};
+
+// True only for a PID this probe started, whose handle Node has not reaped, and
+// which the OS still reports as present. Because the handle is unreaped, that
+// PID cannot yet have been recycled onto an unrelated process.
+function identifyLiveOwnPid(child) {
+  const pid = pidAtSpawn.get(child);
+  if (pid === undefined || pid !== child.pid) return null;
+  if (child.exitCode !== null || child.signalCode !== null) return null;
+  try {
+    process.kill(pid, 0);
+  } catch (error) {
+    // Present but not signallable still means present.
+    if (!error || error.code !== 'EPERM') return null;
+  }
+  return pid;
+}
+
+/** Resolve true when this child ends within \`ms\`, without signalling it. */
+function awaitExit(child, ms) {
+  return new Promise((r) => {
+    const timer = setTimeout(() => { r(false); }, ms);
+    child.on('exit', () => { clearTimeout(timer); r(true); });
+    if (child.exitCode !== null || child.signalCode !== null) { clearTimeout(timer); r(true); }
+  });
+}
+
+const { invokeAgentProcess } = await import(transportUrl);
+
+const environment = {};
+for (const name of ['HOMEDRIVE', 'HOMEPATH', 'LOGONSERVER', 'PATH', 'SYSTEMDRIVE',
+  'SYSTEMROOT', 'TEMP', 'USERDOMAIN', 'USERNAME', 'USERPROFILE', 'WINDIR']) {
+  environment[name] = '';
+}
+if (process.env.SystemRoot !== undefined) {
+  environment.SYSTEMROOT = process.env.SystemRoot;
+}
+
+// The child the transport is asked to run. Every mode needs one that will not
+// exit on its own, so that a process still alive later is evidence rather than
+// a race. The adversarial mode additionally installs a POSIX handler for the
+// graceful signal and keeps running, and only announces itself once that
+// handler is in place: a termination fallback that delivers nothing stronger
+// than \`SIGTERM\` leaves this child alive, which is the whole case.
+const CHILD_SOURCE = WAITS_FOR_CHILD
+  ? "process.on('SIGTERM', () => {}); require('node:fs').writeFileSync(" +
+    JSON.stringify(READY_PATH) +
+    ", 'ready'); setInterval(()=>{},1000);"
+  : 'setInterval(()=>{},1000);';
+
+const spec = {
+  executablePath: process.execPath,
+  args: ['-e', CHILD_SOURCE],
+  workingDirectory: tmpdir(),
+  environment,
+  stdin: '',
+};
+const limits = { timeoutMs: 5000, graceMs: 200, maxStdoutBytes: 65536, maxStderrBytes: 16384 };
+
+// A bounded deadline, so a pending exchange is reported as pending instead of
+// hanging this probe until the runner's own timeout.
+const settlement = await Promise.race([
+  invokeAgentProcess(spec, limits).then(
+    (exchange) => ({ kind: 'resolved', detail: String(exchange && exchange.outcome) }),
+    (error) => ({ kind: 'rejected', detail: String(error && error.message ? error.message : error) }),
+  ),
+  new Promise((r) => setTimeout(() => { r({ kind: 'pending', detail: 'deadline' }); }, 8000)),
+]);
+console.log('SETTLEMENT=' + settlement.kind);
+console.log('DETAIL=' + settlement.detail);
+console.log('CLEANUP_FAULTS=' + cleanupFaults);
+console.log('TERMINATION_FAULTS=' + terminationFaults);
+console.log('DIRECT_CHILD_SIGNALS=' + directChildSignals);
+console.log('SPAWNED=' + spawned.length);
+console.log('CHILD_READY=' + String(childReady));
+
+disarmed = true;
+
+// ---------------------------------------------------------------------------
+// TRANSPORT RESULT, measured before this harness signals anything.
+//
+// Killing a child and then asking whether it is gone measures the harness, not
+// the transport, so nothing is signalled from here. A child the transport did
+// signal dies asynchronously, so each one is given a bounded window to finish
+// exiting on the strength of the transport's own signals alone; the child this
+// probe asks for never exits by itself, so no window can excuse an abandonment.
+// A child still present when its window closes was left alive by the transport.
+// ---------------------------------------------------------------------------
+let abandoned = 0;
+try {
+  for (const child of spawned) {
+    const ended = await awaitExit(child, 3000);
+    const pid = identifyLiveOwnPid(child);
+    if (!ended && pid !== null) {
+      console.log('ABANDONED_PID=' + pid);
+      abandoned += 1;
+    }
+  }
+} catch (error) {
+  // Evidence that cannot be collected is not evidence of a clean transport, and
+  // it must never cost this probe the cleanup below.
+  console.log('MEASUREMENT_FAULT=' + String(error && error.message ? error.message : error));
+  abandoned += 1;
+}
+console.log('ABANDONED=' + abandoned);
+
+// ---------------------------------------------------------------------------
+// HARNESS SELF-CLEANUP, only now that the evidence is recorded.
+//
+// The probe owns every process it started, so none may outlive it even when the
+// measurement above just failed the regression. Each target is a PID this probe
+// spawned and positively re-identified; no broad or name-matching kill is used.
+// ---------------------------------------------------------------------------
+let leaked = 0;
+for (const child of spawned) {
+  const pid = identifyLiveOwnPid(child);
+  if (pid === null) continue;
+  try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+  if (!(await awaitExit(child, 3000))) leaked += 1;
+}
+console.log('LEAKED=' + leaked);
+
+// The probe owns the readiness file too, and process.exit below skips finally.
+try { rmSync(READY_PATH, { force: true }); } catch { /* nothing to remove */ }
+console.log('READY_FILE_LEFT=' + String(existsSync(READY_PATH)));
+
+// Give any discarded internal rejection time to be reported before exiting.
+await new Promise((r) => setTimeout(r, 1000));
+console.log('UNHANDLED=' + unhandled.length);
+for (const message of unhandled) console.log('UNHANDLED_REASON=' + message);
+console.log('SURVIVED');
+process.exit(0);
+`;
+
+/**
  * One ordinary exchange, run from an interpreter the test chooses the flags for.
  *
  * Node's permission model can only be switched on at process start, so the
@@ -520,6 +858,115 @@ async function runIsolatedProbe(mode: string): Promise<ProbeResult> {
   } finally {
     removeTempDirectory(directory);
   }
+}
+
+/**
+ * Run one hardening-settlement probe mode in its own process.
+ *
+ * `nodeExecutable` is the interpreter that process runs under, and `stdio`
+ * the descriptors it is given. Every probe of the transport takes both
+ * defaults; the regressions below vary them to drive this runner's real
+ * asynchronous spawn-failure paths, which is the only way to reach those paths
+ * from a test without starving the machine that runs it.
+ */
+async function runHardeningSettlementProbe(
+  mode: string,
+  nodeExecutable: string = process.execPath,
+  stdio: ('ignore' | 'pipe')[] = ['ignore', 'pipe', 'pipe'],
+): Promise<ProbeResult> {
+  const directory = makeTempDirectory();
+  try {
+    const hook = join(directory, 'hook.mjs');
+    const script = join(directory, 'settlement-probe.mjs');
+    writeFileSync(hook, PROBE_HOOK);
+    writeFileSync(script, HARDENING_SETTLEMENT_PROBE_SCRIPT);
+    return await new Promise<ProbeResult>((resolve) => {
+      const probe = spawn(
+        nodeExecutable,
+        ['--import', pathToFileURL(hook).href, script, TRANSPORT_SOURCE_URL, mode],
+        { stdio },
+      );
+      let stdout = '';
+      let stderr = '';
+      let settled = false;
+      /**
+       * Answer the caller once, with whichever event arrives first.
+       *
+       * A spawn that fails emits 'error' and then 'close', so the caller
+       * receives the failure rather than the platform-specific code the
+       * trailing 'close' carries. `settled` is not what makes that true —
+       * resolving a promise a second time is already a no-op. It is explicit
+       * state recording which event answered, so that first-wins is visible
+       * here rather than inferred from promise semantics.
+       */
+      const settle = (code: number | null): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        resolve({ code, stdout, stderr });
+      };
+      // Registered ahead of the stream listeners, so nothing between the spawn
+      // and this line can leave an asynchronous spawn failure — ENOENT, EMFILE,
+      // a Windows denial — as an unhandled 'error' event. Unhandled, it ends
+      // this worker and takes the probe's evidence with it. Handled, it becomes
+      // ordinary evidence: no exit code, and a stderr line naming the failure,
+      // which is what the assertions that own this probe then fail on.
+      probe.on('error', (error: Error) => {
+        stderr += `PROBE_SPAWN_ERROR: ${error.message}\n`;
+        settle(null);
+      });
+      // Optional because a failed spawn need not leave these behind. When
+      // uv_spawn reports EMFILE or ENFILE there are no descriptors left to
+      // build pipes from, so Node abandons the attempt and returns before
+      // assigning stdout and stderr at all — they are absent at exactly the
+      // moment the 'error' above is the only thing still able to report
+      // anything. A plain `.on` would throw out of this executor and reject
+      // with a TypeError naming neither the errno nor the executable, losing
+      // the failure this runner exists to surface.
+      probe.stdout?.on('data', (chunk: Buffer) => {
+        stdout += chunk.toString('utf8');
+      });
+      probe.stderr?.on('data', (chunk: Buffer) => {
+        stderr += chunk.toString('utf8');
+      });
+      probe.on('close', (code: number | null) => {
+        settle(code);
+      });
+    });
+  } finally {
+    removeTempDirectory(directory);
+  }
+}
+
+/**
+ * Every guarantee one hardening-failure probe must demonstrate.
+ *
+ * The exchange settles inside the probe's own deadline, settles by *rejection*
+ * rather than by producing an exchange, carries the original mandatory
+ * hardening failure rather than a laundered outcome, leaves no discarded
+ * internal rejection unhandled, does not abandon a child it owned, and leaves
+ * no process behind.
+ */
+function expectHardeningFailureSettles(probe: ProbeResult): void {
+  expect(probe.stdout).toContain('SETTLEMENT=rejected');
+  expect(probe.stdout).not.toContain('SETTLEMENT=pending');
+  expect(probe.stdout).not.toContain('SETTLEMENT=resolved');
+  expect(probe.stdout).toContain('DETAIL=forced post-spawn hardening failure');
+  // No outcome vocabulary at all: a rejection is not an AgentExchange, and the
+  // mandatory failure must never be reported as a failure to spawn.
+  expect(probe.stdout).not.toContain('SPAWN_FAILED');
+  expect(probe.stdout).not.toContain('EXITED');
+  expect(probe.stdout).toContain('UNHANDLED=0');
+  // The transport's own result, recorded before the harness cleaned up after
+  // itself, and the harness's result afterwards. Both are required.
+  expect(probe.stdout).toMatch(/^ABANDONED=0$/m);
+  expect(probe.stdout).not.toContain('MEASUREMENT_FAULT=');
+  expect(probe.stdout).toMatch(/^LEAKED=0$/m);
+  expect(probe.stdout).toMatch(/^READY_FILE_LEFT=false$/m);
+  expect(probe.stderr).not.toContain("Unhandled 'error' event");
+  expect(probe.stdout).toContain('SURVIVED');
+  expect(probe.code).toBe(0);
 }
 
 /** Wait for a child-created synchronization file without racing its startup. */
@@ -1183,6 +1630,259 @@ describe('invokeAgentProcess — adversarial', () => {
       }
     }
   });
+
+  it('settles a hardening failure whose cleanup throws reading stdout', async () => {
+    const probe = await runHardeningSettlementProbe('stdout-accessor');
+
+    // The cleanup that follows the mandatory failure really did fault, so this
+    // is the defective path and not one that quietly took an ordinary route.
+    expect(probe.stdout).toMatch(/CLEANUP_FAULTS=[1-9]/);
+    expectHardeningFailureSettles(probe);
+  }, 40_000);
+
+  it('settles a hardening failure whose cleanup throws reading stderr', async () => {
+    const probe = await runHardeningSettlementProbe('stderr-accessor');
+
+    expect(probe.stdout).toMatch(/CLEANUP_FAULTS=[1-9]/);
+    expectHardeningFailureSettles(probe);
+  }, 40_000);
+
+  it('settles a hardening failure whose cleanup throws on a poisoned pipe value', async () => {
+    const probe = await runHardeningSettlementProbe('stdout-value');
+
+    // Here the accessor answers; it is the value it yields that a stream
+    // destroy cannot operate on, which is the second half of the condition.
+    expect(probe.stdout).toMatch(/CLEANUP_FAULTS=[1-9]/);
+    expectHardeningFailureSettles(probe);
+  }, 40_000);
+
+  it('settles a hardening failure whose bounded termination attempt itself fails', async () => {
+    const probe = await runHardeningSettlementProbe('terminate-fault');
+
+    // Termination faulted before it could signal anything, which is the case
+    // that used to strand the exchange without reaching cleanup at all.
+    expect(probe.stdout).toMatch(/TERMINATION_FAULTS=[1-9]/);
+    // Faulting there once meant *no* signal was ever delivered and the live
+    // direct child was abandoned. One guarded direct-child attempt must still
+    // follow, and it must stay a direct-child attempt: no second process is
+    // started, so no process-tree helper is reached for on this path.
+    //
+    // Counted exactly, not merely as non-zero. On this staged path termination
+    // faults on the first handle observation it makes, before either platform
+    // strategy can signal anything, so every signal the count can contain is
+    // the fallback's own — and the fallback is specified to make one attempt
+    // and not to wait. A count of one is therefore the whole claim: an attempt
+    // was made, and the path did not quietly become the escalating termination
+    // it is not allowed to be. The bound is asserted only for this mode, where
+    // it is exact; paths that legitimately signal more than once are not
+    // constrained from here.
+    expect(probe.stdout).toMatch(/^DIRECT_CHILD_SIGNALS=1$/m);
+    expect(probe.stdout).toMatch(/^SPAWNED=1$/m);
+    // What that attempt carried, asserted on every platform. This is a claim
+    // about the transport's own mechanism and nothing more: it says which
+    // signal is delivered, not what any operating system does with it. The
+    // POSIX consequence — that a child may decline the graceful signal and so
+    // survive an attempt that gets only one shot — is proven by outcome in the
+    // POSIX-gated case below, not asserted from here.
+    expect(probe.stdout).toMatch(/^KILL_SIGNAL=SIGKILL$/m);
+    expectHardeningFailureSettles(probe);
+  }, 40_000);
+
+  /**
+   * The same faulting-termination path, against a child that declines the
+   * graceful signal.
+   *
+   * POSIX lets a process catch or ignore `SIGTERM`, and `ChildProcess.kill()`
+   * with no argument sends exactly that. On the ordinary termination path the
+   * graceful signal is only an opening move — the strategy waits out the grace
+   * window and escalates — but the fallback here gets one attempt and cannot
+   * wait, because the caller's rejection is owed on the same turn. A fallback
+   * that spent that one attempt on an ignorable signal would leave this child
+   * running while the transport released responsibility for it, so the outcome
+   * is what is asserted: the child the transport owned is gone, measured before
+   * this harness signals anything of its own.
+   *
+   * POSIX-only, and deliberately not restated for Windows. Windows has no
+   * ignorable termination to defeat: every signal Node accepts there ends the
+   * target unconditionally, so an equivalent child cannot be written and no
+   * claim about Windows is made from this test. The Windows side of the same
+   * fallback stays covered by the mode above.
+   */
+  onPosix('kills a child that ignores SIGTERM when termination faults', async () => {
+    const probe = await runHardeningSettlementProbe('terminate-fault-sigterm-ignored');
+
+    // The adversarial condition really was staged: the child had installed its
+    // SIGTERM handler before the transport's fallback could signal it.
+    expect(probe.stdout).toMatch(/^CHILD_READY=true$/m);
+    // And the path under test is still the faulting one, with exactly one
+    // guarded direct-child attempt and no process-tree helper reached for. The
+    // count is the same exact one the mode above asserts, for the same reason:
+    // this mode stages the identical transport-side fault and differs only in
+    // the child it asks for, so a single attempt is what the outcome below is
+    // being read against.
+    expect(probe.stdout).toMatch(/TERMINATION_FAULTS=[1-9]/);
+    expect(probe.stdout).toMatch(/^DIRECT_CHILD_SIGNALS=1$/m);
+    expect(probe.stdout).toMatch(/^SPAWNED=1$/m);
+    // The signal that attempt carried, recorded for the reader; the assertion
+    // that matters is the ABANDONED=0 inside the shared expectation below,
+    // which is what a lone SIGTERM cannot satisfy against this child.
+    expect(probe.stdout).toMatch(/^KILL_SIGNAL=SIGKILL$/m);
+    expect(probe.stdout).not.toMatch(/^ABANDONED_PID=/m);
+    expectHardeningFailureSettles(probe);
+  }, 40_000);
+
+  /**
+   * The same runner, against a child that never starts.
+   *
+   * A spawn can fail asynchronously for reasons that have nothing to do with
+   * the transport under test — ENOENT, EMFILE or ENFILE, EAGAIN, ENOMEM, a
+   * Windows permission or scanner denial. Node reports every one of them as a
+   * ChildProcess 'error' event, which is not a 'close': a runner that listens
+   * only for 'close' both loses the settlement and, because an unhandled
+   * 'error' event throws, takes this worker down with it. The evidence for the
+   * probe that was running is then gone, and so is the evidence for every
+   * other test sharing the worker.
+   *
+   * Deterministic fault injection rather than real resource exhaustion: a name
+   * that was never created, inside a directory this test just made for its own
+   * use, cannot resolve to an executable on any platform, so the failure
+   * arrives on the same event by the same route. The directory is minted per
+   * test rather than fixed under the shared temp root, so no co-tenant can put
+   * a file — executable or not — where this spawn looks.
+   */
+  it('settles a probe whose child never spawns instead of killing the worker', async () => {
+    const parent = makeTempDirectory();
+    const absent = join(parent, 'absent-node-binary');
+
+    try {
+      const probe = await runHardeningSettlementProbe('stdout-accessor', absent);
+
+      // Reaching this line at all is half the claim: the promise settled and the
+      // worker survived to assert on it.
+      //
+      // The other half is that the result is this probe's, and says what went
+      // wrong. The spawn error names itself, its errno, and the executable that
+      // could not be run.
+      expect(probe.stderr).toContain('PROBE_SPAWN_ERROR: ');
+      expect(probe.stderr).toContain('ENOENT');
+      expect(probe.stderr).toContain(absent);
+      // Nothing ran, so the probe produced no evidence of its own and there is
+      // no exit code to mistake for a clean one. `null` is the 'error' event's
+      // own answer, and it is the answer that survives: a 'close' carrying a
+      // platform-specific code — negative errno on Windows — follows it, as the
+      // test below shows, and the first answer is the one the caller keeps.
+      expect(probe.stdout).toBe('');
+      expect(probe.code).toBeNull();
+      // And this reaches the assertions that own the probe as an ordinary
+      // failure, which is the whole point of converting the event: the harness
+      // fails, attributably, rather than dying.
+      expect(() => {
+        expectHardeningFailureSettles(probe);
+      }).toThrow();
+    } finally {
+      // The parent this test minted, removed by the test that made it. Nothing
+      // was ever created inside it: the child path is the name that must not
+      // resolve, so this leaves no directory behind on success or on failure.
+      removeTempDirectory(parent);
+    }
+  }, 40_000);
+
+  it('receives a close after the spawn error the probe settles on', async () => {
+    const parent = makeTempDirectory();
+    const absent = join(parent, 'absent-node-binary');
+    const events: string[] = [];
+
+    try {
+      await new Promise<void>((resolve) => {
+        const child = spawn(absent, [], { stdio: ['ignore', 'pipe', 'pipe'] });
+        // Registered here for the same reason the runner registers one: without
+        // it this spawn failure would end the worker rather than be observed.
+        child.on('error', () => {
+          events.push('error');
+        });
+        child.on('close', () => {
+          events.push('close');
+          resolve();
+        });
+      });
+
+      // Both events arrive, and in this order. That is what makes the runner's
+      // once-only settlement load-bearing rather than decorative: the failure it
+      // resolves with must not be overwritten by the close that follows.
+      expect(events).toEqual(['error', 'close']);
+    } finally {
+      // Awaited above, so the close has already arrived and nothing is still
+      // reading this directory when it goes.
+      removeTempDirectory(parent);
+    }
+  }, 20_000);
+
+  /**
+   * The same runner, against a spawn that leaves no stdio behind.
+   *
+   * EMFILE and ENFILE are the resource-exhaustion end of this same failure
+   * class, and Node treats them differently from the rest of it. They are
+   * reported as a ChildProcess 'error' like any other spawn failure, but
+   * `ChildProcess.prototype.spawn` also gives up early on them — there are no
+   * descriptors left to build pipes from, so it returns before assigning
+   * `stdout` and `stderr` at all. The handles are absent at precisely the
+   * moment the 'error' listener is the only thing that can still report the
+   * failure, and a runner that registers stream listeners unconditionally
+   * throws out of its own Promise executor before that listener can be used.
+   *
+   * Deterministic fault injection rather than real exhaustion, which would
+   * mean starving the machine running this suite of descriptors: asking for no
+   * pipes leaves the same two handles unassigned by the same statement, and an
+   * executable that cannot resolve still delivers a real asynchronous 'error'.
+   * That exhaustion yields `undefined` where this yields `null` is a
+   * distinction the runner does not draw — both are absent, and absence is
+   * what the registration has to survive.
+   */
+  it('settles a spawn failure that leaves no stdio handles behind', async () => {
+    const parent = makeTempDirectory();
+    const absent = join(parent, 'absent-node-binary');
+
+    try {
+      // The staged condition, asserted rather than assumed: a real ChildProcess,
+      // with neither handle to register a listener on.
+      const staged = spawn(absent, [], { stdio: ['ignore', 'ignore', 'ignore'] });
+      const stagedClosed = new Promise<void>((resolve) => {
+        staged.on('error', () => {});
+        staged.on('close', () => {
+          resolve();
+        });
+      });
+      expect(staged.stdout).toBeNull();
+      expect(staged.stderr).toBeNull();
+      await stagedClosed;
+
+      const probe = await runHardeningSettlementProbe('stdout-accessor', absent, [
+        'ignore',
+        'ignore',
+        'ignore',
+      ]);
+
+      // Resolved rather than rejected, which is the whole of the repair: what
+      // arrives is a ProbeResult and not a TypeError about reading 'on' of null,
+      // and this worker is alive to assert on it.
+      expect(probe.stderr).toContain('PROBE_SPAWN_ERROR: ');
+      expect(probe.stderr).toContain('ENOENT');
+      expect(probe.stderr).toContain(absent);
+      // The real cause reached the caller by the same route it takes when the
+      // handles do exist, and nothing here can be read as success. `null` also
+      // shows the trailing 'close' — which the test above proves arrives, and
+      // which carries a platform-specific code — did not overwrite the answer.
+      expect(probe.stdout).toBe('');
+      expect(probe.code).toBeNull();
+      expect(() => {
+        expectHardeningFailureSettles(probe);
+      }).toThrow();
+    } finally {
+      // Both children are settled by here — the staged one awaited, the probe's
+      // resolved — so nothing holds this directory open when it is removed.
+      removeTempDirectory(parent);
+    }
+  }, 40_000);
 
   it('scopes the probe leak assertion to the run that owns the directory', () => {
     const mine = nextProbePrefix();
