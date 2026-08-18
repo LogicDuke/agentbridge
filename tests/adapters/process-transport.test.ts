@@ -1743,12 +1743,15 @@ describe('invokeAgentProcess — adversarial', () => {
    * probe that was running is then gone, and so is the evidence for every
    * other test sharing the worker.
    *
-   * Deterministic fault injection rather than real resource exhaustion: a path
-   * under a directory that does not exist cannot resolve to an executable on
-   * any platform, so the failure arrives on the same event by the same route.
+   * Deterministic fault injection rather than real resource exhaustion: a name
+   * that was never created, inside a directory this test just made for its own
+   * use, cannot resolve to an executable on any platform, so the failure
+   * arrives on the same event by the same route. The directory is minted per
+   * test rather than fixed under the shared temp root, so no co-tenant can put
+   * a file — executable or not — where this spawn looks.
    */
   it('settles a probe whose child never spawns instead of killing the worker', async () => {
-    const absent = join(tmpdir(), 'agentbridge-absent-node-binary', 'node');
+    const absent = join(makeTempDirectory(), 'absent-node-binary');
 
     const probe = await runHardeningSettlementProbe('stdout-accessor', absent);
 
@@ -1777,7 +1780,7 @@ describe('invokeAgentProcess — adversarial', () => {
   }, 40_000);
 
   it('receives a close after the spawn error the probe settles on', async () => {
-    const absent = join(tmpdir(), 'agentbridge-absent-node-binary', 'node');
+    const absent = join(makeTempDirectory(), 'absent-node-binary');
     const events: string[] = [];
 
     await new Promise<void>((resolve) => {
@@ -1821,7 +1824,7 @@ describe('invokeAgentProcess — adversarial', () => {
    * what the registration has to survive.
    */
   it('settles a spawn failure that leaves no stdio handles behind', async () => {
-    const absent = join(tmpdir(), 'agentbridge-absent-node-binary', 'node');
+    const absent = join(makeTempDirectory(), 'absent-node-binary');
 
     // The staged condition, asserted rather than assumed: a real ChildProcess,
     // with neither handle to register a listener on.
