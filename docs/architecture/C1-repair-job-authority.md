@@ -217,13 +217,63 @@ filesystem-dependent collision that is characterisable from the strings alone; i
 establishes nothing about symbolic refs, which are not decidable from a string at
 all.
 
-**A future trusted repository/Git execution boundary must close the rest.** Before
-exercising any ref-mutating authority represented by an `ExecutionPermit`, that
-boundary must resolve the requested ref against the actual repository, resolve or
-reject repository-dependent symbolic refs, and establish that the repair ref's
-resolved target is not the protected parent's. It must **fail closed** — refuse
-the operation — if the requested repair ref resolves or dereferences to the
-protected parent, or if safe target identity cannot be established at all.
+**A future trusted repository/Git execution boundary must close the rest.** C1
+establishes structural canonical ref-name authority; it cannot establish live
+repository identity, cannot bind the target a mutation will actually reach, and
+cannot enforce anything across a concurrent change. Before acting on any authority
+an `ExecutionPermit` records — not only operations that write a ref — that
+boundary must satisfy the requirements below, and must **fail closed** — refuse
+the operation — wherever a required identity cannot be safely established,
+wherever resolution cycles or is otherwise indeterminate, or wherever an effective
+identity is or dereferences to the protected parent.
+
+*Which identity is compared.* The isolation question is about the **effective
+ref-name referent** — the terminal ref reached by resolving a symbolic-ref chain —
+not about commit-object identity. A freshly created repair branch may legitimately
+point at the **same commit object** as the protected parent until its first repair
+commit, so distinct commit OIDs are neither necessary nor sufficient: two
+different branch refs may share one commit OID, and commit-object equality does not
+make two refs the same authority target. The boundary must detect and reject a
+symbolic or effective ref-name identity that aliases the protected parent, and
+must not rest the check on whether two refs currently resolve to the same commit.
+
+*Binding the effective mutation target.* A resolved ref *name* is not the target a
+mutation will advance, and the boundary must bind the two before it acts:
+
+- **`repair.commit`.** A commit advances the branch reached through the authorized
+  worktree's effective `HEAD` referent, not whatever ref name the request carried.
+  The boundary must bind that effective `HEAD` referent to the authorized repair
+  ref and refuse to commit if the worktree is detached, attached to the protected
+  parent, attached to any other ref, or its safe binding cannot be established.
+- **`repair.push`.** The authorized repair ref identifies a source, not a
+  destination. The boundary must bind the push's **effective destination ref** to
+  the authorized repair ref and must not let a caller-selected destination refspec
+  redirect the push; the receiving/mutation side must fail closed if the effective
+  destination is the protected parent or cannot be proven to be the authorized
+  repair ref.
+
+*Operands that set direction without mutating a ref.* The obligation is not
+limited to ref-mutating operations. `repair.change_request` mutates no ref, but
+its `sourceRef` and `targetRef` fix the effective direction of the stacked
+validation request, which the quarantine requires to run **from** the repair
+branch **to** the protected parent. The boundary must establish that the effective
+source identity is the authorized repair ref and the effective target identity is
+the protected parent ref, reject a symbolic or effective alias that changes that
+direction, and fail closed if either effective identity cannot be safely
+established.
+
+*Concurrency is not closed by a pre-check.* A resolve-then-check-then-mutate
+sequence is **not** an atomic security guarantee: the effective ref or referent
+can change between the comparison and the update, so a name observed as an
+ordinary repair ref can become symbolic to the protected parent before the
+mutation lands. The invariant must be enforced **at the actual mutation/receiving
+boundary**, by a mechanism whose semantics prevent an unchecked identity change
+between comparison and update — not by an earlier client-side observation this
+boundary later trusts.
+
+This document states the required invariant, not an implementation: it names no
+git command, lock, or transaction mechanism, and it claims no more atomicity than
+the eventual executor's own primitives can actually provide.
 
 Writing that obligation down adds no runtime git authority to C1 and grants no new
 authority anywhere: C1 gains no git invocation, no filesystem access, no
@@ -244,11 +294,14 @@ authority cannot be checked against an exact operand has no place in the model.
 | `repair.push` | ref, non-force | ref is exactly the repair branch and the push is not forced |
 | `repair.change_request` | source ref, target ref | repair branch → protected parent ref |
 
-Every ref operand is read through the same canonical branch-ref reader the job
-envelope uses, so "exactly the repair branch" is a claim about a canonical ref
-name and not about a caller's chosen spelling. It is not a claim about what that
-name resolves to in a repository, which only the later trusted execution boundary
-can establish.
+Every ref operand — the `repair.commit` and `repair.push` ref, and the
+`repair.change_request` source and target refs alike — is read through the same
+canonical branch-ref reader the job envelope uses, so "exactly the repair branch"
+is a claim about a canonical ref name and not about a caller's chosen spelling. It
+is not a claim about the effective ref-name referent that name reaches in a
+repository, about which ref a commit or push would actually advance, or about the
+effective direction of a change request — all of which only the later trusted
+execution boundary can establish.
 
 `repair.change_request` is the **only** operation that may name the protected
 parent ref, and only as a change-request *target*. Opening a change request
@@ -454,12 +507,17 @@ actually holds:
 Forgery therefore buys nothing, and a permit widens no authority — it records
 authority already derived from trusted configuration.
 
-A permit is also **not a repository-safety finding**. That a `repair.commit` or
-`repair.push` ref operand passed C1's canonical syntax validation says nothing
-about what that ref resolves to in the repository the operation would touch, so a
-permit must never be read as proof that repository-level ref resolution is safe.
-The trusted execution boundary that acts on a permit performs its own resolution
-and fails closed; see *What canonical ref names do and do not prove* above.
+A permit is also **not a repository-safety finding**. That a ref operand — a
+`repair.commit` or `repair.push` ref, or a `repair.change_request` `sourceRef` or
+`targetRef` — passed C1's canonical syntax validation says nothing about the
+effective ref-name referent it reaches in the repository the operation would
+touch, about which ref a commit or push would actually advance, or about the
+effective direction of a change request, so a permit must never be read as proof
+that repository-level ref identity, the effective mutation target, or the
+change-request direction is safe. The trusted execution boundary that acts on a
+permit binds the effective target, resolves the effective identity, enforces it at
+the mutation/receiving boundary, and fails closed; see *What canonical ref names
+do and do not prove* above.
 
 ### Single use
 
@@ -584,9 +642,12 @@ invariants that stop a later layer from bypassing the quarantine by accident:
 - The protected parent ref is never a write target of any operation, under any
   *spelling*: refs are canonical everywhere, so a caller cannot present a textual
   alias of the parent as a different branch. Repository-dependent aliasing — a
-  canonical repair ref that is symbolic to the parent — is not visible to a pure
-  string boundary, and is the later trusted execution boundary's to resolve or
-  reject before any ref-mutating operation runs.
+  canonical repair ref that is symbolic to the parent, a worktree `HEAD` or push
+  destination whose effective target is the parent, a change-request source or
+  target whose effective direction is reversed, or an effective ref that changes
+  after a pre-check — is not visible to a pure string boundary, and is the later
+  trusted execution boundary's to bind, resolve, or reject before it acts on any
+  authority a permit records.
 - Filesystem-shaped operations are bound to the repair worktree, so an edit
   cannot land in the parent's checkout.
 - The stacked change request must run from the repair branch to the protected
