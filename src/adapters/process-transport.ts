@@ -199,33 +199,110 @@ function protectChildDispatch(child: ChildProcess): void {
 }
 
 /**
- * Make one promise this module owns safe to `await` after hostile code has run.
+ * The promise kind this module awaits.
  *
  * `await` does not read `then` off an ordinary native promise: `PromiseResolve`
  * recognises the promise as its own kind and hands it straight to the internal
- * reaction machinery. The recognition test is `Get(promise, "constructor")`, and
- * for a promise carrying no own `constructor` that read walks up to
+ * reaction machinery. The recognition test is `Get(promise, "constructor")`,
+ * and for a promise carrying no own `constructor` that read walks up to
  * `Promise.prototype.constructor` — an ordinary, writable property of an
  * ordinary, mutable object. Replace it with anything that is not the intrinsic
  * and the fast path is abandoned: the awaited value is then resolved as a plain
- * thenable, which *does* read `then`, reaching whatever a hostile path installed
- * on `Promise.prototype` in the meantime. A replacement that installs no
- * continuation leaves the `await` suspended for good, and everything waiting
+ * thenable, which *does* read `then`, reaching whatever a hostile path
+ * installed on `Promise.prototype` in the meantime. A replacement that installs
+ * no continuation leaves the `await` suspended for good, and everything waiting
  * behind it with it — including the mandatory hardening rejection and the
  * ordinary timeout settlement, neither of which has any further deadline left
  * to rescue it.
  *
- * An own `constructor` fixed to the captured {@link NativePromise} closes that
- * lookup at its source. The recognition test then reads a property no later
- * code can shadow, answers with the intrinsic, and the thenable path — with its
- * `then` read — is never entered. `Symbol.species` is not consulted on this
- * route at all, so no mutation of it is reachable from an `await` of a promise
- * that passed through here.
+ * {@link protectPromiseResolution} answers that lookup with an own property. It
+ * cannot answer it *unconditionally*: defining a property requires an
+ * extensible target, and a promise this module allocates is not private between
+ * the allocation and the next statement. Ordinary Node facilities — an
+ * `async_hooks` `init` hook is the reachable one, which receives each newly
+ * allocated promise as its own resource — can observe it first and seal it, and
+ * the definition then throws before it can land. Nothing in this file can
+ * prevent that, because the observation happens inside the allocation itself.
  *
- * Applied to promises this module has *just* created, which are extensible and
- * carry no own `constructor`, so the definition cannot fail; the guard is here
- * only so that this helper can never become a rejection path of its own.
- * Non-configurable, so nothing that runs later can take it back off again.
+ * The lookup is a *chain* walk, though, and only its last step is the mutable
+ * one. A promise whose immediate prototype is an object this module owns never
+ * reaches `Promise.prototype` at all: the walk stops one link earlier, at a
+ * `constructor` fixed to the captured {@link NativePromise} on a prototype
+ * created and frozen at module load, before any hostile path can run. That
+ * answer needs no own property on the instance, so sealing the instance — the
+ * one thing this module cannot prevent — no longer decides anything.
+ *
+ * Every promise this module *awaits itself* is therefore allocated from here,
+ * and {@link internalStep} exists so that the promises the runtime allocates
+ * for `async` functions are never among them. `Symbol.species` is not consulted
+ * on the `await` route at all, so no mutation of it is reachable either.
+ *
+ * The prototype's `constructor` is redefined rather than added, so a sealed
+ * prototype could not defeat this step either: the class definition already
+ * gave it that own property, and redefining a configurable own property does
+ * not require extensibility.
+ */
+class InternalPromise<T> extends Promise<T> {}
+// `void`: both intrinsics return their own first argument, which here is typed
+// as a promise because a promise prototype is one.
+void objectDefineProperty(InternalPromise.prototype, 'constructor', {
+  configurable: false,
+  enumerable: false,
+  value: NativePromise,
+  writable: false,
+});
+void objectFreeze(InternalPromise.prototype);
+void objectFreeze(InternalPromise);
+
+/**
+ * Report one internal asynchronous step through a promise this module owns.
+ *
+ * An `async` function's own promise comes from the runtime's intrinsic
+ * capability, so it inherits `constructor` straight from `Promise.prototype`
+ * and carries no own one. Awaiting it is exactly the lookup {@link
+ * InternalPromise} exists to avoid, and it cannot be repaired after the fact:
+ * the promise may already be sealed, and the only way to observe it — `then` —
+ * is the property under mutation. So no `async` function's promise is ever
+ * awaited here. The step reports its result through the capability it is
+ * handed, and the promise the runtime made for it is never consulted.
+ *
+ * That makes the step responsible for absorbing its own faults into `fail`,
+ * which every one of them does. The absorber below is a second layer for a
+ * programmer defect only: settlement never depends on it being installed, so a
+ * fault in the intrinsic's own species prologue costs nothing here.
+ */
+function internalStep<T>(
+  step: (settle: (value: T) => void, fail: (reason: unknown) => void) => Promise<void>,
+): Promise<T> {
+  return new InternalPromise<T>((resolve, reject) => {
+    const running = step(resolve, reject);
+    try {
+      void reflectApply(promiseThen, running, [undefined, reject]);
+    } catch {
+      // See the doc comment: the step has already reported through `resolve`
+      // or `reject`, so nothing is waiting on this attachment.
+    }
+  });
+}
+
+/**
+ * Fix one promise's `constructor` lookup with an own property.
+ *
+ * A second layer over {@link InternalPromise}, and the only one available for a
+ * promise handed to a caller outside this module. It answers the same
+ * recognition test one step earlier in the chain, and non-configurably, so
+ * nothing that runs later can take it back off again.
+ *
+ * **It can fail, and its failure is survivable.** Defining a property requires
+ * an extensible target, and an ordinary Node facility can seal a promise inside
+ * the allocation that produced it — before any statement of this module runs
+ * against it. The definition then throws. Returning the promise unchanged keeps
+ * this helper from becoming a rejection path of its own; what makes that
+ * *safe*, rather than a silent downgrade, is that every promise this module
+ * awaits itself already answers the same lookup from a prototype it owns, where
+ * no own property is needed. A promise that only leaves this module — the
+ * settled exchange handed back by {@link resolved} — is not awaited here, and
+ * how an external caller consumes it is that caller's own runtime.
  */
 function protectPromiseResolution<T>(promise: Promise<T>): Promise<T> {
   try {
@@ -237,15 +314,33 @@ function protectPromiseResolution<T>(promise: Promise<T>): Promise<T> {
       writable: false,
     });
   } catch {
-    // Unreachable for a freshly created promise; see the doc comment. Returning
-    // the promise unchanged keeps this helper total.
+    // Reachable: the target may have been sealed inside its own allocation.
+    // See the doc comment for why returning it unchanged is survivable.
   }
   return promise;
 }
 
+/** An already-settled promise for a caller outside this module. */
 function resolved<T>(value: T): Promise<T> {
   return protectPromiseResolution(
     new NativePromise<T>((resolve) => {
+      resolve(value);
+    }),
+  );
+}
+
+/**
+ * An already-settled promise this module goes on to `await` itself.
+ *
+ * Separate from {@link resolved} because the two have different consumers and
+ * therefore different requirements. This one is allocated from {@link
+ * InternalPromise}, whose prototype answers the recognition test without
+ * needing an own property on the instance, so an `await` of it stays on its
+ * fast path even when the instance was sealed inside its own allocation.
+ */
+function internallyResolved<T>(value: T): Promise<T> {
+  return protectPromiseResolution(
+    new InternalPromise<T>((resolve) => {
       resolve(value);
     }),
   );
@@ -458,9 +553,9 @@ function hasEnded(child: ChildProcess): boolean {
 /** Resolve true when the child ends within `ms`, false when it outlives it. */
 function waitForExit(child: ChildProcess, ms: number): Promise<boolean> {
   if (hasEnded(child)) {
-    return resolved(true);
+    return internallyResolved(true);
   }
-  const exited = new NativePromise<boolean>((resolve) => {
+  const exited = new InternalPromise<boolean>((resolve) => {
     let done = false;
     const finish = (value: boolean): void => {
       if (done) {
@@ -578,7 +673,7 @@ function runTaskkill(
   taskkill: { readonly executable: string; readonly systemRoot: string },
   pid: number,
 ): Promise<boolean> {
-  const issued = new NativePromise<boolean>((resolve) => {
+  const issued = new InternalPromise<boolean>((resolve) => {
     let killer: ChildProcess;
     try {
       const decimalPid = reflectApply(numberToString, pid, []);
@@ -675,42 +770,61 @@ function runTaskkill(
  * `setsid` itself has left that group and is not reached — which is why the
  * returned scope says *requested*, never *completed*.
  */
-async function terminatePosix(
+function terminatePosix(
   child: ChildProcess,
   pid: number,
   graceMs: number,
 ): Promise<TerminationScope> {
-  if (hasEnded(child)) {
-    return TERMINATION_SCOPE.DIRECT_CHILD_ONLY;
-  }
+  return internalStep<TerminationScope>(async (settle, fail) => {
+    try {
+      if (hasEnded(child)) {
+        settle(TERMINATION_SCOPE.DIRECT_CHILD_ONLY);
+        return;
+      }
 
-  let groupReached = signalProcessGroup(pid, 'SIGTERM');
-  if (!groupReached) {
-    killDirectChild(child, 'SIGTERM');
-  }
-  if (await waitForExit(child, graceMs)) {
-    return groupReached
-      ? TERMINATION_SCOPE.PROCESS_GROUP_REQUESTED
-      : TERMINATION_SCOPE.DIRECT_CHILD_ONLY;
-  }
+      let groupReached = signalProcessGroup(pid, 'SIGTERM');
+      if (!groupReached) {
+        killDirectChild(child, 'SIGTERM');
+      }
+      if (await waitForExit(child, graceMs)) {
+        settle(
+          groupReached
+            ? TERMINATION_SCOPE.PROCESS_GROUP_REQUESTED
+            : TERMINATION_SCOPE.DIRECT_CHILD_ONLY,
+        );
+        return;
+      }
 
-  // The grace timer and child exit can become ready in the same event-loop
-  // turn. Once the child is observed ended, its numeric process-group ID may
-  // be reused, so it must not receive the escalation signal.
-  if (hasEnded(child)) {
-    return groupReached
-      ? TERMINATION_SCOPE.PROCESS_GROUP_REQUESTED
-      : TERMINATION_SCOPE.DIRECT_CHILD_ONLY;
-  }
+      // The grace timer and child exit can become ready in the same event-loop
+      // turn. Once the child is observed ended, its numeric process-group ID may
+      // be reused, so it must not receive the escalation signal.
+      if (hasEnded(child)) {
+        settle(
+          groupReached
+            ? TERMINATION_SCOPE.PROCESS_GROUP_REQUESTED
+            : TERMINATION_SCOPE.DIRECT_CHILD_ONLY,
+        );
+        return;
+      }
 
-  if (!signalProcessGroup(pid, 'SIGKILL')) {
-    killDirectChild(child, 'SIGKILL');
-    groupReached = false;
-  }
-  await waitForExit(child, graceMs);
-  return groupReached
-    ? TERMINATION_SCOPE.PROCESS_GROUP_REQUESTED
-    : TERMINATION_SCOPE.DIRECT_CHILD_ONLY;
+      if (!signalProcessGroup(pid, 'SIGKILL')) {
+        killDirectChild(child, 'SIGKILL');
+        groupReached = false;
+      }
+      await waitForExit(child, graceMs);
+      settle(
+        groupReached
+          ? TERMINATION_SCOPE.PROCESS_GROUP_REQUESTED
+          : TERMINATION_SCOPE.DIRECT_CHILD_ONLY,
+      );
+    } catch (error) {
+      // Every observation above reads the handle, and a hostile accessor can
+      // fault on any of them. The reason reaches the caller unchanged: this is
+      // the same rejection the `async` form produced, reported through the
+      // capability instead of through a promise nothing here may await.
+      fail(error);
+    }
+  });
 }
 
 /**
@@ -721,33 +835,44 @@ async function terminatePosix(
  * `taskkill` cannot start, fails, or times out, the direct child is terminated
  * and the scope degrades to `DIRECT_CHILD_ONLY` — descendants are not claimed.
  */
-async function terminateWindows(
+function terminateWindows(
   child: ChildProcess,
   pid: number,
   graceMs: number,
 ): Promise<TerminationScope> {
-  // Once the leader has ended, its numeric PID may identify an unrelated
-  // process. Safety outranks reaching descendants that outlived the leader.
-  if (hasEnded(child)) {
-    return TERMINATION_SCOPE.DIRECT_CHILD_ONLY;
-  }
+  return internalStep<TerminationScope>(async (settle, fail) => {
+    try {
+      // Once the leader has ended, its numeric PID may identify an unrelated
+      // process. Safety outranks reaching descendants that outlived the leader.
+      if (hasEnded(child)) {
+        settle(TERMINATION_SCOPE.DIRECT_CHILD_ONLY);
+        return;
+      }
 
-  const taskkill = resolveTaskkill();
-  if (taskkill === null) {
-    killDirectChild(child);
-    await waitForExit(child, graceMs);
-    return TERMINATION_SCOPE.DIRECT_CHILD_ONLY;
-  }
+      const taskkill = resolveTaskkill();
+      if (taskkill === null) {
+        killDirectChild(child);
+        await waitForExit(child, graceMs);
+        settle(TERMINATION_SCOPE.DIRECT_CHILD_ONLY);
+        return;
+      }
 
-  const issued = await runTaskkill(taskkill, pid);
-  if (!issued) {
-    killDirectChild(child);
-    await waitForExit(child, graceMs);
-    return TERMINATION_SCOPE.DIRECT_CHILD_ONLY;
-  }
+      const issued = await runTaskkill(taskkill, pid);
+      if (!issued) {
+        killDirectChild(child);
+        await waitForExit(child, graceMs);
+        settle(TERMINATION_SCOPE.DIRECT_CHILD_ONLY);
+        return;
+      }
 
-  await waitForExit(child, graceMs);
-  return TERMINATION_SCOPE.PROCESS_TREE_REQUESTED;
+      await waitForExit(child, graceMs);
+      settle(TERMINATION_SCOPE.PROCESS_TREE_REQUESTED);
+    } catch (error) {
+      // Same contract as the POSIX strategy: the handle reads above can fault,
+      // and the reason reaches the caller unchanged.
+      fail(error);
+    }
+  });
 }
 
 /**
@@ -770,29 +895,47 @@ async function terminateWindows(
  *
  * Awaiting instead settles this function with a {@link TerminationScope}, which
  * is a string. Resolving a capability with a primitive reads nothing at all, so
- * the assimilation step that made the lookup reachable no longer occurs. The
- * awaited promise itself goes through {@link protectPromiseResolution} so that
- * the `await` cannot be pushed off its own fast path either. Rejection
- * behaviour is unchanged: a platform strategy that faults still rejects this
- * function's promise with the same value, for the same callers to handle.
+ * the assimilation step that made the lookup reachable no longer occurs.
+ *
+ * That leaves the `await` itself, which decides whether it may skip
+ * assimilation by reading `constructor` off the awaited promise. An own
+ * property answers that read only while the promise is extensible, and a
+ * promise is not private between its allocation and the next statement, so the
+ * platform strategies report through {@link internalStep} — an {@link
+ * InternalPromise}, whose prototype answers the read with no own property
+ * involved. This function reports the same way, for the same reason: its own
+ * promise is awaited by {@link releaseUnprotectedChild} and by {@link
+ * runTermination}, and the promise the runtime would have made for an `async`
+ * function is not one either of them could safely await.
+ *
+ * Rejection behaviour is unchanged: a platform strategy that faults still
+ * rejects this function's promise with the same value, for the same callers to
+ * handle.
  */
-async function terminate(
+function terminate(
   child: ChildProcess,
   platform: TransportPlatform,
   graceMs: number,
 ): Promise<TerminationScope> {
-  const pid = child.pid;
-  if (pid === undefined) {
-    // Never started, so nothing beyond the handle can be reached. Reported as
-    // degraded rather than as a successful group or tree request.
-    return TERMINATION_SCOPE.DIRECT_CHILD_ONLY;
-  }
-  const scope = await protectPromiseResolution(
-    platform === 'posix'
-      ? terminatePosix(child, pid, graceMs)
-      : terminateWindows(child, pid, graceMs),
-  );
-  return scope;
+  return internalStep<TerminationScope>(async (settle, fail) => {
+    try {
+      const pid = child.pid;
+      if (pid === undefined) {
+        // Never started, so nothing beyond the handle can be reached. Reported
+        // as degraded rather than as a successful group or tree request.
+        settle(TERMINATION_SCOPE.DIRECT_CHILD_ONLY);
+        return;
+      }
+      const scope = await protectPromiseResolution(
+        platform === 'posix'
+          ? terminatePosix(child, pid, graceMs)
+          : terminateWindows(child, pid, graceMs),
+      );
+      settle(scope);
+    } catch (error) {
+      fail(error);
+    }
+  });
 }
 
 /**
@@ -1145,9 +1288,9 @@ export function invokeAgentProcess(
     /** Resolve true on close, false when the bounded close wait expires. */
     function awaitClose(ms: number): Promise<boolean> {
       if (closed) {
-        return resolved(true);
+        return internallyResolved(true);
       }
-      const observed = new NativePromise<boolean>((resolveWait) => {
+      const observed = new InternalPromise<boolean>((resolveWait) => {
         const waiter = scheduleTimeout(() => {
           notifyClosed = null;
           resolveWait(false);
