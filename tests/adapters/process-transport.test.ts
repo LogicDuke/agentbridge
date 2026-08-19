@@ -89,6 +89,13 @@ import { join } from 'node:path';
 
 const [transportUrl, mode, scratchPrefix] = process.argv.slice(2);
 const realSystemRoot = process.env.SystemRoot;
+// A discarded internal rejection is one of the two ways a substituted helper
+// scheduler surfaces, so it is counted rather than left to Node's default
+// reporting.
+const unhandled = [];
+process.on('unhandledRejection', (reason) => {
+  unhandled.push(String(reason && reason.message ? reason.message : reason));
+});
 const { invokeAgentProcess } = await import(transportUrl);
 
 // Every directory this probe creates, so none outlives the probe.
@@ -123,7 +130,51 @@ function environment() {
 const limits = { timeoutMs: 5000, graceMs: 200, maxStdoutBytes: 65536, maxStderrBytes: 16384 };
 let spec;
 
-if (mode === 'helper') {
+// The tree-kill helper's own settlement is scheduled the same way the exchange's
+// is, and this module stays loaded across exchanges, so a scheduler substituted
+// by any earlier hostile path in the process is still in place when the helper
+// reaches it. These modes stage that directly, at the one moment that orders
+// correctly: the helper handle exists, its dispatch hardening is already
+// guaranteed to throw, and the settlement that failure leads to has not been
+// scheduled yet.
+//
+// Swallowed, the helper's promise never settles, the \`await\` in the Windows
+// termination strategy never returns, and the whole bounded release stalls with
+// the exchange still pending. Thrown, it escapes the helper's executor, rejects
+// a promise every caller treats as total, and surfaces as a discarded rejection
+// with the exchange still unsettled.
+const HELPER_THEN_SWALLOW = mode === 'helper-then-swallow';
+const HELPER_THEN_THROW = mode === 'helper-then-throw';
+const HELPER_HOSTILE_THEN = HELPER_THEN_SWALLOW || HELPER_THEN_THROW;
+const REAL_THEN = Promise.prototype.then;
+const REAL_APPLY = Reflect.apply;
+const HOSTILE_THEN_VALUE = { marker: 'hostile-helper-then-value' };
+let thenArmed = false;
+let thenHookInstalled = 0;
+let thenHookCalls = 0;
+// Calls the hook took during the transport's own synchronous run, sampled when
+// the window closes. Starts negative so a window that never closed is visible
+// as such rather than reading like a clean zero.
+let thenHookHelperCalls = -1;
+function installHostileThen() {
+  thenHookInstalled += 1;
+  Object.defineProperty(Promise.prototype, 'then', {
+    value: function hostileThen(...args) {
+      if (!thenArmed) {
+        return REAL_APPLY(REAL_THEN, this, args);
+      }
+      thenArmed = false;
+      thenHookCalls += 1;
+      if (HELPER_THEN_THROW) {
+        throw HOSTILE_THEN_VALUE;
+      }
+      return new Promise(() => {});
+    },
+    writable: true, enumerable: false, configurable: true,
+  });
+}
+
+if (mode === 'helper' || HELPER_HOSTILE_THEN) {
   // Point taskkill resolution at a directory that holds no taskkill executable,
   // so the helper spawn reports ENOENT asynchronously.
   process.env.SystemRoot = scratchDirectory(scratchPrefix + 'fakeroot-');
@@ -145,6 +196,19 @@ if (mode === 'helper') {
         // Proves the transport's own hardening must throw for this helper,
         // while leaving the genuine emit intrinsic in place.
         wouldThrow = true;
+      }
+      if (HELPER_HOSTILE_THEN) {
+        // Armed here and nowhere else. Everything the transport does between
+        // this line and its helper settlement is synchronous, so the window
+        // covers exactly that call; the microtask below closes it again for a
+        // transport that never reaches the lookup, so nothing else in this
+        // process is answered by the substitution.
+        installHostileThen();
+        thenArmed = true;
+        queueMicrotask(() => {
+          thenArmed = false;
+          thenHookHelperCalls = thenHookCalls;
+        });
       }
     }
     return result;
@@ -205,15 +269,56 @@ if (mode === 'helper') {
 }
 
 try {
-  try {
-    const exchange = await invokeAgentProcess(spec, limits);
-    console.log('RESOLVED=' + exchange.outcome + ' scope=' + exchange.terminationScope);
-  } catch (error) {
-    console.log('REJECTED=' + (error && error.message));
-  }
+  // A bounded deadline, so an exchange the transport has stalled is reported as
+  // stalled instead of hanging this probe until the runner's own timeout. Built
+  // before anything hostile is installed, and every mode that settles normally
+  // settles far inside it.
+  const outcome = await Promise.race([
+    invokeAgentProcess(spec, limits).then(
+      (exchange) => 'RESOLVED=' + exchange.outcome + ' scope=' + exchange.terminationScope,
+      (error) => 'REJECTED=' + (error && error.message ? error.message : error),
+    ),
+    new Promise((resolve) => setTimeout(() => { resolve('PENDING=deadline'); }, 12000)),
+  ]);
+  console.log(outcome);
 
   // Give any queued asynchronous spawn failure time to surface before exiting.
   await new Promise((resolve) => setTimeout(resolve, 1500));
+
+  // What this probe can prove about the scheduler it staged, collected only
+  // now that the transport's own use of it is finished and counted.
+  //
+  // A zero call count reads the same whether the transport avoided the hook or
+  // the hook was never staged at all, so the hook is re-armed and asked
+  // directly, with an ordinary lookup on an ordinary promise, and required to
+  // misbehave exactly as it would have then.
+  let thenHookReachable = false;
+  let thenHookControlSettled = 'not-run';
+  if (HELPER_HOSTILE_THEN) {
+    const before = thenHookCalls;
+    thenArmed = true;
+    try {
+      const control = new Promise((r) => { r('control'); });
+      const derived = control.then(() => { thenHookControlSettled = 'installed'; },
+                                   () => { thenHookControlSettled = 'installed'; });
+      thenHookReachable = thenHookCalls === before + 1;
+      void derived;
+    } catch (error) {
+      thenHookReachable = error === HOSTILE_THEN_VALUE;
+    }
+    thenArmed = false;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  Object.defineProperty(Promise.prototype, 'then', {
+    value: REAL_THEN, writable: true, enumerable: false, configurable: true,
+  });
+  console.log('HELPER_THEN_INSTALLED=' + thenHookInstalled);
+  console.log('HELPER_THEN_TRANSPORT_CALLS=' + thenHookHelperCalls);
+  console.log('HELPER_THEN_REACHABLE=' + String(thenHookReachable));
+  console.log('HELPER_THEN_CONTROL=' + thenHookControlSettled);
+  console.log('HELPER_THEN_RESTORED=' + String(Promise.prototype.then === REAL_THEN));
+  console.log('UNHANDLED=' + unhandled.length);
+  for (const message of unhandled) console.log('UNHANDLED_REASON=' + message);
   console.log('SURVIVED');
 } finally {
   // process.exit skips finally blocks, so clean up before reaching it.
@@ -262,6 +367,28 @@ import { join } from 'node:path';
 
 const [transportUrl, mode] = process.argv.slice(2);
 
+// Every mode this probe implements. An unrecognised name would otherwise fall
+// through to the default branches below, stage a different scenario than the
+// test asked for, and report a pass for a case that was never run. A probe that
+// cannot honour its own configuration must say so and stop.
+const MODES = [
+  'stdout-accessor',
+  'stderr-accessor',
+  'stdout-value',
+  'terminate-fault',
+  'terminate-fault-sigterm-ignored',
+  'unclassifiable-throw',
+  'error-identity-mutation',
+  'hostile-error-global',
+  'hostile-has-instance',
+  'hostile-then-swallow',
+  'hostile-then-throw',
+];
+if (!MODES.includes(mode)) {
+  console.log('MODE_INVALID=' + String(mode));
+  process.exit(3);
+}
+
 const unhandled = [];
 process.on('unhandledRejection', (reason) => {
   unhandled.push(String(reason && reason.message ? reason.message : reason));
@@ -273,13 +400,212 @@ let terminationFaults = 0;
 let armed = false;
 let disarmed = false;
 
+// What the forced hardening failure throws.
+//
+// Ordinarily a plain Error carrying the marker, which is the value the
+// transport owes the caller back unchanged. The \`unclassifiable-throw\` mode
+// throws the proxy instead: a value whose own JavaScript classification faults,
+// because \`instanceof\` walks the operand's prototype chain and this one
+// refuses to be walked. The child is already created and the mandatory
+// hardening has already failed by the time that value is examined, so what the
+// mode asks is whether the bounded release still begins, and whether the
+// hardening failure still reaches the caller, once *classifying* the thrown
+// value is itself the thing that throws.
+const UNCLASSIFIABLE = mode === 'unclassifiable-throw';
+let classificationFaults = 0;
+const UNCLASSIFIABLE_VALUE = new Proxy({}, {
+  getPrototypeOf() {
+    classificationFaults += 1;
+    throw new Error('hostile classification');
+  },
+});
+// The exact Error object the forced failure raised, kept so the value the
+// caller is finally handed can be compared against it by identity rather than
+// by message. A message survives operations an object identity does not, so
+// message equality alone would report a pass for a substituted Error.
+let thrownError = null;
+// Whether this mode arranges for classifying the thrown value to overwrite the
+// \`Error\` global the transport is about to construct its fallback with.
+//
+// The classification is a prototype-chain read, and a Proxy answers it with its
+// own code. That code does not need to throw: it installs a replacement \`Error\`
+// constructor that does, and then answers the read with a plain \`null\` so the
+// classification simply reports "not an Error". A transport that looks the
+// constructor up again at that point builds its fallback through the
+// replacement, the construction throws, the \`catch\` that exists to cover it
+// repeats the same lookup, and the second throw escapes the whole block with
+// the child's bounded release still unreached.
+const HOSTILE_ERROR_GLOBAL = mode === 'hostile-error-global';
+const RealError = Error;
+let globalPoisoned = 0;
+// Constructions of the transport's own fallback that went through the
+// replacement. Counted by message rather than by volume, because this probe's
+// other instrumentation legitimately allocates through the global too once it
+// has been poisoned, and that noise must not be mistaken for the one
+// construction under test. Staying at zero is the property being asserted; a
+// transport that looks the constructor up again drives it non-zero and dies.
+let fallbackViaPoisoned = 0;
+// Deliberately not an Error: whatever escapes a regressed transport must be
+// distinguishable from anything this transport could legitimately have built.
+const HOSTILE_SECONDARY = { marker: 'hostile-global-secondary' };
+const HOSTILE_GLOBAL_VALUE = new Proxy({}, {
+  getPrototypeOf() {
+    globalPoisoned += 1;
+    globalThis.Error = new Proxy(RealError, {
+      construct(target, args) {
+        if (args && args[0] === 'Process dispatch hardening failed') {
+          fallbackViaPoisoned += 1;
+        }
+        throw HOSTILE_SECONDARY;
+      },
+    });
+    // Not a throw. The classification answers cleanly and the damage is left
+    // waiting for the *next* lookup of the global.
+    return null;
+  },
+});
+// Whether this mode arranges for the *classifier itself* to be lied to.
+//
+// Capturing the \`Error\` constructor fixes which object the classification
+// interrogates, but the \`instanceof\` operator does not interrogate that
+// object's prototype chain first: it looks up \`@@hasInstance\` on the
+// constructor and defers to whatever it finds there. \`Error\` is an ordinary
+// mutable object as well as a mutable global, so a path that runs before the
+// classification can define an own hook that simply answers "yes". The value
+// thrown by this mode is a plain object with no Error identity whatsoever; a
+// transport that classifies with the operator is told it is an Error, keeps it
+// unchanged, and hands the caller a raw hostile object where the contract
+// promised the stable hardening failure carrying the original as \`cause\`.
+const HOSTILE_HAS_INSTANCE = mode === 'hostile-has-instance';
+// Deliberately not an Error, and deliberately not a Proxy either: the lie is
+// told by the constructor's own hook, not by anything this value does when it
+// is read. Nothing about the value itself could make a chain walk say yes.
+const HOSTILE_HAS_INSTANCE_VALUE = { marker: 'hostile-has-instance-value' };
+let hasInstanceInstalled = 0;
+let hasInstanceCalls = 0;
+// The ordinary chain walk, captured before anything is installed over it, so
+// the hook can lie about the single value under test and answer every other
+// question truthfully. A hook that said "yes" to everything would also be
+// answering for this probe's own instrumentation and for Node's internals for
+// as long as it stayed installed, and that collateral damage would be
+// indistinguishable from the defect being measured.
+const ORDINARY_HAS_INSTANCE = Function.prototype[Symbol.hasInstance];
+function installHostileHasInstance() {
+  hasInstanceInstalled += 1;
+  Object.defineProperty(RealError, Symbol.hasInstance, {
+    value(candidate) {
+      hasInstanceCalls += 1;
+      if (candidate === HOSTILE_HAS_INSTANCE_VALUE) return true;
+      return Reflect.apply(ORDINARY_HAS_INSTANCE, this, [candidate]);
+    },
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
+}
+// Whether this mode substitutes the *scheduler* the settlement path reaches.
+//
+// The transport hands the caller its mandatory failure from a continuation
+// installed on an internal release promise. Installing it is a property lookup
+// — \`release.then\` — and \`Promise.prototype.then\` is an ordinary writable
+// property of an ordinary mutable object, reachable by any code that runs
+// before the installation. The forced hardening failure is exactly such a
+// window: this hook is installed on the way out of it, strictly before the
+// transport classifies anything and strictly before the release begins.
+//
+// Two shapes, because they defeat the settlement in opposite ways. A scheduler
+// that quietly installs nothing leaves the exchange pending for good — the
+// exchange deadline is not armed on this path, so nothing else ends it. A
+// scheduler that throws escapes the promise executor the settlement sits in
+// and rejects the caller with the hostile value, in place of the mandatory
+// hardening failure the contract owes.
+const HOSTILE_THEN_SWALLOW = mode === 'hostile-then-swallow';
+const HOSTILE_THEN_THROW = mode === 'hostile-then-throw';
+const HOSTILE_THEN = HOSTILE_THEN_SWALLOW || HOSTILE_THEN_THROW;
+// The genuine intrinsic, and the genuine \`Reflect.apply\`, captured before
+// anything is installed over either. The hook delegates through them whenever
+// it is not armed, so the substitution is inert for every promise in this
+// process except the one call under test. A blanket replacement would break
+// this probe's own plumbing and Node's internals alike, and that collateral
+// damage would be indistinguishable from the defect being measured.
+const REAL_THEN = Promise.prototype.then;
+const REAL_APPLY = Reflect.apply;
+// Deliberately not an Error: whatever a regressed transport hands back must be
+// distinguishable from anything this transport could legitimately have built.
+const HOSTILE_THEN_VALUE = { marker: 'hostile-then-value' };
+let thenArmed = false;
+let thenHookInstalled = 0;
+let thenHookCalls = 0;
+function installHostileThen() {
+  thenHookInstalled += 1;
+  Object.defineProperty(Promise.prototype, 'then', {
+    value: function hostileThen(...args) {
+      if (!thenArmed) {
+        return REAL_APPLY(REAL_THEN, this, args);
+      }
+      // One shot. The armed window is the transport's own synchronous run, and
+      // leaving it open past the call under test would start answering for
+      // this probe's plumbing instead.
+      thenArmed = false;
+      thenHookCalls += 1;
+      if (HOSTILE_THEN_THROW) {
+        throw HOSTILE_THEN_VALUE;
+      }
+      // Swallowed: no continuation is installed anywhere, and the promise
+      // handed back never settles.
+      return new Promise(() => {});
+    },
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
+}
+
+function hardeningThrow() {
+  if (HOSTILE_THEN) {
+    // Installed and armed on the way out of the forced hardening failure,
+    // which is strictly before the transport reaches its settlement
+    // scheduling point. The window is closed again the moment the transport's
+    // synchronous work returns, below.
+    installHostileThen();
+    thenArmed = true;
+  }
+  if (HOSTILE_HAS_INSTANCE) {
+    // Installed on the way out of the forced hardening failure, which is
+    // strictly before the transport classifies anything, so the hook is
+    // already in place for the very first question the classifier asks.
+    installHostileHasInstance();
+    return HOSTILE_HAS_INSTANCE_VALUE;
+  }
+  if (HOSTILE_ERROR_GLOBAL) return HOSTILE_GLOBAL_VALUE;
+  if (UNCLASSIFIABLE) return UNCLASSIFIABLE_VALUE;
+  thrownError = new Error(HARDENING_MARKER);
+  return thrownError;
+}
+
+// Whether this mode arranges for the release to *rewrite* the already-thrown
+// Error rather than to fault.
+//
+// The release consults the handle's \`pid\`, \`exitCode\`, and \`signalCode\`
+// synchronously, before it can suspend. This mode gives one of those accessors
+// a side effect instead of a throw: it strips the thrown Error's prototype
+// chain, which is precisely what \`instanceof Error\` consults. A transport that
+// classifies the caught value only after starting the release therefore sees an
+// ordinary Error as unclassifiable and substitutes the generic fallback, and the
+// caller loses the Error that was actually raised. The accessor still runs in
+// the repaired ordering — the count below proves it — so what the mode asks is
+// whether classification already happened by then.
+const IDENTITY_MUTATION = mode === 'error-identity-mutation';
+let identityMutations = 0;
+
 // The value a hostile stdio accessor yields. Defining a property on it throws
-// the marker, which is what forces the transport's own mandatory post-spawn
-// dispatch hardening to fail without replacing Node's emit intrinsic. Reading
-// the state a stream destroy consults throws too, which is the second half of
-// the condition: the cleanup that follows the mandatory failure faults on it.
+// the forced failure above, which is what makes the transport's own mandatory
+// post-spawn dispatch hardening fail without replacing Node's emit intrinsic.
+// Reading the state a stream destroy consults throws too, which is the second
+// half of the condition: the cleanup that follows the mandatory failure faults
+// on it.
 const POISON = new Proxy({}, {
-  defineProperty() { throw new Error(HARDENING_MARKER); },
+  defineProperty() { throw hardeningThrow(); },
   get(target, key) {
     if (key === '_readableState' || key === '_writableState' || key === 'destroy') {
       cleanupFaults += 1;
@@ -379,16 +705,32 @@ for (const key of ['stdin', 'stdout', 'stderr']) {
   });
 }
 
-if (TERMINATE_FAULT) {
-  // Termination consults these before it signals anything, so making them
-  // throw is what fails the bounded termination attempt itself.
+if (TERMINATE_FAULT || IDENTITY_MUTATION) {
+  // Termination consults these before it signals anything, and it does so
+  // synchronously — before the release it belongs to has had any chance to
+  // suspend. That single fact is what both modes below exploit, from opposite
+  // directions: one makes the read fail the bounded termination attempt
+  // outright, the other lets it succeed but uses the moment it is granted to
+  // rewrite the Error that was already thrown.
   for (const key of ['exitCode', 'signalCode']) {
     Object.defineProperty(ChildProcess.prototype, key, {
       configurable: true,
       get() {
         if (armed && !disarmed) {
-          terminationFaults += 1;
-          throw new Error('hostile ' + key + ' accessor');
+          if (TERMINATE_FAULT) {
+            terminationFaults += 1;
+            throw new Error('hostile ' + key + ' accessor');
+          }
+          // Not a throw. Severing the prototype chain leaves the object,
+          // its message, and its stack exactly as they were, and changes only
+          // the one question \`instanceof Error\` asks about it. Nothing here
+          // is undone afterwards, so a transport that already classified the
+          // value keeps it and a transport that has not yet classified it
+          // cannot recognise it any more.
+          if (thrownError !== null) {
+            identityMutations += 1;
+            Object.setPrototypeOf(thrownError, null);
+          }
         }
         const slot = stash.get(this);
         return slot === undefined ? null : slot[key];
@@ -485,18 +827,196 @@ const spec = {
 };
 const limits = { timeoutMs: 5000, graceMs: 200, maxStdoutBytes: 65536, maxStderrBytes: 16384 };
 
+// The call, kept apart from everything this probe then schedules on it.
+//
+// The transport installs its settlement continuation synchronously, inside
+// this call: the hardening failure, the classification, the start of the
+// release, and the scheduling of the rejection all happen before it returns.
+// That makes this line the exact close of the hostile-scheduler window opened
+// in \`hardeningThrow\`, and closing it here is what keeps the substitution
+// answerable only for the transport's own call. It also makes the count below
+// unambiguous: whatever the hook was asked, it was asked by the transport.
+const exchange = invokeAgentProcess(spec, limits);
+const thenHookTransportCalls = thenHookCalls;
+thenArmed = false;
+
 // A bounded deadline, so a pending exchange is reported as pending instead of
 // hanging this probe until the runner's own timeout.
 const settlement = await Promise.race([
-  invokeAgentProcess(spec, limits).then(
+  exchange.then(
     (exchange) => ({ kind: 'resolved', detail: String(exchange && exchange.outcome) }),
-    (error) => ({ kind: 'rejected', detail: String(error && error.message ? error.message : error) }),
+    (error) => ({
+      kind: 'rejected',
+      detail: String(error && error.message ? error.message : error),
+      // Whether the caller was handed back the very Error object the forced
+      // failure threw, decided by reference. Both comparisons are guarded
+      // because this arm may not fail the probe by throwing out of it; a
+      // comparison that could not be made is reported as a failed one.
+      identity: (() => {
+        try { return thrownError !== null && error === thrownError; } catch { return false; }
+      })(),
+      // And, for the value that has no Error identity to preserve, whether the
+      // fallback retained that exact original value as its cause. Reading
+      // \`cause\` here touches an ordinary own property of an Error this probe
+      // did not create; the comparison itself is a reference test and invokes
+      // nothing on the hostile value.
+      causeIdentity: (() => {
+        try {
+          return error !== null && typeof error === 'object' &&
+            error.cause === UNCLASSIFIABLE_VALUE;
+        } catch { return false; }
+      })(),
+      // The same question for the hostile-global mode, whose thrown value is a
+      // different object. Kept as its own comparison so neither mode's identity
+      // claim can be satisfied by the other mode's value.
+      causeIdentityGlobal: (() => {
+        try {
+          return error !== null && typeof error === 'object' &&
+            error.cause === HOSTILE_GLOBAL_VALUE;
+        } catch { return false; }
+      })(),
+      // The same question again for the lying-hook mode. Its value is a third
+      // distinct object, kept as its own comparison so no mode's cause claim
+      // can be satisfied by another mode's value.
+      causeIdentityHasInstance: (() => {
+        try {
+          return error !== null && typeof error === 'object' &&
+            error.cause === HOSTILE_HAS_INSTANCE_VALUE;
+        } catch { return false; }
+      })(),
+      // The same question for the substituted-scheduler modes, whose thrown
+      // value is a fourth distinct object. A throwing scheduler escapes the
+      // executor the settlement sits in, so this is what a regressed transport
+      // hands back in place of the mandatory failure.
+      rawHostileThenReason: (() => {
+        try { return error === HOSTILE_THEN_VALUE; } catch { return false; }
+      })(),
+      // And the failure the repair exists to prevent, asked directly: whether
+      // the raw hostile object was itself handed back as the rejection reason.
+      // A defective classifier answers true here, and it is a reference test,
+      // so no property of the hostile value is read to decide it.
+      rawHostileReason: (() => {
+        try { return error === HOSTILE_HAS_INSTANCE_VALUE; } catch { return false; }
+      })(),
+    }),
   ),
   new Promise((r) => setTimeout(() => { r({ kind: 'pending', detail: 'deadline' }); }, 8000)),
 ]);
+// Whether the constructor the trap installed would in fact have failed the
+// fallback construction. Without this the regression would also pass against a
+// replacement that happened to be harmless, which proves nothing about a
+// transport that avoided it. Asked while it is still installed, and only then
+// is the real constructor put back.
+let hostileCtorLethal = false;
+try { new globalThis.Error('probe'); } catch { hostileCtorLethal = true; }
+globalThis.Error = RealError;
+
+// The lying-hook mode's evidence, collected in one place and in an order that
+// keeps each claim independent of the next.
+//
+// The transport's own classification is finished by now, so the call count is
+// fixed before this probe asks anything of its own; the repaired classifier
+// never consults the hook and leaves it at zero. What that zero does not by
+// itself establish is that the hook was ever *reachable* — a count of zero
+// reads the same whether the classifier avoided the hook or the hook was never
+// staged at all. So the operator is run here, against the same value, with the
+// same hook still installed, and it is required to return the lie. That is the
+// counterfactual made into evidence: an \`instanceof\`-based classifier at the
+// same moment would have been told this plain object is an Error.
+const hasInstanceTransportCalls = hasInstanceCalls;
+let hasInstanceOperatorLie = false;
+try { hasInstanceOperatorLie = HOSTILE_HAS_INSTANCE_VALUE instanceof RealError; } catch {}
+const hasInstanceOperatorCalls = hasInstanceCalls - hasInstanceTransportCalls;
+// And the lie is specific to the staged value rather than a blanket "yes" that
+// would prove nothing about classification: a genuine Error still classifies as
+// one while the hook is installed.
+let hasInstanceGenuine = false;
+try { hasInstanceGenuine = new RealError('control') instanceof RealError; } catch {}
+// Restored before anything else runs, and the restoration is verified rather
+// than assumed: the own hook is gone, the inherited intrinsic answers again,
+// and the value that was being lied about is correctly rejected once more.
+// Deleting is unconditional and harmless on the modes that never installed.
+delete RealError[Symbol.hasInstance];
+let hasInstanceRestored = false;
+try {
+  hasInstanceRestored =
+    Object.getOwnPropertyDescriptor(RealError, Symbol.hasInstance) === undefined &&
+    new RealError('restored') instanceof RealError &&
+    !(HOSTILE_HAS_INSTANCE_VALUE instanceof RealError);
+} catch {}
+// The substituted-scheduler modes' evidence, collected the same way and in the
+// same order: what the transport did first, then what this probe can prove
+// about the hook that was staged for it.
+//
+// The transport's scheduling is finished by now, so its call count is already
+// fixed; a repaired transport schedules through a captured intrinsic and leaves
+// it at zero. A zero on its own proves nothing, because it reads the same
+// whether the transport avoided the hook or the hook was never staged. So the
+// hook is re-armed here and asked directly, with an ordinary lookup on an
+// ordinary promise, and it is required to misbehave exactly as it would have
+// then. That is the counterfactual made into evidence: an ordinary
+// \`release.then\` at the same moment would have reached this.
+let thenHookReachable = false;
+let thenHookControlSettled = 'not-run';
+if (HOSTILE_THEN) {
+  const callsBeforeControl = thenHookCalls;
+  thenArmed = true;
+  try {
+    const control = new Promise((r) => { r('control'); });
+    // Deliberately an ordinary property lookup — the very thing the repair
+    // removed from the transport's settlement path.
+    const derived = control.then(() => { thenHookControlSettled = 'installed'; },
+                                 () => { thenHookControlSettled = 'installed'; });
+    // A swallowing scheduler hands back a promise that never settles and
+    // installs nothing, so the flag above stays untouched.
+    thenHookReachable = thenHookCalls === callsBeforeControl + 1;
+    void derived;
+  } catch (error) {
+    // A throwing scheduler answers by throwing, which is itself the proof.
+    thenHookReachable = error === HOSTILE_THEN_VALUE;
+  }
+  thenArmed = false;
+  // Let a swallowed continuation prove it was swallowed rather than merely
+  // slow: an intact scheduler would have run it by the end of this turn.
+  await new Promise((r) => setTimeout(r, 50));
+}
+// Restored before anything else runs, and the restoration is verified rather
+// than assumed, so this probe cannot leave a substituted scheduler behind for
+// its own cleanup or for Node's shutdown. Unconditional and harmless on the
+// modes that never installed.
+Object.defineProperty(Promise.prototype, 'then', {
+  value: REAL_THEN, writable: true, enumerable: false, configurable: true,
+});
+let thenRestored = false;
+try {
+  thenRestored = Promise.prototype.then === REAL_THEN;
+} catch {}
+console.log('THEN_HOOK_INSTALLED=' + thenHookInstalled);
+console.log('THEN_HOOK_TRANSPORT_CALLS=' + thenHookTransportCalls);
+console.log('THEN_HOOK_TOTAL_CALLS=' + thenHookCalls);
+console.log('THEN_HOOK_REACHABLE=' + String(thenHookReachable));
+console.log('THEN_HOOK_CONTROL=' + thenHookControlSettled);
+console.log('THEN_RESTORED=' + String(thenRestored));
+console.log('REJECTED_RAW_HOSTILE_THEN=' + String(settlement.rawHostileThenReason === true));
+console.log('HASINSTANCE_INSTALLED=' + hasInstanceInstalled);
+console.log('HASINSTANCE_CALLS=' + hasInstanceTransportCalls);
+console.log('HASINSTANCE_OPERATOR_LIE=' + String(hasInstanceOperatorLie));
+console.log('HASINSTANCE_OPERATOR_CALLS=' + hasInstanceOperatorCalls);
+console.log('HASINSTANCE_GENUINE=' + String(hasInstanceGenuine));
+console.log('HASINSTANCE_RESTORED=' + String(hasInstanceRestored));
+console.log('CAUSE_IDENTITY_HASINSTANCE=' + String(settlement.causeIdentityHasInstance === true));
+console.log('REJECTED_RAW_HOSTILE=' + String(settlement.rawHostileReason === true));
+console.log('GLOBAL_POISONED=' + globalPoisoned);
+console.log('FALLBACK_VIA_POISONED=' + fallbackViaPoisoned);
+console.log('HOSTILE_CTOR_LETHAL=' + String(hostileCtorLethal));
+console.log('CAUSE_IDENTITY_GLOBAL=' + String(settlement.causeIdentityGlobal === true));
 console.log('SETTLEMENT=' + settlement.kind);
 console.log('DETAIL=' + settlement.detail);
 console.log('CLEANUP_FAULTS=' + cleanupFaults);
+console.log('CLASSIFICATION_FAULTS=' + classificationFaults);
+console.log('IDENTITY_MUTATIONS=' + identityMutations);
+console.log('ERROR_IDENTITY=' + String(settlement.identity === true));
+console.log('CAUSE_IDENTITY=' + String(settlement.causeIdentity === true));
 console.log('TERMINATION_FAULTS=' + terminationFaults);
 console.log('DIRECT_CHILD_SIGNALS=' + directChildSignals);
 console.log('SPAWNED=' + spawned.length);
@@ -947,12 +1467,20 @@ async function runHardeningSettlementProbe(
  * hardening failure rather than a laundered outcome, leaves no discarded
  * internal rejection unhandled, does not abandon a child it owned, and leaves
  * no process behind.
+ *
+ * `reason` is the message that rejection must carry. It defaults to the marker
+ * the forced failure throws, because on every mode whose thrown value is an
+ * ordinary Error the transport is required to hand that same Error back. Only a
+ * mode whose thrown value is not an Error at all supplies anything else.
  */
-function expectHardeningFailureSettles(probe: ProbeResult): void {
+function expectHardeningFailureSettles(
+  probe: ProbeResult,
+  reason: string = 'forced post-spawn hardening failure',
+): void {
   expect(probe.stdout).toContain('SETTLEMENT=rejected');
   expect(probe.stdout).not.toContain('SETTLEMENT=pending');
   expect(probe.stdout).not.toContain('SETTLEMENT=resolved');
-  expect(probe.stdout).toContain('DETAIL=forced post-spawn hardening failure');
+  expect(probe.stdout).toContain(`DETAIL=${reason}`);
   // No outcome vocabulary at all: a rejection is not an AgentExchange, and the
   // mandatory failure must never be reported as a failure to spawn.
   expect(probe.stdout).not.toContain('SPAWN_FAILED');
@@ -1656,6 +2184,266 @@ describe('invokeAgentProcess — adversarial', () => {
     expectHardeningFailureSettles(probe);
   }, 40_000);
 
+  /**
+   * The same mandatory failure, thrown as a value that cannot be classified.
+   *
+   * Deciding what to reject with means asking whether the caught value is an
+   * Error, and `instanceof` answers that by walking the value's own prototype
+   * chain — an operation the value itself can refuse. Left unguarded, that
+   * question became a precondition for cleanup: a value that refused it left an
+   * already-created child unreleased and put the secondary classification error
+   * in front of the caller as the terminal cause. Neither is allowed. The
+   * question is therefore answered inside a total block, so a value that
+   * refuses it costs the exchange neither the release nor the stable reason it
+   * owes — and the original value, being the only record of what actually went
+   * wrong, is kept as that reason's `cause`.
+   */
+  it('settles a hardening failure whose thrown value cannot be classified', async () => {
+    const probe = await runHardeningSettlementProbe('unclassifiable-throw');
+
+    // The staged condition really was reached: classifying the caught value
+    // threw, where every other mode's value is merely tested. Counted exactly —
+    // the transport asks the question once, and a repair that asked it again
+    // would be re-entering a hostile operation it already knows faults.
+    expect(probe.stdout).toMatch(/^CLASSIFICATION_FAULTS=1$/m);
+    // A real child was created, and the release that follows the mandatory
+    // failure still ran far enough to reach the poisoned pipe value and fault
+    // on it — bounded and absorbed, exactly as on the ordinary modes. Before
+    // the repair the classification threw out of the catch and neither
+    // happened, which is what the total block above now prevents. The
+    // process count is only bounded from below here, because this mode reaches
+    // the ordinary termination strategy and Windows starts a tree-kill helper
+    // there; the exact-count claim belongs to the faulting-termination modes,
+    // where no helper may be reached at all.
+    expect(probe.stdout).toMatch(/^SPAWNED=[1-9][0-9]*$/m);
+    expect(probe.stdout).toMatch(/CLEANUP_FAULTS=[1-9]/);
+    // And the secondary classification error is not what the caller is told.
+    expect(probe.stdout).not.toContain('DETAIL=hostile classification');
+    // The stable hardening failure is, rather than the original Error the other
+    // modes get back, because here there was no Error to preserve.
+    expectHardeningFailureSettles(probe, 'Process dispatch hardening failed');
+    // There was no Error identity to preserve, but there was still a *value*,
+    // and it is the only record of what actually failed. The stable message
+    // alone would read identically whether that value had been retained or
+    // silently dropped, so the reported rejection is checked to carry the exact
+    // original object as its `cause` — by reference, decided inside the probe
+    // where both are in hand.
+    expect(probe.stdout).toMatch(/^CAUSE_IDENTITY=true$/m);
+  }, 40_000);
+
+  /**
+   * An ordinary Error, thrown by the same mandatory failure, against a handle
+   * that rewrites it the moment the release reads anything.
+   *
+   * The release is not an inert operation. Before it can suspend it consults
+   * the handle's `pid`, `exitCode`, and `signalCode`, and each of those is a
+   * call into code the handle controls. Starting it before the caught value has
+   * been classified therefore hands that code the chance to act first, and the
+   * cheapest thing it can do is sever the thrown Error's prototype chain: the
+   * object, its message, and its stack are untouched, but `instanceof Error` —
+   * the one question the transport asks about it — now answers no. The Error
+   * the caller is owed is then replaced by the generic fallback, and nothing in
+   * the reported message gives that away, because the fallback the caller gets
+   * would be a *different* message and the substitution only shows up if the
+   * two objects are compared. So they are compared, by reference.
+   *
+   * The accessor is not disarmed for this mode; the release still reads it and
+   * the rewrite still happens. What the repaired ordering changes is only that
+   * classification has already been decided by then.
+   */
+  it('preserves the thrown Error identity when the release would rewrite it', async () => {
+    const probe = await runHardeningSettlementProbe('error-identity-mutation');
+
+    // The staged condition really was reached: the release read an accessor
+    // this mode had armed, and the thrown Error's prototype chain was severed.
+    // Without this the regression would pass on a transport the mutation never
+    // touched, which is every transport that simply never released the child.
+    expect(probe.stdout).toMatch(/^IDENTITY_MUTATIONS=[1-9][0-9]*$/m);
+    // And the release ran far enough past that read to reach the poisoned pipe
+    // value and fault on it — bounded and absorbed, as on the ordinary modes.
+    expect(probe.stdout).toMatch(/^SPAWNED=[1-9][0-9]*$/m);
+    expect(probe.stdout).toMatch(/CLEANUP_FAULTS=[1-9]/);
+    // Classification was decided before any of that, so it never faulted and
+    // never needed the fallback: no substitute Error was manufactured.
+    expect(probe.stdout).toMatch(/^CLASSIFICATION_FAULTS=0$/m);
+    expect(probe.stdout).not.toContain('DETAIL=Process dispatch hardening failed');
+    // The caller received the very object that was thrown — not an equal one.
+    expect(probe.stdout).toMatch(/^ERROR_IDENTITY=true$/m);
+    expectHardeningFailureSettles(probe);
+  }, 40_000);
+
+  /**
+   * A thrown value that rewrites the `Error` global while it is being
+   * classified, against a transport that must still release the child.
+   *
+   * Classification asks the value one question, and a Proxy answers it with its
+   * own code. The answer given here is an ordinary `null` — "not an Error" —
+   * but on the way out the trap replaces `globalThis.Error` with a constructor
+   * that throws. Everything then turns on where the fallback's constructor
+   * comes from. Looked up again at that moment, it is the replacement: the
+   * ternary's fallback throws, the `catch` written to absorb exactly that
+   * repeats the same lookup, and its throw escapes the block entirely. The
+   * release never runs, and a real child that was already spawned is left
+   * alive — the one outcome this whole path exists to prevent, reached without
+   * the classification ever having thrown.
+   *
+   * The trap still fires here and the replacement is still installed and still
+   * lethal; the probe proves both rather than assuming them. What the repair
+   * changes is only that the constructor was captured before the value that
+   * poisoned the global ever existed, so the fallback is built without ever
+   * consulting it again.
+   */
+  it('builds the fallback with a captured constructor when classification poisons the Error global', async () => {
+    const probe = await runHardeningSettlementProbe('hostile-error-global');
+
+    // The staged condition was genuinely reached: the value's classification
+    // hook ran, and it really did overwrite the global.
+    expect(probe.stdout).toMatch(/^GLOBAL_POISONED=[1-9][0-9]*$/m);
+    // And what it installed would really have failed a construction, so a
+    // transport that used it could not have survived. Without this the case
+    // could pass against a harmless replacement and prove nothing.
+    expect(probe.stdout).toMatch(/^HOSTILE_CTOR_LETHAL=true$/m);
+    // The transport's own fallback was never built through it.
+    expect(probe.stdout).toMatch(/^FALLBACK_VIA_POISONED=0$/m);
+    // The secondary throw a regressed transport would have escaped with never
+    // reached the caller.
+    expect(probe.stdout).not.toContain('hostile-global-secondary');
+    expect(probe.stdout).not.toContain('DETAIL=[object Object]');
+    // A real child existed, and the release ran far enough past the failure to
+    // reach the poisoned pipe value and fault on it — bounded and absorbed,
+    // exactly as on the ordinary modes.
+    expect(probe.stdout).toMatch(/^SPAWNED=[1-9][0-9]*$/m);
+    expect(probe.stdout).toMatch(/CLEANUP_FAULTS=[1-9]/);
+    // The value was never an Error, so the stable hardening failure is the
+    // reason — and the value itself, the only record of what actually went
+    // wrong, is retained on it by reference.
+    expect(probe.stdout).toMatch(/^CAUSE_IDENTITY_GLOBAL=true$/m);
+    expectHardeningFailureSettles(probe, 'Process dispatch hardening failed');
+  }, 40_000);
+
+  /**
+   * A lying `Error[Symbol.hasInstance]`, against a transport that must still
+   * normalize the value it is lying about.
+   *
+   * Capturing the constructor answers one hazard and leaves its twin standing.
+   * A captured binding cannot be swapped out from under the classification, but
+   * it still points at an ordinary mutable object, and the `instanceof` operator
+   * consults that object before it consults anything else: it looks up
+   * `@@hasInstance` on the constructor and, finding an own one, defers to it
+   * completely. The chain walk never happens. So the hostile path that forces
+   * the hardening failure defines such a hook on its way out and then throws a
+   * plain object that is not an Error by any measure.
+   *
+   * A transport classifying with the operator is told that object is an Error,
+   * keeps it as the caller-facing reason unchanged, and rejects with it — no
+   * message, no Error identity, and no `cause`, so the one record of what
+   * actually went wrong is the thing being passed off as the diagnosis. The
+   * release still runs and the child still dies, which is why this is a
+   * contract defect rather than a liveness one, and why the assertions below
+   * demand both halves: the settlement is intact *and* it is the right value.
+   *
+   * The hook is proven reachable rather than assumed so: the probe runs the
+   * operator itself, on the same value, while the same hook is still installed,
+   * and requires the lie back. That is what makes the zero call count below
+   * evidence of a classifier that declined to ask rather than of a hook that
+   * was never staged.
+   */
+  it('classifies past a lying own hasInstance on the Error constructor', async () => {
+    const probe = await runHardeningSettlementProbe('hostile-has-instance');
+
+    // The staged condition was genuinely reached: the hostile path ran and
+    // really did install an own hook on the intrinsic constructor.
+    expect(probe.stdout).toMatch(/^HASINSTANCE_INSTALLED=[1-9][0-9]*$/m);
+    // And that hook really does lie to the operator, for this exact value, at
+    // this exact moment — the behaviour the old classification would have
+    // inherited. Both the answer and the fact that the operator reached the
+    // hook at all are required.
+    expect(probe.stdout).toMatch(/^HASINSTANCE_OPERATOR_LIE=true$/m);
+    expect(probe.stdout).toMatch(/^HASINSTANCE_OPERATOR_CALLS=[1-9][0-9]*$/m);
+    // The lie is confined to the staged value, so nothing here is proven by a
+    // hook that had simply broken classification for everything.
+    expect(probe.stdout).toMatch(/^HASINSTANCE_GENUINE=true$/m);
+    // The transport never consulted it. This is the repair: the classification
+    // is the intrinsic chain walk invoked directly, so the forgeable
+    // own-property lookup that precedes it in the operator never happens.
+    expect(probe.stdout).toMatch(/^HASINSTANCE_CALLS=0$/m);
+    // The raw hostile object was not accepted as an Error and never became the
+    // caller-facing reason.
+    expect(probe.stdout).toMatch(/^REJECTED_RAW_HOSTILE=false$/m);
+    expect(probe.stdout).not.toContain('DETAIL=[object Object]');
+    expect(probe.stdout).not.toContain('DETAIL=undefined');
+    // It was normalized instead, and the value itself — the only record of what
+    // actually went wrong — is retained on the stable failure by reference.
+    expect(probe.stdout).toMatch(/^CAUSE_IDENTITY_HASINSTANCE=true$/m);
+    // A real child existed, and the release ran far enough past the failure to
+    // reach the poisoned pipe value and fault on it — bounded and absorbed,
+    // exactly as on the ordinary modes. Classification was never in the way.
+    expect(probe.stdout).toMatch(/^SPAWNED=[1-9][0-9]*$/m);
+    expect(probe.stdout).toMatch(/CLEANUP_FAULTS=[1-9]/);
+    // The mutated intrinsic was put back, verified rather than assumed, so this
+    // probe cannot leave a lying constructor behind for anything that follows.
+    expect(probe.stdout).toMatch(/^HASINSTANCE_RESTORED=true$/m);
+    // Stable reason, exactly-once settlement, no unhandled rejection, no
+    // abandoned child, no outcome vocabulary.
+    expectHardeningFailureSettles(probe, 'Process dispatch hardening failed');
+  }, 40_000);
+
+  it('settles through a captured scheduler when a hostile then installs nothing', async () => {
+    const probe = await runHardeningSettlementProbe('hostile-then-swallow');
+
+    // The staged condition was genuinely reached: the hostile path ran and
+    // really did substitute the scheduler on the intrinsic prototype.
+    expect(probe.stdout).toMatch(/^THEN_HOOK_INSTALLED=[1-9][0-9]*$/m);
+    // And the substitution really does swallow, for an ordinary lookup, at this
+    // exact moment — the behaviour an ordinary `release.then` would have
+    // inherited. Both that the hook was entered and that it installed nothing
+    // are required, so this cannot pass against an inert replacement.
+    expect(probe.stdout).toMatch(/^THEN_HOOK_REACHABLE=true$/m);
+    expect(probe.stdout).toMatch(/^THEN_HOOK_CONTROL=not-run$/m);
+    // The transport never consulted it. This is the repair: the continuation is
+    // installed through an intrinsic captured at module load and invoked with
+    // the captured `Reflect.apply`, so the forgeable lookup never happens.
+    expect(probe.stdout).toMatch(/^THEN_HOOK_TRANSPORT_CALLS=0$/m);
+    // The failure this prevents, asked directly: an exchange left pending with
+    // no deadline armed to end it.
+    expect(probe.stdout).not.toMatch(/^SETTLEMENT=pending$/m);
+    // A real child existed and the release still ran past the failure into the
+    // poisoned pipe value, bounded and absorbed exactly as on the ordinary
+    // modes. Nothing about the scheduler changed what the release does.
+    expect(probe.stdout).toMatch(/^SPAWNED=[1-9][0-9]*$/m);
+    expect(probe.stdout).toMatch(/CLEANUP_FAULTS=[1-9]/);
+    // The genuine Error the forced failure raised reached the caller unchanged.
+    expect(probe.stdout).toMatch(/^ERROR_IDENTITY=true$/m);
+    // The substituted intrinsic was put back, verified rather than assumed.
+    expect(probe.stdout).toMatch(/^THEN_RESTORED=true$/m);
+    // Stable reason, exactly-once settlement, no unhandled rejection, no
+    // abandoned child, no outcome vocabulary.
+    expectHardeningFailureSettles(probe);
+  }, 40_000);
+
+  it('settles through a captured scheduler when a hostile then throws', async () => {
+    const probe = await runHardeningSettlementProbe('hostile-then-throw');
+
+    // Staged, and genuinely lethal: an ordinary lookup at this moment throws
+    // the hostile value rather than installing anything.
+    expect(probe.stdout).toMatch(/^THEN_HOOK_INSTALLED=[1-9][0-9]*$/m);
+    expect(probe.stdout).toMatch(/^THEN_HOOK_REACHABLE=true$/m);
+    // The transport never reached it.
+    expect(probe.stdout).toMatch(/^THEN_HOOK_TRANSPORT_CALLS=0$/m);
+    // The failure this prevents: the throw escaping the settlement's own
+    // executor and becoming the caller-facing reason in place of the mandatory
+    // hardening failure. A reference test, so no property of the hostile value
+    // is read to decide it.
+    expect(probe.stdout).toMatch(/^REJECTED_RAW_HOSTILE_THEN=false$/m);
+    expect(probe.stdout).not.toContain('DETAIL=[object Object]');
+    expect(probe.stdout).not.toContain('DETAIL=undefined');
+    expect(probe.stdout).toMatch(/^SPAWNED=[1-9][0-9]*$/m);
+    expect(probe.stdout).toMatch(/CLEANUP_FAULTS=[1-9]/);
+    expect(probe.stdout).toMatch(/^ERROR_IDENTITY=true$/m);
+    expect(probe.stdout).toMatch(/^THEN_RESTORED=true$/m);
+    expectHardeningFailureSettles(probe);
+  }, 40_000);
+
   it('settles a hardening failure whose bounded termination attempt itself fails', async () => {
     const probe = await runHardeningSettlementProbe('terminate-fault');
 
@@ -1931,6 +2719,54 @@ describe('invokeAgentProcess — adversarial', () => {
     expect(probe.stdout).toContain('SURVIVED');
     expect(probe.code).toBe(0);
   }, 30_000);
+
+  onWindows('settles the tree-kill helper through a captured scheduler that installs nothing', async () => {
+    const probe = await runIsolatedProbe('helper-then-swallow');
+
+    // The helper really was spawned and its hardening really would have thrown,
+    // so the settlement site under test was genuinely reached.
+    expect(probe.stdout).toMatch(/HELPER_COUNT=[1-9]/);
+    expect(probe.stdout).toContain('HELPER_HARDENING_WOULD_THROW=true');
+    // The substitution was staged, and it really does swallow an ordinary
+    // lookup at this moment while installing nothing.
+    expect(probe.stdout).toMatch(/^HELPER_THEN_INSTALLED=[1-9][0-9]*$/m);
+    expect(probe.stdout).toMatch(/^HELPER_THEN_REACHABLE=true$/m);
+    expect(probe.stdout).toMatch(/^HELPER_THEN_CONTROL=not-run$/m);
+    // The transport never consulted it: the helper's settlement is scheduled
+    // through the intrinsic captured at module load.
+    expect(probe.stdout).toMatch(/^HELPER_THEN_TRANSPORT_CALLS=0$/m);
+    // The failure this prevents: a helper promise that never settles stalls the
+    // Windows strategy's `await`, and with it the bounded release and the
+    // exchange behind it.
+    expect(probe.stdout).not.toContain('PENDING=deadline');
+    expect(probe.stdout).toContain('RESOLVED=TIMED_OUT');
+    expect(probe.stdout).toContain('UNHANDLED=0');
+    expect(probe.stdout).toMatch(/^HELPER_THEN_RESTORED=true$/m);
+    expect(probe.stderr).not.toContain("Unhandled 'error' event");
+    expect(probe.stdout).toContain('SURVIVED');
+    expect(probe.code).toBe(0);
+  }, 40_000);
+
+  onWindows('settles the tree-kill helper through a captured scheduler that throws', async () => {
+    const probe = await runIsolatedProbe('helper-then-throw');
+
+    expect(probe.stdout).toMatch(/HELPER_COUNT=[1-9]/);
+    expect(probe.stdout).toContain('HELPER_HARDENING_WOULD_THROW=true');
+    expect(probe.stdout).toMatch(/^HELPER_THEN_INSTALLED=[1-9][0-9]*$/m);
+    expect(probe.stdout).toMatch(/^HELPER_THEN_REACHABLE=true$/m);
+    expect(probe.stdout).toMatch(/^HELPER_THEN_TRANSPORT_CALLS=0$/m);
+    // The failure this prevents: the throw escaping the helper's executor
+    // rejects a promise every caller treats as total, which surfaces as a
+    // discarded rejection with the exchange still unsettled.
+    expect(probe.stdout).not.toContain('PENDING=deadline');
+    expect(probe.stdout).toContain('RESOLVED=TIMED_OUT');
+    expect(probe.stdout).toContain('UNHANDLED=0');
+    expect(probe.stdout).not.toContain('REJECTED=');
+    expect(probe.stdout).toMatch(/^HELPER_THEN_RESTORED=true$/m);
+    expect(probe.stderr).not.toContain("Unhandled 'error' event");
+    expect(probe.stdout).toContain('SURVIVED');
+    expect(probe.code).toBe(0);
+  }, 40_000);
 
   it('still reports an ordinary asynchronous spawn failure as SPAWN_FAILED', async () => {
     const probe = await runIsolatedProbe('control');

@@ -75,6 +75,59 @@ const objectFreeze = Object.freeze;
 const objectDefineProperty = Object.defineProperty;
 const reflectApply = Reflect.apply;
 const NativePromise = Promise;
+// Continuation scheduling, captured away from the property lookup that reaches
+// it. The settlement paths below hand the caller its mandatory failure from a
+// continuation installed on an internal release promise, and an ordinary
+// `release.then(...)` resolves `then` through `Promise.prototype` — an
+// ordinary, writable property of an ordinary, mutable object. Both of those
+// settlement sites are reached only *after* a value engineered to run code on
+// inspection has already had its turn, so a hostile path gets to substitute
+// the scheduler strictly before the continuation is installed. A replacement
+// that simply returns installs no continuation at all and leaves the caller
+// pending for good — the exchange deadline cannot rescue it, because on these
+// paths that deadline is not armed yet; a replacement that throws replaces the
+// mandatory failure with the hostile value. Read from a binding fixed at module
+// load, the scheduling call is the intrinsic regardless of what
+// `Promise.prototype` holds by the time it is reached.
+//
+// What the capture alone does not make total is the intrinsic's own prologue:
+// `then` derives its result promise through `SpeciesConstructor`, which reads
+// `constructor` off the promise — another mutable inherited property — before
+// it registers anything. Every use below is therefore wrapped so that a fault
+// raised before registration still delivers exactly the settlement the
+// continuation would have delivered. The registration itself cannot be
+// subverted once it is reached: the derived promise is discarded here, and the
+// handlers are attached to the real promise whatever the species constructor
+// returned.
+// eslint-disable-next-line @typescript-eslint/unbound-method
+const promiseThen = Promise.prototype.then;
+// The constructor this module builds its own failures with. `Error` is an
+// ordinary writable global, and the hardening-failure path below has to
+// construct through it *after* having touched a value engineered to run code
+// on inspection. Captured here, at module load, that construction can no
+// longer be routed through whatever such a value installed in the meantime.
+const NativeError = Error;
+// The `instanceof` *operation*, captured away from the `instanceof` *operator*.
+//
+// The operator does not test the prototype chain directly: it first looks up
+// `@@hasInstance` on its right-hand operand, and only walks the chain when that
+// lookup finds nothing. Capturing the constructor therefore fixes only *which*
+// object is asked; it leaves the question itself answerable by an own hook
+// installed on that object. `Error` is a mutable object as well as a mutable
+// global, and a hostile path reachable before classification can define an own
+// `Error[Symbol.hasInstance]` returning `true` for anything — laundering a
+// non-Error into the ordinary-Error branch, so that the raw hostile value
+// becomes the caller-facing reason and the normalization below never runs.
+//
+// `Function.prototype[Symbol.hasInstance]` is the intrinsic that performs the
+// plain chain walk, and it is a non-writable, non-configurable data property of
+// `Function.prototype`, so no code — before this capture or after it — can
+// substitute it. Invoked through the captured `Reflect.apply` with the captured
+// constructor as its `this`, it answers the same question the operator was
+// asked, without the own-property lookup that made the answer forgeable. What
+// it does *not* skip is the operand's own prototype chain: that read is still a
+// call into the value's own code, which is why every use stays inside a `try`.
+const ordinaryHasInstance = Function.prototype[Symbol.hasInstance];
 const scheduleTimeout = setTimeout;
 const cancelTimeout = clearTimeout;
 const runtimeProcess = process;
@@ -502,14 +555,31 @@ function runTaskkill(
       // own steps can throw. Resolving from both settlement paths keeps this
       // helper's promise — and therefore every termination that awaits it —
       // total, and leaves no discarded rejection unhandled.
-      void reapUnprotectedHelper(killer).then(
-        () => {
-          resolve(false);
-        },
-        () => {
-          resolve(false);
-        },
-      );
+      //
+      // Scheduled through the captured {@link promiseThen}: this module stays
+      // loaded across exchanges, so any earlier hostile path in the process —
+      // including the dispatch-hardening one this helper is itself the fallback
+      // for — may already have replaced `Promise.prototype.then`. An ordinary
+      // lookup here would reach that replacement, and a replacement that
+      // installs nothing would leave this helper's promise pending, hanging the
+      // `await` in `terminateWindows` and with it the whole bounded release.
+      // The `catch` covers the intrinsic's own pre-registration prologue, so a
+      // fault there still degrades to the same honest "not issued" answer the
+      // continuations give rather than rejecting a promise the callers of this
+      // helper treat as total.
+      const reaped = reapUnprotectedHelper(killer);
+      try {
+        void reflectApply(promiseThen, reaped, [
+          () => {
+            resolve(false);
+          },
+          () => {
+            resolve(false);
+          },
+        ]);
+      } catch {
+        resolve(false);
+      }
       return;
     }
 
@@ -828,27 +898,89 @@ export function invokeAgentProcess(
       if (invocation.signal !== null) {
         removeAbortListener(invocation.signal, onAbort);
       }
-      // Normalised here, before the asynchronous release, so the reason this
-      // exchange rejects with is already fixed and cannot itself be lost to a
-      // later hostile read.
-      const hardeningFailure =
-        error instanceof Error
-          ? error
-          : new Error('Process dispatch hardening failed', { cause: error });
+      // Decided first, and decided *completely*, before anything else touches
+      // the handle. Two separate hazards meet here and only this order answers
+      // both.
+      //
+      // Classifying the caught value is not a neutral read: the classification
+      // consults the value's own prototype chain, and a value engineered to
+      // refuse that makes the classification itself throw. That is what the
+      // surrounding `try` is for — the block below is total, so a
+      // classification fault cannot escape, and therefore cannot cost an
+      // already-created child the one bounded release attempt it is owed.
+      // Total, though, only because every `Error` here is the captured
+      // {@link NativeError}. A prototype-chain read is a call into the value's
+      // own code, and the cheapest thing that code can do is overwrite the
+      // `Error` global it knows this path is about to construct through. A
+      // fresh lookup would then reach that replacement — in the ternary's
+      // fallback *and* again in the `catch` that exists to cover it — and the
+      // second throw would escape with the release still unreached. Reading the
+      // constructor from a binding fixed before the value existed is what makes
+      // the guard cover anything at all.
+      // Releasing first would answer that hazard too, but at the price of the
+      // second one: `releaseUnprotectedChild` consults `pid`, `exitCode`, and
+      // `signalCode` synchronously before its first suspension, so a hostile
+      // accessor gets to run before this line does. An ordinary Error that had
+      // its prototype chain rewritten by such an accessor would then fail
+      // classification and be replaced by the generic fallback, losing the very
+      // identity the caller is owed. Reading the value here, where nothing
+      // hostile has been invoked since it was thrown, is what makes the
+      // classification a decision about the value as it was actually raised.
+      //
+      // The ordinary case keeps the original Error as the caller-visible
+      // reason; a value that is not an Error — or that faults while being
+      // classified — yields the same stable hardening failure instead, with the
+      // original value retained as `cause`. Retaining it is safe because a
+      // `cause` is only stored, never read. Neither branch can escape, so the
+      // reason is fixed before the release begins and cannot afterwards be lost
+      // to a hostile read.
+      let hardeningFailure: Error;
+      try {
+        hardeningFailure = reflectApply(ordinaryHasInstance, NativeError, [error])
+          ? (error as Error)
+          : new NativeError('Process dispatch hardening failed', {
+              cause: error,
+            });
+      } catch {
+        hardeningFailure = new NativeError('Process dispatch hardening failed', {
+          cause: error,
+        });
+      }
+      // Unconditional: the block above has no escaping path, so the release is
+      // reached on every route through it. Nothing above decides anything this
+      // call depends on — it is ordered second only to keep hostile accessors
+      // away from the caught value, not because it is contingent on the result.
+      const release = releaseUnprotectedChild(child, platform, invocation.graceMs);
       // `releaseUnprotectedChild` runs every step and never rejects, and the
       // rejection is scheduled on *both* settlement paths of the chain anyway,
       // so neither a termination failure nor a cleanup step that throws on a
       // poisoned `stdout`/`stderr` value can leave this exchange pending or
       // leave an internal rejection unhandled. The mandatory hardening failure
       // stays the externally visible reason on every one of those paths.
-      void releaseUnprotectedChild(child, platform, invocation.graceMs).then(
-        () => {
-          reject(hardeningFailure);
-        },
-        () => {
-          reject(hardeningFailure);
-        },
-      );
+      //
+      // Scheduled through the captured {@link promiseThen} rather than through
+      // `release.then`. The value that faulted hardening has already run its
+      // own code by this point, and the cheapest thing that code can do is
+      // replace the scheduler this path is about to reach — a lookup here would
+      // find the replacement. One that installs nothing leaves this exchange
+      // pending with no deadline yet armed to end it; one that throws escapes
+      // this executor and hands the caller the hostile value in place of the
+      // mandatory failure. The `catch` closes the same gap for the intrinsic's
+      // own prologue, which reads the promise's `constructor` before it
+      // registers anything: the release is already running and never rejects,
+      // so settling from here loses nothing but the wait.
+      try {
+        void reflectApply(promiseThen, release, [
+          () => {
+            reject(hardeningFailure);
+          },
+          () => {
+            reject(hardeningFailure);
+          },
+        ]);
+      } catch {
+        reject(hardeningFailure);
+      }
       return;
     }
 
