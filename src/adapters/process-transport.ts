@@ -75,6 +75,12 @@ const objectFreeze = Object.freeze;
 const objectDefineProperty = Object.defineProperty;
 const reflectApply = Reflect.apply;
 const NativePromise = Promise;
+// The constructor this module builds its own failures with. `Error` is an
+// ordinary writable global, and the hardening-failure path below has to
+// construct through it *after* having touched a value engineered to run code
+// on inspection. Captured here, at module load, that construction can no
+// longer be routed through whatever such a value installed in the meantime.
+const NativeError = Error;
 const scheduleTimeout = setTimeout;
 const cancelTimeout = clearTimeout;
 const runtimeProcess = process;
@@ -838,6 +844,15 @@ export function invokeAgentProcess(
       // surrounding `try` is for — the block below is total, so a
       // classification fault cannot escape, and therefore cannot cost an
       // already-created child the one bounded release attempt it is owed.
+      // Total, though, only because every `Error` here is the captured
+      // {@link NativeError}. A prototype-chain read is a call into the value's
+      // own code, and the cheapest thing that code can do is overwrite the
+      // `Error` global it knows this path is about to construct through. A
+      // fresh lookup would then reach that replacement — in the ternary's
+      // fallback *and* again in the `catch` that exists to cover it — and the
+      // second throw would escape with the release still unreached. Reading the
+      // constructor from a binding fixed before the value existed is what makes
+      // the guard cover anything at all.
       // Releasing first would answer that hazard too, but at the price of the
       // second one: `releaseUnprotectedChild` consults `pid`, `exitCode`, and
       // `signalCode` synchronously before its first suspension, so a hostile
@@ -858,11 +873,13 @@ export function invokeAgentProcess(
       let hardeningFailure: Error;
       try {
         hardeningFailure =
-          error instanceof Error
+          error instanceof NativeError
             ? error
-            : new Error('Process dispatch hardening failed', { cause: error });
+            : new NativeError('Process dispatch hardening failed', {
+                cause: error,
+              });
       } catch {
-        hardeningFailure = new Error('Process dispatch hardening failed', {
+        hardeningFailure = new NativeError('Process dispatch hardening failed', {
           cause: error,
         });
       }
