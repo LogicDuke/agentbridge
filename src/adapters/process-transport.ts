@@ -81,6 +81,27 @@ const NativePromise = Promise;
 // on inspection. Captured here, at module load, that construction can no
 // longer be routed through whatever such a value installed in the meantime.
 const NativeError = Error;
+// The `instanceof` *operation*, captured away from the `instanceof` *operator*.
+//
+// The operator does not test the prototype chain directly: it first looks up
+// `@@hasInstance` on its right-hand operand, and only walks the chain when that
+// lookup finds nothing. Capturing the constructor therefore fixes only *which*
+// object is asked; it leaves the question itself answerable by an own hook
+// installed on that object. `Error` is a mutable object as well as a mutable
+// global, and a hostile path reachable before classification can define an own
+// `Error[Symbol.hasInstance]` returning `true` for anything — laundering a
+// non-Error into the ordinary-Error branch, so that the raw hostile value
+// becomes the caller-facing reason and the normalization below never runs.
+//
+// `Function.prototype[Symbol.hasInstance]` is the intrinsic that performs the
+// plain chain walk, and it is a non-writable, non-configurable data property of
+// `Function.prototype`, so no code — before this capture or after it — can
+// substitute it. Invoked through the captured `Reflect.apply` with the captured
+// constructor as its `this`, it answers the same question the operator was
+// asked, without the own-property lookup that made the answer forgeable. What
+// it does *not* skip is the operand's own prototype chain: that read is still a
+// call into the value's own code, which is why every use stays inside a `try`.
+const ordinaryHasInstance = Function.prototype[Symbol.hasInstance];
 const scheduleTimeout = setTimeout;
 const cancelTimeout = clearTimeout;
 const runtimeProcess = process;
@@ -838,7 +859,7 @@ export function invokeAgentProcess(
       // the handle. Two separate hazards meet here and only this order answers
       // both.
       //
-      // Classifying the caught value is not a neutral read: `instanceof`
+      // Classifying the caught value is not a neutral read: the classification
       // consults the value's own prototype chain, and a value engineered to
       // refuse that makes the classification itself throw. That is what the
       // surrounding `try` is for — the block below is total, so a
@@ -858,7 +879,7 @@ export function invokeAgentProcess(
       // `signalCode` synchronously before its first suspension, so a hostile
       // accessor gets to run before this line does. An ordinary Error that had
       // its prototype chain rewritten by such an accessor would then fail
-      // `instanceof` and be replaced by the generic fallback, losing the very
+      // classification and be replaced by the generic fallback, losing the very
       // identity the caller is owed. Reading the value here, where nothing
       // hostile has been invoked since it was thrown, is what makes the
       // classification a decision about the value as it was actually raised.
@@ -872,12 +893,11 @@ export function invokeAgentProcess(
       // to a hostile read.
       let hardeningFailure: Error;
       try {
-        hardeningFailure =
-          error instanceof NativeError
-            ? error
-            : new NativeError('Process dispatch hardening failed', {
-                cause: error,
-              });
+        hardeningFailure = reflectApply(ordinaryHasInstance, NativeError, [error])
+          ? (error as Error)
+          : new NativeError('Process dispatch hardening failed', {
+              cause: error,
+            });
       } catch {
         hardeningFailure = new NativeError('Process dispatch hardening failed', {
           cause: error,

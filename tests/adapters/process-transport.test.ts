@@ -275,6 +275,7 @@ const MODES = [
   'unclassifiable-throw',
   'error-identity-mutation',
   'hostile-error-global',
+  'hostile-has-instance',
 ];
 if (!MODES.includes(mode)) {
   console.log('MODE_INVALID=' + String(mode));
@@ -356,7 +357,53 @@ const HOSTILE_GLOBAL_VALUE = new Proxy({}, {
     return null;
   },
 });
+// Whether this mode arranges for the *classifier itself* to be lied to.
+//
+// Capturing the \`Error\` constructor fixes which object the classification
+// interrogates, but the \`instanceof\` operator does not interrogate that
+// object's prototype chain first: it looks up \`@@hasInstance\` on the
+// constructor and defers to whatever it finds there. \`Error\` is an ordinary
+// mutable object as well as a mutable global, so a path that runs before the
+// classification can define an own hook that simply answers "yes". The value
+// thrown by this mode is a plain object with no Error identity whatsoever; a
+// transport that classifies with the operator is told it is an Error, keeps it
+// unchanged, and hands the caller a raw hostile object where the contract
+// promised the stable hardening failure carrying the original as \`cause\`.
+const HOSTILE_HAS_INSTANCE = mode === 'hostile-has-instance';
+// Deliberately not an Error, and deliberately not a Proxy either: the lie is
+// told by the constructor's own hook, not by anything this value does when it
+// is read. Nothing about the value itself could make a chain walk say yes.
+const HOSTILE_HAS_INSTANCE_VALUE = { marker: 'hostile-has-instance-value' };
+let hasInstanceInstalled = 0;
+let hasInstanceCalls = 0;
+// The ordinary chain walk, captured before anything is installed over it, so
+// the hook can lie about the single value under test and answer every other
+// question truthfully. A hook that said "yes" to everything would also be
+// answering for this probe's own instrumentation and for Node's internals for
+// as long as it stayed installed, and that collateral damage would be
+// indistinguishable from the defect being measured.
+const ORDINARY_HAS_INSTANCE = Function.prototype[Symbol.hasInstance];
+function installHostileHasInstance() {
+  hasInstanceInstalled += 1;
+  Object.defineProperty(RealError, Symbol.hasInstance, {
+    value(candidate) {
+      hasInstanceCalls += 1;
+      if (candidate === HOSTILE_HAS_INSTANCE_VALUE) return true;
+      return Reflect.apply(ORDINARY_HAS_INSTANCE, this, [candidate]);
+    },
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
+}
 function hardeningThrow() {
+  if (HOSTILE_HAS_INSTANCE) {
+    // Installed on the way out of the forced hardening failure, which is
+    // strictly before the transport classifies anything, so the hook is
+    // already in place for the very first question the classifier asks.
+    installHostileHasInstance();
+    return HOSTILE_HAS_INSTANCE_VALUE;
+  }
   if (HOSTILE_ERROR_GLOBAL) return HOSTILE_GLOBAL_VALUE;
   if (UNCLASSIFIABLE) return UNCLASSIFIABLE_VALUE;
   thrownError = new Error(HARDENING_MARKER);
@@ -642,6 +689,22 @@ const settlement = await Promise.race([
             error.cause === HOSTILE_GLOBAL_VALUE;
         } catch { return false; }
       })(),
+      // The same question again for the lying-hook mode. Its value is a third
+      // distinct object, kept as its own comparison so no mode's cause claim
+      // can be satisfied by another mode's value.
+      causeIdentityHasInstance: (() => {
+        try {
+          return error !== null && typeof error === 'object' &&
+            error.cause === HOSTILE_HAS_INSTANCE_VALUE;
+        } catch { return false; }
+      })(),
+      // And the failure the repair exists to prevent, asked directly: whether
+      // the raw hostile object was itself handed back as the rejection reason.
+      // A defective classifier answers true here, and it is a reference test,
+      // so no property of the hostile value is read to decide it.
+      rawHostileReason: (() => {
+        try { return error === HOSTILE_HAS_INSTANCE_VALUE; } catch { return false; }
+      })(),
     }),
   ),
   new Promise((r) => setTimeout(() => { r({ kind: 'pending', detail: 'deadline' }); }, 8000)),
@@ -654,6 +717,48 @@ const settlement = await Promise.race([
 let hostileCtorLethal = false;
 try { new globalThis.Error('probe'); } catch { hostileCtorLethal = true; }
 globalThis.Error = RealError;
+
+// The lying-hook mode's evidence, collected in one place and in an order that
+// keeps each claim independent of the next.
+//
+// The transport's own classification is finished by now, so the call count is
+// fixed before this probe asks anything of its own; the repaired classifier
+// never consults the hook and leaves it at zero. What that zero does not by
+// itself establish is that the hook was ever *reachable* — a count of zero
+// reads the same whether the classifier avoided the hook or the hook was never
+// staged at all. So the operator is run here, against the same value, with the
+// same hook still installed, and it is required to return the lie. That is the
+// counterfactual made into evidence: an \`instanceof\`-based classifier at the
+// same moment would have been told this plain object is an Error.
+const hasInstanceTransportCalls = hasInstanceCalls;
+let hasInstanceOperatorLie = false;
+try { hasInstanceOperatorLie = HOSTILE_HAS_INSTANCE_VALUE instanceof RealError; } catch {}
+const hasInstanceOperatorCalls = hasInstanceCalls - hasInstanceTransportCalls;
+// And the lie is specific to the staged value rather than a blanket "yes" that
+// would prove nothing about classification: a genuine Error still classifies as
+// one while the hook is installed.
+let hasInstanceGenuine = false;
+try { hasInstanceGenuine = new RealError('control') instanceof RealError; } catch {}
+// Restored before anything else runs, and the restoration is verified rather
+// than assumed: the own hook is gone, the inherited intrinsic answers again,
+// and the value that was being lied about is correctly rejected once more.
+// Deleting is unconditional and harmless on the modes that never installed.
+delete RealError[Symbol.hasInstance];
+let hasInstanceRestored = false;
+try {
+  hasInstanceRestored =
+    Object.getOwnPropertyDescriptor(RealError, Symbol.hasInstance) === undefined &&
+    new RealError('restored') instanceof RealError &&
+    !(HOSTILE_HAS_INSTANCE_VALUE instanceof RealError);
+} catch {}
+console.log('HASINSTANCE_INSTALLED=' + hasInstanceInstalled);
+console.log('HASINSTANCE_CALLS=' + hasInstanceTransportCalls);
+console.log('HASINSTANCE_OPERATOR_LIE=' + String(hasInstanceOperatorLie));
+console.log('HASINSTANCE_OPERATOR_CALLS=' + hasInstanceOperatorCalls);
+console.log('HASINSTANCE_GENUINE=' + String(hasInstanceGenuine));
+console.log('HASINSTANCE_RESTORED=' + String(hasInstanceRestored));
+console.log('CAUSE_IDENTITY_HASINSTANCE=' + String(settlement.causeIdentityHasInstance === true));
+console.log('REJECTED_RAW_HOSTILE=' + String(settlement.rawHostileReason === true));
 console.log('GLOBAL_POISONED=' + globalPoisoned);
 console.log('FALLBACK_VIA_POISONED=' + fallbackViaPoisoned);
 console.log('HOSTILE_CTOR_LETHAL=' + String(hostileCtorLethal));
@@ -1966,6 +2071,73 @@ describe('invokeAgentProcess — adversarial', () => {
     // reason — and the value itself, the only record of what actually went
     // wrong, is retained on it by reference.
     expect(probe.stdout).toMatch(/^CAUSE_IDENTITY_GLOBAL=true$/m);
+    expectHardeningFailureSettles(probe, 'Process dispatch hardening failed');
+  }, 40_000);
+
+  /**
+   * A lying `Error[Symbol.hasInstance]`, against a transport that must still
+   * normalize the value it is lying about.
+   *
+   * Capturing the constructor answers one hazard and leaves its twin standing.
+   * A captured binding cannot be swapped out from under the classification, but
+   * it still points at an ordinary mutable object, and the `instanceof` operator
+   * consults that object before it consults anything else: it looks up
+   * `@@hasInstance` on the constructor and, finding an own one, defers to it
+   * completely. The chain walk never happens. So the hostile path that forces
+   * the hardening failure defines such a hook on its way out and then throws a
+   * plain object that is not an Error by any measure.
+   *
+   * A transport classifying with the operator is told that object is an Error,
+   * keeps it as the caller-facing reason unchanged, and rejects with it — no
+   * message, no Error identity, and no `cause`, so the one record of what
+   * actually went wrong is the thing being passed off as the diagnosis. The
+   * release still runs and the child still dies, which is why this is a
+   * contract defect rather than a liveness one, and why the assertions below
+   * demand both halves: the settlement is intact *and* it is the right value.
+   *
+   * The hook is proven reachable rather than assumed so: the probe runs the
+   * operator itself, on the same value, while the same hook is still installed,
+   * and requires the lie back. That is what makes the zero call count below
+   * evidence of a classifier that declined to ask rather than of a hook that
+   * was never staged.
+   */
+  it('classifies past a lying own hasInstance on the Error constructor', async () => {
+    const probe = await runHardeningSettlementProbe('hostile-has-instance');
+
+    // The staged condition was genuinely reached: the hostile path ran and
+    // really did install an own hook on the intrinsic constructor.
+    expect(probe.stdout).toMatch(/^HASINSTANCE_INSTALLED=[1-9][0-9]*$/m);
+    // And that hook really does lie to the operator, for this exact value, at
+    // this exact moment — the behaviour the old classification would have
+    // inherited. Both the answer and the fact that the operator reached the
+    // hook at all are required.
+    expect(probe.stdout).toMatch(/^HASINSTANCE_OPERATOR_LIE=true$/m);
+    expect(probe.stdout).toMatch(/^HASINSTANCE_OPERATOR_CALLS=[1-9][0-9]*$/m);
+    // The lie is confined to the staged value, so nothing here is proven by a
+    // hook that had simply broken classification for everything.
+    expect(probe.stdout).toMatch(/^HASINSTANCE_GENUINE=true$/m);
+    // The transport never consulted it. This is the repair: the classification
+    // is the intrinsic chain walk invoked directly, so the forgeable
+    // own-property lookup that precedes it in the operator never happens.
+    expect(probe.stdout).toMatch(/^HASINSTANCE_CALLS=0$/m);
+    // The raw hostile object was not accepted as an Error and never became the
+    // caller-facing reason.
+    expect(probe.stdout).toMatch(/^REJECTED_RAW_HOSTILE=false$/m);
+    expect(probe.stdout).not.toContain('DETAIL=[object Object]');
+    expect(probe.stdout).not.toContain('DETAIL=undefined');
+    // It was normalized instead, and the value itself — the only record of what
+    // actually went wrong — is retained on the stable failure by reference.
+    expect(probe.stdout).toMatch(/^CAUSE_IDENTITY_HASINSTANCE=true$/m);
+    // A real child existed, and the release ran far enough past the failure to
+    // reach the poisoned pipe value and fault on it — bounded and absorbed,
+    // exactly as on the ordinary modes. Classification was never in the way.
+    expect(probe.stdout).toMatch(/^SPAWNED=[1-9][0-9]*$/m);
+    expect(probe.stdout).toMatch(/CLEANUP_FAULTS=[1-9]/);
+    // The mutated intrinsic was put back, verified rather than assumed, so this
+    // probe cannot leave a lying constructor behind for anything that follows.
+    expect(probe.stdout).toMatch(/^HASINSTANCE_RESTORED=true$/m);
+    // Stable reason, exactly-once settlement, no unhandled rejection, no
+    // abandoned child, no outcome vocabulary.
     expectHardeningFailureSettles(probe, 'Process dispatch hardening failed');
   }, 40_000);
 
