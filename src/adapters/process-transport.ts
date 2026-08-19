@@ -198,10 +198,57 @@ function protectChildDispatch(child: ChildProcess): void {
   protectEventDispatch(child.stderr);
 }
 
+/**
+ * Make one promise this module owns safe to `await` after hostile code has run.
+ *
+ * `await` does not read `then` off an ordinary native promise: `PromiseResolve`
+ * recognises the promise as its own kind and hands it straight to the internal
+ * reaction machinery. The recognition test is `Get(promise, "constructor")`, and
+ * for a promise carrying no own `constructor` that read walks up to
+ * `Promise.prototype.constructor` — an ordinary, writable property of an
+ * ordinary, mutable object. Replace it with anything that is not the intrinsic
+ * and the fast path is abandoned: the awaited value is then resolved as a plain
+ * thenable, which *does* read `then`, reaching whatever a hostile path installed
+ * on `Promise.prototype` in the meantime. A replacement that installs no
+ * continuation leaves the `await` suspended for good, and everything waiting
+ * behind it with it — including the mandatory hardening rejection and the
+ * ordinary timeout settlement, neither of which has any further deadline left
+ * to rescue it.
+ *
+ * An own `constructor` fixed to the captured {@link NativePromise} closes that
+ * lookup at its source. The recognition test then reads a property no later
+ * code can shadow, answers with the intrinsic, and the thenable path — with its
+ * `then` read — is never entered. `Symbol.species` is not consulted on this
+ * route at all, so no mutation of it is reachable from an `await` of a promise
+ * that passed through here.
+ *
+ * Applied to promises this module has *just* created, which are extensible and
+ * carry no own `constructor`, so the definition cannot fail; the guard is here
+ * only so that this helper can never become a rejection path of its own.
+ * Non-configurable, so nothing that runs later can take it back off again.
+ */
+function protectPromiseResolution<T>(promise: Promise<T>): Promise<T> {
+  try {
+    // `void`: the intrinsic returns its own argument, which here is a promise.
+    void objectDefineProperty(promise, 'constructor', {
+      configurable: false,
+      enumerable: false,
+      value: NativePromise,
+      writable: false,
+    });
+  } catch {
+    // Unreachable for a freshly created promise; see the doc comment. Returning
+    // the promise unchanged keeps this helper total.
+  }
+  return promise;
+}
+
 function resolved<T>(value: T): Promise<T> {
-  return new NativePromise<T>((resolve) => {
-    resolve(value);
-  });
+  return protectPromiseResolution(
+    new NativePromise<T>((resolve) => {
+      resolve(value);
+    }),
+  );
 }
 
 function onEvent(
@@ -413,7 +460,7 @@ function waitForExit(child: ChildProcess, ms: number): Promise<boolean> {
   if (hasEnded(child)) {
     return resolved(true);
   }
-  return new NativePromise<boolean>((resolve) => {
+  const exited = new NativePromise<boolean>((resolve) => {
     let done = false;
     const finish = (value: boolean): void => {
       if (done) {
@@ -432,6 +479,7 @@ function waitForExit(child: ChildProcess, ms: number): Promise<boolean> {
     }, ms);
     onEvent(child, 'exit', onExit);
   });
+  return protectPromiseResolution(exited);
 }
 
 /**
@@ -530,7 +578,7 @@ function runTaskkill(
   taskkill: { readonly executable: string; readonly systemRoot: string },
   pid: number,
 ): Promise<boolean> {
-  return new NativePromise<boolean>((resolve) => {
+  const issued = new NativePromise<boolean>((resolve) => {
     let killer: ChildProcess;
     try {
       const decimalPid = reflectApply(numberToString, pid, []);
@@ -616,6 +664,7 @@ function runTaskkill(
       finish(code === 0 || code === 128);
     });
   });
+  return protectPromiseResolution(issued);
 }
 
 /**
@@ -701,7 +750,32 @@ async function terminateWindows(
   return TERMINATION_SCOPE.PROCESS_TREE_REQUESTED;
 }
 
-/** Dispatch termination to the platform strategy. */
+/**
+ * Dispatch termination to the platform strategy.
+ *
+ * The platform result is **awaited and returned as a value**, never returned as
+ * the platform promise itself. Handing a promise back out of an async function
+ * does not pass it through; it resolves this function's own promise capability
+ * *with* it, and resolving a capability with an object reads `then` off that
+ * object. For an ordinary promise that read reaches `Promise.prototype.then` —
+ * writable, inherited, and by this point already reachable by code the handle
+ * ran on inspection. A replacement that installs no continuation makes this
+ * function's promise permanently pending, and with it {@link
+ * releaseUnprotectedChild}, the mandatory hardening rejection that waits on it,
+ * and every ordinary timeout, cancellation, and overflow settlement that runs
+ * through {@link runTermination} — all on paths where the exchange deadline is
+ * either not yet armed or already spent, so nothing is left to end the wait.
+ * Capturing `then` at module load does not help here: this lookup is performed
+ * by the runtime's own resolution step, not by any call site in this file.
+ *
+ * Awaiting instead settles this function with a {@link TerminationScope}, which
+ * is a string. Resolving a capability with a primitive reads nothing at all, so
+ * the assimilation step that made the lookup reachable no longer occurs. The
+ * awaited promise itself goes through {@link protectPromiseResolution} so that
+ * the `await` cannot be pushed off its own fast path either. Rejection
+ * behaviour is unchanged: a platform strategy that faults still rejects this
+ * function's promise with the same value, for the same callers to handle.
+ */
 async function terminate(
   child: ChildProcess,
   platform: TransportPlatform,
@@ -713,9 +787,12 @@ async function terminate(
     // degraded rather than as a successful group or tree request.
     return TERMINATION_SCOPE.DIRECT_CHILD_ONLY;
   }
-  return platform === 'posix'
-    ? terminatePosix(child, pid, graceMs)
-    : terminateWindows(child, pid, graceMs);
+  const scope = await protectPromiseResolution(
+    platform === 'posix'
+      ? terminatePosix(child, pid, graceMs)
+      : terminateWindows(child, pid, graceMs),
+  );
+  return scope;
 }
 
 /**
@@ -741,7 +818,7 @@ async function releaseUnprotectedChild(
   graceMs: number,
 ): Promise<void> {
   try {
-    await terminate(child, platform, graceMs);
+    await protectPromiseResolution(terminate(child, platform, graceMs));
   } catch {
     // A bounded termination attempt that fails is still only an attempt. The
     // exchange's obligation is to settle, not to prove the child is gone.
@@ -1070,7 +1147,7 @@ export function invokeAgentProcess(
       if (closed) {
         return resolved(true);
       }
-      return new NativePromise<boolean>((resolveWait) => {
+      const observed = new NativePromise<boolean>((resolveWait) => {
         const waiter = scheduleTimeout(() => {
           notifyClosed = null;
           resolveWait(false);
@@ -1080,6 +1157,7 @@ export function invokeAgentProcess(
           resolveWait(true);
         };
       });
+      return protectPromiseResolution(observed);
     }
 
     /**
@@ -1121,7 +1199,9 @@ export function invokeAgentProcess(
         return;
       }
       terminating = true;
-      terminationScope = await terminate(child, platform, invocation.graceMs);
+      terminationScope = await protectPromiseResolution(
+        terminate(child, platform, invocation.graceMs),
+      );
 
       if (settled) {
         return;

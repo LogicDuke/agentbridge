@@ -1081,6 +1081,459 @@ process.exit(0);
 `;
 
 /**
+ * One exchange under a *persistent* hostile `Promise.prototype` mutation.
+ *
+ * The scheduler substitutions already covered above are one-shot: they answer a
+ * single lookup and then step aside, which is exactly right for measuring the
+ * two explicit `.then(...)` sites the transport schedules from. It is the wrong
+ * instrument for the lookups this probe exists to measure, because those are
+ * not performed by any call site in the transport at all. They are performed by
+ * the *runtime*, on the transport's behalf, at two places no capture can reach:
+ *
+ *   - resolving an async function's own promise capability with a promise,
+ *     which reads `then` off the returned value (thenable assimilation); and
+ *   - `await`, which reads `constructor` off the awaited promise to decide
+ *     whether it may skip that assimilation, and reads `then` when it may not.
+ *
+ * Neither read can be redirected to a captured binding, so the only way to
+ * measure them is to leave the substitution armed for the whole exchange and
+ * ask whether the exchange still settles. A hook that disarms itself after one
+ * call would be answered by the first lookup and would say nothing about the
+ * rest of the lifecycle — which is where both of these live.
+ *
+ * Four modes, two axes. The path is either the mandatory hardening failure
+ * (whose rejection waits on the release, which waits on termination) or an
+ * ordinary timeout (whose settlement waits on termination directly, with the
+ * exchange deadline already spent). The mutation is either `then` alone or
+ * `then` together with `constructor`, because the two defeat settlement through
+ * different steps: `then` alone is reached only through assimilation, while
+ * mutating `constructor` as well pushes every `await` in the termination chain
+ * off its fast path and into that same assimilation.
+ *
+ * The probe carries its own counterfactuals, run while the hook is still armed
+ * and after the transport has already settled. They reproduce the pre-repair
+ * shape (`return promise`), the half-repaired shape (`return await promise`),
+ * and the repaired shape (`return await` a promise carrying an own
+ * `constructor`) against the identical staged runtime, and report which of them
+ * settles. That is what makes the staged condition provably lethal at the exact
+ * moment the transport survived it, rather than merely present.
+ *
+ * Everything between arming and restoring is written in callbacks. An `await`
+ * there would be the very thing under test, and a probe that suspended on its
+ * own instrumentation would report a pending transport.
+ */
+const PERSISTENT_PROMISE_PROBE_SCRIPT = `
+import { ChildProcess } from 'node:child_process';
+import { tmpdir } from 'node:os';
+
+const [transportUrl, mode] = process.argv.slice(2);
+
+// Every mode this probe implements. An unrecognised name would otherwise stage
+// a different scenario than the test asked for and report a pass for a case
+// that was never run.
+const MODES = [
+  'hardening-persistent-then',
+  'hardening-persistent-ctor-then',
+  'timeout-persistent-then',
+  'timeout-persistent-ctor-then',
+];
+if (!MODES.includes(mode)) {
+  console.log('MODE_INVALID=' + String(mode));
+  process.exit(3);
+}
+const HARDENING =
+  mode === 'hardening-persistent-then' || mode === 'hardening-persistent-ctor-then';
+const MUTATE_CTOR =
+  mode === 'hardening-persistent-ctor-then' || mode === 'timeout-persistent-ctor-then';
+
+// Intrinsics captured before anything is installed over them. This probe has to
+// keep observing, timing, and cleaning up while its own substitution is in
+// place, and every one of those steps would otherwise be answered by the hook.
+const REAL_THEN = Promise.prototype.then;
+const REAL_APPLY = Reflect.apply;
+const REAL_DEFINE = Object.defineProperty;
+const REAL_PROMISE = Promise;
+const REAL_CTOR_DESCRIPTOR = Object.getOwnPropertyDescriptor(Promise.prototype, 'constructor');
+const realSetTimeout = setTimeout;
+const realClearTimeout = clearTimeout;
+
+const unhandled = [];
+process.on('unhandledRejection', (reason) => {
+  unhandled.push(String(reason && reason.message ? reason.message : reason));
+});
+
+const HARDENING_MARKER = 'forced post-spawn hardening failure';
+// Created up front so the value the caller is finally handed can be compared by
+// identity rather than by message. A message survives substitutions an object
+// identity does not.
+const thrownError = new Error(HARDENING_MARKER);
+
+// ---------------------------------------------------------------------------
+// MEASUREMENT INSTRUMENTS, installed before the transport module is loaded so
+// the bindings it captures at load are these counted ones.
+// ---------------------------------------------------------------------------
+let directChildSignals = 0;
+const realKillMethod = ChildProcess.prototype.kill;
+ChildProcess.prototype.kill = function countedKill(...args) {
+  directChildSignals += 1;
+  return REAL_APPLY(realKillMethod, this, args);
+};
+
+// POSIX termination signals the process group through this, not through the
+// handle, so a probe that counted only the handle would report no attempt on
+// the platform where the attempt reaches furthest.
+let groupSignals = 0;
+const realProcessKill = process.kill;
+process.kill = function countedProcessKill(...args) {
+  groupSignals += 1;
+  return REAL_APPLY(realProcessKill, process, args);
+};
+
+const spawned = [];
+// PIDs recorded at spawn time, so identifying a process later never depends on
+// a read this probe has arranged to be hostile.
+const pidAtSpawn = new WeakMap();
+const realSpawnMethod = ChildProcess.prototype.spawn;
+ChildProcess.prototype.spawn = function patchedSpawn(...args) {
+  spawned.push(this);
+  const result = REAL_APPLY(realSpawnMethod, this, args);
+  if (typeof this.pid === 'number') pidAtSpawn.set(this, this.pid);
+  return result;
+};
+
+// The forced post-spawn hardening failure, for the modes that need one.
+//
+// A stdio accessor yields, exactly once, a value that dispatch hardening cannot
+// protect: defining a property on it throws. Every later read returns the real
+// stream, so the release that follows operates on Node's own objects and the
+// only thing this stages is the mandatory failure itself.
+const stash = new WeakMap();
+function slotFor(self) {
+  let slot = stash.get(self);
+  if (slot === undefined) {
+    slot = { stdin: null, stdout: null, stderr: null };
+    stash.set(self, slot);
+  }
+  return slot;
+}
+let hardeningPoisoned = 0;
+const POISON = new Proxy({}, {
+  defineProperty() {
+    hardeningPoisoned += 1;
+    throw thrownError;
+  },
+});
+if (HARDENING) {
+  for (const key of ['stdin', 'stdout', 'stderr']) {
+    REAL_DEFINE(ChildProcess.prototype, key, {
+      configurable: true,
+      get() {
+        const slot = stash.get(this);
+        if (slot === undefined) return null;
+        if (key === 'stdout' && hardeningPoisoned === 0 && slot.stdout !== null) {
+          return POISON;
+        }
+        return slot[key];
+      },
+      set(value) { slotFor(this)[key] = value; },
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// THE TRANSPORT, loaded before anything hostile is installed.
+//
+// The module captures its intrinsics at load. Installing the substitution first
+// would let it capture the hostile one, which is a different scenario than the
+// one under audit: what is measured here is a mutation that arrives after a
+// correctly captured module is already resident.
+// ---------------------------------------------------------------------------
+const { invokeAgentProcess } = await import(transportUrl);
+
+// ---------------------------------------------------------------------------
+// THE PERSISTENT SUBSTITUTION.
+//
+// Not one-shot, and never self-disarming. It is installed before the exchange
+// begins and stays installed, answering every ordinary lookup, until the
+// transport has settled and this probe's own counterfactuals have run.
+// ---------------------------------------------------------------------------
+const HOSTILE_CONSTRUCTOR = { marker: 'hostile-promise-constructor' };
+let hookInstalled = 0;
+let hookCalls = 0;
+function installPersistentHostileThen() {
+  hookInstalled += 1;
+  REAL_DEFINE(Promise.prototype, 'then', {
+    value: function hostileThen() {
+      hookCalls += 1;
+      // Installs no continuation, anywhere, ever. Whatever waited on this
+      // lookup waits for good.
+      return new REAL_PROMISE(() => {});
+    },
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
+}
+function installHostileConstructor() {
+  // Deliberately not a constructor. The runtime's own promise-recognition step
+  // only asks whether this is the intrinsic; anything else sends the awaited
+  // value down the thenable path and into the hook above. A plain object also
+  // leaves species resolution answering with the real intrinsic for the
+  // captured-intrinsic calls this probe makes, so the substitution stays lethal
+  // for the transport without disabling the instrument measuring it.
+  REAL_DEFINE(Promise.prototype, 'constructor', {
+    value: HOSTILE_CONSTRUCTOR,
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
+}
+function armed() {
+  return Promise.prototype.then !== REAL_THEN &&
+    (!MUTATE_CTOR || Promise.prototype.constructor === HOSTILE_CONSTRUCTOR);
+}
+function restoreIntrinsics() {
+  REAL_DEFINE(Promise.prototype, 'then', {
+    value: REAL_THEN, writable: true, enumerable: false, configurable: true,
+  });
+  REAL_DEFINE(Promise.prototype, 'constructor', REAL_CTOR_DESCRIPTOR);
+}
+
+/**
+ * Observe one promise without performing a single ordinary property lookup.
+ *
+ * 'tally', when given, counts every settlement callback the observed promise
+ * fires — deliberately *outside* the once-guard below, so a promise that
+ * settled twice is reported as having settled twice rather than being quietly
+ * collapsed into one answer by the guard. Only the exchange is tallied; the
+ * counterfactuals below are measured, not audited for exactly-once.
+ */
+function observe(promise, ms, onResult, tally) {
+  let done = false;
+  const finishOnce = (result) => {
+    if (done) return;
+    done = true;
+    onResult(result);
+  };
+  const counted = () => {
+    if (tally !== undefined) tally.count += 1;
+  };
+  const timer = realSetTimeout(() => {
+    finishOnce({ kind: 'pending', detail: 'deadline' });
+  }, ms);
+  try {
+    REAL_APPLY(REAL_THEN, promise, [
+      (value) => {
+        counted();
+        realClearTimeout(timer);
+        finishOnce({ kind: 'resolved', value });
+      },
+      (error) => {
+        counted();
+        realClearTimeout(timer);
+        finishOnce({ kind: 'rejected', error });
+      },
+    ]);
+  } catch (error) {
+    realClearTimeout(timer);
+    finishOnce({ kind: 'observe-failed', error });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// THE COUNTERFACTUALS, run against the identical staged runtime.
+//
+// 'thenable-return' is the shape the transport's dispatcher had before the
+// repair. 'await-unprotected' is the shape it would have with only half the
+// repair. 'await-protected' is the shape it has now. Each is a bare promise
+// pipeline with no transport involved, so what they report is a property of the
+// staged runtime alone.
+// ---------------------------------------------------------------------------
+function controlLater(value) {
+  return new REAL_PROMISE((resolve) => {
+    realSetTimeout(() => { resolve(value); }, 1);
+  });
+}
+function protectLikeRepair(promise) {
+  REAL_DEFINE(promise, 'constructor', {
+    configurable: false, enumerable: false, value: REAL_PROMISE, writable: false,
+  });
+  return promise;
+}
+async function controlThenableReturn() { return controlLater('thenable-return'); }
+async function controlAwaitUnprotected() { return await controlLater('await-unprotected'); }
+async function controlAwaitProtected() {
+  return await protectLikeRepair(controlLater('await-protected'));
+}
+
+const environment = {};
+for (const name of ['HOMEDRIVE', 'HOMEPATH', 'LOGONSERVER', 'PATH', 'SYSTEMDRIVE',
+  'SYSTEMROOT', 'TEMP', 'USERDOMAIN', 'USERNAME', 'USERPROFILE', 'WINDIR']) {
+  environment[name] = '';
+}
+if (process.env.SystemRoot !== undefined) {
+  environment.SYSTEMROOT = process.env.SystemRoot;
+}
+
+// A child that never exits on its own, so a process still alive later is
+// evidence rather than a race, and so the timeout modes reach their deadline.
+const spec = {
+  executablePath: process.execPath,
+  args: ['-e', 'setInterval(()=>{},1000);'],
+  workingDirectory: tmpdir(),
+  environment,
+  stdin: '',
+};
+const limits = {
+  timeoutMs: HARDENING ? 30000 : 1000,
+  graceMs: 200,
+  maxStdoutBytes: 65536,
+  maxStderrBytes: 16384,
+};
+
+if (MUTATE_CTOR) installHostileConstructor();
+installPersistentHostileThen();
+
+const exchange = invokeAgentProcess(spec, limits);
+const hookCallsAfterCall = hookCalls;
+
+let armedAtSettlement = false;
+let hookCallsAtSettlement = -1;
+let settlement = null;
+const controls = {};
+
+const publicSettlements = { count: 0 };
+observe(exchange, 12000, (result) => {
+  settlement = result;
+  armedAtSettlement = armed();
+  hookCallsAtSettlement = hookCalls;
+  // Still armed, and now asked directly. Each control reproduces one shape of
+  // the dispatcher against the runtime the transport just survived.
+  observe(controlThenableReturn(), 400, (a) => {
+    controls.thenableReturn = a.kind;
+    observe(controlAwaitUnprotected(), 400, (b) => {
+      controls.awaitUnprotected = b.kind;
+      observe(controlAwaitProtected(), 400, (c) => {
+        controls.awaitProtected = c.kind;
+        // Only now, with every measurement taken while the substitution was in
+        // place, is the runtime handed back intact.
+        const stillArmedAtEnd = armed();
+        restoreIntrinsics();
+        report(stillArmedAtEnd);
+      });
+    });
+  });
+}, publicSettlements);
+
+function report(stillArmedAtEnd) {
+  let restored = false;
+  try {
+    restored = Promise.prototype.then === REAL_THEN &&
+      Promise.prototype.constructor === REAL_PROMISE;
+  } catch { restored = false; }
+  console.log('HOOK_INSTALLED=' + hookInstalled);
+  console.log('HOOK_CALLS_AFTER_CALL=' + hookCallsAfterCall);
+  console.log('HOOK_CALLS_AT_SETTLEMENT=' + hookCallsAtSettlement);
+  console.log('HOOK_CALLS_FINAL=' + hookCalls);
+  console.log('ARMED_AT_SETTLEMENT=' + String(armedAtSettlement));
+  console.log('ARMED_AT_END=' + String(stillArmedAtEnd));
+  console.log('INTRINSICS_RESTORED=' + String(restored));
+  console.log('CONTROL_THENABLE_RETURN=' + String(controls.thenableReturn));
+  console.log('CONTROL_AWAIT_UNPROTECTED=' + String(controls.awaitUnprotected));
+  console.log('CONTROL_AWAIT_PROTECTED=' + String(controls.awaitProtected));
+  console.log('SETTLEMENT=' + settlement.kind);
+  console.log('PUBLIC_SETTLEMENTS=' + publicSettlements.count);
+  if (settlement.kind === 'resolved') {
+    const value = settlement.value;
+    console.log('DETAIL=' + String(value && value.outcome));
+    console.log('SCOPE=' + String(value && value.terminationScope));
+  } else if (settlement.kind === 'rejected') {
+    const error = settlement.error;
+    console.log('DETAIL=' + String(error && error.message ? error.message : error));
+    let identity = false;
+    try { identity = error === thrownError; } catch { identity = false; }
+    console.log('ERROR_IDENTITY=' + String(identity));
+  } else {
+    console.log('DETAIL=' + String(settlement.detail));
+  }
+  console.log('HARDENING_POISONED=' + hardeningPoisoned);
+  console.log('DIRECT_CHILD_SIGNALS=' + directChildSignals);
+  console.log('GROUP_SIGNALS=' + groupSignals);
+  console.log('SPAWNED=' + spawned.length);
+  console.log('RELEASE_ATTEMPTED=' + String(
+    directChildSignals + groupSignals + (spawned.length > 1 ? 1 : 0) > 0,
+  ));
+  void finish();
+}
+
+/** Resolve true when this child ends within ms, without signalling it. */
+function awaitExit(child, ms) {
+  return new Promise((r) => {
+    const timer = setTimeout(() => { r(false); }, ms);
+    child.on('exit', () => { clearTimeout(timer); r(true); });
+    if (child.exitCode !== null || child.signalCode !== null) { clearTimeout(timer); r(true); }
+  });
+}
+
+// True only for a PID this probe started, whose handle Node has not reaped, and
+// which the OS still reports as present. Because the handle is unreaped, that
+// PID cannot yet have been recycled onto an unrelated process.
+function identifyLiveOwnPid(child) {
+  const pid = pidAtSpawn.get(child);
+  if (pid === undefined || pid !== child.pid) return null;
+  if (child.exitCode !== null || child.signalCode !== null) return null;
+  try {
+    REAL_APPLY(realProcessKill, process, [pid, 0]);
+  } catch (error) {
+    // Present but not signallable still means present.
+    if (!error || error.code !== 'EPERM') return null;
+  }
+  return pid;
+}
+
+async function finish() {
+  // -------------------------------------------------------------------------
+  // TRANSPORT RESULT, measured before this harness signals anything. Killing a
+  // child and then asking whether it is gone would measure the harness.
+  // -------------------------------------------------------------------------
+  let abandoned = 0;
+  try {
+    for (const child of spawned) {
+      const ended = await awaitExit(child, 3000);
+      const pid = identifyLiveOwnPid(child);
+      if (!ended && pid !== null) {
+        console.log('ABANDONED_PID=' + pid);
+        abandoned += 1;
+      }
+    }
+  } catch (error) {
+    console.log('MEASUREMENT_FAULT=' + String(error && error.message ? error.message : error));
+    abandoned += 1;
+  }
+  console.log('ABANDONED=' + abandoned);
+
+  // -------------------------------------------------------------------------
+  // HARNESS SELF-CLEANUP, only now that the evidence is recorded.
+  // -------------------------------------------------------------------------
+  let leaked = 0;
+  for (const child of spawned) {
+    const pid = identifyLiveOwnPid(child);
+    if (pid === null) continue;
+    try { REAL_APPLY(realProcessKill, process, [pid, 'SIGKILL']); } catch { /* already gone */ }
+    if (!(await awaitExit(child, 3000))) leaked += 1;
+  }
+  console.log('LEAKED=' + leaked);
+
+  // Give any discarded internal rejection time to be reported before exiting.
+  await new Promise((r) => setTimeout(r, 1000));
+  console.log('UNHANDLED=' + unhandled.length);
+  for (const message of unhandled) console.log('UNHANDLED_REASON=' + message);
+  console.log('SURVIVED');
+  process.exit(0);
+}
+`;
+
+/**
  * One ordinary exchange, run from an interpreter the test chooses the flags for.
  *
  * Node's permission model can only be switched on at process start, so the
@@ -1457,6 +1910,115 @@ async function runHardeningSettlementProbe(
   } finally {
     removeTempDirectory(directory);
   }
+}
+
+/**
+ * Run one persistent-`Promise.prototype`-mutation probe mode in its own process.
+ *
+ * Its own process for the usual three reasons — it mutates a shared intrinsic
+ * for the whole of an exchange, it needs a private `unhandledRejection`
+ * listener, and a queued child `error` with no listener would end the host —
+ * and for a fourth specific to this probe: a `Promise.prototype` left
+ * substituted, even briefly, would be substituted for the test runner too.
+ */
+async function runPersistentPromiseProbe(mode: string): Promise<ProbeResult> {
+  const directory = makeTempDirectory();
+  try {
+    const hook = join(directory, 'hook.mjs');
+    const script = join(directory, 'persistent-promise-probe.mjs');
+    writeFileSync(hook, PROBE_HOOK);
+    writeFileSync(script, PERSISTENT_PROMISE_PROBE_SCRIPT);
+    return await new Promise<ProbeResult>((resolve) => {
+      const probe = spawn(
+        process.execPath,
+        ['--import', pathToFileURL(hook).href, script, TRANSPORT_SOURCE_URL, mode],
+        { stdio: ['ignore', 'pipe', 'pipe'] },
+      );
+      let stdout = '';
+      let stderr = '';
+      let settled = false;
+      const settle = (code: number | null): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        resolve({ code, stdout, stderr });
+      };
+      probe.on('error', (error: Error) => {
+        stderr += `PROBE_SPAWN_ERROR: ${error.message}\n`;
+        settle(null);
+      });
+      probe.stdout.on('data', (chunk: Buffer) => {
+        stdout += chunk.toString('utf8');
+      });
+      probe.stderr.on('data', (chunk: Buffer) => {
+        stderr += chunk.toString('utf8');
+      });
+      probe.on('close', (code: number | null) => {
+        settle(code);
+      });
+    });
+  } finally {
+    removeTempDirectory(directory);
+  }
+}
+
+/**
+ * The evidence every persistent-mutation mode owes, whichever path it exercised.
+ *
+ * `expectLethal` names the counterfactual shapes this mode's staged runtime is
+ * required to defeat. Requiring them to *fail* is what keeps the mode honest: a
+ * probe whose substitution had quietly stopped biting would otherwise report a
+ * pass for a transport that was never actually tested. The repaired shape is
+ * required to survive in every mode, at the same moment, against the same
+ * runtime — so the difference between the two is attributable to the shape
+ * alone and not to the staging.
+ */
+function expectPersistentMutationSurvived(
+  probe: ProbeResult,
+  expectLethal: readonly string[],
+): void {
+  // The substitution was genuinely installed, was still installed when the
+  // transport settled, and was still installed when the last counterfactual
+  // ran. Persistence is asserted, not assumed.
+  expect(probe.stdout).toMatch(/^HOOK_INSTALLED=1$/m);
+  expect(probe.stdout).toMatch(/^ARMED_AT_SETTLEMENT=true$/m);
+  expect(probe.stdout).toMatch(/^ARMED_AT_END=true$/m);
+  // Nothing in the transport performed an ordinary `then` lookup for the whole
+  // exchange: not at the two explicit scheduling sites, which go through the
+  // captured intrinsic, and not through the runtime's assimilation step, which
+  // the repair no longer reaches.
+  expect(probe.stdout).toMatch(/^HOOK_CALLS_AT_SETTLEMENT=0$/m);
+  // The counterfactuals, run against this same armed runtime after the
+  // transport had already settled.
+  for (const shape of ['THENABLE_RETURN', 'AWAIT_UNPROTECTED', 'AWAIT_PROTECTED']) {
+    const lethal = expectLethal.includes(shape);
+    expect(probe.stdout).toMatch(
+      new RegExp(`^CONTROL_${shape}=${lethal ? 'pending' : 'resolved'}$`, 'm'),
+    );
+  }
+  // The exchange settled, once, within the probe's own bounded deadline.
+  expect(probe.stdout).not.toMatch(/^SETTLEMENT=pending$/m);
+  expect(probe.stdout).not.toMatch(/^SETTLEMENT=observe-failed$/m);
+  expect(probe.stdout).toMatch(/^PUBLIC_SETTLEMENTS=1$/m);
+  // A real child existed and the mandatory release attempt was actually made,
+  // rather than skipped on the way to a settlement.
+  expect(probe.stdout).toMatch(/^SPAWNED=[1-9][0-9]*$/m);
+  expect(probe.stdout).toMatch(/^RELEASE_ATTEMPTED=true$/m);
+  // The transport's own result, recorded before the harness cleaned up after
+  // itself, and the harness's result afterwards. Both are required.
+  expect(probe.stdout).toMatch(/^ABANDONED=0$/m);
+  expect(probe.stdout).not.toContain('MEASUREMENT_FAULT=');
+  expect(probe.stdout).toMatch(/^LEAKED=0$/m);
+  // No discarded internal rejection, and no lifecycle event left uncovered.
+  expect(probe.stdout).toContain('UNHANDLED=0');
+  expect(probe.stderr).not.toContain("Unhandled 'error' event");
+  // The mutated intrinsics were put back, verified rather than assumed, so this
+  // probe cannot leave a substituted `Promise.prototype` behind for its own
+  // cleanup or for Node's shutdown.
+  expect(probe.stdout).toMatch(/^INTRINSICS_RESTORED=true$/m);
+  expect(probe.stdout).toContain('SURVIVED');
+  expect(probe.code).toBe(0);
 }
 
 /**
@@ -2443,6 +3005,81 @@ describe('invokeAgentProcess — adversarial', () => {
     expect(probe.stdout).toMatch(/^THEN_RESTORED=true$/m);
     expectHardeningFailureSettles(probe);
   }, 40_000);
+
+
+  it('settles a hardening failure under a persistently substituted Promise.prototype.then', async () => {
+    const probe = await runPersistentPromiseProbe('hardening-persistent-then');
+
+    // The mandatory rejection is delivered only once the release has finished,
+    // and the release finishes only once the platform termination it awaits
+    // reports. Handing that platform promise back out of the dispatcher would
+    // have resolved the dispatcher's own capability *with* it, and the runtime
+    // reads `then` off a value resolved that way. This is that read, staged and
+    // still armed: the counterfactual below proves an unrepaired dispatcher
+    // would have hung here, with no exchange deadline yet armed to end it.
+    expectPersistentMutationSurvived(probe, ['THENABLE_RETURN']);
+    // The staged failure was genuinely reached and genuinely mandatory.
+    expect(probe.stdout).toMatch(/^HARDENING_POISONED=[1-9][0-9]*$/m);
+    // The exact hardening failure, by identity, not by message.
+    expect(probe.stdout).toContain('SETTLEMENT=rejected');
+    expect(probe.stdout).toContain('DETAIL=forced post-spawn hardening failure');
+    expect(probe.stdout).toMatch(/^ERROR_IDENTITY=true$/m);
+    // A rejection is not an AgentExchange, and the mandatory failure is never
+    // reported as a failure to spawn.
+    expect(probe.stdout).not.toContain('SPAWN_FAILED');
+    expect(probe.stdout).not.toContain('SETTLEMENT=resolved');
+  }, 60_000);
+
+  it('settles an ordinary timeout under a persistently substituted Promise.prototype.then', async () => {
+    const probe = await runPersistentPromiseProbe('timeout-persistent-then');
+
+    // The other half of the same defect, and the more exposed one: here the
+    // exchange deadline has already fired, so it is the thing that *started*
+    // the termination rather than anything that could still rescue it, and
+    // `terminating` is latched so no later cause can start a second lifecycle.
+    // A dispatcher that hung would leave this exchange pending permanently.
+    expectPersistentMutationSurvived(probe, ['THENABLE_RETURN']);
+    // Nothing forced a failure here; this is the ordinary path.
+    expect(probe.stdout).toMatch(/^HARDENING_POISONED=0$/m);
+    // The intended outcome, with the termination it initiated actually reported
+    // rather than left at NOT_REQUIRED.
+    expect(probe.stdout).toContain('SETTLEMENT=resolved');
+    expect(probe.stdout).toContain('DETAIL=TIMED_OUT');
+    expect(probe.stdout).not.toMatch(/^SCOPE=NOT_REQUIRED$/m);
+    expect(probe.stdout).not.toContain('SETTLEMENT=rejected');
+  }, 60_000);
+
+  it('settles a hardening failure under a persistent Promise.prototype constructor and then', async () => {
+    const probe = await runPersistentPromiseProbe('hardening-persistent-ctor-then');
+
+    // The second mechanism, which the first repair alone does not close.
+    // `await` skips assimilation only for a promise it recognises as the
+    // runtime's own kind, and it decides that by reading `constructor` — also
+    // inherited, also writable. Mutate it and every `await` in the termination
+    // chain falls back to the thenable path and reaches the same hook. The
+    // counterfactual list is what states this: with this runtime staged, both
+    // the pre-repair shape *and* the merely-awaited shape hang, and only a
+    // promise carrying its own `constructor` still settles.
+    expectPersistentMutationSurvived(probe, ['THENABLE_RETURN', 'AWAIT_UNPROTECTED']);
+    expect(probe.stdout).toMatch(/^HARDENING_POISONED=[1-9][0-9]*$/m);
+    expect(probe.stdout).toContain('SETTLEMENT=rejected');
+    expect(probe.stdout).toContain('DETAIL=forced post-spawn hardening failure');
+    expect(probe.stdout).toMatch(/^ERROR_IDENTITY=true$/m);
+    expect(probe.stdout).not.toContain('SPAWN_FAILED');
+    expect(probe.stdout).not.toContain('SETTLEMENT=resolved');
+  }, 60_000);
+
+  it('settles an ordinary timeout under a persistent Promise.prototype constructor and then', async () => {
+    const probe = await runPersistentPromiseProbe('timeout-persistent-ctor-then');
+
+    // The same second mechanism on the path with nothing left to rescue it.
+    expectPersistentMutationSurvived(probe, ['THENABLE_RETURN', 'AWAIT_UNPROTECTED']);
+    expect(probe.stdout).toMatch(/^HARDENING_POISONED=0$/m);
+    expect(probe.stdout).toContain('SETTLEMENT=resolved');
+    expect(probe.stdout).toContain('DETAIL=TIMED_OUT');
+    expect(probe.stdout).not.toMatch(/^SCOPE=NOT_REQUIRED$/m);
+    expect(probe.stdout).not.toContain('SETTLEMENT=rejected');
+  }, 60_000);
 
   it('settles a hardening failure whose bounded termination attempt itself fails', async () => {
     const probe = await runHardeningSettlementProbe('terminate-fault');
