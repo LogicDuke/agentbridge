@@ -237,8 +237,8 @@ describe('termination vocabulary claims no more than the OS provides', () => {
   });
 
   it('invalidates a POSIX group target before either possible signal', () => {
-    const start = IMPLEMENTATION_SOURCE.indexOf('async function terminatePosix');
-    const end = IMPLEMENTATION_SOURCE.indexOf('async function terminateWindows');
+    const start = IMPLEMENTATION_SOURCE.indexOf('function terminatePosix');
+    const end = IMPLEMENTATION_SOURCE.indexOf('function terminateWindows');
     const implementation = IMPLEMENTATION_SOURCE.slice(start, end);
     const firstGuard = implementation.indexOf('if (hasEnded(child))');
     const termSignal = implementation.indexOf("signalProcessGroup(pid, 'SIGTERM')");
@@ -257,7 +257,7 @@ describe('termination vocabulary claims no more than the OS provides', () => {
   });
 
   it('invalidates a Windows PID before resolving or spawning taskkill', () => {
-    const start = IMPLEMENTATION_SOURCE.indexOf('async function terminateWindows');
+    const start = IMPLEMENTATION_SOURCE.indexOf('function terminateWindows');
     const end = IMPLEMENTATION_SOURCE.indexOf('/** Dispatch termination', start);
     const implementation = IMPLEMENTATION_SOURCE.slice(start, end);
     const guard = implementation.indexOf('if (hasEnded(child))');
