@@ -274,6 +274,7 @@ const MODES = [
   'terminate-fault-sigterm-ignored',
   'unclassifiable-throw',
   'error-identity-mutation',
+  'hostile-error-global',
 ];
 if (!MODES.includes(mode)) {
   console.log('MODE_INVALID=' + String(mode));
@@ -315,7 +316,48 @@ const UNCLASSIFIABLE_VALUE = new Proxy({}, {
 // by message. A message survives operations an object identity does not, so
 // message equality alone would report a pass for a substituted Error.
 let thrownError = null;
+// Whether this mode arranges for classifying the thrown value to overwrite the
+// \`Error\` global the transport is about to construct its fallback with.
+//
+// The classification is a prototype-chain read, and a Proxy answers it with its
+// own code. That code does not need to throw: it installs a replacement \`Error\`
+// constructor that does, and then answers the read with a plain \`null\` so the
+// classification simply reports "not an Error". A transport that looks the
+// constructor up again at that point builds its fallback through the
+// replacement, the construction throws, the \`catch\` that exists to cover it
+// repeats the same lookup, and the second throw escapes the whole block with
+// the child's bounded release still unreached.
+const HOSTILE_ERROR_GLOBAL = mode === 'hostile-error-global';
+const RealError = Error;
+let globalPoisoned = 0;
+// Constructions of the transport's own fallback that went through the
+// replacement. Counted by message rather than by volume, because this probe's
+// other instrumentation legitimately allocates through the global too once it
+// has been poisoned, and that noise must not be mistaken for the one
+// construction under test. Staying at zero is the property being asserted; a
+// transport that looks the constructor up again drives it non-zero and dies.
+let fallbackViaPoisoned = 0;
+// Deliberately not an Error: whatever escapes a regressed transport must be
+// distinguishable from anything this transport could legitimately have built.
+const HOSTILE_SECONDARY = { marker: 'hostile-global-secondary' };
+const HOSTILE_GLOBAL_VALUE = new Proxy({}, {
+  getPrototypeOf() {
+    globalPoisoned += 1;
+    globalThis.Error = new Proxy(RealError, {
+      construct(target, args) {
+        if (args && args[0] === 'Process dispatch hardening failed') {
+          fallbackViaPoisoned += 1;
+        }
+        throw HOSTILE_SECONDARY;
+      },
+    });
+    // Not a throw. The classification answers cleanly and the damage is left
+    // waiting for the *next* lookup of the global.
+    return null;
+  },
+});
 function hardeningThrow() {
+  if (HOSTILE_ERROR_GLOBAL) return HOSTILE_GLOBAL_VALUE;
   if (UNCLASSIFIABLE) return UNCLASSIFIABLE_VALUE;
   thrownError = new Error(HARDENING_MARKER);
   return thrownError;
@@ -591,10 +633,31 @@ const settlement = await Promise.race([
             error.cause === UNCLASSIFIABLE_VALUE;
         } catch { return false; }
       })(),
+      // The same question for the hostile-global mode, whose thrown value is a
+      // different object. Kept as its own comparison so neither mode's identity
+      // claim can be satisfied by the other mode's value.
+      causeIdentityGlobal: (() => {
+        try {
+          return error !== null && typeof error === 'object' &&
+            error.cause === HOSTILE_GLOBAL_VALUE;
+        } catch { return false; }
+      })(),
     }),
   ),
   new Promise((r) => setTimeout(() => { r({ kind: 'pending', detail: 'deadline' }); }, 8000)),
 ]);
+// Whether the constructor the trap installed would in fact have failed the
+// fallback construction. Without this the regression would also pass against a
+// replacement that happened to be harmless, which proves nothing about a
+// transport that avoided it. Asked while it is still installed, and only then
+// is the real constructor put back.
+let hostileCtorLethal = false;
+try { new globalThis.Error('probe'); } catch { hostileCtorLethal = true; }
+globalThis.Error = RealError;
+console.log('GLOBAL_POISONED=' + globalPoisoned);
+console.log('FALLBACK_VIA_POISONED=' + fallbackViaPoisoned);
+console.log('HOSTILE_CTOR_LETHAL=' + String(hostileCtorLethal));
+console.log('CAUSE_IDENTITY_GLOBAL=' + String(settlement.causeIdentityGlobal === true));
 console.log('SETTLEMENT=' + settlement.kind);
 console.log('DETAIL=' + settlement.detail);
 console.log('CLEANUP_FAULTS=' + cleanupFaults);
@@ -1855,6 +1918,55 @@ describe('invokeAgentProcess — adversarial', () => {
     // The caller received the very object that was thrown — not an equal one.
     expect(probe.stdout).toMatch(/^ERROR_IDENTITY=true$/m);
     expectHardeningFailureSettles(probe);
+  }, 40_000);
+
+  /**
+   * A thrown value that rewrites the `Error` global while it is being
+   * classified, against a transport that must still release the child.
+   *
+   * Classification asks the value one question, and a Proxy answers it with its
+   * own code. The answer given here is an ordinary `null` — "not an Error" —
+   * but on the way out the trap replaces `globalThis.Error` with a constructor
+   * that throws. Everything then turns on where the fallback's constructor
+   * comes from. Looked up again at that moment, it is the replacement: the
+   * ternary's fallback throws, the `catch` written to absorb exactly that
+   * repeats the same lookup, and its throw escapes the block entirely. The
+   * release never runs, and a real child that was already spawned is left
+   * alive — the one outcome this whole path exists to prevent, reached without
+   * the classification ever having thrown.
+   *
+   * The trap still fires here and the replacement is still installed and still
+   * lethal; the probe proves both rather than assuming them. What the repair
+   * changes is only that the constructor was captured before the value that
+   * poisoned the global ever existed, so the fallback is built without ever
+   * consulting it again.
+   */
+  it('builds the fallback with a captured constructor when classification poisons the Error global', async () => {
+    const probe = await runHardeningSettlementProbe('hostile-error-global');
+
+    // The staged condition was genuinely reached: the value's classification
+    // hook ran, and it really did overwrite the global.
+    expect(probe.stdout).toMatch(/^GLOBAL_POISONED=[1-9][0-9]*$/m);
+    // And what it installed would really have failed a construction, so a
+    // transport that used it could not have survived. Without this the case
+    // could pass against a harmless replacement and prove nothing.
+    expect(probe.stdout).toMatch(/^HOSTILE_CTOR_LETHAL=true$/m);
+    // The transport's own fallback was never built through it.
+    expect(probe.stdout).toMatch(/^FALLBACK_VIA_POISONED=0$/m);
+    // The secondary throw a regressed transport would have escaped with never
+    // reached the caller.
+    expect(probe.stdout).not.toContain('hostile-global-secondary');
+    expect(probe.stdout).not.toContain('DETAIL=[object Object]');
+    // A real child existed, and the release ran far enough past the failure to
+    // reach the poisoned pipe value and fault on it — bounded and absorbed,
+    // exactly as on the ordinary modes.
+    expect(probe.stdout).toMatch(/^SPAWNED=[1-9][0-9]*$/m);
+    expect(probe.stdout).toMatch(/CLEANUP_FAULTS=[1-9]/);
+    // The value was never an Error, so the stable hardening failure is the
+    // reason — and the value itself, the only record of what actually went
+    // wrong, is retained on it by reference.
+    expect(probe.stdout).toMatch(/^CAUSE_IDENTITY_GLOBAL=true$/m);
+    expectHardeningFailureSettles(probe, 'Process dispatch hardening failed');
   }, 40_000);
 
   it('settles a hardening failure whose bounded termination attempt itself fails', async () => {
