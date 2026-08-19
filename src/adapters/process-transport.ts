@@ -75,6 +75,32 @@ const objectFreeze = Object.freeze;
 const objectDefineProperty = Object.defineProperty;
 const reflectApply = Reflect.apply;
 const NativePromise = Promise;
+// Continuation scheduling, captured away from the property lookup that reaches
+// it. The settlement paths below hand the caller its mandatory failure from a
+// continuation installed on an internal release promise, and an ordinary
+// `release.then(...)` resolves `then` through `Promise.prototype` — an
+// ordinary, writable property of an ordinary, mutable object. Both of those
+// settlement sites are reached only *after* a value engineered to run code on
+// inspection has already had its turn, so a hostile path gets to substitute
+// the scheduler strictly before the continuation is installed. A replacement
+// that simply returns installs no continuation at all and leaves the caller
+// pending for good — the exchange deadline cannot rescue it, because on these
+// paths that deadline is not armed yet; a replacement that throws replaces the
+// mandatory failure with the hostile value. Read from a binding fixed at module
+// load, the scheduling call is the intrinsic regardless of what
+// `Promise.prototype` holds by the time it is reached.
+//
+// What the capture alone does not make total is the intrinsic's own prologue:
+// `then` derives its result promise through `SpeciesConstructor`, which reads
+// `constructor` off the promise — another mutable inherited property — before
+// it registers anything. Every use below is therefore wrapped so that a fault
+// raised before registration still delivers exactly the settlement the
+// continuation would have delivered. The registration itself cannot be
+// subverted once it is reached: the derived promise is discarded here, and the
+// handlers are attached to the real promise whatever the species constructor
+// returned.
+// eslint-disable-next-line @typescript-eslint/unbound-method
+const promiseThen = Promise.prototype.then;
 // The constructor this module builds its own failures with. `Error` is an
 // ordinary writable global, and the hardening-failure path below has to
 // construct through it *after* having touched a value engineered to run code
@@ -529,14 +555,31 @@ function runTaskkill(
       // own steps can throw. Resolving from both settlement paths keeps this
       // helper's promise — and therefore every termination that awaits it —
       // total, and leaves no discarded rejection unhandled.
-      void reapUnprotectedHelper(killer).then(
-        () => {
-          resolve(false);
-        },
-        () => {
-          resolve(false);
-        },
-      );
+      //
+      // Scheduled through the captured {@link promiseThen}: this module stays
+      // loaded across exchanges, so any earlier hostile path in the process —
+      // including the dispatch-hardening one this helper is itself the fallback
+      // for — may already have replaced `Promise.prototype.then`. An ordinary
+      // lookup here would reach that replacement, and a replacement that
+      // installs nothing would leave this helper's promise pending, hanging the
+      // `await` in `terminateWindows` and with it the whole bounded release.
+      // The `catch` covers the intrinsic's own pre-registration prologue, so a
+      // fault there still degrades to the same honest "not issued" answer the
+      // continuations give rather than rejecting a promise the callers of this
+      // helper treat as total.
+      const reaped = reapUnprotectedHelper(killer);
+      try {
+        void reflectApply(promiseThen, reaped, [
+          () => {
+            resolve(false);
+          },
+          () => {
+            resolve(false);
+          },
+        ]);
+      } catch {
+        resolve(false);
+      }
       return;
     }
 
@@ -914,14 +957,30 @@ export function invokeAgentProcess(
       // poisoned `stdout`/`stderr` value can leave this exchange pending or
       // leave an internal rejection unhandled. The mandatory hardening failure
       // stays the externally visible reason on every one of those paths.
-      void release.then(
-        () => {
-          reject(hardeningFailure);
-        },
-        () => {
-          reject(hardeningFailure);
-        },
-      );
+      //
+      // Scheduled through the captured {@link promiseThen} rather than through
+      // `release.then`. The value that faulted hardening has already run its
+      // own code by this point, and the cheapest thing that code can do is
+      // replace the scheduler this path is about to reach — a lookup here would
+      // find the replacement. One that installs nothing leaves this exchange
+      // pending with no deadline yet armed to end it; one that throws escapes
+      // this executor and hands the caller the hostile value in place of the
+      // mandatory failure. The `catch` closes the same gap for the intrinsic's
+      // own prologue, which reads the promise's `constructor` before it
+      // registers anything: the release is already running and never rejects,
+      // so settling from here loses nothing but the wait.
+      try {
+        void reflectApply(promiseThen, release, [
+          () => {
+            reject(hardeningFailure);
+          },
+          () => {
+            reject(hardeningFailure);
+          },
+        ]);
+      } catch {
+        reject(hardeningFailure);
+      }
       return;
     }
 

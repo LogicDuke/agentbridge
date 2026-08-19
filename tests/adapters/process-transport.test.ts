@@ -89,6 +89,13 @@ import { join } from 'node:path';
 
 const [transportUrl, mode, scratchPrefix] = process.argv.slice(2);
 const realSystemRoot = process.env.SystemRoot;
+// A discarded internal rejection is one of the two ways a substituted helper
+// scheduler surfaces, so it is counted rather than left to Node's default
+// reporting.
+const unhandled = [];
+process.on('unhandledRejection', (reason) => {
+  unhandled.push(String(reason && reason.message ? reason.message : reason));
+});
 const { invokeAgentProcess } = await import(transportUrl);
 
 // Every directory this probe creates, so none outlives the probe.
@@ -123,7 +130,51 @@ function environment() {
 const limits = { timeoutMs: 5000, graceMs: 200, maxStdoutBytes: 65536, maxStderrBytes: 16384 };
 let spec;
 
-if (mode === 'helper') {
+// The tree-kill helper's own settlement is scheduled the same way the exchange's
+// is, and this module stays loaded across exchanges, so a scheduler substituted
+// by any earlier hostile path in the process is still in place when the helper
+// reaches it. These modes stage that directly, at the one moment that orders
+// correctly: the helper handle exists, its dispatch hardening is already
+// guaranteed to throw, and the settlement that failure leads to has not been
+// scheduled yet.
+//
+// Swallowed, the helper's promise never settles, the \`await\` in the Windows
+// termination strategy never returns, and the whole bounded release stalls with
+// the exchange still pending. Thrown, it escapes the helper's executor, rejects
+// a promise every caller treats as total, and surfaces as a discarded rejection
+// with the exchange still unsettled.
+const HELPER_THEN_SWALLOW = mode === 'helper-then-swallow';
+const HELPER_THEN_THROW = mode === 'helper-then-throw';
+const HELPER_HOSTILE_THEN = HELPER_THEN_SWALLOW || HELPER_THEN_THROW;
+const REAL_THEN = Promise.prototype.then;
+const REAL_APPLY = Reflect.apply;
+const HOSTILE_THEN_VALUE = { marker: 'hostile-helper-then-value' };
+let thenArmed = false;
+let thenHookInstalled = 0;
+let thenHookCalls = 0;
+// Calls the hook took during the transport's own synchronous run, sampled when
+// the window closes. Starts negative so a window that never closed is visible
+// as such rather than reading like a clean zero.
+let thenHookHelperCalls = -1;
+function installHostileThen() {
+  thenHookInstalled += 1;
+  Object.defineProperty(Promise.prototype, 'then', {
+    value: function hostileThen(...args) {
+      if (!thenArmed) {
+        return REAL_APPLY(REAL_THEN, this, args);
+      }
+      thenArmed = false;
+      thenHookCalls += 1;
+      if (HELPER_THEN_THROW) {
+        throw HOSTILE_THEN_VALUE;
+      }
+      return new Promise(() => {});
+    },
+    writable: true, enumerable: false, configurable: true,
+  });
+}
+
+if (mode === 'helper' || HELPER_HOSTILE_THEN) {
   // Point taskkill resolution at a directory that holds no taskkill executable,
   // so the helper spawn reports ENOENT asynchronously.
   process.env.SystemRoot = scratchDirectory(scratchPrefix + 'fakeroot-');
@@ -145,6 +196,19 @@ if (mode === 'helper') {
         // Proves the transport's own hardening must throw for this helper,
         // while leaving the genuine emit intrinsic in place.
         wouldThrow = true;
+      }
+      if (HELPER_HOSTILE_THEN) {
+        // Armed here and nowhere else. Everything the transport does between
+        // this line and its helper settlement is synchronous, so the window
+        // covers exactly that call; the microtask below closes it again for a
+        // transport that never reaches the lookup, so nothing else in this
+        // process is answered by the substitution.
+        installHostileThen();
+        thenArmed = true;
+        queueMicrotask(() => {
+          thenArmed = false;
+          thenHookHelperCalls = thenHookCalls;
+        });
       }
     }
     return result;
@@ -205,15 +269,56 @@ if (mode === 'helper') {
 }
 
 try {
-  try {
-    const exchange = await invokeAgentProcess(spec, limits);
-    console.log('RESOLVED=' + exchange.outcome + ' scope=' + exchange.terminationScope);
-  } catch (error) {
-    console.log('REJECTED=' + (error && error.message));
-  }
+  // A bounded deadline, so an exchange the transport has stalled is reported as
+  // stalled instead of hanging this probe until the runner's own timeout. Built
+  // before anything hostile is installed, and every mode that settles normally
+  // settles far inside it.
+  const outcome = await Promise.race([
+    invokeAgentProcess(spec, limits).then(
+      (exchange) => 'RESOLVED=' + exchange.outcome + ' scope=' + exchange.terminationScope,
+      (error) => 'REJECTED=' + (error && error.message ? error.message : error),
+    ),
+    new Promise((resolve) => setTimeout(() => { resolve('PENDING=deadline'); }, 12000)),
+  ]);
+  console.log(outcome);
 
   // Give any queued asynchronous spawn failure time to surface before exiting.
   await new Promise((resolve) => setTimeout(resolve, 1500));
+
+  // What this probe can prove about the scheduler it staged, collected only
+  // now that the transport's own use of it is finished and counted.
+  //
+  // A zero call count reads the same whether the transport avoided the hook or
+  // the hook was never staged at all, so the hook is re-armed and asked
+  // directly, with an ordinary lookup on an ordinary promise, and required to
+  // misbehave exactly as it would have then.
+  let thenHookReachable = false;
+  let thenHookControlSettled = 'not-run';
+  if (HELPER_HOSTILE_THEN) {
+    const before = thenHookCalls;
+    thenArmed = true;
+    try {
+      const control = new Promise((r) => { r('control'); });
+      const derived = control.then(() => { thenHookControlSettled = 'installed'; },
+                                   () => { thenHookControlSettled = 'installed'; });
+      thenHookReachable = thenHookCalls === before + 1;
+      void derived;
+    } catch (error) {
+      thenHookReachable = error === HOSTILE_THEN_VALUE;
+    }
+    thenArmed = false;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  Object.defineProperty(Promise.prototype, 'then', {
+    value: REAL_THEN, writable: true, enumerable: false, configurable: true,
+  });
+  console.log('HELPER_THEN_INSTALLED=' + thenHookInstalled);
+  console.log('HELPER_THEN_TRANSPORT_CALLS=' + thenHookHelperCalls);
+  console.log('HELPER_THEN_REACHABLE=' + String(thenHookReachable));
+  console.log('HELPER_THEN_CONTROL=' + thenHookControlSettled);
+  console.log('HELPER_THEN_RESTORED=' + String(Promise.prototype.then === REAL_THEN));
+  console.log('UNHANDLED=' + unhandled.length);
+  for (const message of unhandled) console.log('UNHANDLED_REASON=' + message);
   console.log('SURVIVED');
 } finally {
   // process.exit skips finally blocks, so clean up before reaching it.
@@ -276,6 +381,8 @@ const MODES = [
   'error-identity-mutation',
   'hostile-error-global',
   'hostile-has-instance',
+  'hostile-then-swallow',
+  'hostile-then-throw',
 ];
 if (!MODES.includes(mode)) {
   console.log('MODE_INVALID=' + String(mode));
@@ -396,7 +503,73 @@ function installHostileHasInstance() {
     configurable: true,
   });
 }
+// Whether this mode substitutes the *scheduler* the settlement path reaches.
+//
+// The transport hands the caller its mandatory failure from a continuation
+// installed on an internal release promise. Installing it is a property lookup
+// — \`release.then\` — and \`Promise.prototype.then\` is an ordinary writable
+// property of an ordinary mutable object, reachable by any code that runs
+// before the installation. The forced hardening failure is exactly such a
+// window: this hook is installed on the way out of it, strictly before the
+// transport classifies anything and strictly before the release begins.
+//
+// Two shapes, because they defeat the settlement in opposite ways. A scheduler
+// that quietly installs nothing leaves the exchange pending for good — the
+// exchange deadline is not armed on this path, so nothing else ends it. A
+// scheduler that throws escapes the promise executor the settlement sits in
+// and rejects the caller with the hostile value, in place of the mandatory
+// hardening failure the contract owes.
+const HOSTILE_THEN_SWALLOW = mode === 'hostile-then-swallow';
+const HOSTILE_THEN_THROW = mode === 'hostile-then-throw';
+const HOSTILE_THEN = HOSTILE_THEN_SWALLOW || HOSTILE_THEN_THROW;
+// The genuine intrinsic, and the genuine \`Reflect.apply\`, captured before
+// anything is installed over either. The hook delegates through them whenever
+// it is not armed, so the substitution is inert for every promise in this
+// process except the one call under test. A blanket replacement would break
+// this probe's own plumbing and Node's internals alike, and that collateral
+// damage would be indistinguishable from the defect being measured.
+const REAL_THEN = Promise.prototype.then;
+const REAL_APPLY = Reflect.apply;
+// Deliberately not an Error: whatever a regressed transport hands back must be
+// distinguishable from anything this transport could legitimately have built.
+const HOSTILE_THEN_VALUE = { marker: 'hostile-then-value' };
+let thenArmed = false;
+let thenHookInstalled = 0;
+let thenHookCalls = 0;
+function installHostileThen() {
+  thenHookInstalled += 1;
+  Object.defineProperty(Promise.prototype, 'then', {
+    value: function hostileThen(...args) {
+      if (!thenArmed) {
+        return REAL_APPLY(REAL_THEN, this, args);
+      }
+      // One shot. The armed window is the transport's own synchronous run, and
+      // leaving it open past the call under test would start answering for
+      // this probe's plumbing instead.
+      thenArmed = false;
+      thenHookCalls += 1;
+      if (HOSTILE_THEN_THROW) {
+        throw HOSTILE_THEN_VALUE;
+      }
+      // Swallowed: no continuation is installed anywhere, and the promise
+      // handed back never settles.
+      return new Promise(() => {});
+    },
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
+}
+
 function hardeningThrow() {
+  if (HOSTILE_THEN) {
+    // Installed and armed on the way out of the forced hardening failure,
+    // which is strictly before the transport reaches its settlement
+    // scheduling point. The window is closed again the moment the transport's
+    // synchronous work returns, below.
+    installHostileThen();
+    thenArmed = true;
+  }
   if (HOSTILE_HAS_INSTANCE) {
     // Installed on the way out of the forced hardening failure, which is
     // strictly before the transport classifies anything, so the hook is
@@ -654,10 +827,23 @@ const spec = {
 };
 const limits = { timeoutMs: 5000, graceMs: 200, maxStdoutBytes: 65536, maxStderrBytes: 16384 };
 
+// The call, kept apart from everything this probe then schedules on it.
+//
+// The transport installs its settlement continuation synchronously, inside
+// this call: the hardening failure, the classification, the start of the
+// release, and the scheduling of the rejection all happen before it returns.
+// That makes this line the exact close of the hostile-scheduler window opened
+// in \`hardeningThrow\`, and closing it here is what keeps the substitution
+// answerable only for the transport's own call. It also makes the count below
+// unambiguous: whatever the hook was asked, it was asked by the transport.
+const exchange = invokeAgentProcess(spec, limits);
+const thenHookTransportCalls = thenHookCalls;
+thenArmed = false;
+
 // A bounded deadline, so a pending exchange is reported as pending instead of
 // hanging this probe until the runner's own timeout.
 const settlement = await Promise.race([
-  invokeAgentProcess(spec, limits).then(
+  exchange.then(
     (exchange) => ({ kind: 'resolved', detail: String(exchange && exchange.outcome) }),
     (error) => ({
       kind: 'rejected',
@@ -697,6 +883,13 @@ const settlement = await Promise.race([
           return error !== null && typeof error === 'object' &&
             error.cause === HOSTILE_HAS_INSTANCE_VALUE;
         } catch { return false; }
+      })(),
+      // The same question for the substituted-scheduler modes, whose thrown
+      // value is a fourth distinct object. A throwing scheduler escapes the
+      // executor the settlement sits in, so this is what a regressed transport
+      // hands back in place of the mandatory failure.
+      rawHostileThenReason: (() => {
+        try { return error === HOSTILE_THEN_VALUE; } catch { return false; }
       })(),
       // And the failure the repair exists to prevent, asked directly: whether
       // the raw hostile object was itself handed back as the rejection reason.
@@ -751,6 +944,60 @@ try {
     new RealError('restored') instanceof RealError &&
     !(HOSTILE_HAS_INSTANCE_VALUE instanceof RealError);
 } catch {}
+// The substituted-scheduler modes' evidence, collected the same way and in the
+// same order: what the transport did first, then what this probe can prove
+// about the hook that was staged for it.
+//
+// The transport's scheduling is finished by now, so its call count is already
+// fixed; a repaired transport schedules through a captured intrinsic and leaves
+// it at zero. A zero on its own proves nothing, because it reads the same
+// whether the transport avoided the hook or the hook was never staged. So the
+// hook is re-armed here and asked directly, with an ordinary lookup on an
+// ordinary promise, and it is required to misbehave exactly as it would have
+// then. That is the counterfactual made into evidence: an ordinary
+// \`release.then\` at the same moment would have reached this.
+let thenHookReachable = false;
+let thenHookControlSettled = 'not-run';
+if (HOSTILE_THEN) {
+  const callsBeforeControl = thenHookCalls;
+  thenArmed = true;
+  try {
+    const control = new Promise((r) => { r('control'); });
+    // Deliberately an ordinary property lookup — the very thing the repair
+    // removed from the transport's settlement path.
+    const derived = control.then(() => { thenHookControlSettled = 'installed'; },
+                                 () => { thenHookControlSettled = 'installed'; });
+    // A swallowing scheduler hands back a promise that never settles and
+    // installs nothing, so the flag above stays untouched.
+    thenHookReachable = thenHookCalls === callsBeforeControl + 1;
+    void derived;
+  } catch (error) {
+    // A throwing scheduler answers by throwing, which is itself the proof.
+    thenHookReachable = error === HOSTILE_THEN_VALUE;
+  }
+  thenArmed = false;
+  // Let a swallowed continuation prove it was swallowed rather than merely
+  // slow: an intact scheduler would have run it by the end of this turn.
+  await new Promise((r) => setTimeout(r, 50));
+}
+// Restored before anything else runs, and the restoration is verified rather
+// than assumed, so this probe cannot leave a substituted scheduler behind for
+// its own cleanup or for Node's shutdown. Unconditional and harmless on the
+// modes that never installed.
+Object.defineProperty(Promise.prototype, 'then', {
+  value: REAL_THEN, writable: true, enumerable: false, configurable: true,
+});
+let thenRestored = false;
+try {
+  thenRestored = Promise.prototype.then === REAL_THEN;
+} catch {}
+console.log('THEN_HOOK_INSTALLED=' + thenHookInstalled);
+console.log('THEN_HOOK_TRANSPORT_CALLS=' + thenHookTransportCalls);
+console.log('THEN_HOOK_TOTAL_CALLS=' + thenHookCalls);
+console.log('THEN_HOOK_REACHABLE=' + String(thenHookReachable));
+console.log('THEN_HOOK_CONTROL=' + thenHookControlSettled);
+console.log('THEN_RESTORED=' + String(thenRestored));
+console.log('REJECTED_RAW_HOSTILE_THEN=' + String(settlement.rawHostileThenReason === true));
 console.log('HASINSTANCE_INSTALLED=' + hasInstanceInstalled);
 console.log('HASINSTANCE_CALLS=' + hasInstanceTransportCalls);
 console.log('HASINSTANCE_OPERATOR_LIE=' + String(hasInstanceOperatorLie));
@@ -2141,6 +2388,62 @@ describe('invokeAgentProcess — adversarial', () => {
     expectHardeningFailureSettles(probe, 'Process dispatch hardening failed');
   }, 40_000);
 
+  it('settles through a captured scheduler when a hostile then installs nothing', async () => {
+    const probe = await runHardeningSettlementProbe('hostile-then-swallow');
+
+    // The staged condition was genuinely reached: the hostile path ran and
+    // really did substitute the scheduler on the intrinsic prototype.
+    expect(probe.stdout).toMatch(/^THEN_HOOK_INSTALLED=[1-9][0-9]*$/m);
+    // And the substitution really does swallow, for an ordinary lookup, at this
+    // exact moment — the behaviour an ordinary `release.then` would have
+    // inherited. Both that the hook was entered and that it installed nothing
+    // are required, so this cannot pass against an inert replacement.
+    expect(probe.stdout).toMatch(/^THEN_HOOK_REACHABLE=true$/m);
+    expect(probe.stdout).toMatch(/^THEN_HOOK_CONTROL=not-run$/m);
+    // The transport never consulted it. This is the repair: the continuation is
+    // installed through an intrinsic captured at module load and invoked with
+    // the captured `Reflect.apply`, so the forgeable lookup never happens.
+    expect(probe.stdout).toMatch(/^THEN_HOOK_TRANSPORT_CALLS=0$/m);
+    // The failure this prevents, asked directly: an exchange left pending with
+    // no deadline armed to end it.
+    expect(probe.stdout).not.toMatch(/^SETTLEMENT=pending$/m);
+    // A real child existed and the release still ran past the failure into the
+    // poisoned pipe value, bounded and absorbed exactly as on the ordinary
+    // modes. Nothing about the scheduler changed what the release does.
+    expect(probe.stdout).toMatch(/^SPAWNED=[1-9][0-9]*$/m);
+    expect(probe.stdout).toMatch(/CLEANUP_FAULTS=[1-9]/);
+    // The genuine Error the forced failure raised reached the caller unchanged.
+    expect(probe.stdout).toMatch(/^ERROR_IDENTITY=true$/m);
+    // The substituted intrinsic was put back, verified rather than assumed.
+    expect(probe.stdout).toMatch(/^THEN_RESTORED=true$/m);
+    // Stable reason, exactly-once settlement, no unhandled rejection, no
+    // abandoned child, no outcome vocabulary.
+    expectHardeningFailureSettles(probe);
+  }, 40_000);
+
+  it('settles through a captured scheduler when a hostile then throws', async () => {
+    const probe = await runHardeningSettlementProbe('hostile-then-throw');
+
+    // Staged, and genuinely lethal: an ordinary lookup at this moment throws
+    // the hostile value rather than installing anything.
+    expect(probe.stdout).toMatch(/^THEN_HOOK_INSTALLED=[1-9][0-9]*$/m);
+    expect(probe.stdout).toMatch(/^THEN_HOOK_REACHABLE=true$/m);
+    // The transport never reached it.
+    expect(probe.stdout).toMatch(/^THEN_HOOK_TRANSPORT_CALLS=0$/m);
+    // The failure this prevents: the throw escaping the settlement's own
+    // executor and becoming the caller-facing reason in place of the mandatory
+    // hardening failure. A reference test, so no property of the hostile value
+    // is read to decide it.
+    expect(probe.stdout).toMatch(/^REJECTED_RAW_HOSTILE_THEN=false$/m);
+    expect(probe.stdout).not.toContain('DETAIL=[object Object]');
+    expect(probe.stdout).not.toContain('DETAIL=undefined');
+    expect(probe.stdout).toMatch(/^SPAWNED=[1-9][0-9]*$/m);
+    expect(probe.stdout).toMatch(/CLEANUP_FAULTS=[1-9]/);
+    expect(probe.stdout).toMatch(/^ERROR_IDENTITY=true$/m);
+    expect(probe.stdout).toMatch(/^THEN_RESTORED=true$/m);
+    expectHardeningFailureSettles(probe);
+  }, 40_000);
+
   it('settles a hardening failure whose bounded termination attempt itself fails', async () => {
     const probe = await runHardeningSettlementProbe('terminate-fault');
 
@@ -2416,6 +2719,54 @@ describe('invokeAgentProcess — adversarial', () => {
     expect(probe.stdout).toContain('SURVIVED');
     expect(probe.code).toBe(0);
   }, 30_000);
+
+  onWindows('settles the tree-kill helper through a captured scheduler that installs nothing', async () => {
+    const probe = await runIsolatedProbe('helper-then-swallow');
+
+    // The helper really was spawned and its hardening really would have thrown,
+    // so the settlement site under test was genuinely reached.
+    expect(probe.stdout).toMatch(/HELPER_COUNT=[1-9]/);
+    expect(probe.stdout).toContain('HELPER_HARDENING_WOULD_THROW=true');
+    // The substitution was staged, and it really does swallow an ordinary
+    // lookup at this moment while installing nothing.
+    expect(probe.stdout).toMatch(/^HELPER_THEN_INSTALLED=[1-9][0-9]*$/m);
+    expect(probe.stdout).toMatch(/^HELPER_THEN_REACHABLE=true$/m);
+    expect(probe.stdout).toMatch(/^HELPER_THEN_CONTROL=not-run$/m);
+    // The transport never consulted it: the helper's settlement is scheduled
+    // through the intrinsic captured at module load.
+    expect(probe.stdout).toMatch(/^HELPER_THEN_TRANSPORT_CALLS=0$/m);
+    // The failure this prevents: a helper promise that never settles stalls the
+    // Windows strategy's `await`, and with it the bounded release and the
+    // exchange behind it.
+    expect(probe.stdout).not.toContain('PENDING=deadline');
+    expect(probe.stdout).toContain('RESOLVED=TIMED_OUT');
+    expect(probe.stdout).toContain('UNHANDLED=0');
+    expect(probe.stdout).toMatch(/^HELPER_THEN_RESTORED=true$/m);
+    expect(probe.stderr).not.toContain("Unhandled 'error' event");
+    expect(probe.stdout).toContain('SURVIVED');
+    expect(probe.code).toBe(0);
+  }, 40_000);
+
+  onWindows('settles the tree-kill helper through a captured scheduler that throws', async () => {
+    const probe = await runIsolatedProbe('helper-then-throw');
+
+    expect(probe.stdout).toMatch(/HELPER_COUNT=[1-9]/);
+    expect(probe.stdout).toContain('HELPER_HARDENING_WOULD_THROW=true');
+    expect(probe.stdout).toMatch(/^HELPER_THEN_INSTALLED=[1-9][0-9]*$/m);
+    expect(probe.stdout).toMatch(/^HELPER_THEN_REACHABLE=true$/m);
+    expect(probe.stdout).toMatch(/^HELPER_THEN_TRANSPORT_CALLS=0$/m);
+    // The failure this prevents: the throw escaping the helper's executor
+    // rejects a promise every caller treats as total, which surfaces as a
+    // discarded rejection with the exchange still unsettled.
+    expect(probe.stdout).not.toContain('PENDING=deadline');
+    expect(probe.stdout).toContain('RESOLVED=TIMED_OUT');
+    expect(probe.stdout).toContain('UNHANDLED=0');
+    expect(probe.stdout).not.toContain('REJECTED=');
+    expect(probe.stdout).toMatch(/^HELPER_THEN_RESTORED=true$/m);
+    expect(probe.stderr).not.toContain("Unhandled 'error' event");
+    expect(probe.stdout).toContain('SURVIVED');
+    expect(probe.code).toBe(0);
+  }, 40_000);
 
   it('still reports an ordinary asynchronous spawn failure as SPAWN_FAILED', async () => {
     const probe = await runIsolatedProbe('control');
