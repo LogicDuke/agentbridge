@@ -121,15 +121,18 @@ offending names in declaration order.
 Two structural invariants are enforced as configuration validity rather than as
 a runtime check that could be forgotten:
 
-- `repairBranch` and `protectedParentRef` denote **different branches**. A job
-  whose repair branch *is* the protected parent is not a quarantined repair; it
-  is a direct write to protected history wearing a repair job's name.
+- `repairBranch` and `protectedParentRef` are **different branch refs** under
+  C1's canonical comparison rule. A job whose repair branch *is* the protected
+  parent is not a quarantined repair; it is a direct write to protected history
+  wearing a repair job's name. This compares canonical ref *names*; establishing
+  that two accepted names resolve to distinct targets in a repository is the
+  later trusted execution boundary's obligation, described below.
 - `independentValidatorId !== repairAgentId`. A repair agent that is its own
   validator defeats the quarantine the whole pipeline exists to enforce.
 
 ### Branch refs have exactly one accepted spelling
 
-"Different branches", not "different strings". Git resolves `main`,
+"Different branch refs", not "different strings". Git resolves `main`,
 `heads/main`, and `refs/heads/main` to one and the same ref, so a boundary that
 compares ref strings has three names for one authority target. Configuring
 `protectedParentRef: 'refs/heads/main'` beside `repairBranch: 'main'` would
@@ -149,14 +152,18 @@ and refuses every other spelling of the same branch as malformed:
 - no segment beginning or ending with `.`, no `..` anywhere, and no segment
   ending in `.lock` in any ASCII case
 
-The property that buys: **two accepted refs denote the same branch if and only if
-they are equal strings.** That is what makes the distinctness invariant mean
-something. The conservative ASCII character set is part of the guarantee, not a
-convenience — it removes Unicode normalisation, under which an NFC and an NFD
-spelling of one name are unequal strings a filesystem-backed loose ref can
-resolve to a single ref, and it removes `~`, `^`, `:`, `?`, `*`, `[`, `\`, `@{`,
-and whitespace in one rule. Nothing is normalised, prefixed, or case-folded on
-the way in: a value is accepted exactly as supplied or refused.
+The property that buys is a property of ref *names*, not of repository state:
+**two accepted refs are the same canonical ref name if and only if they are equal
+strings.** That is what closes caller-controlled textual aliasing and what makes
+the distinctness invariant mean something at this layer. It is not a claim that
+two unequal canonical names denote two distinct targets in a repository; see
+*What canonical ref names do and do not prove* below. The conservative ASCII
+character set is part of the guarantee, not a convenience — it removes Unicode
+normalisation, under which an NFC and an NFD spelling of one name are unequal
+strings a filesystem-backed loose ref can resolve to a single ref, and it removes
+`~`, `^`, `:`, `?`, `*`, `[`, `\`, `@{`, and whitespace in one rule. Nothing is
+normalised, prefixed, or case-folded on the way in: a value is accepted exactly
+as supplied or refused.
 
 The same reader is applied to **every** security-relevant ref position — the two
 job fields, and the `ref`, `sourceRef`, and `targetRef` request operands — so
@@ -165,14 +172,6 @@ uncanonical request operand. A supplied operand that is not canonical is refused
 `REF_MALFORMED` before any comparison, rather than compared as though it were a
 different branch.
 
-**What this does not prove**, and must not be claimed to: that two unequal
-accepted refs are two distinct refs on every filesystem. Git stores loose refs as
-files, so on a case-insensitive filesystem `refs/heads/Main` and
-`refs/heads/main` can be one ref while comparing unequal. C1 observes no
-filesystem, so it refuses the ambiguous case instead of pretending it away: the
-job's two configured refs are additionally compared with ASCII case folded, and a
-pair that differs only by case is rejected as malformed configuration.
-
 One relationship is enforced at authorization time, because it is about
 freshness rather than shape: `findingHeadSha` must equal `parentHeadSha`, or
 every operation is denied `FINDING_SHA_STALE`. A repair derived from a finding
@@ -180,6 +179,55 @@ about some other commit is a repair of something that may no longer be there.
 PR 004 remains the owner of `CURRENT` versus `STALE` for evidence; this is the
 narrower structural check that the job's own two SHAs agree, which C1 can decide
 without importing that kernel or producing a second answer to PR 004's question.
+
+### What canonical ref names do and do not prove
+
+Stated precisely, because overclaiming here would be worse than not checking.
+
+**Proved.** An accepted value is a string in the one canonical `refs/heads/<name>`
+shape, and two accepted values that remain unequal under C1's documented
+comparison rule are two different canonical ref names. Caller-supplied textual
+aliasing is closed within that structural authority: the originally proven bypass
+— configuring or requesting `main`, `heads/main`, and `refs/heads/main` against
+one another so the protected parent could be presented as a different branch — is
+refused as `REF_MALFORMED` before any comparison, and a configured pair that
+collides under the comparison rule invalidates the job rather than authorizing it.
+
+**Not proved, and not claimed.** That two different canonical ref names are two
+distinct branch targets in a repository. C1 does not establish repository-resolved
+ref identity, does not detect whether an accepted ref is symbolic, does not
+resolve a symbolic ref's target, does not determine whether two distinct canonical
+names ultimately dereference to the same repository target, and observes no live
+repository state. Two independent reasons stand:
+
+- **Symbolic refs.** A repository may hold a canonical-looking ref — say
+  `refs/heads/repair` — that is itself a symbolic ref to `refs/heads/main`.
+  Whether such a ref exists, and what it points at, is repository state at the
+  moment the name is used. C1 runs no git, spawns no subprocess, opens no file,
+  and observes no repository, so no string comparison it performs can decide it.
+- **Filesystem identity.** Git stores loose refs as files, so on a
+  case-insensitive filesystem `refs/heads/Main` and `refs/heads/main` can be one
+  ref while comparing unequal. C1 observes no filesystem, so it refuses the
+  ambiguous case instead of pretending it away: the job's two configured refs are
+  additionally compared with ASCII case folded, and a pair that differs only by
+  case is rejected as malformed configuration.
+
+The case fold is a conservative refusal, not a resolution. It narrows one
+filesystem-dependent collision that is characterisable from the strings alone; it
+establishes nothing about symbolic refs, which are not decidable from a string at
+all.
+
+**A future trusted repository/Git execution boundary must close the rest.** Before
+exercising any ref-mutating authority represented by an `ExecutionPermit`, that
+boundary must resolve the requested ref against the actual repository, resolve or
+reject repository-dependent symbolic refs, and establish that the repair ref's
+resolved target is not the protected parent's. It must **fail closed** — refuse
+the operation — if the requested repair ref resolves or dereferences to the
+protected parent, or if safe target identity cannot be established at all.
+
+Writing that obligation down adds no runtime git authority to C1 and grants no new
+authority anywhere: C1 gains no git invocation, no filesystem access, no
+subprocess, and no network, and remains pure TypeScript.
 
 ## Operations are structured, not named
 
@@ -197,8 +245,10 @@ authority cannot be checked against an exact operand has no place in the model.
 | `repair.change_request` | source ref, target ref | repair branch → protected parent ref |
 
 Every ref operand is read through the same canonical branch-ref reader the job
-envelope uses, so "exactly the repair branch" is a claim about a branch and not
-about a spelling.
+envelope uses, so "exactly the repair branch" is a claim about a canonical ref
+name and not about a caller's chosen spelling. It is not a claim about what that
+name resolves to in a repository, which only the later trusted execution boundary
+can establish.
 
 `repair.change_request` is the **only** operation that may name the protected
 parent ref, and only as a change-request *target*. Opening a change request
@@ -404,6 +454,13 @@ actually holds:
 Forgery therefore buys nothing, and a permit widens no authority — it records
 authority already derived from trusted configuration.
 
+A permit is also **not a repository-safety finding**. That a `repair.commit` or
+`repair.push` ref operand passed C1's canonical syntax validation says nothing
+about what that ref resolves to in the repository the operation would touch, so a
+permit must never be read as proof that repository-level ref resolution is safe.
+The trusted execution boundary that acts on a permit performs its own resolution
+and fails closed; see *What canonical ref names do and do not prove* above.
+
 ### Single use
 
 Single use is stated structurally. `singleUse` is typed as the literal `true` and
@@ -525,8 +582,11 @@ C1 implements none of that workflow. It encodes only the minimal authority
 invariants that stop a later layer from bypassing the quarantine by accident:
 
 - The protected parent ref is never a write target of any operation, under any
-  spelling: refs are canonical everywhere, so an alias of the parent cannot be
-  presented as a different branch.
+  *spelling*: refs are canonical everywhere, so a caller cannot present a textual
+  alias of the parent as a different branch. Repository-dependent aliasing — a
+  canonical repair ref that is symbolic to the parent — is not visible to a pure
+  string boundary, and is the later trusted execution boundary's to resolve or
+  reject before any ref-mutating operation runs.
 - Filesystem-shaped operations are bound to the repair worktree, so an edit
   cannot land in the parent's checkout.
 - The stacked change request must run from the repair branch to the protected
