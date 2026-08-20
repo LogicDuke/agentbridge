@@ -225,7 +225,23 @@ an `ExecutionPermit` records — not only operations that write a ref — that
 boundary must satisfy the requirements below, and must **fail closed** — refuse
 the operation — wherever a required identity cannot be safely established,
 wherever resolution cycles or is otherwise indeterminate, or wherever an effective
-identity is or dereferences to the protected parent.
+identity is or dereferences to a ref the operand's role is not authorized to
+denote.
+
+*The protected-parent rule is role-bound.* Protected-parent identity is forbidden
+only where it is unauthorized for the operand's role — which is every role but
+one. The effective mutation target of a `repair.commit` or a `repair.push`, and a
+`repair.change_request` `sourceRef`, must each be the authorized repair ref, so
+for all three an effective identity that is or dereferences to the protected
+parent is a refusal. A `repair.change_request` `targetRef` is the single operand
+whose *required* effective identity **is** the protected parent ref — the same
+operand C1's string layer already singles out as the only one that may name it —
+so for that role, and only that role, reaching the protected parent is the
+authorized outcome and reaching anything else is the refusal. Stated role-blind
+instead, the rule would forbid the one direction the quarantine depends on. No
+role widens past this: an operand authorized to denote the protected parent as a
+change-request *target* acquires no authority to denote it anywhere else, and the
+exemption never reaches an operand that would mutate the parent.
 
 *Which identity is compared.* The isolation question is about the **effective
 ref-name referent** — the terminal ref reached by resolving a symbolic-ref chain —
@@ -233,9 +249,15 @@ not about commit-object identity. A freshly created repair branch may legitimate
 point at the **same commit object** as the protected parent until its first repair
 commit, so distinct commit OIDs are neither necessary nor sufficient: two
 different branch refs may share one commit OID, and commit-object equality does not
-make two refs the same authority target. The boundary must detect and reject a
-symbolic or effective ref-name identity that aliases the protected parent, and
-must not rest the check on whether two refs currently resolve to the same commit.
+make two refs the same authority target. The boundary must therefore compare
+effective ref-name referents, and must not rest the check on whether two refs
+currently resolve to the same commit. What that comparison must *yield* is fixed
+by the operand's role: for an operand whose required identity is the authorized
+repair ref, a symbolic or effective ref-name identity that aliases the protected
+parent must be detected and rejected; for the one operand whose required identity
+is the protected parent ref — the `repair.change_request` `targetRef` — the alias
+to detect and reject is the converse one, an effective identity that is not the
+protected parent ref.
 
 *Binding the effective mutation target.* A resolved ref *name* is not the target a
 mutation will advance, and the boundary must bind the two before it acts:
