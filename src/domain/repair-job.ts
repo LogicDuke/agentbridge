@@ -538,10 +538,11 @@ function endsWithDotLockSuffix(value: string, start: number, end: number): boole
  * the protected parent ref, and fails closed when it reaches anything else. Because
  * that operation mutates no ref, the identity it consumes is bound at its provider
  * create/update request: the effective source must remain the authorized repair ref
- * and the effective target the protected parent ref through to that request, the
- * provider must not independently re-resolve those refs or derive them from ambient
- * repository state, and the boundary must fail closed if that relationship cannot be
- * maintained there.
+ * and the effective target the protected parent ref through to that request. The
+ * provider may resolve those ref names at its own boundary, but must not let
+ * re-resolution or ambient repository state substitute a materially different
+ * effective identity for either end, and the boundary must fail closed if the
+ * authorized relationship cannot be maintained or shown equivalent there.
  * Nothing here acquires git invocation, filesystem access, a subprocess, or
  * network to decide it. See `docs/architecture/C1-repair-job-authority.md`,
  * "What canonical ref names do and do not prove".

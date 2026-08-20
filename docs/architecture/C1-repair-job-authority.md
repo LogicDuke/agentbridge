@@ -286,13 +286,19 @@ established. Because this operation performs no ref update to guard, the boundar
 that consumes these identities is the change-request/provider creation — or
 update — request itself, and the established source and target identities must be
 **bound through to that provider request**: the provider must create the request
-from exactly the authorized effective source and target, and must not
-independently re-resolve the ref names, derive the source or target from ambient
-repository state, or otherwise act on an identity that has changed since it was
-established. If that authorized source-to-target relationship cannot be maintained
-through to the provider request — because an effective identity has changed, or
-cannot be safely re-established at that boundary — the boundary must fail closed
-and create no change request.
+from exactly the authorized effective source and target. Provider-side resolution
+of the supplied ref names is not itself forbidden — a create/update API may have
+to resolve the source and target names against its own authoritative repository
+state — but it must yield exactly those authorized effective identities: it must
+not let re-resolution, ambient repository state, or any substitution cause the
+request to be created from, or to consume, a **materially different** effective
+source or target than the one authorized. Resolution that preserves the exact
+authorized source-to-target relationship conforms; resolution that would consume
+a materially different effective identity does not. If that authorized
+source-to-target relationship cannot be maintained through to the provider
+request — because an effective identity has changed, cannot be safely
+re-established, or cannot be shown equivalent to the authorized one at that
+boundary — the boundary must fail closed and create no change request.
 
 *Concurrency is not closed by a pre-check.* A resolve-then-check-then-act
 sequence is **not** an atomic security guarantee: an effective ref or referent can
