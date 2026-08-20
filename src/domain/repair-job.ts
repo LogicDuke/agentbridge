@@ -527,13 +527,16 @@ function endsWithDotLockSuffix(value: string, start: number, end: number): boole
  * protected parent's commit OID — and bind the effective mutation target it will
  * actually advance: the worktree's effective `HEAD` referent for a commit, and the
  * effective destination ref for a push. It must **fail closed** — refusing the
- * operation — if that effective identity is or dereferences to the protected
- * parent, if it changes between comparison and update, or if it cannot be safely
- * established; a resolve-then-mutate pre-check is not itself atomic, so the
- * invariant is enforced at the mutation/receiving boundary. Nothing here acquires
- * git invocation, filesystem access, a subprocess, or network to decide it. See
- * `docs/architecture/C1-repair-job-authority.md`, "What canonical ref names do
- * and do not prove".
+ * operation — if that effective mutation target is or dereferences to the
+ * protected parent, if it changes between comparison and update, or if it cannot
+ * be safely established; a resolve-then-mutate pre-check is not itself atomic, so
+ * the invariant is enforced at the mutation/receiving boundary. That refusal is
+ * bound to the operand's role rather than being a blanket ban on the protected
+ * parent's identity: a `repair.change_request` `targetRef` is *required* to reach
+ * the protected parent ref, and fails closed when it reaches anything else.
+ * Nothing here acquires git invocation, filesystem access, a subprocess, or
+ * network to decide it. See `docs/architecture/C1-repair-job-authority.md`,
+ * "What canonical ref names do and do not prove".
  *
  * The value is returned exactly as supplied, or not at all. No normalisation,
  * no prefixing, no case folding: a boundary that repaired the spelling would be
