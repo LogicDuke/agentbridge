@@ -518,15 +518,39 @@ function endsWithDotLockSuffix(value: string, start: number, end: number): boole
  *   than pretended away here. C1 observes no filesystem and cannot do better
  *   than refuse the ambiguous case.
  *
- * The symbolic-ref residue is not narrowable from a string at all. A later
- * trusted repository/Git execution boundary must resolve the requested ref
- * against the actual repository and **fail closed** — refusing the operation —
- * before exercising any ref-mutating authority carried by an `ExecutionPermit`,
- * if the repair ref resolves or dereferences to the protected parent or if safe
- * target identity cannot be established. Nothing here acquires git invocation,
- * filesystem access, a subprocess, or network to decide it. See
- * `docs/architecture/C1-repair-job-authority.md`, "What canonical ref names do
- * and do not prove".
+ * The symbolic-ref residue is not narrowable from a string at all, and neither is
+ * the effective target a mutation would reach. A later trusted repository/Git
+ * execution boundary must, before acting on any authority an `ExecutionPermit`
+ * records, resolve the requested ref's effective ref-name referent against the
+ * actual repository — the terminal ref reached through a symbolic-ref chain, not
+ * commit-object identity, since a fresh repair branch may legitimately share the
+ * protected parent's commit OID — and bind each effective identity the operation
+ * acts on to the authorized repair ref. A commit advances one mutation target: the
+ * worktree's effective `HEAD` referent, the ref it will actually advance. A push
+ * binds two effective identities in distinct roles — its destination ref, the
+ * receiving/mutation target the push advances, and its source ref, the input the
+ * push consumes to select what is sent — each of which must be the authorized
+ * repair ref, so an absent (deletion) or redirected source is refused. It must
+ * **fail closed** — refusing the
+ * operation — if any such effective identity is or dereferences to the
+ * protected parent, if it changes between comparison and update, or if it cannot
+ * be safely established; a resolve-then-act pre-check is not itself atomic, so the
+ * invariant is enforced at the boundary that actually consumes each identity — the
+ * mutation/receiving boundary for a commit or push, and the
+ * change-request/provider creation boundary for a change request. That refusal is
+ * bound to the operand's role rather than being a blanket ban on the protected
+ * parent's identity: a `repair.change_request` `targetRef` is *required* to reach
+ * the protected parent ref, and fails closed when it reaches anything else. Because
+ * that operation mutates no ref, the identity it consumes is bound at its provider
+ * create/update request: the effective source must remain the authorized repair ref
+ * and the effective target the protected parent ref through to that request. The
+ * provider may resolve those ref names at its own boundary, but must not let
+ * re-resolution or ambient repository state substitute a materially different
+ * effective identity for either end, and the boundary must fail closed if the
+ * authorized relationship cannot be maintained or shown equivalent there.
+ * Nothing here acquires git invocation, filesystem access, a subprocess, or
+ * network to decide it. See `docs/architecture/C1-repair-job-authority.md`,
+ * "What canonical ref names do and do not prove".
  *
  * The value is returned exactly as supplied, or not at all. No normalisation,
  * no prefixing, no case folding: a boundary that repaired the spelling would be
@@ -596,8 +620,11 @@ export function readCanonicalBranchRef(value: unknown): string | null {
  * A `false` result means only that the two names are distinct under this rule.
  * It is **not** a finding that they denote distinct targets in a repository: this
  * compares strings and resolves nothing, so a canonical name that is a symbolic
- * ref to the other still answers `false` here. Repository-resolved identity is
- * the later trusted repository/Git execution boundary's to establish; see
+ * ref to the other still answers `false` here, and — since two different branch
+ * refs may legitimately share one commit object — commit-object equality is not
+ * the question either. Repository-resolved identity, meaning the effective
+ * ref-name referent reached by resolving a symbolic-ref chain, is the later
+ * trusted repository/Git execution boundary's to establish; see
  * {@link readCanonicalBranchRef}.
  */
 function mayDenoteSameBranchRef(left: string, right: string): boolean {
@@ -755,7 +782,7 @@ export interface RepairJobAuthorization {
    * that the two names resolve to distinct targets in a repository — a canonical
    * repair ref that is symbolic to the parent is invisible to a pure string
    * boundary — which the later trusted repository/Git execution boundary must
-   * resolve or reject before any ref-mutating operation runs. See
+   * resolve or reject before it acts on any authority a permit records. See
    * {@link readCanonicalBranchRef}.
    */
   readonly repairBranch: string;
