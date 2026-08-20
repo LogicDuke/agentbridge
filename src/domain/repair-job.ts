@@ -525,8 +525,10 @@ function endsWithDotLockSuffix(value: string, start: number, end: number): boole
  * actual repository — the terminal ref reached through a symbolic-ref chain, not
  * commit-object identity, since a fresh repair branch may legitimately share the
  * protected parent's commit OID — and bind the effective mutation target it will
- * actually advance: the worktree's effective `HEAD` referent for a commit, and the
- * effective destination ref for a push. It must **fail closed** — refusing the
+ * actually advance: the worktree's effective `HEAD` referent for a commit, and,
+ * for a push, both the effective source and destination refs — each the authorized
+ * repair ref, so an absent (deletion) or redirected source is refused. It must
+ * **fail closed** — refusing the
  * operation — if that effective mutation target is or dereferences to the
  * protected parent, if it changes between comparison and update, or if it cannot
  * be safely established; a resolve-then-act pre-check is not itself atomic, so the

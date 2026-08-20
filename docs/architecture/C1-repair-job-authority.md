@@ -267,12 +267,22 @@ mutation will advance, and the boundary must bind the two before it acts:
   The boundary must bind that effective `HEAD` referent to the authorized repair
   ref and refuse to commit if the worktree is detached, attached to the protected
   parent, attached to any other ref, or its safe binding cannot be established.
-- **`repair.push`.** The authorized repair ref identifies a source, not a
-  destination. The boundary must bind the push's **effective destination ref** to
-  the authorized repair ref and must not let a caller-selected destination refspec
-  redirect the push; the receiving/mutation side must fail closed if the effective
-  destination is the protected parent or cannot be proven to be the authorized
-  repair ref.
+- **`repair.push`.** A push carries both a source and a destination ref, and the
+  authorized repair ref governs **both**. The boundary must bind the push's
+  **effective source ref** and its **effective destination ref** — each by its
+  effective ref-name referent, not by commit-object identity — to the authorized
+  repair ref, and must not let a caller-selected source or destination refspec
+  redirect either half. The source must be **present**: an absent source, the
+  deletion refspec `:refs/heads/…`, is not a `repair.push` at all but a
+  `branch.delete`, which is denied, so a destination that still names the repair
+  ref does not make it authorized. No alternate branch, tag, or commit-ish may
+  stand in for the authorized repair ref on either half. The receiving/mutation
+  side must fail closed if either effective half is the protected parent, is not
+  provably the authorized repair ref, or ceases to be between the check and the
+  push — the authorized source-to-destination relationship must hold through to
+  that consuming boundary, not only at an earlier pre-check. An ordinary
+  `refs/heads/repair:refs/heads/repair` push, whose effective source and
+  destination are both the authorized repair ref, remains authorized.
 
 *Operands that set direction without mutating a ref.* The obligation is not
 limited to ref-mutating operations. `repair.change_request` mutates no ref, but
