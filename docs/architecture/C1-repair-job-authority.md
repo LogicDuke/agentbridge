@@ -282,16 +282,40 @@ branch **to** the protected parent. The boundary must establish that the effecti
 source identity is the authorized repair ref and the effective target identity is
 the protected parent ref, reject a symbolic or effective alias that changes that
 direction, and fail closed if either effective identity cannot be safely
-established.
+established. Because this operation performs no ref update to guard, the boundary
+that consumes these identities is the change-request/provider creation — or
+update — request itself, and the established source and target identities must be
+**bound through to that provider request**: the provider must create the request
+from exactly the authorized effective source and target. Provider-side resolution
+of the supplied ref names is not itself forbidden — a create/update API may have
+to resolve the source and target names against its own authoritative repository
+state — but it must yield exactly those authorized effective identities: it must
+not let re-resolution, ambient repository state, or any substitution cause the
+request to be created from, or to consume, a **materially different** effective
+source or target than the one authorized. Resolution that preserves the exact
+authorized source-to-target relationship conforms; resolution that would consume
+a materially different effective identity does not. If that authorized
+source-to-target relationship cannot be maintained through to the provider
+request — because an effective identity has changed, cannot be safely
+re-established, or cannot be shown equivalent to the authorized one at that
+boundary — the boundary must fail closed and create no change request.
 
-*Concurrency is not closed by a pre-check.* A resolve-then-check-then-mutate
-sequence is **not** an atomic security guarantee: the effective ref or referent
-can change between the comparison and the update, so a name observed as an
-ordinary repair ref can become symbolic to the protected parent before the
-mutation lands. The invariant must be enforced **at the actual mutation/receiving
-boundary**, by a mechanism whose semantics prevent an unchecked identity change
-between comparison and update — not by an earlier client-side observation this
-boundary later trusts.
+*Concurrency is not closed by a pre-check.* A resolve-then-check-then-act
+sequence is **not** an atomic security guarantee: an effective ref or referent can
+change between the comparison and the moment the identity is consumed, so a name
+observed as an ordinary repair ref can become symbolic to the protected parent —
+or a target can cease to denote it — after the check and before the act. The
+invariant must be enforced **at the actual trusted execution boundary that
+consumes each identity, not only where a ref is mutated**, by a mechanism whose
+semantics prevent an unchecked identity change between the comparison and that
+consumption — not by an earlier client-side observation the boundary later trusts.
+That consuming boundary differs by operation and the obligation is identical at
+each: for `repair.commit` it is the commit mutation boundary, for `repair.push`
+the push receiving/mutation boundary, and for `repair.change_request` — which
+mutates no ref — the change-request/provider creation boundary at which the source
+and target identities are actually consumed. An operation whose authorized
+effective-identity relationship cannot be held through to its consuming boundary
+must fail closed.
 
 This document states the required invariant, not an implementation: it names no
 git command, lock, or transaction mechanism, and it claims no more atomicity than
@@ -537,9 +561,11 @@ touch, about which ref a commit or push would actually advance, or about the
 effective direction of a change request, so a permit must never be read as proof
 that repository-level ref identity, the effective mutation target, or the
 change-request direction is safe. The trusted execution boundary that acts on a
-permit binds the effective target, resolves the effective identity, enforces it at
-the mutation/receiving boundary, and fails closed; see *What canonical ref names
-do and do not prove* above.
+permit binds the effective identity, resolves it, and enforces it at the boundary
+that actually consumes that identity — the mutation/receiving boundary for a
+`repair.commit` or `repair.push`, and the change-request/provider creation boundary
+for a `repair.change_request` — and fails closed; see *What canonical ref names do
+and do not prove* above.
 
 ### Single use
 

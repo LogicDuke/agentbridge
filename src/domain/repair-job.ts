@@ -529,11 +529,20 @@ function endsWithDotLockSuffix(value: string, start: number, end: number): boole
  * effective destination ref for a push. It must **fail closed** — refusing the
  * operation — if that effective mutation target is or dereferences to the
  * protected parent, if it changes between comparison and update, or if it cannot
- * be safely established; a resolve-then-mutate pre-check is not itself atomic, so
- * the invariant is enforced at the mutation/receiving boundary. That refusal is
+ * be safely established; a resolve-then-act pre-check is not itself atomic, so the
+ * invariant is enforced at the boundary that actually consumes each identity — the
+ * mutation/receiving boundary for a commit or push, and the
+ * change-request/provider creation boundary for a change request. That refusal is
  * bound to the operand's role rather than being a blanket ban on the protected
  * parent's identity: a `repair.change_request` `targetRef` is *required* to reach
- * the protected parent ref, and fails closed when it reaches anything else.
+ * the protected parent ref, and fails closed when it reaches anything else. Because
+ * that operation mutates no ref, the identity it consumes is bound at its provider
+ * create/update request: the effective source must remain the authorized repair ref
+ * and the effective target the protected parent ref through to that request. The
+ * provider may resolve those ref names at its own boundary, but must not let
+ * re-resolution or ambient repository state substitute a materially different
+ * effective identity for either end, and the boundary must fail closed if the
+ * authorized relationship cannot be maintained or shown equivalent there.
  * Nothing here acquires git invocation, filesystem access, a subprocess, or
  * network to decide it. See `docs/architecture/C1-repair-job-authority.md`,
  * "What canonical ref names do and do not prove".
