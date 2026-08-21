@@ -251,7 +251,15 @@ commit, so distinct commit OIDs are neither necessary nor sufficient: two
 different branch refs may share one commit OID, and commit-object equality does not
 make two refs the same authority target. The boundary must therefore compare
 effective ref-name referents, and must not rest the check on whether two refs
-currently resolve to the same commit. What that comparison must *yield* is fixed
+currently resolve to the same commit. A terminal ref-name *spelling* is not by
+itself repository ref identity: where a repository applies its own ref-identity
+semantics — for instance a case-insensitive ref store under which
+`refs/heads/Main` and `refs/heads/main` are one ref — two terminal names that are
+not equal strings may still be the same repository ref, so the boundary must
+decide whether two effective referents are the same or distinct under that
+repository's actual ref-identity semantics rather than by terminal-name string
+(in)equality alone, and must fail closed wherever the required distinctness cannot
+be safely proven under those semantics. What that comparison must *yield* is fixed
 by the operand's role: for an operand whose required identity is the authorized
 repair ref, a symbolic or effective ref-name identity that aliases the protected
 parent must be detected and rejected; for the one operand whose required identity
