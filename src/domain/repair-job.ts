@@ -525,7 +525,14 @@ function endsWithDotLockSuffix(value: string, start: number, end: number): boole
  * actual repository — the terminal ref reached through a symbolic-ref chain, not
  * commit-object identity, since a fresh repair branch may legitimately share the
  * protected parent's commit OID — and bind each effective identity the operation
- * acts on to the authorized repair ref. A commit advances one mutation target: the
+ * acts on to the authorized repair ref. A terminal ref-name spelling is not by
+ * itself repository ref identity: where a repository applies its own ref-identity
+ * semantics — for instance a case-insensitive ref store treating `refs/heads/Main`
+ * and `refs/heads/main` as one ref — terminal names that are not equal strings may
+ * still be the same repository ref, so the boundary must judge sameness or
+ * distinctness under that repository's actual ref-identity semantics rather than by
+ * terminal-name string (in)equality alone, and fail closed where the required
+ * distinctness cannot be safely proven. A commit advances one mutation target: the
  * worktree's effective `HEAD` referent, the ref it will actually advance. A push
  * binds two effective identities in distinct roles — its destination ref, the
  * receiving/mutation target the push advances, and its source ref, the input the
@@ -622,10 +629,11 @@ export function readCanonicalBranchRef(value: unknown): string | null {
  * compares strings and resolves nothing, so a canonical name that is a symbolic
  * ref to the other still answers `false` here, and — since two different branch
  * refs may legitimately share one commit object — commit-object equality is not
- * the question either. Repository-resolved identity, meaning the effective
- * ref-name referent reached by resolving a symbolic-ref chain, is the later
- * trusted repository/Git execution boundary's to establish; see
- * {@link readCanonicalBranchRef}.
+ * the question either. Repository-resolved identity — whether the effective
+ * referents reached by resolving symbolic-ref chains are the same or distinct
+ * under the repository's own ref-identity semantics, which a terminal ref-name
+ * spelling alone does not settle — is the later trusted repository/Git execution
+ * boundary's to establish; see {@link readCanonicalBranchRef}.
  */
 function mayDenoteSameBranchRef(left: string, right: string): boolean {
   if (left === right) {
