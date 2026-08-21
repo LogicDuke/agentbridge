@@ -123,12 +123,22 @@ function freezeRecord<T extends object>(record: T): Readonly<T> {
  * non-enumerable, so it changes neither enumeration nor structural equality.
  */
 function freezeList<T>(list: T[]): readonly T[] {
-  objectDefineProperty(list, 'toJSON', {
+  // The descriptor object itself is given a `null` prototype before it reaches
+  // `Object.defineProperty`. A hostile getter run earlier during validation may
+  // have installed `Object.prototype.get`/`.set`; an ordinary `{...}` descriptor
+  // would inherit those, and `ToPropertyDescriptor` — which walks the prototype
+  // chain — would then observe inherited accessor keys beside the own `value`/
+  // `writable` keys, reject the mixed descriptor, and throw, breaking this
+  // reader's never-throws contract. A `null` prototype removes the inherited
+  // chain entirely, the same insulation `freezeRecord` gives its nodes.
+  const descriptor: PropertyDescriptor = {
     value: undefined,
     enumerable: false,
     writable: false,
     configurable: false,
-  });
+  };
+  objectSetPrototypeOf(descriptor, null);
+  objectDefineProperty(list, 'toJSON', descriptor);
   return objectFreeze(list);
 }
 
