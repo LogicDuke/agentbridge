@@ -3,9 +3,12 @@ import { describe, expect, it } from 'vitest';
 import {
   authorizeJobOperation,
   JOB_AUTHORIZATION,
+  operatorMergeAuthorizes,
   permitAuthorizes,
   type ExecutionPermit,
   type JobOperationRequest,
+  type MergeTarget,
+  type OperatorMergeAuthorization,
   type RepairJobAuthorization,
 } from '../../src/domain/index.js';
 import {
@@ -14,13 +17,16 @@ import {
   buildJob,
   buildPush,
   buildRequest,
+  HEAD_A,
   HEAD_B,
   JOB_B,
   NON_OBJECTS,
+  PARENT_PR_A,
   PARENT_PR_B,
   PARENT_REF,
   REPAIR_BRANCH,
   REPAIR_WORKTREE,
+  REPO_A,
   REPO_B,
   SECOND_AUTHORIZED_PATH,
   throwingRecord,
@@ -405,5 +411,52 @@ describe('permit identity cannot be collided by operand content', () => {
     expect(withStowaway.operands.ref).toBeNull();
     expect(withStowaway.operands.targetRef).toBeNull();
     expect(withStowaway.operands.commandClass).toBeNull();
+  });
+});
+
+describe('the merge target is captured before the candidate is read', () => {
+  const buildTarget = (): MergeTarget => ({
+    repositoryId: REPO_A,
+    pullRequestId: PARENT_PR_A,
+    currentHeadSha: HEAD_A,
+  });
+  const buildAuthorization = (): OperatorMergeAuthorization => ({
+    authorizationId: 'auth-0001',
+    operatorId: 'operator-1',
+    repositoryId: REPO_A,
+    pullRequestId: PARENT_PR_A,
+    // A stale/wrong HEAD: does not match the target's authoritative SHA.
+    headSha: HEAD_B,
+    authorizedAt: '2026-01-01T00:00:00Z',
+    singleUse: true,
+  });
+
+  it('rejects a candidate whose HEAD SHA does not match the supplied target', () => {
+    expect(operatorMergeAuthorizes(buildAuthorization(), buildTarget())).toBe(false);
+  });
+
+  it('a candidate getter cannot rewrite the supplied target to match itself', () => {
+    // The candidate carries a getter that, while the candidate is being read,
+    // rewrites the still-live target's HEAD to the candidate's stale SHA. If the
+    // target were captured *after* the candidate were read, that mutation would
+    // turn a false into a true.
+    let getterRan = false;
+    const target = buildTarget(); // currentHeadSha === HEAD_A (authoritative)
+    const hostile = {
+      ...buildAuthorization(), // headSha === HEAD_B (stale)
+      get authorizationId() {
+        getterRan = true;
+        (target as { currentHeadSha: string }).currentHeadSha = HEAD_B;
+        return 'auth-0001';
+      },
+    } as unknown as OperatorMergeAuthorization;
+
+    const result = operatorMergeAuthorizes(hostile, target);
+
+    // The getter must actually have executed, or the test proves nothing.
+    expect(getterRan).toBe(true);
+    // The authoritative target SHA was already captured, so the stale candidate
+    // never matches.
+    expect(result).toBe(false);
   });
 });

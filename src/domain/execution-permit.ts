@@ -398,6 +398,14 @@ export function operatorMergeAuthorizes(
     return false;
   }
 
+  // The supplied target is captured *before* any candidate property is read.
+  // Reading the untrusted candidate runs its own getters and Proxy traps, which
+  // could otherwise mutate the still-live target before its fields are captured
+  // and make a stale candidate match a target it was rewritten to fit.
+  const targetRepositoryId = readExactIdentifier(readOwnProperty(targetRecord, 'repositoryId'));
+  const targetPullRequestId = readExactIdentifier(readOwnProperty(targetRecord, 'pullRequestId'));
+  const targetHeadSha = readExactIdentifier(readOwnProperty(targetRecord, 'currentHeadSha'));
+
   const authorizationId = readExactIdentifier(readOwnProperty(record, 'authorizationId'));
   const operatorId = readExactIdentifier(readOwnProperty(record, 'operatorId'));
   const repositoryId = readExactIdentifier(readOwnProperty(record, 'repositoryId'));
@@ -405,10 +413,6 @@ export function operatorMergeAuthorizes(
   const headSha = readExactIdentifier(readOwnProperty(record, 'headSha'));
   const authorizedAt = readExactIdentifier(readOwnProperty(record, 'authorizedAt'));
   const singleUse = readOwnProperty(record, 'singleUse');
-
-  const targetRepositoryId = readExactIdentifier(readOwnProperty(targetRecord, 'repositoryId'));
-  const targetPullRequestId = readExactIdentifier(readOwnProperty(targetRecord, 'pullRequestId'));
-  const targetHeadSha = readExactIdentifier(readOwnProperty(targetRecord, 'currentHeadSha'));
 
   if (
     authorizationId === null ||

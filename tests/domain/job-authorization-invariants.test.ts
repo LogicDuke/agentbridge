@@ -690,6 +690,36 @@ describe('a value read twice cannot differ between validation and use', () => {
     expect(after.decision).toBe(JOB_AUTHORIZATION.ALLOW_ONCE);
     expect(Object.isFrozen(before.invalidJobFields)).toBe(true);
   });
+
+  it('snapshots the trusted job before the hostile request is read', () => {
+    // A `repair.push` naming the protected parent ref. Honestly evaluated this
+    // is a protected-ref mutation and must be denied. The request carries a
+    // getter that, while the request is being read, mutates the still-live
+    // trusted job so the protected ref becomes the repair branch. If the job
+    // were snapshotted *after* the request were read, that mutation would flip
+    // DENY into ALLOW_ONCE and issue a permit to push the protected branch.
+    let getterRan = false;
+    const job = buildJob();
+    const hostile = {
+      ...buildPush({ ref: PARENT_REF }),
+      get operation() {
+        getterRan = true;
+        (job as { repairBranch: string }).repairBranch = PARENT_REF;
+        (job as { protectedParentRef: string }).protectedParentRef = REPAIR_BRANCH;
+        return JOB_OPERATION.REPAIR_PUSH;
+      },
+    } as unknown as JobOperationRequest;
+
+    const decision = authorizeJobOperation(job, hostile);
+
+    // The getter must actually have executed, or the test proves nothing.
+    expect(getterRan).toBe(true);
+    // The trusted job was already captured, so the mutation changed no authority.
+    expect(decision.decision).toBe(JOB_AUTHORIZATION.DENY);
+    expect(decision.reason).toBe(JOB_AUTHORIZATION_REASON.PROTECTED_REF_MUTATION);
+    expect(decision.permit).toBeNull();
+    expect(decision.mayExecuteOnce).toBe(false);
+  });
 });
 
 describe('prototype pollution and inherited properties create no authority', () => {
