@@ -10,6 +10,8 @@ import {
 import {
   buildFinding,
   buildProvenance,
+  buildPullRequest,
+  buildRepository,
   buildSnapshot,
   COLLECTOR_A,
 } from './read-model-fixtures.js';
@@ -153,6 +155,86 @@ describe('single-read discipline', () => {
     // Not an actual array, so Array.isArray refuses it outright.
     const result = readCockpitSnapshot(buildSnapshot({ findings: withElements as never }));
     expect(result.snapshot).toBeNull();
+  });
+});
+
+/* -------------------------------------------------------------------------
+ * Present-but-unreadable optional properties fail closed (D1-44-F1)
+ * ------------------------------------------------------------------------- */
+
+describe('present-but-unreadable optional properties are not absence', () => {
+  /** Replace one key of a copied record with an own getter that throws. */
+  function withThrowingGetter<T extends object>(record: T, key: string): T {
+    const copy = { ...(record as Record<string, unknown>) };
+    Reflect.deleteProperty(copy, key);
+    Object.defineProperty(copy, key, {
+      get() {
+        throw new Error(`hostile getter: ${key}`);
+      },
+      enumerable: true,
+      configurable: true,
+    });
+    return copy as T;
+  }
+
+  it('rejects a repository whose present defaultBranchRef getter throws', () => {
+    const result = readCockpitSnapshot(
+      buildSnapshot({ repository: withThrowingGetter(buildRepository(), 'defaultBranchRef') }),
+    );
+
+    expect(result.snapshot).toBeNull();
+    expect(result.invalidFields).toEqual(['repository.defaultBranchRef']);
+  });
+
+  it('rejects a pull request whose present baseRef getter throws', () => {
+    const result = readCockpitSnapshot(
+      buildSnapshot({ pullRequests: [withThrowingGetter(buildPullRequest(), 'baseRef')] }),
+    );
+
+    expect(result.snapshot).toBeNull();
+    expect(result.invalidFields).toEqual(['pullRequests']);
+  });
+
+  it('rejects a pull request whose present title getter throws', () => {
+    const result = readCockpitSnapshot(
+      buildSnapshot({ pullRequests: [withThrowingGetter(buildPullRequest(), 'title')] }),
+    );
+
+    expect(result.snapshot).toBeNull();
+    expect(result.invalidFields).toEqual(['pullRequests']);
+  });
+
+  it('rejects a finding whose present filePath getter throws', () => {
+    const result = readCockpitSnapshot(
+      buildSnapshot({ findings: [withThrowingGetter(buildFinding(), 'filePath')] }),
+    );
+
+    expect(result.snapshot).toBeNull();
+    expect(result.invalidFields).toEqual(['findings']);
+  });
+
+  it('still accepts the same optional properties when genuinely missing', () => {
+    const repository: Record<string, unknown> = { ...buildRepository() };
+    Reflect.deleteProperty(repository, 'defaultBranchRef');
+    const pullRequest: Record<string, unknown> = { ...buildPullRequest() };
+    Reflect.deleteProperty(pullRequest, 'baseRef');
+    Reflect.deleteProperty(pullRequest, 'title');
+    const finding: Record<string, unknown> = { ...buildFinding() };
+    Reflect.deleteProperty(finding, 'filePath');
+
+    const result = readCockpitSnapshot(
+      buildSnapshot({
+        repository: repository as never,
+        pullRequests: [pullRequest as never],
+        findings: [finding as never],
+      }),
+    );
+
+    expect(result.invalidFields).toEqual([]);
+    expect(result.snapshot?.repository.defaultBranchRef).toBeNull();
+    expect(result.snapshot?.pullRequests[0]?.baseRef).toBeNull();
+    expect(result.snapshot?.pullRequests[0]?.title).toBeNull();
+    expect(result.snapshot?.findings[0]?.filePath).toBeNull();
   });
 });
 

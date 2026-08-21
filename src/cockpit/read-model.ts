@@ -433,6 +433,39 @@ function readCockpitList<T>(
 }
 
 /**
+ * Unreadability marker for {@link readOwnOptionalProperty}. Module-private,
+ * compared by reference identity only. `undefined` cannot mark unreadability
+ * here, because `undefined` already means legitimate absence on the optional
+ * path, and a present-but-unreadable property must never read as absent.
+ */
+const UNREADABLE_PROPERTY = {};
+
+/**
+ * Read one **own** optional property, distinguishing absence from a present
+ * property that cannot be read. A property that is not an own property —
+ * including one inherited from a hostile prototype — is absence (`undefined`).
+ * A present own property whose read throws, or a record whose presence check
+ * itself throws, is {@link UNREADABLE_PROPERTY}, never absence: "the collector
+ * did not send this" and "the collector sent something unreadable" must not
+ * collapse into one answer on a fail-closed boundary. The value is read
+ * exactly once.
+ */
+function readOwnOptionalProperty(target: object, key: string): unknown {
+  try {
+    if (!objectHasOwn(target, key)) {
+      return undefined;
+    }
+  } catch {
+    return UNREADABLE_PROPERTY;
+  }
+  try {
+    return (target as Record<string, unknown>)[key];
+  } catch {
+    return UNREADABLE_PROPERTY;
+  }
+}
+
+/**
  * Read an optional field: absent (`undefined`/`null`) is a legitimate `null`,
  * while a present-but-unreadable value rejects. The distinction matters — "the
  * collector did not observe this" and "the collector sent something malformed"
@@ -442,6 +475,9 @@ function readOptional(
   raw: unknown,
   read: (value: unknown) => string | null,
 ): { readonly value: string | null; readonly valid: boolean } {
+  if (raw === UNREADABLE_PROPERTY) {
+    return { value: null, valid: false };
+  }
   if (raw === undefined || raw === null) {
     return { value: null, valid: true };
   }
@@ -463,9 +499,9 @@ function readPullRequestObservation(element: unknown): CockpitPullRequestObserva
   }
   const pullRequestId = readExactIdentifier(readOwnProperty(element, 'pullRequestId'));
   const headSha = readExactIdentifier(readOwnProperty(element, 'headSha'));
-  const baseRef = readOptional(readOwnProperty(element, 'baseRef'), readCanonicalBranchRef);
+  const baseRef = readOptional(readOwnOptionalProperty(element, 'baseRef'), readCanonicalBranchRef);
   const state = readCockpitPullRequestState(readOwnProperty(element, 'state'));
-  const title = readOptional(readOwnProperty(element, 'title'), (value: unknown) =>
+  const title = readOptional(readOwnOptionalProperty(element, 'title'), (value: unknown) =>
     readText(value, REVIEW_BOUNDS.MAX_TITLE_LENGTH),
   );
   if (pullRequestId === null || headSha === null || !baseRef.valid || !title.valid) {
@@ -521,7 +557,7 @@ function readFindingReadModel(element: unknown): CockpitFindingReadModel | null 
   const status = readStatus(readOwnProperty(element, 'status'));
   const title = readText(readOwnProperty(element, 'title'), REVIEW_BOUNDS.MAX_TITLE_LENGTH);
   const message = readText(readOwnProperty(element, 'message'), REVIEW_BOUNDS.MAX_MESSAGE_LENGTH);
-  const filePath = readOptional(readOwnProperty(element, 'filePath'), (value: unknown) =>
+  const filePath = readOptional(readOwnOptionalProperty(element, 'filePath'), (value: unknown) =>
     readText(value, REVIEW_BOUNDS.MAX_PATH_LENGTH),
   );
   const disposition = readCockpitFindingDisposition(readOwnProperty(element, 'disposition'));
@@ -621,7 +657,7 @@ export function readCockpitSnapshot(value: unknown): CockpitSnapshotReadResult {
     repositoryId = readExactIdentifier(readOwnProperty(rawRepository, 'repositoryId'));
     observedHeadSha = readExactIdentifier(readOwnProperty(rawRepository, 'observedHeadSha'));
     defaultBranchRef = readOptional(
-      readOwnProperty(rawRepository, 'defaultBranchRef'),
+      readOwnOptionalProperty(rawRepository, 'defaultBranchRef'),
       readCanonicalBranchRef,
     );
   }
