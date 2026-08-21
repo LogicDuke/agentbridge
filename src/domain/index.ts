@@ -142,6 +142,7 @@ export {
   findInvalidRepairJobFields,
   isVerificationCommandClass,
   JOB_BOUNDS,
+  readCanonicalBranchRef,
   readRepairJobAuthorization,
   readRepositoryRelativePath,
   REPAIR_JOB_FIELD_ORDER,

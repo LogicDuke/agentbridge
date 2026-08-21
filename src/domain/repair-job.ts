@@ -266,6 +266,14 @@ const CODE_DOT = 0x2e;
 const CODE_TILDE = 0x7e;
 const CODE_DELETE = 0x7f;
 const CODE_SPACE = 0x20;
+const CODE_HYPHEN = 0x2d;
+const CODE_UNDERSCORE = 0x5f;
+const CODE_DIGIT_0 = 0x30;
+const CODE_DIGIT_9 = 0x39;
+const CODE_UPPER_A = 0x41;
+const CODE_UPPER_Z = 0x5a;
+const CODE_LOWER_A = 0x61;
+const CODE_LOWER_Z = 0x7a;
 
 /** Is `value[start, end)` the segment `.git`, in any ASCII case? */
 function isDotGitSegment(value: string, start: number, end: number): boolean {
@@ -387,6 +395,272 @@ export function readRepositoryRelativePath(value: unknown): string | null {
 }
 
 /**
+ * The one accepted spelling of a branch ref.
+ *
+ * Fully qualified, lower case, and matched literally. Git resolves the shorthand
+ * `main`, the partially qualified `heads/main`, and the fully qualified
+ * `refs/heads/main` to one and the same ref, so a boundary that compares ref
+ * *strings* has three spellings for one authority target unless it fixes the
+ * spelling first. C1 fixes it here.
+ */
+const BRANCH_REF_PREFIX = 'refs/heads/';
+
+/** Is this the code of a character C1 accepts inside a branch name? */
+function isBranchNameCharacter(code: number): boolean {
+  return (
+    (code >= CODE_LOWER_A && code <= CODE_LOWER_Z) ||
+    (code >= CODE_UPPER_A && code <= CODE_UPPER_Z) ||
+    (code >= CODE_DIGIT_0 && code <= CODE_DIGIT_9) ||
+    code === CODE_HYPHEN ||
+    code === CODE_UNDERSCORE ||
+    code === CODE_DOT
+  );
+}
+
+/** Does `value` begin with the literal, case-sensitive {@link BRANCH_REF_PREFIX}? */
+function hasBranchRefPrefix(value: string): boolean {
+  const prefixLength = BRANCH_REF_PREFIX.length;
+  if (value.length <= prefixLength) {
+    return false;
+  }
+  for (let index = 0; index < prefixLength; index += 1) {
+    // An unreadable code reads as -1 and cannot equal a prefix character.
+    if (charCodeAt(value, index) !== charCodeAt(BRANCH_REF_PREFIX, index)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** Is `value[start, end)` a segment ending in `.lock`, in any ASCII case? */
+function endsWithDotLockSuffix(value: string, start: number, end: number): boolean {
+  if (end - start < 5) {
+    return false;
+  }
+  if (charCodeAt(value, end - 5) !== CODE_DOT) {
+    return false;
+  }
+  // 0x20 folds ASCII upper case to lower case; only these four positions matter.
+  const l = charCodeAt(value, end - 4) | 0x20;
+  const o = charCodeAt(value, end - 3) | 0x20;
+  const c = charCodeAt(value, end - 2) | 0x20;
+  const k = charCodeAt(value, end - 1) | 0x20;
+  return l === 0x6c && o === 0x6f && c === 0x63 && k === 0x6b;
+}
+
+/**
+ * Read a branch ref in the one canonical spelling C1 accepts.
+ *
+ * **Why one spelling, rather than a resolver.** Git's own shorthand rules make
+ * `main`, `heads/main`, and `refs/heads/main` three names for one branch, and
+ * the ambiguity is not decidable from the string alone: whether `main` resolves
+ * to a branch, a tag, or a remote-tracking ref depends on what exists in a
+ * repository at the moment the name is used. C1 is pure TypeScript by
+ * construction — it runs no git, spawns no subprocess, opens no file, and
+ * observes no repository — so it cannot ask which ref a shorthand denotes, and a
+ * boundary that guesses would be guessing about authority.
+ *
+ * So C1 does not resolve; it **narrows**. Exactly one spelling is accepted, and
+ * every other spelling of the same branch is refused as malformed rather than
+ * silently treated as a different ref. The property that buys is precise, and it
+ * is a property of ref *names* rather than of repository state:
+ *
+ * > Two accepted refs are the same canonical ref name if and only if they are
+ * > equal strings — up to the ASCII-case caveat below.
+ *
+ * That is what makes `repairBranch !== protectedParentRef` mean "two different
+ * canonical ref names" instead of "two different strings", which is what closes
+ * caller-controlled textual aliasing. Before this, a job configured with
+ * `protectedParentRef: 'refs/heads/main'` and `repairBranch: 'main'` was accepted
+ * as a quarantined repair, and a `repair.push` naming `main` passed every check
+ * and produced an `ExecutionPermit` whose ref denotes the protected branch.
+ *
+ * Accepted, and nothing else:
+ *
+ * - a value that survives {@link readExactIdentifier}, so the identifier bound
+ *   applies and nothing is trimmed or truncated
+ * - the literal, case-sensitive prefix `refs/heads/`, followed by a non-empty
+ *   name; `Refs/Heads/x`, `heads/x`, `x`, `refs/tags/x`, `refs/remotes/…`, and a
+ *   bare `refs/heads/` are all refused
+ * - name segments separated by single `/`, each non-empty, so `//`, a leading
+ *   `/`, and a trailing `/` are refused
+ * - segment characters drawn only from `A-Z`, `a-z`, `0-9`, `-`, `_`, and `.`
+ * - no segment beginning or ending with `.`, no `..` anywhere, and no segment
+ *   ending in `.lock` in any ASCII case — the ref-name forms git itself refuses
+ *
+ * The conservative character set is deliberate and is part of the guarantee.
+ * Restricting names to ASCII removes Unicode normalisation entirely: without it
+ * an NFC and an NFD spelling of one branch name are unequal strings that a
+ * filesystem-backed loose ref can resolve to a single ref, which is the same
+ * aliasing failure in a different alphabet. It also removes `~`, `^`, `:`, `?`,
+ * `*`, `[`, `\`, `@{`, and whitespace — every character git rejects in a ref
+ * name, plus the revision-syntax operators that make `x^{}` and `x@{1}` name
+ * something other than `x`. A branch name outside this set is refused, never
+ * rewritten.
+ *
+ * **What this does not prove**, and must not be claimed to: that two unequal
+ * accepted refs are two distinct branch targets in a repository. What is proved
+ * is a structural canonical ref-name representation and this module's own
+ * documented string-comparison rules; repository-resolved ref identity is not
+ * established here. Two residues stand:
+ *
+ * - **Symbolic refs.** A repository may hold a canonical-looking ref — say
+ *   `refs/heads/repair` — that is itself a symbolic ref to `refs/heads/main`.
+ *   Whether such a ref exists, and what it dereferences to, is repository state
+ *   at the moment the name is used. C1 does not detect that a ref is symbolic,
+ *   does not resolve a symbolic ref's target, and cannot tell whether two
+ *   distinct canonical names ultimately dereference to one repository target.
+ * - **Filesystem identity.** Git stores loose refs as files, so on a
+ *   case-insensitive filesystem `refs/heads/Main` and `refs/heads/main` can be
+ *   one ref while comparing unequal here. That residue is handled where it
+ *   matters — {@link mayDenoteSameBranchRef} compares the job's two configured
+ *   refs case-insensitively, so such a pair is refused as configuration — rather
+ *   than pretended away here. C1 observes no filesystem and cannot do better
+ *   than refuse the ambiguous case.
+ *
+ * The symbolic-ref residue is not narrowable from a string at all, and neither is
+ * the effective target a mutation would reach. A later trusted repository/Git
+ * execution boundary must, before acting on any authority an `ExecutionPermit`
+ * records, resolve the requested ref's effective ref-name referent against the
+ * actual repository — the terminal ref reached through a symbolic-ref chain, not
+ * commit-object identity, since a fresh repair branch may legitimately share the
+ * protected parent's commit OID — and bind each effective identity the operation
+ * acts on to the authorized repair ref. A terminal ref-name spelling is not by
+ * itself repository ref identity: where a repository applies its own ref-identity
+ * semantics — for instance a case-insensitive ref store treating `refs/heads/Main`
+ * and `refs/heads/main` as one ref — terminal names that are not equal strings may
+ * still be the same repository ref, so the boundary must judge sameness or
+ * distinctness under that repository's actual ref-identity semantics rather than by
+ * terminal-name string (in)equality alone, and fail closed where the required
+ * distinctness cannot be safely proven. A commit advances one mutation target: the
+ * worktree's effective `HEAD` referent, the ref it will actually advance. A push
+ * binds two effective identities in distinct roles — its destination ref, the
+ * receiving/mutation target the push advances, and its source ref, the input the
+ * push consumes to select what is sent — each of which must be the authorized
+ * repair ref, so an absent (deletion) or redirected source is refused. It must
+ * **fail closed** — refusing the
+ * operation — if any such effective identity is or dereferences to the
+ * protected parent, if it changes between comparison and update, or if it cannot
+ * be safely established; a resolve-then-act pre-check is not itself atomic, so the
+ * invariant is enforced at the boundary that actually consumes each identity — the
+ * mutation/receiving boundary for a commit or push, and the
+ * change-request/provider creation boundary for a change request. That refusal is
+ * bound to the operand's role rather than being a blanket ban on the protected
+ * parent's identity: a `repair.change_request` `targetRef` is *required* to reach
+ * the protected parent ref, and fails closed when it reaches anything else. Because
+ * that operation mutates no ref, the identity it consumes is bound at its provider
+ * create/update request: the effective source must remain the authorized repair ref
+ * and the effective target the protected parent ref through to that request. The
+ * provider may resolve those ref names at its own boundary, but must not let
+ * re-resolution or ambient repository state substitute a materially different
+ * effective identity for either end, and the boundary must fail closed if the
+ * authorized relationship cannot be maintained or shown equivalent there.
+ * Nothing here acquires git invocation, filesystem access, a subprocess, or
+ * network to decide it. See `docs/architecture/C1-repair-job-authority.md`,
+ * "What canonical ref names do and do not prove".
+ *
+ * The value is returned exactly as supplied, or not at all. No normalisation,
+ * no prefixing, no case folding: a boundary that repaired the spelling would be
+ * choosing an authority target on the caller's behalf.
+ */
+export function readCanonicalBranchRef(value: unknown): string | null {
+  const identifier = readExactIdentifier(value);
+  if (identifier === null) {
+    return null;
+  }
+  if (!hasBranchRefPrefix(identifier)) {
+    return null;
+  }
+
+  const length = identifier.length;
+  let segmentStart = BRANCH_REF_PREFIX.length;
+  for (let index = segmentStart; index <= length; index += 1) {
+    const atEnd = index === length;
+    const code = atEnd ? CODE_SLASH : charCodeAt(identifier, index);
+
+    if (!atEnd && code !== CODE_SLASH) {
+      // An unreadable code reads as -1, which is not a name character.
+      if (!isBranchNameCharacter(code)) {
+        return null;
+      }
+      // `..` is a revision-range operator and git refuses it in a ref name.
+      if (code === CODE_DOT && charCodeAt(identifier, index - 1) === CODE_DOT) {
+        return null;
+      }
+      continue;
+    }
+
+    const segmentLength = index - segmentStart;
+    if (segmentLength === 0) {
+      return null;
+    }
+    if (charCodeAt(identifier, segmentStart) === CODE_DOT) {
+      return null;
+    }
+    if (charCodeAt(identifier, index - 1) === CODE_DOT) {
+      return null;
+    }
+    if (endsWithDotLockSuffix(identifier, segmentStart, index)) {
+      return null;
+    }
+    segmentStart = index + 1;
+  }
+
+  return identifier;
+}
+
+/**
+ * Could these two accepted canonical ref names collapse into one ref?
+ *
+ * Both arguments are already-validated canonical refs, so this is exact string
+ * equality widened by one conservative allowance: ASCII case. Git stores loose
+ * refs as files, and on a case-insensitive filesystem `refs/heads/Main` and
+ * `refs/heads/main` can be the same ref while comparing unequal. C1 observes no
+ * filesystem and cannot tell which kind it will run on, so it treats such a pair
+ * as possibly-identical and the job that configures one is refused.
+ *
+ * Conservative in the safe direction: it answers `true` — refuse — whenever it
+ * cannot establish that the two *names* are distinct, including for a character
+ * it could not read at all. Only ASCII case is folded, because the canonical
+ * reader admits no other alphabet.
+ *
+ * A `false` result means only that the two names are distinct under this rule.
+ * It is **not** a finding that they denote distinct targets in a repository: this
+ * compares strings and resolves nothing, so a canonical name that is a symbolic
+ * ref to the other still answers `false` here, and — since two different branch
+ * refs may legitimately share one commit object — commit-object equality is not
+ * the question either. Repository-resolved identity — whether the effective
+ * referents reached by resolving symbolic-ref chains are the same or distinct
+ * under the repository's own ref-identity semantics, which a terminal ref-name
+ * spelling alone does not settle — is the later trusted repository/Git execution
+ * boundary's to establish; see {@link readCanonicalBranchRef}.
+ */
+function mayDenoteSameBranchRef(left: string, right: string): boolean {
+  if (left === right) {
+    return true;
+  }
+  if (left.length !== right.length) {
+    return false;
+  }
+  for (let index = 0; index < left.length; index += 1) {
+    const leftCode = charCodeAt(left, index);
+    const rightCode = charCodeAt(right, index);
+    if (leftCode === -1 || rightCode === -1) {
+      // Unreadable: cannot establish distinctness, so refuse the pair.
+      return true;
+    }
+    const foldedLeft =
+      leftCode >= CODE_UPPER_A && leftCode <= CODE_UPPER_Z ? leftCode | 0x20 : leftCode;
+    const foldedRight =
+      rightCode >= CODE_UPPER_A && rightCode <= CODE_UPPER_Z ? rightCode | 0x20 : rightCode;
+    if (foldedLeft !== foldedRight) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
  * Read a bounded list of untrusted values, all-or-nothing.
  *
  * One unreadable entry rejects the whole list, and an oversized list is
@@ -475,7 +749,8 @@ export interface RepairJobAuthorization {
   /** The protected parent feature pull request this repair is stacked under. */
   readonly parentPullRequestId: string;
   /**
-   * The protected parent integration ref.
+   * The protected parent integration ref, in the canonical `refs/heads/<name>`
+   * spelling {@link readCanonicalBranchRef} defines.
    *
    * **No job operation may ever write to it.** It appears in exactly one
    * authorizable position: as the *target* of the stacked validation change
@@ -497,12 +772,26 @@ export interface RepairJobAuthorization {
    */
   readonly findingHeadSha: string;
   /**
-   * The isolated repair branch.
+   * The isolated repair branch, in the canonical `refs/heads/<name>` spelling
+   * {@link readCanonicalBranchRef} defines.
    *
-   * Must differ from {@link protectedParentRef}. A job whose repair branch is
-   * the protected parent ref is not a quarantined repair; it is a direct write
-   * to protected history wearing a repair job's name, and it is rejected as
-   * malformed configuration rather than evaluated.
+   * Must be a different canonical ref name from {@link protectedParentRef}. A
+   * job whose repair branch is the protected parent ref is not a quarantined
+   * repair; it is a direct write to protected history wearing a repair job's
+   * name, and it is rejected as malformed configuration rather than evaluated.
+   *
+   * "Different branch ref", not "different string": both refs are read through
+   * the canonical reader, so an alternate spelling of the protected parent —
+   * `main`, `heads/main` — cannot pass as an isolated repair branch, and a pair
+   * that differs only by ASCII case is refused too because a case-insensitive
+   * filesystem can store the two as one loose ref.
+   *
+   * That closes caller-controlled textual aliasing only. It does not establish
+   * that the two names resolve to distinct targets in a repository — a canonical
+   * repair ref that is symbolic to the parent is invisible to a pure string
+   * boundary — which the later trusted repository/Git execution boundary must
+   * resolve or reject before it acts on any authority a permit records. See
+   * {@link readCanonicalBranchRef}.
    */
   readonly repairBranch: string;
   /** The isolated repair worktree. Filesystem-shaped operations are bound to it. */
@@ -616,12 +905,14 @@ export function readRepairJobAuthorization(job: RepairJobAuthorization): RepairJ
   const policyVersion = readExactIdentifier(readOwnProperty(record, 'policyVersion'));
   const repositoryId = readExactIdentifier(readOwnProperty(record, 'repositoryId'));
   const parentPullRequestId = readExactIdentifier(readOwnProperty(record, 'parentPullRequestId'));
-  const protectedParentRef = readExactIdentifier(readOwnProperty(record, 'protectedParentRef'));
+  const protectedParentRef = readCanonicalBranchRef(
+    readOwnProperty(record, 'protectedParentRef'),
+  );
   const parentHeadSha = readExactIdentifier(readOwnProperty(record, 'parentHeadSha'));
   const findingSource = readExactIdentifier(readOwnProperty(record, 'findingSource'));
   const findingId = readExactIdentifier(readOwnProperty(record, 'findingId'));
   const findingHeadSha = readExactIdentifier(readOwnProperty(record, 'findingHeadSha'));
-  const repairBranch = readExactIdentifier(readOwnProperty(record, 'repairBranch'));
+  const repairBranch = readCanonicalBranchRef(readOwnProperty(record, 'repairBranch'));
   const repairWorktreeId = readExactIdentifier(readOwnProperty(record, 'repairWorktreeId'));
   const authorizedPaths = readList(
     readOwnProperty(record, 'authorizedPaths'),
@@ -666,9 +957,17 @@ export function readRepairJobAuthorization(job: RepairJobAuthorization): RepairJ
   if (findingHeadSha === null) {
     append(invalidFields, 'findingHeadSha');
   }
-  // The repair branch must be distinguishable from the protected parent ref, or
-  // the isolation the whole quarantine depends on does not exist.
-  if (repairBranch === null || repairBranch === protectedParentRef) {
+  // The repair branch must be a *different branch ref* from the protected parent
+  // ref, or the isolation the whole quarantine depends on does not exist. Both
+  // refs are canonical here, so unequal strings are different canonical ref names
+  // — except for the ASCII-case pair a case-insensitive filesystem can collapse
+  // into one loose ref, which `mayDenoteSameBranchRef` refuses as well. This is a
+  // name-level check: repository-resolved identity, including a canonical ref
+  // that is symbolic to the parent, is the later trusted execution boundary's.
+  if (
+    repairBranch === null ||
+    (protectedParentRef !== null && mayDenoteSameBranchRef(repairBranch, protectedParentRef))
+  ) {
     append(invalidFields, 'repairBranch');
   }
   if (repairWorktreeId === null) {
