@@ -349,8 +349,13 @@ export function authorizeJobOperation(
   job: RepairJobAuthorization,
   request: JobOperationRequest,
 ): JobAuthorizationDecision {
-  const operation = readJobOperation(request);
+  // The trusted job is snapshotted into a frozen copy *before* the untrusted
+  // request is read. Reading the request runs its own getters and Proxy traps,
+  // which could otherwise mutate the still-live trusted job before it is
+  // captured; taking the snapshot first means every later check reads only the
+  // frozen `snapshot`, never a value request-side code could still change.
   const jobRead = readRepairJobAuthorization(job);
+  const operation = readJobOperation(request);
   const snapshot = jobRead.snapshot;
   const kind: JobOperation = operation.operation;
 
