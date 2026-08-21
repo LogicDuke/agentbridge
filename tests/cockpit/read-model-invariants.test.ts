@@ -278,3 +278,126 @@ describe('authority-shaped input has nowhere to land', () => {
     }
   });
 });
+
+/* -------------------------------------------------------------------------
+ * Accepted snapshots are JSON-round-trip safe even when hostile input poisons
+ * Object.prototype during validation (D1-44-F2)
+ * ------------------------------------------------------------------------- */
+
+describe('an accepted snapshot survives JSON serialization after prototype poisoning', () => {
+  /**
+   * A finding whose own `title` getter runs during validation and, as a side
+   * effect, installs a hostile `Object.prototype.toJSON`. The getter still
+   * returns a valid title, so the finding — and the whole snapshot — is
+   * otherwise accepted.
+   */
+  function findingThatPoisonsToJSON(onPoison: () => void): Record<string, unknown> {
+    const finding: Record<string, unknown> = { ...buildFinding() };
+    delete finding.title;
+    Object.defineProperty(finding, 'title', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        onPoison();
+        return 'a valid title';
+      },
+    });
+    return finding;
+  }
+
+  it('does not invoke a poisoned inherited toJSON and round-trips unchanged', () => {
+    const originalToJSON = Object.getOwnPropertyDescriptor(Object.prototype, 'toJSON');
+    let getterRan = false;
+    let poisonedHookInvoked = false;
+    const POISON_MARKER = '__poisoned_toJSON_marker__';
+
+    try {
+      const finding = findingThatPoisonsToJSON(() => {
+        getterRan = true;
+        // Hostile realm mutation performed mid-validation.
+        Object.defineProperty(Object.prototype, 'toJSON', {
+          configurable: true,
+          enumerable: false,
+          writable: true,
+          value() {
+            poisonedHookInvoked = true;
+            return POISON_MARKER;
+          },
+        });
+      });
+
+      const result = readCockpitSnapshot(buildSnapshot({ findings: [finding as never] }));
+
+      // (1)+(2): the hostile getter executed during validation and poisoned the realm.
+      expect(getterRan).toBe(true);
+      expect(typeof (Object.prototype as { toJSON?: unknown }).toJSON).toBe('function');
+
+      // (3): the otherwise-valid snapshot is still accepted.
+      expect(result.invalidFields).toEqual([]);
+      const snapshot = result.snapshot;
+      expect(snapshot).not.toBeNull();
+      if (snapshot === null) {
+        return;
+      }
+
+      // (4): serializing the accepted snapshot never reaches the poisoned hook.
+      const serialized = JSON.stringify(snapshot);
+      expect(poisonedHookInvoked).toBe(false);
+      expect(serialized).not.toContain(POISON_MARKER);
+
+      // (6): every nested record and list node is equally insulated — proven by
+      // serializing each in isolation while the poison is still installed.
+      for (const node of [
+        snapshot,
+        snapshot.repository,
+        snapshot.provenance,
+        snapshot.pullRequests,
+        snapshot.pullRequests[0],
+        snapshot.evidence,
+        snapshot.evidence[0],
+        snapshot.findings,
+        snapshot.findings[0],
+        snapshot.repairJobs,
+        snapshot.repairJobs[0],
+      ]) {
+        expect(() => JSON.stringify(node)).not.toThrow();
+      }
+      expect(poisonedHookInvoked).toBe(false);
+
+      // Lists remain genuine, iterable, frozen arrays despite the insulation.
+      expect(Array.isArray(snapshot.findings)).toBe(true);
+      expect([...snapshot.findings]).toHaveLength(1);
+      expect(Object.isFrozen(snapshot.findings)).toBe(true);
+      expect(Object.isFrozen(snapshot.findings[0])).toBe(true);
+
+      // (5): the accepted snapshot round-trips through plain JSON to an equal snapshot.
+      const revived: unknown = JSON.parse(serialized);
+      const second = readCockpitSnapshot(revived);
+      expect(second.invalidFields).toEqual([]);
+      expect(second.snapshot).toEqual(snapshot);
+      expect(second.snapshot?.findings[0]?.title).toBe('a valid title');
+    } finally {
+      // (8): restore global realm state no matter how the assertions resolved.
+      if (originalToJSON) {
+        Object.defineProperty(Object.prototype, 'toJSON', originalToJSON);
+      } else {
+        delete (Object.prototype as { toJSON?: unknown }).toJSON;
+      }
+    }
+
+    // The realm is clean again for every later test.
+    expect(Object.getOwnPropertyDescriptor(Object.prototype, 'toJSON')).toBeUndefined();
+  });
+
+  it('(7) still round-trips a clean snapshot with no prototype poisoning', () => {
+    const first = readCockpitSnapshot(buildSnapshot()).snapshot;
+    expect(first).not.toBeNull();
+
+    const serialized = JSON.stringify(first);
+    const revived: unknown = JSON.parse(serialized);
+    const second = readCockpitSnapshot(revived);
+
+    expect(second.invalidFields).toEqual([]);
+    expect(second.snapshot).toEqual(first);
+  });
+});

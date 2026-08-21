@@ -89,8 +89,48 @@ import {
  */
 const objectFreeze = Object.freeze;
 const objectHasOwn = Object.hasOwn;
+const objectSetPrototypeOf = Object.setPrototypeOf;
+const objectDefineProperty = Object.defineProperty;
 const arrayIsArray = Array.isArray;
 const numberIsInteger = Number.isInteger;
+
+/**
+ * Build an accepted-snapshot **record** node that cannot inherit behaviour from
+ * the live `Object.prototype`, then freeze it.
+ *
+ * A hostile getter or Proxy trap that runs mid-validation can mutate the realm —
+ * for instance installing `Object.prototype.toJSON = () => { throw }`. The reader
+ * still accepts an otherwise-valid snapshot, but an ordinary `{...}` record would
+ * inherit that poisoned hook, so a later `JSON.stringify(snapshot)` would invoke
+ * it and break D1's plain-JSON round-trip promise. Giving every returned record a
+ * `null` prototype removes the inherited chain entirely, so no realm mutation can
+ * reach the accepted object graph. Own data properties are unaffected.
+ */
+function freezeRecord<T extends object>(record: T): Readonly<T> {
+  objectSetPrototypeOf(record, null);
+  return objectFreeze(record);
+}
+
+/**
+ * Freeze an accepted-snapshot **list** node so it, too, is insulated from a
+ * poisoned inherited `toJSON`.
+ *
+ * A list must keep `Array.prototype` — consumers iterate and map the returned
+ * arrays — so a `null` prototype is not usable here. Instead the inherited
+ * `toJSON` is shadowed by an own, non-enumerable `undefined`: `JSON.stringify`
+ * finds a non-callable own `toJSON`, skips it, and serialises the array itself,
+ * never reaching a mutated `Object.prototype.toJSON`. The shadow is
+ * non-enumerable, so it changes neither enumeration nor structural equality.
+ */
+function freezeList<T>(list: T[]): readonly T[] {
+  objectDefineProperty(list, 'toJSON', {
+    value: undefined,
+    enumerable: false,
+    writable: false,
+    configurable: false,
+  });
+  return objectFreeze(list);
+}
 
 /** V1 bounds. Every unbounded dimension is capped before iteration. */
 export const COCKPIT_BOUNDS = objectFreeze({
@@ -429,7 +469,7 @@ function readCockpitList<T>(
     }
     append(parsed, parsedElement);
   }
-  return objectFreeze(parsed);
+  return freezeList(parsed);
 }
 
 /**
@@ -507,7 +547,7 @@ function readPullRequestObservation(element: unknown): CockpitPullRequestObserva
   if (pullRequestId === null || headSha === null || !baseRef.valid || !title.valid) {
     return null;
   }
-  return objectFreeze({
+  return freezeRecord({
     pullRequestId,
     headSha,
     baseRef: baseRef.value,
@@ -539,7 +579,7 @@ function readEvidenceReadModel(element: unknown): CockpitEvidenceReadModel | nul
   ) {
     return null;
   }
-  return objectFreeze({ evidenceId, kind, source, commitSha, reference, observedAt });
+  return freezeRecord({ evidenceId, kind, source, commitSha, reference, observedAt });
 }
 
 /** Read one finding read model, or `null` when malformed. */
@@ -574,7 +614,7 @@ function readFindingReadModel(element: unknown): CockpitFindingReadModel | null 
   ) {
     return null;
   }
-  return objectFreeze({
+  return freezeRecord({
     findingId,
     pullRequestId,
     reviewedCommitSha,
@@ -614,7 +654,7 @@ function readRepairJobReadModel(element: unknown): CockpitRepairJobReadModel | n
   ) {
     return null;
   }
-  return objectFreeze({
+  return freezeRecord({
     jobId,
     parentPullRequestId,
     findingId,
@@ -743,14 +783,14 @@ export function readCockpitSnapshot(value: unknown): CockpitSnapshotReadResult {
   }
 
   return objectFreeze({
-    snapshot: objectFreeze({
+    snapshot: freezeRecord<CockpitSnapshot>({
       schemaVersion: COCKPIT_SNAPSHOT_SCHEMA_VERSION,
-      repository: objectFreeze({
+      repository: freezeRecord({
         repositoryId,
         observedHeadSha,
         defaultBranchRef: defaultBranchRef.value,
       }),
-      provenance: objectFreeze({ collectorId, observedAt }),
+      provenance: freezeRecord({ collectorId, observedAt }),
       pullRequests,
       evidence,
       findings,
