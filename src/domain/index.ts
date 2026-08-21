@@ -139,6 +139,63 @@ export {
 } from './agent-invocation-report.js';
 
 export {
+  findInvalidRepairJobFields,
+  isVerificationCommandClass,
+  JOB_BOUNDS,
+  readCanonicalBranchRef,
+  readRepairJobAuthorization,
+  readRepositoryRelativePath,
+  REPAIR_JOB_FIELD_ORDER,
+  satisfiesIndependentValidator,
+  VERIFICATION_COMMAND_CLASS,
+  VERIFICATION_COMMAND_CLASSES,
+  type RepairJobAuthorization,
+  type RepairJobField,
+  type RepairJobReadResult,
+  type RepairJobSnapshot,
+  type ValidatorClaim,
+  type VerificationCommandClass,
+} from './repair-job.js';
+
+export {
+  FORBIDDEN_OPERATION,
+  FORBIDDEN_OPERATIONS,
+  isForbiddenJobOperation,
+  isRepairAuthorizableOperation,
+  JOB_OPERATION,
+  PERMIT_OPERAND_ORDER,
+  readJobOperation,
+  REPAIR_AUTHORIZABLE_OPERATIONS,
+  resolveJobOperation,
+  UNKNOWN_JOB_OPERATION,
+  type ForbiddenJobOperation,
+  type JobOperation,
+  type JobOperationRequest,
+  type NormalizedJobOperation,
+  type PermitOperands,
+  type RepairAuthorizableOperation,
+  type UnknownJobOperation,
+} from './job-operation.js';
+
+export {
+  operatorMergeAuthorizes,
+  type ExecutionPermit,
+  type MergeTarget,
+  type OperatorMergeAuthorization,
+} from './execution-permit.js';
+
+export {
+  authorizeJobOperation,
+  JOB_AUTHORIZATION,
+  JOB_AUTHORIZATION_OUTCOMES,
+  JOB_AUTHORIZATION_REASON,
+  permitAuthorizes,
+  type JobAuthorizationDecision,
+  type JobAuthorizationOutcome,
+  type JobAuthorizationReason,
+} from './job-authorization.js';
+
+export {
   currentEvidenceOfKind,
   evaluateEvidenceFreshness,
   evaluateEvidenceSet,
