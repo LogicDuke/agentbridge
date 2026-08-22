@@ -612,3 +612,206 @@ describe('freezeList descriptor is insulated from Object.prototype accessor pois
     expect(result.snapshot).not.toBeNull();
   });
 });
+
+/* -------------------------------------------------------------------------
+ * Cockpit list/invalidFields appends never inherit accessor keys from a
+ * poisoned Object.prototype (D1-44-F3)
+ *
+ * `readCockpitList` appends every accepted element, and `readCockpitSnapshot`
+ * appends every invalid field name. Both run on the reader's never-throws
+ * path. If an earlier accepted getter has installed `Object.prototype.get`/
+ * `.set`, an ordinary prototype-inheriting append descriptor would make
+ * `Object.defineProperty`'s `ToPropertyDescriptor` observe inherited accessor
+ * keys beside the own `value`/`writable` keys, reject the mixed descriptor,
+ * and throw. These cases reach the append path that D1-46-F1's `freezeList`
+ * hardening does not cover: a *non-empty* list (freezeList's own regression
+ * used only empty lists) and the `invalidFields` collection. The Cockpit-local
+ * append gives its descriptor a `null` prototype before `Object.defineProperty`
+ * consumes it, the same insulation `freezeList` uses.
+ * ------------------------------------------------------------------------- */
+
+describe('Cockpit append is insulated from Object.prototype accessor poisoning (D1-44-F3)', () => {
+  type AccessorKey = 'get' | 'set';
+
+  /**
+   * Install one accessor key on `Object.prototype` the way a prototype-pollution
+   * attacker would. The installer's own descriptor has a `null` prototype so it
+   * is immune to the very bug under test.
+   */
+  function installAccessorPoison(key: AccessorKey): void {
+    const descriptor: PropertyDescriptor = Object.assign(Object.create(null) as object, {
+      value: () => undefined,
+      writable: true,
+      configurable: true,
+    });
+    Object.defineProperty(Object.prototype, key, descriptor);
+  }
+
+  /**
+   * Run `body`, then restore `Object.prototype.get`/`.set` to their exact
+   * pre-test descriptors (or absence) no matter how it resolves, before any
+   * later assertion or test observes the realm.
+   */
+  function withAccessorRestore<T>(body: () => T): T {
+    const saved: Record<AccessorKey, PropertyDescriptor | undefined> = {
+      get: Object.getOwnPropertyDescriptor(Object.prototype, 'get'),
+      set: Object.getOwnPropertyDescriptor(Object.prototype, 'set'),
+    };
+    try {
+      return body();
+    } finally {
+      for (const key of ['get', 'set'] as const) {
+        const descriptor = saved[key];
+        if (descriptor === undefined) {
+          Reflect.deleteProperty(Object.prototype, key);
+        } else {
+          Object.defineProperty(Object.prototype, key, descriptor);
+        }
+      }
+    }
+  }
+
+  /**
+   * A repository whose own `repositoryId` getter installs the named accessor
+   * keys on `Object.prototype` as a side effect, then returns a valid id so the
+   * snapshot proceeds into the append paths. With `validId: false` it returns an
+   * invalid id, forcing the `repository.repositoryId` invalidFields append to
+   * run under the poison instead.
+   */
+  function repositoryThatPoisons(
+    keys: readonly AccessorKey[],
+    validId = true,
+  ): Record<string, unknown> {
+    const repository: Record<string, unknown> = { ...buildRepository() };
+    delete repository.repositoryId;
+    Object.defineProperty(repository, 'repositoryId', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        for (const key of keys) {
+          installAccessorPoison(key);
+        }
+        return validId ? REPO_A : '';
+      },
+    });
+    return repository;
+  }
+
+  /** A snapshot with one valid pull request, so the list append is reached. */
+  function nonEmptyListSnapshot(repository: object) {
+    return buildSnapshot({
+      repository: repository as never,
+      pullRequests: [buildPullRequest()],
+      evidence: [],
+      findings: [],
+      repairJobs: [],
+    });
+  }
+
+  function expectRealmClean(): void {
+    expect(Object.getOwnPropertyDescriptor(Object.prototype, 'get')).toBeUndefined();
+    expect(Object.getOwnPropertyDescriptor(Object.prototype, 'set')).toBeUndefined();
+  }
+
+  /** Assert totality and returned list shape when a non-empty list is appended under poison. */
+  function expectListAppendTotalUnderPoison(keys: readonly AccessorKey[]): void {
+    const result = withAccessorRestore(() =>
+      readCockpitSnapshot(nonEmptyListSnapshot(repositoryThatPoisons(keys))),
+    );
+
+    // The realm is clean again for every later assertion and test.
+    expectRealmClean();
+
+    // Totality: the non-empty-list append was reached under poison and did not throw.
+    expect(result.invalidFields).toEqual([]);
+    const snapshot = result.snapshot;
+    expect(snapshot).not.toBeNull();
+    if (snapshot === null) {
+      return;
+    }
+    const list = snapshot.pullRequests;
+    expect(Array.isArray(list)).toBe(true);
+    expect(Object.isFrozen(list)).toBe(true);
+    expect(list.length).toBe(1);
+    expect(list[0]?.pullRequestId).toBe('42');
+  }
+
+  it('(1) returns normally when get is poisoned before a non-empty list append', () => {
+    expectListAppendTotalUnderPoison(['get']);
+  });
+
+  it('(2) returns normally when set is poisoned before a non-empty list append', () => {
+    expectListAppendTotalUnderPoison(['set']);
+  });
+
+  it('(3) returns normally when get and set are poisoned before a non-empty list append', () => {
+    expectListAppendTotalUnderPoison(['get', 'set']);
+  });
+
+  it('(4) returns normally when poison precedes an invalidFields append', () => {
+    // The repositoryId getter installs the poison and then returns an invalid id,
+    // so `append(invalidFields, 'repository.repositoryId')` runs under the poison.
+    const result = withAccessorRestore(() =>
+      readCockpitSnapshot(nonEmptyListSnapshot(repositoryThatPoisons(['get', 'set'], false))),
+    );
+    expectRealmClean();
+    expect(result.snapshot).toBeNull();
+    expect(result.invalidFields).toContain('repository.repositoryId');
+  });
+
+  it('(5) preserves append descriptor semantics on appended list elements', () => {
+    // A cleanly accepted snapshot: the appended element must be an own, enumerable
+    // data property carrying the value. `writable`/`configurable` are `true` at
+    // append time (as in the shared helper) and then sealed by the accepted
+    // snapshot's mandatory freeze — the same lifecycle as before this repair.
+    const result = readCockpitSnapshot(
+      buildSnapshot({
+        pullRequests: [buildPullRequest()],
+        evidence: [],
+        findings: [],
+        repairJobs: [],
+      }),
+    );
+    const list = result.snapshot?.pullRequests;
+    expect(list).toBeDefined();
+    if (!list) {
+      return;
+    }
+    expect(Object.prototype.hasOwnProperty.call(list, 0)).toBe(true);
+    const descriptor = Object.getOwnPropertyDescriptor(list, 0);
+    expect(descriptor).toBeDefined();
+    expect(descriptor?.enumerable).toBe(true);
+    expect((descriptor?.value as { pullRequestId: string }).pullRequestId).toBe('42');
+    // Sealed by the accepted-snapshot freeze.
+    expect(descriptor?.writable).toBe(false);
+    expect(descriptor?.configurable).toBe(false);
+  });
+
+  it('(6) returns real, indexable, iterable, mappable, frozen Cockpit lists', () => {
+    const result = readCockpitSnapshot(
+      buildSnapshot({
+        pullRequests: [buildPullRequest(), buildPullRequest({ pullRequestId: '43' })],
+        evidence: [],
+        findings: [],
+        repairJobs: [],
+      }),
+    );
+    const list = result.snapshot?.pullRequests;
+    expect(list).toBeDefined();
+    if (!list) {
+      return;
+    }
+    expect(Array.isArray(list)).toBe(true);
+    expect(Object.isFrozen(list)).toBe(true);
+    expect(list[0]?.pullRequestId).toBe('42');
+    expect([...list].length).toBe(2);
+    expect(list.map((pullRequest) => pullRequest.pullRequestId)).toEqual(['42', '43']);
+  });
+
+  it('(7) leaves clean, non-empty input behaviour unchanged', () => {
+    const result = readCockpitSnapshot(buildSnapshot());
+    expect(result.invalidFields).toEqual([]);
+    expect(result.snapshot).not.toBeNull();
+    expect(result.snapshot?.pullRequests.length).toBe(1);
+  });
+});
