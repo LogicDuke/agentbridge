@@ -63,7 +63,6 @@ import {
 } from '../domain/evidence.js';
 import { FRESHNESS_STATES, type FreshnessState } from '../domain/evidence-freshness.js';
 import {
-  append,
   containsValue,
   readCanonicalBranchRef,
   readExactIdentifier,
@@ -140,6 +139,33 @@ function freezeList<T>(list: T[]): readonly T[] {
   objectSetPrototypeOf(descriptor, null);
   objectDefineProperty(list, 'toJSON', descriptor);
   return objectFreeze(list);
+}
+
+/**
+ * Append `value` as the next own indexed property of `list`.
+ *
+ * Same append semantics as C1's shared `repair-job` helper — define an own
+ * indexed data property rather than call `Array.prototype.push`, so a mutated
+ * `push` cannot intercept the write — but the descriptor is given a `null`
+ * prototype before the captured `Object.defineProperty` consumes it. A hostile
+ * getter read earlier during validation may have installed
+ * `Object.prototype.get`/`.set`; an ordinary `{...}` descriptor would inherit
+ * those, and `ToPropertyDescriptor` — which walks the prototype chain — would
+ * then observe inherited accessor keys beside the own `value`/`writable` keys,
+ * reject the mixed descriptor, and throw. Every Cockpit append runs on the
+ * reader's never-throws path (list building and `invalidFields` collection),
+ * so this module keeps its own insulated append rather than the shared one,
+ * the same defensive shape {@link freezeList} gives its `toJSON` descriptor.
+ */
+function append<T>(list: T[], value: T): void {
+  const descriptor: PropertyDescriptor = {
+    value,
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  };
+  objectSetPrototypeOf(descriptor, null);
+  objectDefineProperty(list, list.length, descriptor);
 }
 
 /** V1 bounds. Every unbounded dimension is capped before iteration. */
