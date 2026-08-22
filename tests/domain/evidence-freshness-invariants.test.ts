@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  currentEvidenceOfKind,
   EVIDENCE_KINDS,
   EVIDENCE_SOURCES,
   evaluateEvidenceFreshness,
@@ -1115,5 +1116,248 @@ describe('the kernel answers freshness, not authority', () => {
         expect(typeof value === 'boolean', `${key} is boolean`).toBe(false);
       }
     }
+  });
+});
+
+/* -------------------------------------------------------------------------
+ * append()'s descriptor never inherits accessor keys from a poisoned
+ * Object.prototype (D2-PREQ-F1)
+ *
+ * The descriptor handed to `Object.defineProperty` inside the module-local
+ * `append()` helper must not inherit `get`/`set` from `Object.prototype`, or
+ * `ToPropertyDescriptor` would see inherited accessor keys beside the own
+ * `value`/`writable` keys and throw — breaking the kernel's never-throws
+ * contract. Every append site is exercised: result lists and buckets in
+ * `evaluateEvidenceSet`, `invalidFields` and target invalid fields in
+ * `evaluateEvidenceFreshness`, and the match list in `currentEvidenceOfKind`.
+ *
+ * Every prototype mutation is restored in a `finally` before any assertion
+ * runs, so the realm after each test exactly matches the realm before it.
+ * ------------------------------------------------------------------------- */
+
+describe('append descriptor is insulated from Object.prototype accessor poisoning (D2-PREQ-F1)', () => {
+  type AccessorKey = 'get' | 'set';
+
+  /**
+   * Install one accessor key on `Object.prototype` the way a prototype-pollution
+   * attacker would. The descriptor itself is given a `null` prototype so this
+   * installation is immune to the very bug under test.
+   */
+  function installAccessorPoison(key: AccessorKey): void {
+    const descriptor: PropertyDescriptor = Object.assign(Object.create(null) as object, {
+      value: () => undefined,
+      writable: true,
+      configurable: true,
+    });
+    Object.defineProperty(Object.prototype, key, descriptor);
+  }
+
+  /**
+   * Run `body`, then restore `Object.prototype.get`/`.set` no matter how it
+   * resolves. The restore runs *before* any assertion executes: while a hostile
+   * accessor key is installed, the test runner's own descriptor-building
+   * machinery would itself throw, so the poison window is confined to `body`.
+   */
+  function withAccessorRestore<T>(body: () => T): T {
+    const saved: Record<AccessorKey, PropertyDescriptor | undefined> = {
+      get: Object.getOwnPropertyDescriptor(Object.prototype, 'get'),
+      set: Object.getOwnPropertyDescriptor(Object.prototype, 'set'),
+    };
+    try {
+      return body();
+    } finally {
+      for (const key of ['get', 'set'] as const) {
+        const descriptor = saved[key];
+        if (descriptor === undefined) {
+          Reflect.deleteProperty(Object.prototype, key);
+        } else {
+          Object.defineProperty(Object.prototype, key, descriptor);
+        }
+      }
+    }
+  }
+
+  /** Run `body` with the given keys already installed before evaluation begins. */
+  function underAmbientPoison<T>(keys: readonly AccessorKey[], body: () => T): T {
+    return withAccessorRestore(() => {
+      for (const key of keys) {
+        installAccessorPoison(key);
+      }
+      return body();
+    });
+  }
+
+  /**
+   * A well-formed record whose `evidenceId` getter — the first property the
+   * kernel reads — installs the named accessor keys mid-evaluation and then
+   * returns a valid identifier. Every later append in the same evaluation runs
+   * under the poison.
+   */
+  function recordThatPoisons(keys: readonly AccessorKey[]): ReturnType<typeof buildEvidence> {
+    const record: Record<string, unknown> = { ...buildEvidence() };
+    delete record.evidenceId;
+    Object.defineProperty(record, 'evidenceId', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        for (const key of keys) {
+          installAccessorPoison(key);
+        }
+        return 'ev-0001';
+      },
+    });
+    return record as unknown as ReturnType<typeof buildEvidence>;
+  }
+
+  function expectRealmClean(): void {
+    expect(Object.getOwnPropertyDescriptor(Object.prototype, 'get')).toBeUndefined();
+    expect(Object.getOwnPropertyDescriptor(Object.prototype, 'set')).toBeUndefined();
+  }
+
+  const POISON_CASES: readonly (readonly [string, readonly AccessorKey[]])[] = [
+    ['get', ['get']],
+    ['set', ['set']],
+    ['get + set', ['get', 'set']],
+  ];
+
+  for (const [label, keys] of POISON_CASES) {
+    it(`(${label}) evaluateEvidenceSet returns one CURRENT record under ambient poison`, () => {
+      const evaluation = underAmbientPoison(keys, () =>
+        evaluateEvidenceSet([buildEvidence()], buildTarget()),
+      );
+      expectRealmClean();
+
+      expect(evaluation.results).toHaveLength(1);
+      expect(evaluation.current).toHaveLength(1);
+      expect(evaluation.stale).toHaveLength(0);
+      expect(evaluation.invalid).toHaveLength(0);
+      expect(evaluation.current[0]?.state).toBe(FRESHNESS.CURRENT);
+      expect(evaluation.current[0]?.reason).toBe(FRESHNESS_REASON.BOUND_TO_CURRENT_HEAD);
+    });
+
+    it(`(${label}) evaluateEvidenceFreshness reports invalidFields for a malformed record under ambient poison`, () => {
+      const malformed = {
+        ...buildEvidence(),
+        commitSha: 42,
+        kind: 'not-a-kind',
+      } as unknown as ReturnType<typeof buildEvidence>;
+      const result = underAmbientPoison(keys, () =>
+        evaluateEvidenceFreshness(malformed, buildTarget()),
+      );
+      expectRealmClean();
+
+      expect(result.state).toBe(FRESHNESS.INVALID);
+      expect(result.reason).toBe(FRESHNESS_REASON.EVIDENCE_MALFORMED);
+      expect(result.invalidFields).toEqual(['commitSha', 'kind']);
+    });
+
+    it(`(${label}) evaluateEvidenceFreshness reports target invalid fields under ambient poison`, () => {
+      const result = underAmbientPoison(keys, () =>
+        evaluateEvidenceFreshness(buildEvidence(), {} as never),
+      );
+      expectRealmClean();
+
+      expect(result.state).toBe(FRESHNESS.INVALID);
+      expect(result.reason).toBe(FRESHNESS_REASON.EVALUATION_TARGET_INVALID);
+      expect(result.invalidFields).toEqual(['target.repositoryId', 'target.currentHeadSha']);
+    });
+
+    it(`(${label}) a hostile getter installing the poison mid-evaluation cannot abort a set`, () => {
+      const evaluation = withAccessorRestore(() =>
+        evaluateEvidenceSet(
+          [recordThatPoisons(keys), buildEvidence({ evidenceId: 'ev-0002', commitSha: HEAD_B })],
+          buildTarget(),
+        ),
+      );
+      expectRealmClean();
+
+      expect(evaluation.results.map((r) => r.evidenceId)).toEqual(['ev-0001', 'ev-0002']);
+      expect(evaluation.current.map((r) => r.evidenceId)).toEqual(['ev-0001']);
+      expect(evaluation.stale.map((r) => r.evidenceId)).toEqual(['ev-0002']);
+      expect(evaluation.invalid).toHaveLength(0);
+      expect(evaluation.current[0]?.state).toBe(FRESHNESS.CURRENT);
+      expect(evaluation.current[0]?.reason).toBe(FRESHNESS_REASON.BOUND_TO_CURRENT_HEAD);
+      expect(evaluation.stale[0]?.reason).toBe(FRESHNESS_REASON.COMMIT_SHA_MISMATCH);
+    });
+
+    it(`(${label}) currentEvidenceOfKind matches the same records as the clean realm`, () => {
+      const records = [
+        buildEvidence({ evidenceId: 'ev-ci', kind: 'ci-result' }),
+        buildEvidence({ evidenceId: 'ev-review', kind: 'code-review' }),
+        buildEvidence({ evidenceId: 'ev-stale', kind: 'ci-result', commitSha: HEAD_B }),
+      ];
+      const clean = evaluateEvidenceSet(records, buildTarget());
+      const expectedCi = currentEvidenceOfKind(clean, 'ci-result').map((r) => r.evidenceId);
+      const expectedReview = currentEvidenceOfKind(clean, 'code-review').map((r) => r.evidenceId);
+
+      const poisoned = underAmbientPoison(keys, () => ({
+        ci: currentEvidenceOfKind(clean, 'ci-result').map((r) => r.evidenceId),
+        review: currentEvidenceOfKind(clean, 'code-review').map((r) => r.evidenceId),
+      }));
+      expectRealmClean();
+
+      expect(expectedCi).toEqual(['ev-ci']);
+      expect(expectedReview).toEqual(['ev-review']);
+      expect(poisoned.ci).toEqual(expectedCi);
+      expect(poisoned.review).toEqual(expectedReview);
+    });
+
+    it(`(${label}) an empty evidence set evaluates unchanged under ambient poison`, () => {
+      const evaluation = underAmbientPoison(keys, () => evaluateEvidenceSet([], buildTarget()));
+      expectRealmClean();
+
+      expect(evaluation.results).toEqual([]);
+      expect(evaluation.current).toEqual([]);
+      expect(evaluation.stale).toEqual([]);
+      expect(evaluation.invalid).toEqual([]);
+    });
+  }
+
+  it('leaves clean-realm behaviour unchanged', () => {
+    expectRealmClean();
+    const evaluation = evaluateEvidenceSet(
+      [buildEvidence(), buildEvidence({ evidenceId: 'ev-0002', commitSha: HEAD_B })],
+      buildTarget(),
+    );
+
+    expect(evaluation.current.map((r) => r.evidenceId)).toEqual(['ev-0001']);
+    expect(evaluation.stale.map((r) => r.evidenceId)).toEqual(['ev-0002']);
+    expect(evaluation.invalid).toEqual([]);
+    expect(currentEvidenceOfKind(evaluation, 'ci-result').map((r) => r.evidenceId)).toEqual([
+      'ev-0001',
+    ]);
+  });
+
+  it('keeps exact data-property descriptor semantics on appended elements', () => {
+    for (const keys of [[], ['get'], ['set'], ['get', 'set']] as const) {
+      const evaluation = underAmbientPoison(keys, () =>
+        evaluateEvidenceSet([buildEvidence()], buildTarget()),
+      );
+      expectRealmClean();
+
+      // Lists are frozen after construction, so the descriptor that append()
+      // defined is observable as a data property whose writable/configurable
+      // flags were `true` until `Object.freeze` cleared them; enumerable is
+      // untouched by freeze and must still be `true`.
+      const descriptor = Object.getOwnPropertyDescriptor(evaluation.results, 0);
+      expect(descriptor).toBeDefined();
+      expect(descriptor?.enumerable).toBe(true);
+      expect(descriptor?.writable).toBe(false);
+      expect(descriptor?.configurable).toBe(false);
+      expect('get' in (descriptor ?? {})).toBe(false);
+      expect('set' in (descriptor ?? {})).toBe(false);
+      expect(Object.isFrozen(evaluation.results)).toBe(true);
+    }
+  });
+
+  it('restores Object.prototype.get/set even when the body throws', () => {
+    expect(() =>
+      withAccessorRestore(() => {
+        installAccessorPoison('get');
+        installAccessorPoison('set');
+        throw new Error('simulated failure');
+      }),
+    ).toThrow('simulated failure');
+    expectRealmClean();
   });
 });
