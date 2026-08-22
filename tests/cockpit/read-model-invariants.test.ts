@@ -14,6 +14,7 @@ import {
   buildRepository,
   buildSnapshot,
   COLLECTOR_A,
+  REPO_A,
 } from './read-model-fixtures.js';
 
 /* -------------------------------------------------------------------------
@@ -276,5 +277,338 @@ describe('authority-shaped input has nowhere to land', () => {
         expect(Object.hasOwn(record as object, key)).toBe(false);
       }
     }
+  });
+});
+
+/* -------------------------------------------------------------------------
+ * Accepted snapshots are JSON-round-trip safe even when hostile input poisons
+ * Object.prototype during validation (D1-44-F2)
+ * ------------------------------------------------------------------------- */
+
+describe('an accepted snapshot survives JSON serialization after prototype poisoning', () => {
+  /**
+   * A finding whose own `title` getter runs during validation and, as a side
+   * effect, installs a hostile `Object.prototype.toJSON`. The getter still
+   * returns a valid title, so the finding — and the whole snapshot — is
+   * otherwise accepted.
+   */
+  function findingThatPoisonsToJSON(onPoison: () => void): Record<string, unknown> {
+    const finding: Record<string, unknown> = { ...buildFinding() };
+    delete finding.title;
+    Object.defineProperty(finding, 'title', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        onPoison();
+        return 'a valid title';
+      },
+    });
+    return finding;
+  }
+
+  it('does not invoke a poisoned inherited toJSON and round-trips unchanged', () => {
+    const originalToJSON = Object.getOwnPropertyDescriptor(Object.prototype, 'toJSON');
+    let getterRan = false;
+    let poisonedHookInvoked = false;
+    const POISON_MARKER = '__poisoned_toJSON_marker__';
+
+    try {
+      const finding = findingThatPoisonsToJSON(() => {
+        getterRan = true;
+        // Hostile realm mutation performed mid-validation.
+        Object.defineProperty(Object.prototype, 'toJSON', {
+          configurable: true,
+          enumerable: false,
+          writable: true,
+          value() {
+            poisonedHookInvoked = true;
+            return POISON_MARKER;
+          },
+        });
+      });
+
+      const result = readCockpitSnapshot(buildSnapshot({ findings: [finding as never] }));
+
+      // (1)+(2): the hostile getter executed during validation and poisoned the realm.
+      expect(getterRan).toBe(true);
+      expect(typeof (Object.prototype as { toJSON?: unknown }).toJSON).toBe('function');
+
+      // (3): the otherwise-valid snapshot is still accepted.
+      expect(result.invalidFields).toEqual([]);
+      const snapshot = result.snapshot;
+      expect(snapshot).not.toBeNull();
+      if (snapshot === null) {
+        return;
+      }
+
+      // (4): serializing the accepted snapshot never reaches the poisoned hook.
+      const serialized = JSON.stringify(snapshot);
+      expect(poisonedHookInvoked).toBe(false);
+      expect(serialized).not.toContain(POISON_MARKER);
+
+      // (6): every nested record and list node is equally insulated — proven by
+      // serializing each in isolation while the poison is still installed.
+      for (const node of [
+        snapshot,
+        snapshot.repository,
+        snapshot.provenance,
+        snapshot.pullRequests,
+        snapshot.pullRequests[0],
+        snapshot.evidence,
+        snapshot.evidence[0],
+        snapshot.findings,
+        snapshot.findings[0],
+        snapshot.repairJobs,
+        snapshot.repairJobs[0],
+      ]) {
+        expect(() => JSON.stringify(node)).not.toThrow();
+      }
+      expect(poisonedHookInvoked).toBe(false);
+
+      // Lists remain genuine, iterable, frozen arrays despite the insulation.
+      expect(Array.isArray(snapshot.findings)).toBe(true);
+      expect([...snapshot.findings]).toHaveLength(1);
+      expect(Object.isFrozen(snapshot.findings)).toBe(true);
+      expect(Object.isFrozen(snapshot.findings[0])).toBe(true);
+
+      // (5): the accepted snapshot round-trips through plain JSON to an equal snapshot.
+      const revived: unknown = JSON.parse(serialized);
+      const second = readCockpitSnapshot(revived);
+      expect(second.invalidFields).toEqual([]);
+      expect(second.snapshot).toEqual(snapshot);
+      expect(second.snapshot?.findings[0]?.title).toBe('a valid title');
+    } finally {
+      // (8): restore global realm state no matter how the assertions resolved.
+      if (originalToJSON) {
+        Object.defineProperty(Object.prototype, 'toJSON', originalToJSON);
+      } else {
+        delete (Object.prototype as { toJSON?: unknown }).toJSON;
+      }
+    }
+
+    // The realm is clean again for every later test.
+    expect(Object.getOwnPropertyDescriptor(Object.prototype, 'toJSON')).toBeUndefined();
+  });
+
+  it('(7) still round-trips a clean snapshot with no prototype poisoning', () => {
+    const first = readCockpitSnapshot(buildSnapshot()).snapshot;
+    expect(first).not.toBeNull();
+
+    const serialized = JSON.stringify(first);
+    const revived: unknown = JSON.parse(serialized);
+    const second = readCockpitSnapshot(revived);
+
+    expect(second.invalidFields).toEqual([]);
+    expect(second.snapshot).toEqual(first);
+  });
+});
+
+/* -------------------------------------------------------------------------
+ * freezeList's descriptor never inherits accessor keys from a poisoned
+ * Object.prototype (D1-46-F1)
+ *
+ * The descriptor object handed to `Object.defineProperty` inside `freezeList`
+ * must not inherit `get`/`set` from `Object.prototype`, or `ToPropertyDescriptor`
+ * would see inherited accessor keys beside the own `value`/`writable` keys and
+ * throw — breaking the reader's never-throws contract. These cases genuinely
+ * reach `freezeList`: an *earlier* legitimately-read scalar getter poisons the
+ * realm, and every list is empty so the domain `append()` helper (a separate,
+ * out-of-scope family site) never executes before `freezeList`.
+ * ------------------------------------------------------------------------- */
+
+describe('freezeList descriptor is insulated from Object.prototype accessor poisoning (D1-46-F1)', () => {
+  /**
+   * Install one accessor key on `Object.prototype` the way a prototype-pollution
+   * attacker would. The descriptor itself is given a `null` prototype so this
+   * installation is immune to the very bug under test — installing `set` after
+   * `get` with an ordinary literal would otherwise throw here.
+   */
+  function installAccessorPoison(key: 'get' | 'set'): void {
+    const descriptor: PropertyDescriptor = Object.assign(Object.create(null) as object, {
+      value: () => undefined,
+      writable: true,
+      configurable: true,
+    });
+    Object.defineProperty(Object.prototype, key, descriptor);
+  }
+
+  /**
+   * A repository whose own `repositoryId` getter is read early in
+   * `readCockpitSnapshot` and, as a side effect, installs the named accessor
+   * keys on `Object.prototype`. It returns a valid id, so the snapshot — whose
+   * lists are all empty — is otherwise accepted and proceeds to `freezeList([])`.
+   */
+  function repositoryThatPoisons(keys: readonly ('get' | 'set')[]): Record<string, unknown> {
+    const repository: Record<string, unknown> = { ...buildRepository() };
+    delete repository.repositoryId;
+    Object.defineProperty(repository, 'repositoryId', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        for (const key of keys) {
+          installAccessorPoison(key);
+        }
+        return REPO_A;
+      },
+    });
+    return repository;
+  }
+
+  /** A snapshot whose lists are all empty, keeping `append()` off the path. */
+  function emptyListSnapshot(repository: object) {
+    return buildSnapshot({
+      repository: repository as never,
+      pullRequests: [],
+      evidence: [],
+      findings: [],
+      repairJobs: [],
+    });
+  }
+
+  /**
+   * Run `body`, then restore `Object.prototype.get`/`.set` no matter how it
+   * resolves. The restore must run *before* any assertion executes: while a
+   * hostile accessor key is installed, the test runner's own descriptor-building
+   * machinery would itself throw, so the poison window is confined to `body`.
+   */
+  function withAccessorRestore<T>(body: () => T): T {
+    const saved: Record<string, PropertyDescriptor | undefined> = {
+      get: Object.getOwnPropertyDescriptor(Object.prototype, 'get'),
+      set: Object.getOwnPropertyDescriptor(Object.prototype, 'set'),
+    };
+    try {
+      return body();
+    } finally {
+      for (const key of ['get', 'set'] as const) {
+        const descriptor = saved[key];
+        if (descriptor === undefined) {
+          Reflect.deleteProperty(Object.prototype, key);
+        } else {
+          Object.defineProperty(Object.prototype, key, descriptor);
+        }
+      }
+    }
+  }
+
+  /**
+   * Read an empty-list snapshot while the given accessor keys are installed,
+   * restoring the realm before returning so the caller can assert safely. On
+   * the base implementation this throws inside `freezeList`; on the candidate it
+   * returns a normal result.
+   */
+  function readUnderPoison(keys: readonly ('get' | 'set')[]) {
+    return withAccessorRestore(() =>
+      readCockpitSnapshot(emptyListSnapshot(repositoryThatPoisons(keys))),
+    );
+  }
+
+  /** Assert totality (1–3) and returned list shape (5–7) under the poison. */
+  function expectTotalUnderPoison(keys: readonly ('get' | 'set')[]): void {
+    const result = readUnderPoison(keys);
+
+    // The realm is clean again for every later assertion and test.
+    expect(Object.getOwnPropertyDescriptor(Object.prototype, 'get')).toBeUndefined();
+    expect(Object.getOwnPropertyDescriptor(Object.prototype, 'set')).toBeUndefined();
+
+    // Totality: freezeList was reached under the poison and did not throw.
+    expect(result.invalidFields).toEqual([]);
+    const snapshot = result.snapshot;
+    expect(snapshot).not.toBeNull();
+    if (snapshot === null) {
+      return;
+    }
+
+    for (const list of [
+      snapshot.pullRequests,
+      snapshot.evidence,
+      snapshot.findings,
+      snapshot.repairJobs,
+    ]) {
+      // (5) still a real array, (6) still frozen.
+      expect(Array.isArray(list)).toBe(true);
+      expect(Object.isFrozen(list)).toBe(true);
+      // (7) the own inert non-enumerable toJSON shadow is unchanged.
+      expect(Object.getOwnPropertyDescriptor(list, 'toJSON')).toEqual({
+        value: undefined,
+        enumerable: false,
+        writable: false,
+        configurable: false,
+      });
+    }
+  }
+
+  it('(1) returns normally when an earlier scalar getter installs Object.prototype.get', () => {
+    expectTotalUnderPoison(['get']);
+  });
+
+  it('(2) returns normally when an earlier scalar getter installs Object.prototype.set', () => {
+    expectTotalUnderPoison(['set']);
+  });
+
+  it('(3) returns normally when an earlier scalar getter installs both get and set', () => {
+    expectTotalUnderPoison(['get', 'set']);
+  });
+
+  it('(4) restores Object.prototype.get/set even when the body throws', () => {
+    expect(() =>
+      withAccessorRestore(() => {
+        installAccessorPoison('get');
+        installAccessorPoison('set');
+        throw new Error('simulated failure');
+      }),
+    ).toThrow('simulated failure');
+
+    expect(Object.getOwnPropertyDescriptor(Object.prototype, 'get')).toBeUndefined();
+    expect(Object.getOwnPropertyDescriptor(Object.prototype, 'set')).toBeUndefined();
+  });
+
+  it('(8) preserves the D1-44-F2 toJSON shadow so a poisoned inherited toJSON is never serialized', () => {
+    const savedToJSON = Object.getOwnPropertyDescriptor(Object.prototype, 'toJSON');
+    let poisonInvoked = false;
+    const POISON_MARKER = '__d1_46_toJSON_marker__';
+
+    try {
+      const snapshot = readCockpitSnapshot(emptyListSnapshot(buildRepository())).snapshot;
+      expect(snapshot).not.toBeNull();
+      if (snapshot === null) {
+        return;
+      }
+
+      Object.defineProperty(Object.prototype, 'toJSON', {
+        configurable: true,
+        enumerable: false,
+        writable: true,
+        value() {
+          poisonInvoked = true;
+          return POISON_MARKER;
+        },
+      });
+
+      for (const list of [
+        snapshot.pullRequests,
+        snapshot.evidence,
+        snapshot.findings,
+        snapshot.repairJobs,
+      ]) {
+        const serialized = JSON.stringify(list);
+        expect(serialized).toBe('[]');
+        expect(serialized).not.toContain(POISON_MARKER);
+      }
+      expect(poisonInvoked).toBe(false);
+    } finally {
+      if (savedToJSON) {
+        Object.defineProperty(Object.prototype, 'toJSON', savedToJSON);
+      } else {
+        delete (Object.prototype as { toJSON?: unknown }).toJSON;
+      }
+    }
+
+    expect(Object.getOwnPropertyDescriptor(Object.prototype, 'toJSON')).toBeUndefined();
+  });
+
+  it('(9) leaves clean input behaviour unchanged', () => {
+    const result = readCockpitSnapshot(buildSnapshot());
+    expect(result.invalidFields).toEqual([]);
+    expect(result.snapshot).not.toBeNull();
   });
 });
