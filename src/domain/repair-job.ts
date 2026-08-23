@@ -55,6 +55,7 @@
  */
 const objectFreeze = Object.freeze;
 const objectDefineProperty = Object.defineProperty;
+const objectSetPrototypeOf = Object.setPrototypeOf;
 const objectHasOwn = Object.hasOwn;
 const arrayIsArray = Array.isArray;
 const numberIsInteger = Number.isInteger;
@@ -77,14 +78,29 @@ export function containsValue(list: readonly string[], value: unknown): boolean 
   return false;
 }
 
-/** Append by defining an own element, bypassing inherited index setters. */
+/**
+ * Append by defining an own element, bypassing inherited index setters.
+ *
+ * The descriptor is given a `null` prototype through the captured
+ * `Object.setPrototypeOf` before the captured `Object.defineProperty` consumes
+ * it. A hostile getter or Proxy trap read earlier during evaluation may have
+ * installed `Object.prototype.get`/`.set`; an ordinary `{...}` descriptor would
+ * inherit those, and `ToPropertyDescriptor` — which walks the prototype chain —
+ * would then observe inherited accessor keys beside the own `value`/`writable`
+ * keys, reject the mixed descriptor, and throw. Every append runs on a
+ * never-throws authority path (validated lists, `invalidFields` reporting, and
+ * the imported permit-id builder), so the descriptor is insulated. Descriptor
+ * flags, index semantics, and ordering are unchanged.
+ */
 export function append<T>(list: T[], value: T): void {
-  objectDefineProperty(list, list.length, {
+  const descriptor: PropertyDescriptor = {
     value,
     writable: true,
     enumerable: true,
     configurable: true,
-  });
+  };
+  objectSetPrototypeOf(descriptor, null);
+  objectDefineProperty(list, list.length, descriptor);
 }
 
 /**

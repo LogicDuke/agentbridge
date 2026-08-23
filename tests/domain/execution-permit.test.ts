@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 
 import {
   authorizeJobOperation,
@@ -411,6 +411,102 @@ describe('permit identity cannot be collided by operand content', () => {
     expect(withStowaway.operands.ref).toBeNull();
     expect(withStowaway.operands.targetRef).toBeNull();
     expect(withStowaway.operands.commandClass).toBeNull();
+  });
+});
+
+describe('C1-RJ-F1: permit issuance survives prototype poisoning via the shared append', () => {
+  // issueExecutionPermit builds its permitId through the imported repair-job
+  // `append`. Before the repair, ambient Object.prototype.get/.set poison made
+  // that helper throw, so an otherwise-authorized ALLOW_ONCE mint threw instead
+  // of returning a permit. This proves the single repair-job change closes the
+  // consumer without any edit to execution-permit.ts itself.
+  const captureSetPrototypeOf = Object.setPrototypeOf;
+  function withPrototypePoison<T>(keys: readonly ('get' | 'set')[], body: () => T): T {
+    const saved: Record<string, PropertyDescriptor | undefined> = {};
+    for (const key of keys) {
+      saved[key] = Object.getOwnPropertyDescriptor(Object.prototype, key);
+      // Null-prototype the installer's own descriptor so installing `set` while
+      // `get` is present does not reproduce the very bug under test.
+      const descriptor: PropertyDescriptor = {
+        value: function () {},
+        configurable: true,
+        writable: true,
+      };
+      captureSetPrototypeOf(descriptor, null);
+      Object.defineProperty(Object.prototype, key, descriptor);
+    }
+    try {
+      return body();
+    } finally {
+      for (const key of keys) {
+        const descriptor = saved[key];
+        if (descriptor === undefined) {
+          Reflect.deleteProperty(Object.prototype, key);
+        } else {
+          captureSetPrototypeOf(descriptor, null);
+          Object.defineProperty(Object.prototype, key, descriptor);
+        }
+      }
+    }
+  }
+
+  // The exact permit a clean realm mints, for field-by-field comparison.
+  const clean = issue();
+
+  // Mint under poison WITHOUT calling `expect` inside the poisoned region: the
+  // assertion library itself builds prototype-inheriting descriptors, so an
+  // `expect` under poison would throw from the harness rather than the product.
+  // The authorization runs inside the poison; every assertion runs after the
+  // realm is restored.
+  const issueUnderPoison = (keys: readonly ('get' | 'set')[]): ExecutionPermit => {
+    const permit = withPrototypePoison(keys, () => {
+      const decision = authorizeJobOperation(buildJob(), buildEdit());
+      if (decision.decision !== JOB_AUTHORIZATION.ALLOW_ONCE) {
+        throw new Error(`expected ALLOW_ONCE, got ${decision.decision}`);
+      }
+      if (decision.permit === null) {
+        throw new Error('expected a permit under poison');
+      }
+      return decision.permit;
+    });
+    return permit;
+  };
+
+  const expectSamePermit = (permit: ExecutionPermit): void => {
+    // Every field equals the clean-realm permit — poison widens nothing and
+    // changes no permitId component ordering.
+    expect(permit.permitId).toBe(clean.permitId);
+    expect(permit.operation).toBe(clean.operation);
+    expect(permit.operands).toEqual(clean.operands);
+    expect(permit.singleUse).toBe(true);
+    expect(permit.scope).toBe('exactly-one-execution');
+    expect(Object.keys(permit).sort()).toEqual(Object.keys(clean).sort());
+    expect(permitAuthorizes(permit, buildJob(), buildEdit())).toBe(true);
+  };
+
+  it('issues an unchanged permit under Object.prototype.get poison', () => {
+    expectSamePermit(issueUnderPoison(['get']));
+  });
+
+  it('issues an unchanged permit under Object.prototype.set poison', () => {
+    expectSamePermit(issueUnderPoison(['set']));
+  });
+
+  it('issues an unchanged permit under get + set poison', () => {
+    expectSamePermit(issueUnderPoison(['get', 'set']));
+  });
+
+  it('still refuses an out-of-scope operation under poison, minting no permit', () => {
+    const decision = withPrototypePoison(['get', 'set'], () =>
+      authorizeJobOperation(buildJob(), buildEdit({ path: UNAUTHORIZED_PATH })),
+    );
+    expect(decision.decision).not.toBe(JOB_AUTHORIZATION.ALLOW_ONCE);
+    expect(decision.permit).toBeNull();
+  });
+
+  afterEach(() => {
+    expect(Object.getOwnPropertyDescriptor(Object.prototype, 'get')).toBeUndefined();
+    expect(Object.getOwnPropertyDescriptor(Object.prototype, 'set')).toBeUndefined();
   });
 });
 
