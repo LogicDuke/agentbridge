@@ -17,6 +17,9 @@ import * as cockpit from '../../src/cockpit/index.js';
 
 const cockpitDir = fileURLToPath(new URL('../../src/cockpit/', import.meta.url));
 
+/** The single non-`read*` public function the Cockpit layer may export (D2). */
+const D2_PROJECTION_EXPORT = 'projectCockpitEvidenceFreshness';
+
 function cockpitSources(): readonly { readonly file: string; readonly text: string }[] {
   return readdirSync(cockpitDir)
     .filter((name) => name.endsWith('.ts'))
@@ -72,8 +75,12 @@ describe('D1 exported surface grants no authority', () => {
     for (const [name, value] of Object.entries(cockpit)) {
       if (typeof value === 'function') {
         // Every exported function is a pure reader by naming convention and by
-        // contract; nothing exported authorizes, executes, persists, or grants.
-        expect(name.startsWith('read'), `unexpected non-reader export: ${name}`).toBe(true);
+        // contract, with exactly one named D2 exception: the freshness
+        // projection over an already-validated snapshot. No general `project*`
+        // namespace is granted; any other non-`read*` function is rejected.
+        // Nothing exported authorizes, executes, persists, or grants.
+        const allowed = name.startsWith('read') || name === D2_PROJECTION_EXPORT;
+        expect(allowed, `unexpected non-reader export: ${name}`).toBe(true);
       } else if (typeof value === 'object') {
         expect(Object.isFrozen(value), `unfrozen exported constant: ${name}`).toBe(true);
       }
@@ -96,5 +103,14 @@ describe('D1 exported surface grants no authority', () => {
     for (const key of forbiddenKeys) {
       expect(Object.hasOwn(result, key)).toBe(false);
     }
+  });
+
+  it('the D2 projection export is exactly the one named function', () => {
+    expect(typeof cockpit[D2_PROJECTION_EXPORT]).toBe('function');
+    const nonReaderFunctions = Object.entries(cockpit)
+      .filter(([, value]) => typeof value === 'function')
+      .map(([name]) => name)
+      .filter((name) => !name.startsWith('read'));
+    expect(nonReaderFunctions).toEqual([D2_PROJECTION_EXPORT]);
   });
 });
