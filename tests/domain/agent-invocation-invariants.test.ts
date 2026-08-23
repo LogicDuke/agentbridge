@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   evaluateEvidenceFreshness,
+  findInvalidInvocationFields,
   ingestInvocationReport,
   ingestReview,
   INVOCATION_BOUNDS,
@@ -732,5 +733,218 @@ describe('PR 005 correlation convention', () => {
     // requestedAt is validated for traceability but is not part of the report
     // contract, so it cannot be mistaken for an observation timestamp.
     expect(Object.keys(result)).not.toContain('requestedAt');
+  });
+});
+
+/**
+ * C1-AI-F1 — the diagnostic append path stays total under a hostile
+ * `Object.prototype`.
+ *
+ * `findInvalidInvocationFields` (and its non-object `allRequiredFields` branch)
+ * build their result with `append`, which defines an own index via
+ * `Object.defineProperty`. A descriptor object literal inherits from
+ * `Object.prototype`, so an inherited `get`/`set` accessor was consulted by
+ * ToPropertyDescriptor and made the call throw a `TypeError` — turning valid
+ * diagnostic reporting into a crash. The repair detaches the descriptor's
+ * prototype before the define, so only its own data attributes are read.
+ *
+ * Poison installers use null-prototype descriptors so the harness never
+ * reproduces the bug itself; product code runs under poison, the realm is
+ * restored, and assertions run afterwards (Section 13 of the repair gate).
+ */
+describe('C1-AI-F1 append survives hostile Object.prototype get/set', () => {
+  const defineProp = Object.defineProperty;
+  const getOwnDesc = Object.getOwnPropertyDescriptor;
+
+  function nullProto<T extends object>(object: T): T {
+    Object.setPrototypeOf(object, null);
+    return object;
+  }
+
+  /** Plant inherited data-property poison; return a realm-restoring function. */
+  function poisonPrototype(keys: readonly string[]): () => void {
+    const saved: Record<string, PropertyDescriptor | undefined> = Object.create(
+      null,
+    ) as Record<string, PropertyDescriptor | undefined>;
+    for (const key of keys) {
+      saved[key] = getOwnDesc(Object.prototype, key);
+    }
+    for (const key of keys) {
+      defineProp(
+        Object.prototype,
+        key,
+        nullProto({ value: 'inherited-poison', configurable: true, writable: true }),
+      );
+    }
+    return () => {
+      for (const key of keys) {
+        const descriptor = saved[key];
+        if (descriptor === undefined) {
+          Reflect.deleteProperty(Object.prototype, key);
+        } else {
+          defineProp(Object.prototype, key, nullProto({ ...descriptor }));
+        }
+      }
+    };
+  }
+
+  function underPoison<T>(
+    keys: readonly string[],
+    run: () => T,
+  ): { result: T | null; thrown: unknown } {
+    const restore = poisonPrototype(keys);
+    let result: T | null = null;
+    let thrown: unknown = null;
+    try {
+      result = run();
+    } catch (error: unknown) {
+      thrown = error;
+    } finally {
+      restore();
+    }
+    return { result, thrown };
+  }
+
+  const invalidPurpose = (extra: Partial<AgentInvocation> = {}): AgentInvocation =>
+    ({ ...buildInvocation(extra), purpose: 'nope' }) as unknown as AgentInvocation;
+
+  const POISON_SETS: readonly (readonly string[])[] = [['get'], ['set'], ['get', 'set']];
+
+  for (const keys of POISON_SETS) {
+    it(`reports a single invalid field under ${keys.join('+')} poison`, () => {
+      const { result, thrown } = underPoison(keys, () =>
+        findInvalidInvocationFields(invalidPurpose()),
+      );
+
+      expect(thrown).toBeNull();
+      expect(result && [...result]).toEqual(['purpose']);
+    });
+  }
+
+  for (const keys of POISON_SETS) {
+    it(`reports every required field for a non-object under ${keys.join('+')} poison`, () => {
+      const { result, thrown } = underPoison(keys, () =>
+        findInvalidInvocationFields(null as unknown as AgentInvocation),
+      );
+
+      expect(thrown).toBeNull();
+      expect(result && [...result]).toEqual([
+        'invocationId',
+        'repositoryId',
+        'targetCommitSha',
+        'providerId',
+        'agentId',
+        'purpose',
+        'requestedAt',
+      ]);
+    });
+  }
+
+  it('preserves invalid-field declaration order under get+set poison', () => {
+    const invocation = invalidPurpose({ invocationId: '', requestedAt: '' });
+    const { result, thrown } = underPoison(['get', 'set'], () =>
+      findInvalidInvocationFields(invocation),
+    );
+
+    expect(thrown).toBeNull();
+    expect(result && [...result]).toEqual(['invocationId', 'purpose', 'requestedAt']);
+  });
+
+  it('survives a getter that installs get poison mid-evaluation', () => {
+    const saved = getOwnDesc(Object.prototype, 'get');
+    let result: readonly string[] | null = null;
+    let thrown: unknown = null;
+    try {
+      const invocation = { ...buildInvocation() };
+      defineProp(invocation, 'invocationId', {
+        get(): string {
+          defineProp(
+            Object.prototype,
+            'get',
+            nullProto({ value: 'planted', configurable: true, writable: true }),
+          );
+          return ''; // invalid, so append('invocationId') runs under the poison it just installed
+        },
+        configurable: true,
+        enumerable: true,
+      });
+      try {
+        result = findInvalidInvocationFields(invocation as AgentInvocation);
+      } catch (error: unknown) {
+        thrown = error;
+      }
+    } finally {
+      if (saved === undefined) {
+        Reflect.deleteProperty(Object.prototype, 'get');
+      } else {
+        defineProp(Object.prototype, 'get', nullProto({ ...saved }));
+      }
+    }
+
+    expect(thrown).toBeNull();
+    expect(result && [...result]).toEqual(['invocationId']);
+  });
+
+  it('survives a getter that installs set poison mid-evaluation', () => {
+    const saved = getOwnDesc(Object.prototype, 'set');
+    let result: readonly string[] | null = null;
+    let thrown: unknown = null;
+    try {
+      const invocation = { ...buildInvocation() };
+      defineProp(invocation, 'invocationId', {
+        get(): string {
+          defineProp(
+            Object.prototype,
+            'set',
+            nullProto({ value: 'planted', configurable: true, writable: true }),
+          );
+          return '';
+        },
+        configurable: true,
+        enumerable: true,
+      });
+      try {
+        result = findInvalidInvocationFields(invocation as AgentInvocation);
+      } catch (error: unknown) {
+        thrown = error;
+      }
+    } finally {
+      if (saved === undefined) {
+        Reflect.deleteProperty(Object.prototype, 'set');
+      } else {
+        defineProp(Object.prototype, 'set', nullProto({ ...saved }));
+      }
+    }
+
+    expect(thrown).toBeNull();
+    expect(result && [...result]).toEqual(['invocationId']);
+  });
+
+  it('matches the clean control under get+set poison', () => {
+    const invocation = invalidPurpose({ invocationId: '' });
+    const clean = [...findInvalidInvocationFields(invocation)];
+    const { result, thrown } = underPoison(['get', 'set'], () =>
+      findInvalidInvocationFields(invocation),
+    );
+
+    expect(thrown).toBeNull();
+    expect(result && [...result]).toEqual(clean);
+    expect(clean).toEqual(['invocationId', 'purpose']);
+  });
+
+  it('leaves a clean valid invocation reporting nothing under poison', () => {
+    const { result, thrown } = underPoison(['get', 'set'], () =>
+      findInvalidInvocationFields(buildInvocation()),
+    );
+
+    expect(thrown).toBeNull();
+    expect(result && [...result]).toEqual([]);
+  });
+
+  it('restores Object.prototype after every poisoned run', () => {
+    underPoison(['get', 'set'], () => findInvalidInvocationFields(invalidPurpose()));
+
+    expect(getOwnDesc(Object.prototype, 'get')).toBeUndefined();
+    expect(getOwnDesc(Object.prototype, 'set')).toBeUndefined();
   });
 });
