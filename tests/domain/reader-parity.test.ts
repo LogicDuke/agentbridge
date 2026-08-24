@@ -1,23 +1,26 @@
 /**
- * Differential parity between the PR 005 and PR 006 untrusted-input readers.
+ * Differential parity between the PR 005, PR 006, and PR 007 untrusted-input
+ * readers.
  *
- * The two boundaries are deliberately independent: `agent-invocation.ts`
- * imports nothing from `review.ts`, so a defect or refactor on one side cannot
- * change the other's validation. That independence is worth more than
- * deduplicating six small readers — but it does create a drift risk, because
- * the shared readers are byte-equivalent today by convention rather than by
- * construction.
+ * The three boundaries are deliberately independent: `agent-invocation.ts`
+ * imports nothing from `review.ts`, and `workflow.ts` imports no reader from
+ * either, so a defect or refactor on one side cannot change another's
+ * validation and each captures its own intrinsics at its own load time. That
+ * independence is worth more than deduplicating a handful of small readers —
+ * but it does create a drift risk, because the shared readers are
+ * byte-equivalent today by convention rather than by construction.
  *
  * This suite converts that convention into a build failure. It runs one shared
- * hostile-input corpus through both copies of every reader whose contract
+ * hostile-input corpus through every copy of every reader whose contract
  * overlaps and asserts identical results, so a change to one side that is not
- * mirrored on the other cannot merge silently.
+ * mirrored on the others cannot merge silently.
  *
- * **This file is the only place the two modules meet.** It is a test, so it
- * creates no production dependency; neither `src/domain/review*.ts` nor
- * `src/domain/agent-invocation*.ts` references the other at runtime.
+ * **This file is the only place the three modules meet.** It is a test, so it
+ * creates no production dependency; none of `src/domain/review*.ts`,
+ * `src/domain/agent-invocation*.ts`, or `src/domain/workflow*.ts` references
+ * another's readers at runtime.
  *
- * Where the two boundaries intentionally differ, the divergence is pinned
+ * Where the boundaries intentionally differ, the divergence is pinned
  * explicitly at the bottom of this file rather than omitted.
  */
 
@@ -36,6 +39,13 @@ import {
   readText as reviewReadText,
 } from '../../src/domain/review.js';
 import { ingestReview } from '../../src/domain/review-ingestion.js';
+import {
+  clampText as workflowClampText,
+  readExactIdentifier as workflowReadExactIdentifier,
+  readOwnProperty as workflowReadOwnProperty,
+  readText as workflowReadText,
+  WORKFLOW_BOUNDS,
+} from '../../src/domain/workflow.js';
 import { buildInvocation, buildReport, label, oversized, PR_A, REPO_A, SHA_A } from './invocation-fixtures.js';
 
 /** Limits that straddle both boundaries' bounds and their edges. */
@@ -170,8 +180,18 @@ function buildTargets(): readonly (readonly [string, object])[] {
 describe('the reader copies are genuinely independent', () => {
   it('are distinct function objects, so parity is a real assertion', () => {
     expect(invocationReadText).not.toBe(reviewReadText);
+    expect(workflowReadText).not.toBe(reviewReadText);
+    expect(workflowReadText).not.toBe(invocationReadText);
+
     expect(invocationClampText).not.toBe(reviewClampText);
+    expect(workflowClampText).not.toBe(reviewClampText);
+    expect(workflowClampText).not.toBe(invocationClampText);
+
     expect(invocationReadOwnProperty).not.toBe(reviewReadOwnProperty);
+    expect(workflowReadOwnProperty).not.toBe(reviewReadOwnProperty);
+    expect(workflowReadOwnProperty).not.toBe(invocationReadOwnProperty);
+
+    expect(workflowReadExactIdentifier).not.toBe(readExactIdentifier);
   });
 });
 
@@ -181,25 +201,29 @@ describe('readText parity', () => {
       for (const limit of LIMITS) {
         const review = reviewReadText(value, limit);
         const invocation = invocationReadText(value, limit);
+        const workflow = workflowReadText(value, limit);
 
         expect(invocation, `${label(value)} @ ${String(limit)}`).toBe(review);
+        expect(workflow, `${label(value)} @ ${String(limit)}`).toBe(review);
       }
     }
   });
 
   it('agrees that a bounded-then-blank value is null', () => {
-    // The bound is applied before the blankness check on both sides, so a
+    // The bound is applied before the blankness check on every side, so a
     // string whose first `limit` characters are whitespace reads as blank.
     const value = `${' '.repeat(10)}text`;
 
     expect(invocationReadText(value, 5)).toBeNull();
     expect(reviewReadText(value, 5)).toBeNull();
+    expect(workflowReadText(value, 5)).toBeNull();
   });
 
   it('agrees that the returned value is never the trimmed form', () => {
     for (const value of [' abc', 'abc ', ' abc ']) {
       expect(invocationReadText(value, 256)).toBe(value);
       expect(reviewReadText(value, 256)).toBe(value);
+      expect(workflowReadText(value, 256)).toBe(value);
     }
   });
 });
@@ -210,8 +234,10 @@ describe('clampText parity', () => {
       for (const limit of LIMITS) {
         const review = reviewClampText(value, limit);
         const invocation = invocationClampText(value, limit);
+        const workflow = workflowClampText(value, limit);
 
         expect(invocation, `${label(value)} @ ${String(limit)}`).toBe(review);
+        expect(workflow, `${label(value)} @ ${String(limit)}`).toBe(review);
         expect(invocation.length).toBeLessThanOrEqual(Math.min(value.length, limit));
       }
     }
@@ -219,7 +245,9 @@ describe('clampText parity', () => {
 
   it('agrees on splitting a surrogate pair at an odd boundary', () => {
     expect(invocationClampText('👍👍', 1)).toBe(reviewClampText('👍👍', 1));
+    expect(workflowClampText('👍👍', 1)).toBe(reviewClampText('👍👍', 1));
     expect(invocationClampText('👍👍', 3)).toBe(reviewClampText('👍👍', 3));
+    expect(workflowClampText('👍👍', 3)).toBe(reviewClampText('👍👍', 3));
   });
 });
 
@@ -229,26 +257,44 @@ describe('readOwnProperty parity', () => {
       for (const key of KEY_CORPUS) {
         const review: unknown = reviewReadOwnProperty(target, key);
         const invocation: unknown = invocationReadOwnProperty(target, key);
+        const workflow: unknown = workflowReadOwnProperty(target, key);
 
         expect(invocation, `${targetLabel}.${key}`).toBe(review);
+        expect(workflow, `${targetLabel}.${key}`).toBe(review);
       }
     }
   });
 
-  it('agrees that an inherited value is invisible to both', () => {
+  it('agrees that an inherited value is invisible to all three', () => {
     const inherited: object = Object.create({ reference: 'inherited' }) as object;
 
     expect(invocationReadOwnProperty(inherited, 'reference')).toBeUndefined();
     expect(reviewReadOwnProperty(inherited, 'reference')).toBeUndefined();
+    expect(workflowReadOwnProperty(inherited, 'reference')).toBeUndefined();
   });
 
-  it('agrees that neither throws for any target and key', () => {
+  it('agrees that none throws for any target and key', () => {
     for (const [targetLabel, target] of buildTargets()) {
       for (const key of KEY_CORPUS) {
         expect(() => reviewReadOwnProperty(target, key), `${targetLabel}.${key}`).not.toThrow();
         expect(() => invocationReadOwnProperty(target, key), `${targetLabel}.${key}`).not.toThrow();
+        expect(() => workflowReadOwnProperty(target, key), `${targetLabel}.${key}`).not.toThrow();
       }
     }
+  });
+});
+
+describe('readExactIdentifier parity between PR 006 and PR 007', () => {
+  it('agrees on every corpus value', () => {
+    for (const value of VALUE_CORPUS) {
+      expect(workflowReadExactIdentifier(value), label(value)).toBe(readExactIdentifier(value));
+    }
+  });
+
+  it('agrees that oversize rejects rather than shortens on both sides', () => {
+    expect(readExactIdentifier(oversized(257))).toBeNull();
+    expect(workflowReadExactIdentifier(oversized(257))).toBeNull();
+    expect(workflowReadExactIdentifier(oversized(256))).toBe(oversized(256));
   });
 });
 
@@ -345,11 +391,26 @@ describe('intentional divergence is pinned, not hidden', () => {
     expect(invocation.providerId).toBeNull();
   });
 
-  it('pins the identifier bound as equal on both sides', () => {
-    // Shared by convention, not by import. If either side changes its bound,
-    // the id that one boundary accepts is no longer the id the other stores.
+  it('pins the identifier bound as equal on all three sides', () => {
+    // Shared by convention, not by import. If any side changes its bound, the
+    // id that one boundary accepts is no longer the id another stores.
     expect(readExactIdentifier(oversized(256))).not.toBeNull();
     expect(readExactIdentifier(oversized(257))).toBeNull();
+    expect(workflowReadExactIdentifier(oversized(256))).not.toBeNull();
+    expect(workflowReadExactIdentifier(oversized(257))).toBeNull();
     expect(reviewReadText(oversized(256), 256)).toBe(oversized(256));
+    expect(WORKFLOW_BOUNDS.MAX_IDENTIFIER_LENGTH).toBe(256);
+  });
+
+  /**
+   * PR 007 has no truncating path at all: it stores no prose, so `clampText`
+   * and `readText` exist there only to keep the reader set byte-equivalent and
+   * pinnable. Every field it stores goes through `readExactIdentifier`.
+   */
+  it('pins PR 007 as having no field that truncates', () => {
+    const workflow = ingestInvocationReport(buildInvocation(), buildReport([]));
+
+    expect(workflow.outcome).toBe('INGESTED');
+    expect(workflowReadExactIdentifier(oversized(257))).toBeNull();
   });
 });

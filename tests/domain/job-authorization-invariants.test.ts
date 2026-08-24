@@ -722,6 +722,153 @@ describe('a value read twice cannot differ between validation and use', () => {
   });
 });
 
+describe('C1-JO-F1: an unreadable push force operand fails closed', () => {
+  // The invariant, stated once: only an ABSENT own `force` or an own `force`
+  // that reads as literally `false` is "definitely not forced". A present but
+  // unreadable operand — an own data `undefined`, a getter that returns
+  // `undefined`, a getter or Proxy trap that throws, or a presence check that
+  // throws — must not collapse into the same non-forced default that absence
+  // has. It is forced, and a forced push is denied with no permit.
+
+  function pushWithForceAccessor(descriptor: PropertyDescriptor): JobOperationRequest {
+    const request = { ...buildPush() };
+    Object.defineProperty(request, 'force', { configurable: true, enumerable: true, ...descriptor });
+    return request as unknown as JobOperationRequest;
+  }
+
+  function expectForcedDenied(request: JobOperationRequest): void {
+    const decision = authorizeJobOperation(buildJob(), request);
+    expect(decision.decision).toBe(JOB_AUTHORIZATION.DENY);
+    expect(decision.reason).toBe(JOB_AUTHORIZATION_REASON.FORCE_PUSH_FORBIDDEN);
+    expect(decision.mayExecuteOnce).toBe(false);
+    expect(decision.permit).toBeNull();
+  }
+
+  it('preserves absent force as an unforced, authorized push', () => {
+    const request = buildPush();
+    delete (request as { force?: unknown }).force;
+    expect(Object.hasOwn(request, 'force')).toBe(false);
+    expect(readJobOperation(request).force).toBe(false);
+
+    const decision = authorizeJobOperation(buildJob(), request);
+    expect(decision.decision).toBe(JOB_AUTHORIZATION.ALLOW_ONCE);
+    expect(decision.mayExecuteOnce).toBe(true);
+    expect(decision.permit?.operands.force).toBe(false);
+  });
+
+  it('preserves literally-false force as an unforced, authorized push', () => {
+    const request = buildPush({ force: false });
+    expect(readJobOperation(request).force).toBe(false);
+
+    const decision = authorizeJobOperation(buildJob(), request);
+    expect(decision.decision).toBe(JOB_AUTHORIZATION.ALLOW_ONCE);
+    expect(decision.permit?.operands.force).toBe(false);
+  });
+
+  it('denies an honestly forced push', () => {
+    const request = buildPush({ force: true });
+    expect(readJobOperation(request).force).toBe(true);
+    expectForcedDenied(request);
+  });
+
+  it('denies a present own force of undefined (absence and present-undefined do not collapse)', () => {
+    const request = pushWithForceAccessor({ value: undefined, writable: true });
+    expect(Object.hasOwn(request, 'force')).toBe(true);
+    expect(readJobOperation(request).force).toBe(true);
+    expectForcedDenied(request);
+  });
+
+  it('denies an own getter that returns undefined, reading it exactly once', () => {
+    const getter = vi.fn(() => undefined);
+    const request = pushWithForceAccessor({ get: getter });
+    expect(readJobOperation(request).force).toBe(true);
+    expect(getter).toHaveBeenCalledTimes(1);
+    expectForcedDenied(request);
+  });
+
+  it('still authorizes an own getter that returns literally false, reading it exactly once', () => {
+    const getter = vi.fn(() => false);
+    const request = pushWithForceAccessor({ get: getter });
+    expect(readJobOperation(request).force).toBe(false);
+    expect(getter).toHaveBeenCalledTimes(1);
+
+    const decision = authorizeJobOperation(buildJob(), request);
+    expect(decision.decision).toBe(JOB_AUTHORIZATION.ALLOW_ONCE);
+    expect(decision.permit?.operands.force).toBe(false);
+  });
+
+  it('denies an own throwing force getter without throwing, reading it at most once', () => {
+    const getter = vi.fn(() => {
+      throw new Error('hostile force getter');
+    });
+    const request = pushWithForceAccessor({ get: getter });
+    expect(Object.hasOwn(request, 'force')).toBe(true);
+
+    const normalized = readJobOperation(request);
+    expect(normalized.readable).toBe(true);
+    expect(normalized.force).toBe(true);
+    expect(getter).toHaveBeenCalledTimes(1);
+    expectForcedDenied(request);
+  });
+
+  it('denies a Proxy whose force get trap throws, without throwing', () => {
+    const request = new Proxy(
+      { ...buildPush() },
+      {
+        get(target, key, receiver): unknown {
+          if (key === 'force') {
+            throw new Error('hostile force get trap');
+          }
+          return Reflect.get(target, key, receiver);
+        },
+      },
+    ) as unknown as JobOperationRequest;
+    expect(readJobOperation(request).force).toBe(true);
+    expectForcedDenied(request);
+  });
+
+  it('denies a Proxy whose own-property detection for force throws, without throwing', () => {
+    const request = new Proxy(
+      { ...buildPush() },
+      {
+        getOwnPropertyDescriptor(target, key) {
+          if (key === 'force') {
+            throw new Error('hostile force own-property trap');
+          }
+          return Reflect.getOwnPropertyDescriptor(target, key);
+        },
+      },
+    ) as unknown as JobOperationRequest;
+    expect(readJobOperation(request).force).toBe(true);
+    expectForcedDenied(request);
+  });
+
+  it('denies every present non-false force value', () => {
+    const forcedValues: readonly unknown[] = [undefined, null, 0, '', 'false', {}, []];
+    for (const value of forcedValues) {
+      const request = buildPush({ force: value as never });
+      expect(readJobOperation(request).force).toBe(true);
+      expectForcedDenied(request);
+    }
+  });
+
+  it('does not turn a force-only read failure into an unreadable whole request', () => {
+    // The rest of the request is honest; only `force` throws. The snapshot must
+    // stay readable, so the operation is denied for being forced, not for being
+    // unreadable — every other operand is still available to the evaluator.
+    const request = pushWithForceAccessor({
+      get() {
+        throw new Error('hostile force getter');
+      },
+    });
+    const normalized = readJobOperation(request);
+    expect(normalized.readable).toBe(true);
+    expect(normalized.operation).toBe(JOB_OPERATION.REPAIR_PUSH);
+    expect(normalized.ref).toBe(REPAIR_BRANCH);
+    expect(normalized.requestId).not.toBeNull();
+  });
+});
+
 describe('prototype pollution and inherited properties create no authority', () => {
   it('ignores authorization fields planted on Object.prototype', () => {
     const baseline = authorizeJobOperation(buildJob(), buildEdit({ path: UNAUTHORIZED_PATH }));
