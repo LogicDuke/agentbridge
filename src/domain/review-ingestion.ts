@@ -44,18 +44,26 @@ import {
  */
 const objectFreeze = Object.freeze;
 const objectDefineProperty = Object.defineProperty;
+const objectSetPrototypeOf = Object.setPrototypeOf;
 const arrayIsArray = Array.isArray;
 const numberIsInteger = Number.isInteger;
 const stringConstructor = String;
 
 /** Append by defining an own element, bypassing inherited index setters. */
 function append<T>(list: T[], value: T): void {
-  objectDefineProperty(list, list.length, {
+  // The descriptor object inherits from `Object.prototype`, and
+  // `Object.defineProperty` runs ToPropertyDescriptor over it — consulting
+  // inherited `get`/`set` via [[HasProperty]]. A poisoned `Object.prototype.get`
+  // or `.set` would therefore be read and make the call throw. Detaching the
+  // descriptor's prototype first means only its own data attributes are visible.
+  const descriptor: PropertyDescriptor = {
     value,
     writable: true,
     enumerable: true,
     configurable: true,
-  });
+  };
+  objectSetPrototypeOf(descriptor, null);
+  objectDefineProperty(list, list.length, descriptor);
 }
 
 /** Read a positive integer line number, or `null`. */
