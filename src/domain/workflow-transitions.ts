@@ -105,6 +105,7 @@ const objectFreeze = Object.freeze;
 const objectHasOwn = Object.hasOwn;
 const arrayIsArray = Array.isArray;
 const objectDefineProperty = Object.defineProperty;
+const objectSetPrototypeOf = Object.setPrototypeOf;
 const objectIsFrozen = Object.isFrozen;
 const reflectIsExtensible = Reflect.isExtensible;
 const reflectOwnKeys = Reflect.ownKeys;
@@ -318,20 +319,28 @@ function noteRevisionSpan(
       const low = lowest[index];
       const high = highest[index];
       if (low !== undefined && sequence < low) {
-        objectDefineProperty(lowest, index, {
+        // Null-prototype the descriptor before `defineProperty` reads it, so a
+        // poisoned inherited `get`/`set` cannot be observed by
+        // `ToPropertyDescriptor` and turn this stamp into a thrown `TypeError`.
+        // Same insulation as `workflow.ts::append`, kept inline here on purpose.
+        const descriptor: PropertyDescriptor = {
           value: sequence,
           writable: true,
           enumerable: true,
           configurable: true,
-        });
+        };
+        objectSetPrototypeOf(descriptor, null);
+        objectDefineProperty(lowest, index, descriptor);
       }
       if (high !== undefined && sequence > high) {
-        objectDefineProperty(highest, index, {
+        const descriptor: PropertyDescriptor = {
           value: sequence,
           writable: true,
           enumerable: true,
           configurable: true,
-        });
+        };
+        objectSetPrototypeOf(descriptor, null);
+        objectDefineProperty(highest, index, descriptor);
       }
       return;
     }

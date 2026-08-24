@@ -27,6 +27,7 @@ import {
   type WorkflowEvent,
   type WorkflowState,
 } from '../../src/domain/index.js';
+import { append } from '../../src/domain/workflow.js';
 import {
   admitEvidence,
   admitReview,
@@ -124,6 +125,46 @@ function withPoisoned(target: object, key: PropertyKey, value: unknown, body: ()
     } else {
       Object.defineProperty(target, key, original);
     }
+  }
+}
+
+/**
+ * Plant inherited accessor fields on `Object.prototype` and restore them exactly.
+ *
+ * A poisoned `get`/`set` is what makes `ToPropertyDescriptor` throw on any
+ * ordinary descriptor literal: it sees an inherited, callable accessor sitting
+ * beside the literal's own `value`/`writable`, the one combination the intrinsic
+ * refuses. The installing descriptor is itself null-prototyped, so poisoning
+ * `set` while `get` is already poisoned does not disrupt the very
+ * `defineProperty` call that installs it — the harness stays valid under the
+ * exact condition it exercises, and cannot mask the defect with its own throw.
+ */
+function withAccessorPoison(keys: readonly PropertyKey[], body: () => void): void {
+  const proto = Object.prototype;
+  const saved = keys.map((key) => Object.getOwnPropertyDescriptor(proto, key));
+  const poison: PropertyDescriptor = {
+    value(): unknown {
+      return undefined;
+    },
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  };
+  Object.setPrototypeOf(poison, null);
+  try {
+    for (const key of keys) {
+      Object.defineProperty(proto, key, poison);
+    }
+    body();
+  } finally {
+    keys.forEach((key, index) => {
+      const original = saved[index];
+      if (original === undefined) {
+        Reflect.deleteProperty(proto, key);
+      } else {
+        Object.defineProperty(proto, key, original);
+      }
+    });
   }
 }
 
@@ -2820,5 +2861,153 @@ describe('group M — forbidden vocabulary', () => {
     for (const name of Object.keys(domain)) {
       expect(name).not.toMatch(/^(legalEventKinds|nextAction|recommend|select|route|plan)/);
     }
+  });
+});
+
+describe('group N — PR9-WF-F1: descriptor objects survive prototype poisoning', () => {
+  // `append` builds a PropertyDescriptor and hands it to `Object.defineProperty`.
+  // `ToPropertyDescriptor` probes `get`/`set` with `HasProperty`, which walks the
+  // prototype chain, so an inherited poison on `Object.prototype` was observed by
+  // the conversion and threw `TypeError` — turning the layer's intended
+  // deterministic result into an unexpected throw. Every case here must complete
+  // without throwing and must leave the realm exactly as it found it.
+
+  // The realm is always restored before any assertion runs: a matcher such as
+  // `toEqual` builds descriptor objects of its own, which would themselves throw
+  // under the poison and mask what is being tested (Section 14). Every case
+  // captures plain values inside the poisoned block and asserts once outside it.
+
+  it('appends under a poisoned Object.prototype.get without throwing', () => {
+    const list: number[] = [];
+    withAccessorPoison(['get'], () => {
+      append(list, 7);
+    });
+    expect(list).toHaveLength(1);
+    expect(list[0]).toBe(7);
+  });
+
+  it('appends under a poisoned Object.prototype.set without throwing', () => {
+    const list: string[] = [];
+    withAccessorPoison(['set'], () => {
+      append(list, 'x');
+    });
+    expect(list).toEqual(['x']);
+  });
+
+  it('appends under a poisoned get *and* set without throwing', () => {
+    const list: number[] = [];
+    withAccessorPoison(['get', 'set'], () => {
+      append(list, 1);
+      append(list, 2);
+    });
+    expect(list).toEqual([1, 2]);
+  });
+
+  it('preserves append index and flag semantics under poison', () => {
+    const list: number[] = [];
+    let descriptor: PropertyDescriptor | undefined;
+    withAccessorPoison(['get', 'set'], () => {
+      append(list, 42);
+      descriptor = Object.getOwnPropertyDescriptor(list, 0);
+    });
+    expect(descriptor).toEqual({
+      value: 42,
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    });
+  });
+
+  it.each([['get'], ['set'], ['get', 'set']] as const)(
+    'reaches append through applyWorkflowEvent under %s poison and still applies',
+    (...keys) => {
+      // `requested()` carries one invocation, so validating it re-runs the
+      // snapshot append path before the report is applied. Compare against the
+      // clean evaluation: same input semantics must yield the same output.
+      const clean = applyWorkflowEvent(requested(), reportInvocation());
+      let poisoned: unknown;
+
+      withAccessorPoison([...keys], () => {
+        poisoned = applyWorkflowEvent(requested(), reportInvocation());
+      });
+
+      expect(poisoned).toEqual(clean);
+      expect((poisoned as typeof clean).outcome).toBe('APPLIED');
+      expect((poisoned as typeof clean).state.invocations[0]?.state).toBe('REPORTED');
+    },
+  );
+
+  it('returns the identical prior state on a rejection reached under poison', () => {
+    const prior = requested();
+    let result: ReturnType<typeof applyWorkflowEvent> | undefined;
+
+    withAccessorPoison(['get', 'set'], () => {
+      // A duplicate invocation id rejects, and the snapshot of `prior` reaches
+      // `append` on the way to that rejection.
+      result = applyWorkflowEvent(prior, requestInvocation());
+    });
+
+    expect(result?.outcome).toBe('REJECTED');
+    expect(result?.rejection).toBe('DUPLICATE_INVOCATION_ID');
+    expect(result?.state).toBe(prior);
+  });
+
+  it.each([['get'], ['set']] as const)(
+    'survives an Object.prototype.%s poison installed mid-evaluation before a later append',
+    (key) => {
+      const proto = Object.prototype;
+      const saved = Object.getOwnPropertyDescriptor(proto, key);
+      const base = requested();
+      const hostile = { ...base } as Record<string, unknown>;
+      const poison: PropertyDescriptor = {
+        value(): unknown {
+          return undefined;
+        },
+        writable: true,
+        enumerable: false,
+        configurable: true,
+      };
+      Object.setPrototypeOf(poison, null);
+      // The bound commit is read early in the snapshot; arming the poison from
+      // its getter guarantees the poison is live before the invocation list's
+      // `append` calls run later in the same evaluation.
+      Object.defineProperty(hostile, 'boundCommitSha', {
+        get(): string {
+          Object.defineProperty(proto, key, poison);
+          return base.boundCommitSha;
+        },
+        enumerable: true,
+        configurable: true,
+      });
+
+      let outcome: string | undefined;
+      let invocationState: string | undefined;
+      try {
+        const result = applyWorkflowEvent(
+          hostile as unknown as WorkflowState,
+          reportInvocation(),
+        );
+        outcome = result.outcome;
+        invocationState = result.state.invocations[0]?.state;
+      } finally {
+        if (saved === undefined) {
+          Reflect.deleteProperty(proto, key);
+        } else {
+          Object.defineProperty(proto, key, saved);
+        }
+      }
+
+      // Assert only after the realm is restored, so the matcher itself runs
+      // against a clean `Object.prototype`.
+      expect(outcome).toBe('APPLIED');
+      expect(invocationState).toBe('REPORTED');
+    },
+  );
+
+  it('leaves Object.prototype.get and Object.prototype.set untouched afterwards', () => {
+    // Every case above restores in `finally`; this pins that the realm is clean
+    // once the group has run, so no later test inherits a poisoned prototype.
+    expect(Object.getOwnPropertyDescriptor(Object.prototype, 'get')).toBeUndefined();
+    expect(Object.getOwnPropertyDescriptor(Object.prototype, 'set')).toBeUndefined();
   });
 });
