@@ -36,6 +36,10 @@ import {
 } from './repair-job.js';
 
 const objectFreeze = Object.freeze;
+// Captured at module load, before any untrusted request is evaluated, so a
+// property planted on a global after this module initializes cannot substitute
+// the own-property test the force reader fails closed on.
+const objectHasOwn = Object.hasOwn;
 
 /**
  * Operations a repair job may be authorized to perform.
@@ -320,15 +324,53 @@ const UNREADABLE_OPERATION: NormalizedJobOperation = objectFreeze({
 });
 
 /**
- * Read a force flag, failing closed.
+ * Read a push force flag, presence-aware and failing closed.
  *
- * Absent or literally `false` is not a force. **Everything else is**, including
- * `0`, `''`, `null`, `'false'`, and an object — a value that cannot be read as
- * "definitely not forced" is treated as forced, and forced pushes are denied
- * unconditionally.
+ * Only two shapes are "definitely not forced": an **absent** own `force`, and
+ * an own `force` whose value reads as literally `false`. **Everything else is
+ * forced**, and forced pushes are denied unconditionally.
+ *
+ * The distinction absence-versus-unreadable is the whole point. The shared
+ * {@link readOwnProperty} reader reports both an absent property and a getter
+ * that threw as `undefined`, so a value-only parser cannot tell "the caller
+ * sent nothing" from "the caller sent something this process could not read".
+ * Collapsing the second into the first is a fail-*open*: a present-but-
+ * unreadable force operand would normalize to non-forced and a push it could
+ * not establish as unforced would be authorized. So this reader looks at
+ * presence itself, not only a read value:
+ *
+ * - The own-property test is guarded; if it throws, presence is undecidable and
+ *   the flag fails closed to forced.
+ * - An absent own `force` is not forced — the ordinary unforced push.
+ * - A present own `force` is read exactly once, own-only. If that read throws —
+ *   an own getter or a Proxy `get` trap — it is unreadable and fails closed.
+ * - Only a read value of literally `false` is unforced. Any other value —
+ *   `undefined` included, so a present-but-`undefined` own property is forced
+ *   rather than mistaken for absence — is forced, as are `0`, `''`, `null`,
+ *   `'false'`, and an object. No truthiness coercion is applied; `=== false`
+ *   is the only unforced value.
+ *
+ * The own value is read at most once, so an accessor's getter runs at most once
+ * per {@link readJobOperation} call and the single-read snapshot discipline is
+ * preserved. Pure, total, deterministic, and never throws.
  */
-function readForceFlag(value: unknown): boolean {
-  return !(value === undefined || value === false);
+function readForceFlag(record: object): boolean {
+  let present: boolean;
+  try {
+    present = objectHasOwn(record, 'force');
+  } catch {
+    return true;
+  }
+  if (!present) {
+    return false;
+  }
+  let value: unknown;
+  try {
+    value = (record as Record<string, unknown>).force;
+  } catch {
+    return true;
+  }
+  return value !== false;
 }
 
 /**
@@ -376,7 +418,7 @@ export function readJobOperation(request: JobOperationRequest): NormalizedJobOpe
     sourceRefMalformed: sourceRef === null && rawSourceRef !== undefined,
     targetRef,
     targetRefMalformed: targetRef === null && rawTargetRef !== undefined,
-    force: readForceFlag(readOwnProperty(record, 'force')),
+    force: readForceFlag(record),
   });
 }
 
