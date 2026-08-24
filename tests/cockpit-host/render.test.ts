@@ -86,3 +86,86 @@ describe('Cockpit D3 rendered page', () => {
     expect(html).toContain('state-STALE');
   });
 });
+
+describe('Cockpit D3 finding binding (D3-CODEX-F1)', () => {
+  const html = buildDashboardHtml();
+
+  // Fixture SHAs. Each finding is reviewed against exactly one of these.
+  const HEAD_SHA = 'c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00';
+  const OLD_SHA = 'dead0000dead0000dead0000dead0000dead0000';
+
+  // Isolate the Findings <section> so assertions are scoped to it, not to the
+  // whole page: the PR ids and reviewed-commit SHAs also legitimately appear in
+  // the Pull requests, Evidence, and Repair-jobs sections, so a page-wide
+  // `toContain` would pass even if the Findings table still omitted the binding.
+  const headingAt = html.indexOf('<h2>Findings');
+  const sectionStart = html.lastIndexOf('<section>', headingAt);
+  const sectionEnd = html.indexOf('</section>', headingAt);
+  const findingsSection = html.slice(sectionStart, sectionEnd);
+
+  // The header row, and each finding's <tr>, scoped within the Findings section.
+  const headerRow = findingsSection.slice(
+    findingsSection.indexOf('<thead>'),
+    findingsSection.indexOf('</thead>'),
+  );
+  const rowFor = (findingId: string): string => {
+    const rows = findingsSection.split('</tr>');
+    const row = rows.find((candidate) => candidate.includes(`>${findingId}<`));
+    expect(row, `row for ${findingId}`).toBeDefined();
+    return row as string;
+  };
+
+  it('labels PR, Reviewed commit, and Advisory freshness as distinct columns', () => {
+    expect(headerRow).toContain('<th>PR</th>');
+    expect(headerRow).toContain('<th>Reviewed commit</th>');
+    expect(headerRow).toContain('<th>Advisory freshness</th>');
+    // "Reviewed commit" is the load-bearing label: it must not collapse to a
+    // bare "Commit", which would blur it against the repository Observed HEAD
+    // SHA and the PR Head SHA shown elsewhere on the page.
+    expect(headerRow).not.toContain('<th>Commit</th>');
+  });
+
+  it('binds f-001 to pr-42 reviewed against the older (STALE) commit', () => {
+    const row = rowFor('f-001');
+    expect(row).toContain('pr-42');
+    expect(row).toContain(OLD_SHA);
+  });
+
+  it('binds f-002 to pr-42 reviewed against the observed HEAD commit', () => {
+    const row = rowFor('f-002');
+    expect(row).toContain('pr-42');
+    expect(row).toContain(HEAD_SHA);
+  });
+
+  it('binds an f-003/pr-43 finding to its PR and reviewed commit', () => {
+    const row = rowFor('f-003');
+    expect(row).toContain('pr-43');
+    expect(row).toContain(HEAD_SHA);
+  });
+
+  it('keeps two same-PR findings distinguishable by reviewed commit', () => {
+    // f-001 and f-002 are both pr-42 but were reviewed against different
+    // commits; the reviewed-commit binding, not advisory freshness, is what
+    // tells them apart.
+    expect(rowFor('f-001')).toContain(OLD_SHA);
+    expect(rowFor('f-002')).toContain(HEAD_SHA);
+    expect(rowFor('f-001')).not.toContain(HEAD_SHA);
+  });
+
+  it('keeps advisory freshness separate from reviewed-commit identity', () => {
+    // f-003 carries no advisory claim yet still shows its reviewed commit:
+    // freshness is not a substitute for commit identity.
+    const row = rowFor('f-003');
+    expect(row).toContain(HEAD_SHA);
+    expect(row).toContain('no claim');
+  });
+
+  it('renders both binding values as inert escaped text', () => {
+    // pullRequestId / reviewedCommitSha go through the same escaper as every
+    // other value; no raw markup or interactive control is introduced.
+    expect(findingsSection).not.toContain('<a ');
+    expect(findingsSection).not.toContain('href=');
+    expect(findingsSection).not.toContain('<button');
+    expect(findingsSection).not.toContain('onclick');
+  });
+});
