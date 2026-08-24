@@ -425,3 +425,233 @@ describe('ingestion decides nothing beyond normalization', () => {
     expect(revived).toEqual(result);
   });
 });
+
+/**
+ * C1-RI-F1 — review ingestion stays total under a hostile `Object.prototype`.
+ *
+ * `ingestReview` accumulates normalized findings and rejected findings with
+ * `append`, which defines an own index via `Object.defineProperty`. Because a
+ * descriptor object literal inherits from `Object.prototype`, an inherited
+ * `get`/`set` accessor was consulted by ToPropertyDescriptor and made the call
+ * throw a `TypeError` — an otherwise-valid submission carrying >= 1 finding
+ * turned into a crash, losing the evidence being ingested. The repair detaches
+ * the descriptor's prototype before the define, so only its own data attributes
+ * are read.
+ *
+ * Poison installers use null-prototype descriptors so the harness never
+ * reproduces the bug itself; product code runs under poison, the realm is
+ * restored, and assertions run afterwards (Section 13 of the repair gate).
+ */
+describe('C1-RI-F1 append survives hostile Object.prototype get/set', () => {
+  const defineProp = Object.defineProperty;
+  const getOwnDesc = Object.getOwnPropertyDescriptor;
+
+  function nullProto<T extends object>(object: T): T {
+    Object.setPrototypeOf(object, null);
+    return object;
+  }
+
+  /** Plant inherited data-property poison; return a realm-restoring function. */
+  function poisonPrototype(keys: readonly string[]): () => void {
+    const saved: Record<string, PropertyDescriptor | undefined> = Object.create(
+      null,
+    ) as Record<string, PropertyDescriptor | undefined>;
+    for (const key of keys) {
+      saved[key] = getOwnDesc(Object.prototype, key);
+    }
+    for (const key of keys) {
+      defineProp(
+        Object.prototype,
+        key,
+        nullProto({ value: 'inherited-poison', configurable: true, writable: true }),
+      );
+    }
+    return () => {
+      for (const key of keys) {
+        const descriptor = saved[key];
+        if (descriptor === undefined) {
+          Reflect.deleteProperty(Object.prototype, key);
+        } else {
+          defineProp(Object.prototype, key, nullProto({ ...descriptor }));
+        }
+      }
+    };
+  }
+
+  function underPoison<T>(
+    keys: readonly string[],
+    run: () => T,
+  ): { result: T | null; thrown: unknown } {
+    const restore = poisonPrototype(keys);
+    let result: T | null = null;
+    let thrown: unknown = null;
+    try {
+      result = run();
+    } catch (error: unknown) {
+      thrown = error;
+    } finally {
+      restore();
+    }
+    return { result, thrown };
+  }
+
+  const POISON_SETS: readonly (readonly string[])[] = [['get'], ['set'], ['get', 'set']];
+
+  for (const keys of POISON_SETS) {
+    it(`ingests a submission with one finding under ${keys.join('+')} poison`, () => {
+      const { result, thrown } = underPoison(keys, () =>
+        ingestReview(buildContext(), buildSubmission([buildFinding()])),
+      );
+
+      expect(thrown).toBeNull();
+      expect(result?.outcome).toBe(INGESTION_OUTCOME.INGESTED);
+      expect(result?.findings.length).toBe(1);
+    });
+  }
+
+  it('preserves finding order under get+set poison', () => {
+    const submission = buildSubmission([
+      buildFinding({ title: 'first' }),
+      buildFinding({ title: 'second' }),
+      buildFinding({ title: 'third' }),
+    ]);
+    const { result, thrown } = underPoison(['get', 'set'], () =>
+      ingestReview(buildContext(), submission),
+    );
+
+    expect(thrown).toBeNull();
+    expect(result?.findings.map((finding) => finding.title)).toEqual([
+      'first',
+      'second',
+      'third',
+    ]);
+    expect(result?.findings.map((finding) => finding.findingId)).toEqual(['f0', 'f1', 'f2']);
+  });
+
+  it('produces finding content identical to the clean control under get+set poison', () => {
+    const submission = buildSubmission([buildFinding()]);
+    const clean = ingestReview(buildContext(), submission);
+    const { result, thrown } = underPoison(['get', 'set'], () =>
+      ingestReview(buildContext(), submission),
+    );
+
+    expect(thrown).toBeNull();
+    expect(result).toEqual(clean);
+  });
+
+  it('appends a rejected finding under get+set poison', () => {
+    const submission = buildSubmission([
+      buildFinding({ title: 'kept' }),
+      { message: 'no title' },
+    ]);
+    const clean = ingestReview(buildContext(), submission);
+    const { result, thrown } = underPoison(['get', 'set'], () =>
+      ingestReview(buildContext(), submission),
+    );
+
+    expect(thrown).toBeNull();
+    expect(result?.findings.length).toBe(1);
+    expect(result?.findings[0]?.title).toBe('kept');
+    expect(result?.rejected.length).toBe(1);
+    expect(result?.rejected[0]?.reason).toBe('REQUIRED_FIELD_MISSING');
+    expect(result).toEqual(clean);
+  });
+
+  it('survives a finding getter that installs get poison mid-evaluation', () => {
+    const saved = getOwnDesc(Object.prototype, 'get');
+    let result: ReturnType<typeof ingestReview> | null = null;
+    let thrown: unknown = null;
+    try {
+      const hostile = defineProp({ ...buildFinding() }, 'title', {
+        get(): string {
+          defineProp(
+            Object.prototype,
+            'get',
+            nullProto({ value: 'planted', configurable: true, writable: true }),
+          );
+          return 'title-mid'; // valid, so append(findings, finding) runs under the freshly installed poison
+        },
+        configurable: true,
+        enumerable: true,
+      }) as ReturnType<typeof buildFinding>;
+      const submission = buildSubmission([hostile, buildFinding({ title: 'title-after' })]);
+      try {
+        result = ingestReview(buildContext(), submission);
+      } catch (error: unknown) {
+        thrown = error;
+      }
+    } finally {
+      if (saved === undefined) {
+        Reflect.deleteProperty(Object.prototype, 'get');
+      } else {
+        defineProp(Object.prototype, 'get', nullProto({ ...saved }));
+      }
+    }
+
+    expect(thrown).toBeNull();
+    expect(result?.outcome).toBe(INGESTION_OUTCOME.INGESTED);
+    expect(result?.findings.map((finding) => finding.title)).toEqual([
+      'title-mid',
+      'title-after',
+    ]);
+  });
+
+  it('survives a finding getter that installs set poison mid-evaluation', () => {
+    const saved = getOwnDesc(Object.prototype, 'set');
+    let result: ReturnType<typeof ingestReview> | null = null;
+    let thrown: unknown = null;
+    try {
+      const hostile = defineProp({ ...buildFinding() }, 'title', {
+        get(): string {
+          defineProp(
+            Object.prototype,
+            'set',
+            nullProto({ value: 'planted', configurable: true, writable: true }),
+          );
+          return 'title-mid';
+        },
+        configurable: true,
+        enumerable: true,
+      }) as ReturnType<typeof buildFinding>;
+      const submission = buildSubmission([hostile, buildFinding({ title: 'title-after' })]);
+      try {
+        result = ingestReview(buildContext(), submission);
+      } catch (error: unknown) {
+        thrown = error;
+      }
+    } finally {
+      if (saved === undefined) {
+        Reflect.deleteProperty(Object.prototype, 'set');
+      } else {
+        defineProp(Object.prototype, 'set', nullProto({ ...saved }));
+      }
+    }
+
+    expect(thrown).toBeNull();
+    expect(result?.outcome).toBe(INGESTION_OUTCOME.INGESTED);
+    expect(result?.findings.map((finding) => finding.title)).toEqual([
+      'title-mid',
+      'title-after',
+    ]);
+  });
+
+  it('ingests a clean submission identically with and without poison', () => {
+    const submission = buildSubmission([buildFinding()]);
+    const clean = ingestReview(buildContext(), submission);
+    const { result, thrown } = underPoison(['get', 'set'], () =>
+      ingestReview(buildContext(), submission),
+    );
+
+    expect(thrown).toBeNull();
+    expect(result).toEqual(clean);
+  });
+
+  it('restores Object.prototype after every poisoned run', () => {
+    underPoison(['get', 'set'], () =>
+      ingestReview(buildContext(), buildSubmission([buildFinding()])),
+    );
+
+    expect(getOwnDesc(Object.prototype, 'get')).toBeUndefined();
+    expect(getOwnDesc(Object.prototype, 'set')).toBeUndefined();
+  });
+});
