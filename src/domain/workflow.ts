@@ -60,6 +60,7 @@ import type { InvocationReportResult } from './agent-invocation-report.js';
  */
 const objectFreeze = Object.freeze;
 const objectDefineProperty = Object.defineProperty;
+const objectSetPrototypeOf = Object.setPrototypeOf;
 const objectHasOwn = Object.hasOwn;
 const objectIs = Object.is;
 const numberIsInteger = Number.isInteger;
@@ -90,12 +91,20 @@ function containsValue(list: readonly string[], value: unknown): boolean {
 
 /** Append by defining an own element, bypassing inherited index setters. */
 export function append<T>(list: T[], value: T): void {
-  objectDefineProperty(list, list.length, {
+  // The descriptor is null-prototyped before `defineProperty` consumes it.
+  // `ToPropertyDescriptor` tests `get`/`set` with `HasProperty`, which walks the
+  // prototype chain: an ordinary literal inherits from `Object.prototype`, so a
+  // poisoned inherited `get`/`set` would be observed and throw `TypeError`
+  // instead of appending. Severing the prototype leaves only the own data
+  // fields visible, so conversion sees exactly what is written here.
+  const descriptor: PropertyDescriptor = {
     value,
     writable: true,
     enumerable: true,
     configurable: true,
-  });
+  };
+  objectSetPrototypeOf(descriptor, null);
+  objectDefineProperty(list, list.length, descriptor);
 }
 
 /**

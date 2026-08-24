@@ -1283,3 +1283,134 @@ describe('applyWorkflowEvent — group N, end-to-end lifecycle replay', () => {
     expect(label(REVIEW_B)).toContain(REVIEW_B);
   });
 });
+
+/**
+ * Plant inherited accessor fields on `Object.prototype`, restoring them exactly.
+ *
+ * The installing descriptor is null-prototyped so that poisoning `set` while
+ * `get` is already poisoned does not disrupt the very `defineProperty` that
+ * installs it — the harness stays valid under the same condition it exercises.
+ */
+function withAccessorPoison(keys: readonly PropertyKey[], body: () => void): void {
+  const proto = Object.prototype;
+  const saved = keys.map((key) => Object.getOwnPropertyDescriptor(proto, key));
+  const poison: PropertyDescriptor = {
+    value(): unknown {
+      return undefined;
+    },
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  };
+  Object.setPrototypeOf(poison, null);
+  try {
+    for (const key of keys) {
+      Object.defineProperty(proto, key, poison);
+    }
+    body();
+  } finally {
+    keys.forEach((key, index) => {
+      const original = saved[index];
+      if (original === undefined) {
+        Reflect.deleteProperty(proto, key);
+      } else {
+        Object.defineProperty(proto, key, original);
+      }
+    });
+  }
+}
+
+describe('PR9-WF-F1: noteRevisionSpan inline descriptors survive prototype poisoning', () => {
+  // `noteRevisionSpan` stamps its lowest/highest slots with `Object.defineProperty`
+  // over an inline descriptor. Those calls are on the public evaluation path:
+  // `applyWorkflowEvent` -> `snapshotWorkflow` -> `noteRevisionSpan`. An inherited
+  // `get`/`set` poison made `ToPropertyDescriptor` throw there, so a hostile realm
+  // turned an intended apply/rejection into an unexpected `TypeError`.
+
+  /** One invocation requested then reported at the same revision. */
+  function reportedInvocation(): WorkflowState {
+    return applyOrThrow(withRequestedInvocation(), reportInvocation());
+  }
+
+  /**
+   * A state whose two same-revision invocation records are ordered so the
+   * second-listed carries the lower sequence — driving `noteRevisionSpan`
+   * through its lowest-slot inline descriptor. Built from real transitions,
+   * then reordered; lists are refrozen to stay faithful to a produced state.
+   */
+  function reachesLowestSpanSite(): WorkflowState {
+    let state = openedWorkflow();
+    state = applyOrThrow(state, requestInvocation(buildInvocation({ invocationId: INVOCATION_A })));
+    state = applyOrThrow(state, requestInvocation(buildInvocation({ invocationId: INVOCATION_B })));
+    const invocations = Object.freeze([
+      Object.freeze({ ...state.invocations[0], requestedAtSequence: 2 }),
+      Object.freeze({ ...state.invocations[1], requestedAtSequence: 1 }),
+    ]);
+    return Object.freeze({ ...state, invocations }) as WorkflowState;
+  }
+
+  const deeplyFrozen = (state: WorkflowState): boolean =>
+    Object.isFrozen(state) &&
+    Object.isFrozen(state.invocations) &&
+    Object.isFrozen(state.evidence) &&
+    Object.isFrozen(state.reviews);
+
+  it.each([['get'], ['set'], ['get', 'set']] as const)(
+    'reaches the highest-slot inline descriptor under %s poison and applies unchanged',
+    (...keys) => {
+      const prior = reportedInvocation();
+      const clean = applyWorkflowEvent(prior, admitEvidence());
+      let poisoned: ReturnType<typeof applyWorkflowEvent> | undefined;
+
+      withAccessorPoison([...keys], () => {
+        poisoned = applyWorkflowEvent(prior, admitEvidence());
+      });
+
+      expect(poisoned).toEqual(clean);
+      expect(poisoned?.outcome).toBe('APPLIED');
+      // Chronology, revision, and sequence accounting are all unchanged.
+      expect(poisoned?.state.revision).toBe(clean.state.revision);
+      expect(poisoned?.state.sequence).toBe(clean.state.sequence);
+      expect(poisoned ? deeplyFrozen(poisoned.state) : false).toBe(true);
+    },
+  );
+
+  it.each([['get'], ['set'], ['get', 'set']] as const)(
+    'reaches the lowest-slot inline descriptor under %s poison with identical outcome',
+    (...keys) => {
+      const prior = reachesLowestSpanSite();
+      const clean = applyWorkflowEvent(prior, admitEvidence());
+      let poisoned: ReturnType<typeof applyWorkflowEvent> | undefined;
+
+      withAccessorPoison([...keys], () => {
+        poisoned = applyWorkflowEvent(prior, admitEvidence());
+      });
+
+      // Whether the reordered state reads as applicable or as a deterministic
+      // rejection, the poisoned run must reproduce the clean run exactly.
+      expect(poisoned).toEqual(clean);
+      expect(poisoned?.outcome).toBe(clean.outcome);
+      expect(poisoned?.rejection).toBe(clean.rejection);
+    },
+  );
+
+  it('preserves prior-state identity on a rejection reached through noteRevisionSpan', () => {
+    const prior = reportedInvocation();
+    let poisoned: ReturnType<typeof applyWorkflowEvent> | undefined;
+
+    withAccessorPoison(['get', 'set'], () => {
+      // A duplicate invocation id rejects, but the snapshot of `prior` reaches
+      // `noteRevisionSpan` first.
+      poisoned = applyWorkflowEvent(prior, requestInvocation());
+    });
+
+    expect(poisoned?.outcome).toBe('REJECTED');
+    expect(poisoned?.rejection).toBe('DUPLICATE_INVOCATION_ID');
+    expect(poisoned?.state).toBe(prior);
+  });
+
+  it('leaves the realm clean after exercising the inline descriptors', () => {
+    expect(Object.getOwnPropertyDescriptor(Object.prototype, 'get')).toBeUndefined();
+    expect(Object.getOwnPropertyDescriptor(Object.prototype, 'set')).toBeUndefined();
+  });
+});
