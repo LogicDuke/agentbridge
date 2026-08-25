@@ -34,23 +34,36 @@ function hostSources(): readonly { readonly file: string; readonly text: string 
  *   - static:       `import x from '...'` / `import x from "..."`
  *                   (including multi-line `import type { ... } from '...'`)
  *   - side-effect:  `import '...'` / `import "..."`
- *   - dynamic:      `import('...')` / `import("...")`
+ *   - dynamic:      `import('...')` / `import("...")`, with or without a second
+ *                   options argument (`import('...', { with: { type: 'json' } })`)
  *   - re-export:    `export { x } from '...'` / `export * from "..."`
+ *
+ * A block comment between tokens does not hide the specifier — not even a block
+ * comment that itself contains quote characters (a quoted-comment token
+ * separator between `import` and `from`, or a comment just inside `import(`).
+ * The token region between keywords consumes a whole block comment as a single
+ * unit instead of stopping at the first quote inside it. (Ordinary unquoted
+ * comment separators were already handled and remain so.)
  *
  * `import.meta.url` is deliberately not matched: the `import` keyword must be
  * followed by whitespace (static/side-effect) or `(` (dynamic), and `.` is
  * neither. This is a bounded lexical scan, not a parser — no AST dependency is
- * introduced, and, like the original scanner, it does not exclude specifiers
- * that appear inside comments.
+ * introduced.
  */
 function extractModuleSpecifiers(source: string): readonly string[] {
+  // A run of source between two keywords that may legally hold whole block
+  // comments (which can contain quote characters) or any other non-quote text.
+  // Consuming a `/* ... */` as one unit is what lets a quoted comment sit
+  // between `import` and `from` without the scanner mistaking the comment's
+  // quote for the specifier delimiter.
   const patterns: readonly RegExp[] = [
     // static (`import x from 'S'`) and side-effect (`import 'S'`) imports.
-    /\bimport\s+(?:[^'"]*?\bfrom\s+)?['"]([^'"]+)['"]/g,
-    // dynamic imports: `import('S')`.
-    /\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)/g,
+    /\bimport\s+(?:(?:\/\*[\s\S]*?\*\/|[^'"])*?\bfrom\s+)?['"]([^'"]+)['"]/g,
+    // dynamic imports: `import('S')`, an optional leading block comment, and an
+    // optional second options argument (closing `)` or a comma introduces it).
+    /\bimport\s*\(\s*(?:\/\*[\s\S]*?\*\/\s*)?['"]([^'"]+)['"]\s*[,)]/g,
     // re-export bindings: `export { x } from 'S'`, `export * from 'S'`.
-    /\bexport\b[^'"]*?\bfrom\s+['"]([^'"]+)['"]/g,
+    /\bexport\b(?:\/\*[\s\S]*?\*\/|[^'"])*?\bfrom\s+['"]([^'"]+)['"]/g,
   ];
   const specifiers: string[] = [];
   for (const pattern of patterns) {
@@ -153,5 +166,54 @@ describe('D3 host import scanner recognizes every supported ESM form (D3-CR-F1)'
   it('does not treat `import.meta.url` as a module specifier', () => {
     const source = `const isEntry = import.meta.url === pathToFileURL(entry).href;`;
     expect(extractModuleSpecifiers(source)).toEqual([]);
+  });
+});
+
+describe('D3 host import scanner covers dynamic-options and block-comment forms (D3-CR-F2/F3)', () => {
+  const forbiddenIn = (source: string): readonly string[] =>
+    extractModuleSpecifiers(source).filter((s) => /\.\.\/(?:domain|adapters)\//.test(s));
+
+  // D3-CR-F2: a dynamic import that carries a second options argument still
+  // surfaces its specifier. Before this fix the scanner required `)` right after
+  // the closing quote, so the comma-led options form extracted nothing and the
+  // forbidden dependency slipped past both discipline checks.
+  it('extracts the specifier from a dynamic import with an import-attributes options object', () => {
+    expect(forbiddenIn(`import('../domain/foo.js', { with: { type: 'json' } })`).length).toBeGreaterThan(0);
+  });
+
+  it('extracts the specifier from a dynamic import with a bundler-style options object', () => {
+    expect(forbiddenIn(`import('../domain/foo.js', { webpackChunkName: 'foo' })`).length).toBeGreaterThan(0);
+  });
+
+  // D3-CR-F3 (narrow, independently reproduced cases only).
+  it('extracts the specifier when a block comment sits inside the dynamic import', () => {
+    expect(forbiddenIn(`import(/* note */ '../domain/foo.js')`).length).toBeGreaterThan(0);
+  });
+
+  it('extracts the specifier across a quoted-comment token separator', () => {
+    // The block comment contains a quote character; the scanner must consume the
+    // whole comment as a unit rather than treating that inner quote as the
+    // specifier delimiter.
+    expect(forbiddenIn(`import /* 'note' */ x from '../domain/foo.js';`).length).toBeGreaterThan(0);
+  });
+
+  // Preservation: the ordinary unquoted comment separator was never broken and
+  // must keep working (guards against over-narrowing the fix). The broad claim
+  // that ordinary comment separators evade the scanner was NOT REPRODUCIBLE.
+  it('still extracts across an ordinary unquoted comment separator', () => {
+    expect(forbiddenIn(`import /* note */ x from '../domain/foo.js';`).length).toBeGreaterThan(0);
+    expect(forbiddenIn(`export /* note */ { x } from '../domain/foo.js';`).length).toBeGreaterThan(0);
+  });
+
+  // Preservation: a single-argument dynamic import and allowed specifiers are
+  // unaffected, and import.meta.url is still ignored.
+  it('preserves single-argument dynamic, allowed, and import.meta behaviour', () => {
+    expect(extractModuleSpecifiers(`import('../domain/foo.js');`)).toContain('../domain/foo.js');
+    expect(extractModuleSpecifiers(`import http from 'node:http';`)).toContain('node:http');
+    expect(extractModuleSpecifiers(`import { a } from "./local.js";`)).toContain('./local.js');
+    expect(extractModuleSpecifiers(`import { r } from '../cockpit/index.js';`)).toContain(
+      '../cockpit/index.js',
+    );
+    expect(extractModuleSpecifiers(`const isEntry = import.meta.url === x;`)).toEqual([]);
   });
 });
