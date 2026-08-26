@@ -70,8 +70,10 @@ function extractModuleSpecifiers(source: string): readonly string[] {
     // options argument (closing `)` or a comma introduces it).
     /\bimport\s*\(\s*(?:\/\*[\s\S]*?\*\/\s*)?['"]([^'"]+)['"](?:\s|\/\*[\s\S]*?\*\/)*[,)]/g,
     // re-export bindings: `export { x } from 'S'`, `export * from 'S'`, with
-    // optional block comments between `from` and the module string.
-    /\bexport\b(?:\/\*[\s\S]*?\*\/|[^'"])*?\bfrom\s+(?:\/\*[\s\S]*?\*\/\s*)*['"]([^'"]+)['"]/g,
+    // optional whitespace and/or block comments between `from` and the module
+    // string. The separator after `from` is `\s*`, not `\s+`, so a block comment
+    // (or the quote itself) may abut `from` directly, e.g. `from/* c */'S'`.
+    /\bexport\b(?:\/\*[\s\S]*?\*\/|[^'"])*?\bfrom\s*(?:\/\*[\s\S]*?\*\/\s*)*['"]([^'"]+)['"]/g,
   ];
   const specifiers: string[] = [];
   for (const pattern of patterns) {
@@ -359,5 +361,74 @@ describe('D3 host import scanner covers post-`from` re-export comments (D3-CR-F6
       "export { b } from '../cockpit/index.js';",
     ].join('\n');
     expect(extractModuleSpecifiers(source)).toEqual(['./local.js', '../cockpit/index.js']);
+  });
+});
+
+describe('D3 host import scanner covers `from`-abutting re-export comments (D3-CR-F7)', () => {
+  const forbiddenIn = (source: string): readonly string[] =>
+    extractModuleSpecifiers(source).filter((s) => /\.\.\/(?:domain|adapters)\//.test(s));
+
+  // D3-CR-F7: the F6 separator after `from` was `\s+`, so it still required at
+  // least one whitespace character before the block comment. A comment (or the
+  // quote itself) abutting `from` directly — `from/* note */'S'` — was missed,
+  // letting a forbidden dependency bypass the discipline check. The separator is
+  // now `\s*`, so no whitespace is required after `from`.
+  it('extracts a named re-export with a block comment abutting `from`', () => {
+    expect(forbiddenIn(`export { x } from/* note */'../domain/foo.js';`).length).toBeGreaterThan(0);
+  });
+
+  it('extracts an export-star with a block comment abutting `from`', () => {
+    expect(forbiddenIn(`export * from/* note */'../domain/foo.js';`).length).toBeGreaterThan(0);
+  });
+
+  it('extracts an `export type` with a block comment abutting `from`', () => {
+    expect(
+      forbiddenIn(`export type { T } from/* note */'../domain/foo.js';`).length,
+    ).toBeGreaterThan(0);
+  });
+
+  it('extracts a double-quoted specifier with a block comment abutting `from`', () => {
+    expect(forbiddenIn(`export * from/* note */"../adapters/foo.js";`).length).toBeGreaterThan(0);
+  });
+
+  it('extracts a specifier across a multi-line block comment abutting `from`', () => {
+    const source = ['export { x } from/* multi', " line note */'../domain/foo.js';"].join('\n');
+    expect(forbiddenIn(source).length).toBeGreaterThan(0);
+  });
+
+  // Preservation: the F6 whitespace form must still be detected, and widening
+  // `\s+` to `\s*` must not misread an identifier that merely starts with
+  // `from`, capture across a statement boundary, or double-count.
+  it('preserves the F6 whitespace form after `from`', () => {
+    expect(forbiddenIn(`export { x } from /* note */ '../domain/foo.js';`).length).toBeGreaterThan(
+      0,
+    );
+  });
+
+  it('does not treat an identifier beginning with `from` as the re-export keyword', () => {
+    // `fromValues` is a local binding, not the `from` clause; only the real
+    // re-export specifier `../domain/foo.js` must surface — exactly once.
+    expect(extractModuleSpecifiers(`export { fromValues } from/* c */'../domain/foo.js';`)).toEqual([
+      '../domain/foo.js',
+    ]);
+  });
+
+  it('extracts each `from`-abutting specifier once, without capturing across statements', () => {
+    const source = [
+      "export { a } from/* note */'./local.js';",
+      "export { b } from '../cockpit/index.js';",
+    ].join('\n');
+    expect(extractModuleSpecifiers(source)).toEqual(['./local.js', '../cockpit/index.js']);
+  });
+
+  it('preserves static, dynamic, allowed, and import.meta behaviour', () => {
+    expect(forbiddenIn(`import /* note */ '../domain/foo.js';`).length).toBeGreaterThan(0);
+    expect(forbiddenIn(`import(/* note */ '../domain/foo.js')`).length).toBeGreaterThan(0);
+    expect(extractModuleSpecifiers(`import http from 'node:http';`)).toContain('node:http');
+    expect(extractModuleSpecifiers(`import { a } from "./local.js";`)).toContain('./local.js');
+    expect(extractModuleSpecifiers(`import { r } from '../cockpit/index.js';`)).toContain(
+      '../cockpit/index.js',
+    );
+    expect(extractModuleSpecifiers(`const isEntry = import.meta.url === x;`)).toEqual([]);
   });
 });
