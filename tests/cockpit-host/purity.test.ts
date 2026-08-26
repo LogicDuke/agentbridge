@@ -44,9 +44,10 @@ function hostSources(): readonly { readonly file: string; readonly text: string 
  * The token region between keywords consumes a whole block comment as a single
  * unit instead of stopping at the first quote inside it. (Ordinary unquoted
  * comment separators were already handled and remain so.) A block comment is
- * also tolerated in two further positions: immediately before a bare
- * side-effect specifier (between `import` and the string), and after a
- * dynamic-import specifier, before the options comma or the closing paren.
+ * also tolerated in three further positions: immediately before a bare
+ * side-effect specifier (between `import` and the string), after a
+ * dynamic-import specifier, before the options comma or the closing paren,
+ * and between a re-export's `from` and its module string.
  *
  * `import.meta.url` is deliberately not matched: the `import` keyword must be
  * followed by whitespace (static/side-effect) or `(` (dynamic), and `.` is
@@ -68,8 +69,9 @@ function extractModuleSpecifiers(source: string): readonly string[] {
     // optional block comment after the specifier, and an optional second
     // options argument (closing `)` or a comma introduces it).
     /\bimport\s*\(\s*(?:\/\*[\s\S]*?\*\/\s*)?['"]([^'"]+)['"](?:\s|\/\*[\s\S]*?\*\/)*[,)]/g,
-    // re-export bindings: `export { x } from 'S'`, `export * from 'S'`.
-    /\bexport\b(?:\/\*[\s\S]*?\*\/|[^'"])*?\bfrom\s+['"]([^'"]+)['"]/g,
+    // re-export bindings: `export { x } from 'S'`, `export * from 'S'`, with
+    // optional block comments between `from` and the module string.
+    /\bexport\b(?:\/\*[\s\S]*?\*\/|[^'"])*?\bfrom\s+(?:\/\*[\s\S]*?\*\/\s*)*['"]([^'"]+)['"]/g,
   ];
   const specifiers: string[] = [];
   for (const pattern of patterns) {
@@ -275,5 +277,87 @@ describe('D3 host import scanner covers boundary block-comment positions (D3-CR-
       '../cockpit/index.js',
     );
     expect(extractModuleSpecifiers(`const isEntry = import.meta.url === x;`)).toEqual([]);
+  });
+});
+
+describe('D3 host import scanner covers post-`from` re-export comments (D3-CR-F6)', () => {
+  const forbiddenIn = (source: string): readonly string[] =>
+    extractModuleSpecifiers(source).filter((s) => /\.\.\/(?:domain|adapters)\//.test(s));
+
+  // D3-CR-F6: a block comment between a re-export's `from` and its module string
+  // blocked the match, because the pattern required the quote right after
+  // `from`. The static-import pattern already tolerated that position, so only
+  // the re-export form was blind and the forbidden dependency slipped past both
+  // discipline checks.
+  it('extracts a re-export specifier preceded by an unquoted block comment', () => {
+    expect(forbiddenIn(`export { x } from /* note */ '../domain/foo.js';`).length).toBeGreaterThan(
+      0,
+    );
+  });
+
+  it('extracts a re-export specifier preceded by a quoted block comment', () => {
+    // The comment holds a quote character, so it must be consumed as a whole
+    // unit rather than mistaken for the specifier delimiter.
+    expect(
+      forbiddenIn(`export { x } from /* "note" */ '../domain/foo.js';`).length,
+    ).toBeGreaterThan(0);
+  });
+
+  it('extracts a double-quoted re-export specifier preceded by a block comment', () => {
+    expect(forbiddenIn(`export { x } from /* note */ "../domain/foo.js";`).length).toBeGreaterThan(
+      0,
+    );
+  });
+
+  it('extracts an export-star specifier preceded by a block comment', () => {
+    expect(forbiddenIn(`export * from /* note */ '../domain/foo.js';`).length).toBeGreaterThan(0);
+  });
+
+  it('extracts a double-quoted export-star specifier preceded by a block comment', () => {
+    expect(forbiddenIn(`export * from /* note */ "../adapters/foo.js";`).length).toBeGreaterThan(0);
+  });
+
+  it('extracts an `export type` specifier preceded by a block comment', () => {
+    expect(
+      forbiddenIn(`export type { T } from /* note */ '../domain/foo.js';`).length,
+    ).toBeGreaterThan(0);
+  });
+
+  it('extracts a re-export specifier across a multi-line block comment', () => {
+    const source = ['export { x } from /* multi', " line note */ '../domain/foo.js';"].join('\n');
+    expect(forbiddenIn(source).length).toBeGreaterThan(0);
+  });
+
+  // Preservation: the comment-free re-export, every earlier comment position,
+  // allowed specifiers, and the import.meta.url exclusion are unaffected by
+  // widening this one position.
+  it('preserves prior re-export, import, dynamic, allowed, and import.meta behaviour', () => {
+    expect(forbiddenIn(`export { y } from "../domain/foo.js";`).length).toBeGreaterThan(0);
+    expect(forbiddenIn(`export /* note */ { x } from '../domain/foo.js';`).length).toBeGreaterThan(
+      0,
+    );
+    expect(forbiddenIn(`import /* note */ '../domain/foo.js';`).length).toBeGreaterThan(0);
+    expect(forbiddenIn(`import /* 'note' */ x from '../domain/foo.js';`).length).toBeGreaterThan(0);
+    expect(forbiddenIn(`import(/* note */ '../domain/foo.js')`).length).toBeGreaterThan(0);
+    expect(forbiddenIn(`import('../domain/foo.js' /* note */)`).length).toBeGreaterThan(0);
+    expect(
+      forbiddenIn(`import('../domain/foo.js', { with: { type: 'json' } })`).length,
+    ).toBeGreaterThan(0);
+    expect(extractModuleSpecifiers(`import http from 'node:http';`)).toContain('node:http');
+    expect(extractModuleSpecifiers(`import { a } from "./local.js";`)).toContain('./local.js');
+    expect(extractModuleSpecifiers(`import { r } from '../cockpit/index.js';`)).toContain(
+      '../cockpit/index.js',
+    );
+    expect(extractModuleSpecifiers(`const isEntry = import.meta.url === x;`)).toEqual([]);
+  });
+
+  // The widened position must not double-count a specifier, and one match must
+  // not swallow the statement that follows it.
+  it('extracts each re-export specifier once, without capturing across statements', () => {
+    const source = [
+      "export { a } from /* note */ './local.js';",
+      "export { b } from '../cockpit/index.js';",
+    ].join('\n');
+    expect(extractModuleSpecifiers(source)).toEqual(['./local.js', '../cockpit/index.js']);
   });
 });
