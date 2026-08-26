@@ -73,7 +73,17 @@ function extractModuleSpecifiers(source: string): readonly string[] {
     // optional whitespace and/or block comments between `from` and the module
     // string. The separator after `from` is `\s*`, not `\s+`, so a block comment
     // (or the quote itself) may abut `from` directly, e.g. `from/* c */'S'`.
-    /\bexport\b(?:\/\*[\s\S]*?\*\/|[^'"])*?\bfrom\s*(?:\/\*[\s\S]*?\*\/\s*)*['"]([^'"]+)['"]/g,
+    //
+    // The prefix between `export` and `from` may traverse a whole block comment
+    // (consumed as one unit), a genuine lone `/` that does not start a comment,
+    // or any other character that is neither a quote, a `;`, nor a `/`. It must
+    // NOT enter comment *text*: a `//` line comment cannot be traversed, a `/*`
+    // is only crossable as a complete unit, and a `;` statement terminator stops
+    // the prefix. This keeps a comment-contained `from` — e.g. a doc line
+    // `export const x = true; // from'../domain/y.js'` — from fabricating a
+    // re-export dependency (D3-CX-F8), while still detecting a real re-export
+    // whose `from` carries an adjacent block comment (D3-CR-F6/F7).
+    /\bexport\b(?:\/\*[\s\S]*?\*\/|\/(?![*/])|[^'";/])*?\bfrom\s*(?:\/\*[\s\S]*?\*\/\s*)*['"]([^'"]+)['"]/g,
   ];
   const specifiers: string[] = [];
   for (const pattern of patterns) {
@@ -424,6 +434,127 @@ describe('D3 host import scanner covers `from`-abutting re-export comments (D3-C
   it('preserves static, dynamic, allowed, and import.meta behaviour', () => {
     expect(forbiddenIn(`import /* note */ '../domain/foo.js';`).length).toBeGreaterThan(0);
     expect(forbiddenIn(`import(/* note */ '../domain/foo.js')`).length).toBeGreaterThan(0);
+    expect(extractModuleSpecifiers(`import http from 'node:http';`)).toContain('node:http');
+    expect(extractModuleSpecifiers(`import { a } from "./local.js";`)).toContain('./local.js');
+    expect(extractModuleSpecifiers(`import { r } from '../cockpit/index.js';`)).toContain(
+      '../cockpit/index.js',
+    );
+    expect(extractModuleSpecifiers(`const isEntry = import.meta.url === x;`)).toEqual([]);
+  });
+});
+
+describe('D3 host import scanner rejects comment-contained re-export `from` (D3-CX-F8)', () => {
+  const forbiddenIn = (source: string): readonly string[] =>
+    extractModuleSpecifiers(source).filter((s) => /\.\.\/(?:domain|adapters)\//.test(s));
+
+  // D3-CX-F8: the re-export prefix between `export` and `from` could nibble into
+  // comment text and bind a comment-contained `from` as though it were the real
+  // re-export clause, fabricating a dependency from a mere doc comment. The
+  // prefix now stops at `;`, cannot enter a `//` line comment, and only crosses
+  // a `/* ... */` as a whole unit — so none of the following valid sources may
+  // surface `../domain/example.js`. Each fixture is syntactically valid ESM
+  // (the declaration is terminated by `;` or by ASI before a trailing comment).
+  const falsePositiveFixtures: readonly { readonly form: string; readonly source: string }[] = [
+    {
+      form: 'line comment, `from` abutting the quote',
+      source: `export const safe = true; // docs: from'../domain/example.js'`,
+    },
+    {
+      form: 'line comment, whitespace before the quote',
+      source: `export const safe = true; // docs: from '../domain/example.js'`,
+    },
+    {
+      form: 'block comment, `from` abutting the quote',
+      source: `export const safe = true; /* docs: from'../domain/example.js' */`,
+    },
+    {
+      form: 'multi-line block comment',
+      source: ['export const safe = true;', '/* docs:', "   from'../domain/example.js'", '*/'].join(
+        '\n',
+      ),
+    },
+    {
+      form: 'ASI (no semicolon), trailing block comment',
+      source: `export const x = true /* docs: from'../domain/example.js' */`,
+    },
+    {
+      form: 'ASI (no semicolon), block comment on the next line',
+      source: ['export const x = true', "/* docs: from'../domain/example.js' */"].join('\n'),
+    },
+    {
+      form: 'ASI (no semicolon), trailing line comment',
+      source: ['export const x = true', "// docs: from'../domain/example.js'"].join('\n'),
+    },
+  ];
+
+  for (const { form, source } of falsePositiveFixtures) {
+    it(`does not extract a comment-contained module (${form})`, () => {
+      expect(extractModuleSpecifiers(source)).not.toContain('../domain/example.js');
+      expect(forbiddenIn(source)).toEqual([]);
+    });
+  }
+
+  // Positive controls: a real re-export whose `from` carries an adjacent comment
+  // must still be detected exactly once — the narrowing must not regress F6/F7.
+  it('still detects a real re-export with a block comment abutting `from` (F7)', () => {
+    expect(forbiddenIn(`export { x } from/* note */'../domain/foo.js';`).length).toBeGreaterThan(0);
+  });
+
+  it('still detects a real re-export with a whitespace+comment before the module (F6)', () => {
+    expect(forbiddenIn(`export { x } from /* note */ '../domain/foo.js';`).length).toBeGreaterThan(
+      0,
+    );
+  });
+
+  it('still detects star, type, and double-quoted re-exports with adjacent comments', () => {
+    expect(forbiddenIn(`export * from/* note */'../domain/foo.js';`).length).toBeGreaterThan(0);
+    expect(
+      forbiddenIn(`export type { T } from/* note */'../domain/foo.js';`).length,
+    ).toBeGreaterThan(0);
+    expect(forbiddenIn(`export * from/* note */"../adapters/foo.js";`).length).toBeGreaterThan(0);
+  });
+
+  it('still consumes a prefix block comment as a unit, even one containing quotes or `from`', () => {
+    // A block comment BEFORE the real `from` (holding a quote, or the word
+    // `from`) must be crossed whole, and only the genuine specifier surfaces.
+    expect(extractModuleSpecifiers(`export /* 'note' */ { x } from '../domain/foo.js';`)).toEqual([
+      '../domain/foo.js',
+    ]);
+    expect(extractModuleSpecifiers(`export /* from 'x' */ { a } from '../domain/foo.js';`)).toEqual([
+      '../domain/foo.js',
+    ]);
+  });
+
+  it('still tolerates multiple and multi-line comments after `from`', () => {
+    expect(forbiddenIn(`export { x } from/* a *//* b */'../domain/foo.js';`).length).toBeGreaterThan(
+      0,
+    );
+    const multiline = ['export { x } from /* multi', " line */ '../domain/foo.js';"].join('\n');
+    expect(forbiddenIn(multiline).length).toBeGreaterThan(0);
+  });
+
+  it('does not treat an identifier beginning with `from` as the clause keyword', () => {
+    expect(extractModuleSpecifiers(`export const fromValues = 1;`)).toEqual([]);
+    expect(extractModuleSpecifiers(`export const from_foo = true;`)).toEqual([]);
+    expect(extractModuleSpecifiers(`export { y } fromX '../domain/foo.js';`)).toEqual([]);
+    expect(extractModuleSpecifiers(`export { y } from1 '../domain/foo.js';`)).toEqual([]);
+  });
+
+  it('extracts across statements exactly once, without a comment bridging them', () => {
+    const source = [
+      "export { a } from/* note */'./local.js';",
+      "export const doc = true; // from'../domain/example.js'",
+      "export { b } from '../cockpit/index.js';",
+    ].join('\n');
+    expect(extractModuleSpecifiers(source)).toEqual(['./local.js', '../cockpit/index.js']);
+  });
+
+  it('preserves static, dynamic, allowed, and import.meta behaviour under F8 narrowing', () => {
+    expect(forbiddenIn(`import /* note */ '../domain/foo.js';`).length).toBeGreaterThan(0);
+    expect(forbiddenIn(`import(/* note */ '../domain/foo.js')`).length).toBeGreaterThan(0);
+    expect(
+      extractModuleSpecifiers(`import('../domain/foo.js', { with: { type: 'json' } })`),
+    ).toContain('../domain/foo.js');
     expect(extractModuleSpecifiers(`import http from 'node:http';`)).toContain('node:http');
     expect(extractModuleSpecifiers(`import { a } from "./local.js";`)).toContain('./local.js');
     expect(extractModuleSpecifiers(`import { r } from '../cockpit/index.js';`)).toContain(
