@@ -43,7 +43,10 @@ function hostSources(): readonly { readonly file: string; readonly text: string 
  * separator between `import` and `from`, or a comment just inside `import(`).
  * The token region between keywords consumes a whole block comment as a single
  * unit instead of stopping at the first quote inside it. (Ordinary unquoted
- * comment separators were already handled and remain so.)
+ * comment separators were already handled and remain so.) A block comment is
+ * also tolerated in two further positions: immediately before a bare
+ * side-effect specifier (between `import` and the string), and after a
+ * dynamic-import specifier, before the options comma or the closing paren.
  *
  * `import.meta.url` is deliberately not matched: the `import` keyword must be
  * followed by whitespace (static/side-effect) or `(` (dynamic), and `.` is
@@ -57,11 +60,14 @@ function extractModuleSpecifiers(source: string): readonly string[] {
   // between `import` and `from` without the scanner mistaking the comment's
   // quote for the specifier delimiter.
   const patterns: readonly RegExp[] = [
-    // static (`import x from 'S'`) and side-effect (`import 'S'`) imports.
-    /\bimport\s+(?:(?:\/\*[\s\S]*?\*\/|[^'"])*?\bfrom\s+)?['"]([^'"]+)['"]/g,
-    // dynamic imports: `import('S')`, an optional leading block comment, and an
-    // optional second options argument (closing `)` or a comma introduces it).
-    /\bimport\s*\(\s*(?:\/\*[\s\S]*?\*\/\s*)?['"]([^'"]+)['"]\s*[,)]/g,
+    // static (`import x from 'S'`) and side-effect (`import 'S'`) imports. The
+    // trailing `(?:/*...*/\s*)*` also lets block comments sit right before a
+    // bare side-effect specifier, where there is no `from` to consume them.
+    /\bimport\s+(?:(?:\/\*[\s\S]*?\*\/|[^'"])*?\bfrom\s+)?(?:\/\*[\s\S]*?\*\/\s*)*['"]([^'"]+)['"]/g,
+    // dynamic imports: `import('S')`, an optional leading block comment, an
+    // optional block comment after the specifier, and an optional second
+    // options argument (closing `)` or a comma introduces it).
+    /\bimport\s*\(\s*(?:\/\*[\s\S]*?\*\/\s*)?['"]([^'"]+)['"](?:\s|\/\*[\s\S]*?\*\/)*[,)]/g,
     // re-export bindings: `export { x } from 'S'`, `export * from 'S'`.
     /\bexport\b(?:\/\*[\s\S]*?\*\/|[^'"])*?\bfrom\s+['"]([^'"]+)['"]/g,
   ];
@@ -211,6 +217,60 @@ describe('D3 host import scanner covers dynamic-options and block-comment forms 
     expect(extractModuleSpecifiers(`import('../domain/foo.js');`)).toContain('../domain/foo.js');
     expect(extractModuleSpecifiers(`import http from 'node:http';`)).toContain('node:http');
     expect(extractModuleSpecifiers(`import { a } from "./local.js";`)).toContain('./local.js');
+    expect(extractModuleSpecifiers(`import { r } from '../cockpit/index.js';`)).toContain(
+      '../cockpit/index.js',
+    );
+    expect(extractModuleSpecifiers(`const isEntry = import.meta.url === x;`)).toEqual([]);
+  });
+});
+
+describe('D3 host import scanner covers boundary block-comment positions (D3-CR-F4/F5)', () => {
+  const forbiddenIn = (source: string): readonly string[] =>
+    extractModuleSpecifiers(source).filter((s) => /\.\.\/(?:domain|adapters)\//.test(s));
+
+  // D3-CR-F4: a bare side-effect import has no `from`, so a block comment
+  // between `import` and the specifier previously fell through every branch and
+  // the forbidden dependency was not surfaced.
+  it('extracts a side-effect specifier preceded by an unquoted block comment', () => {
+    expect(forbiddenIn(`import /* note */ '../domain/foo.js';`).length).toBeGreaterThan(0);
+  });
+
+  it('extracts a side-effect specifier preceded by a quoted block comment', () => {
+    expect(forbiddenIn(`import /* "note" */ '../domain/foo.js';`).length).toBeGreaterThan(0);
+  });
+
+  it('extracts a double-quoted side-effect specifier preceded by a block comment', () => {
+    expect(forbiddenIn(`import /* note */ "../adapters/foo.js";`).length).toBeGreaterThan(0);
+  });
+
+  // D3-CR-F5: a block comment after the dynamic-import specifier, before the
+  // options comma or the closing paren, previously blocked the match because
+  // only whitespace was allowed in that position.
+  it('extracts a dynamic specifier with a trailing block comment before the options object', () => {
+    expect(
+      forbiddenIn(`import('../domain/foo.js' /* note */, { with: { type: 'json' } })`).length,
+    ).toBeGreaterThan(0);
+  });
+
+  it('extracts a double-quoted dynamic specifier with a trailing block comment before options', () => {
+    expect(
+      forbiddenIn(`import("../domain/foo.js" /* note */, { with: { type: "json" } })`).length,
+    ).toBeGreaterThan(0);
+  });
+
+  it('extracts a dynamic specifier with a trailing block comment before the closing paren', () => {
+    expect(forbiddenIn(`import('../domain/foo.js' /* note */)`).length).toBeGreaterThan(0);
+  });
+
+  // Preservation: the earlier boundary-comment forms and allowed/import.meta
+  // behaviour are unaffected by widening these two positions.
+  it('preserves prior comment forms, allowed imports, and import.meta exclusion', () => {
+    expect(forbiddenIn(`import(/* note */ '../domain/foo.js')`).length).toBeGreaterThan(0);
+    expect(
+      forbiddenIn(`import('../domain/foo.js', { with: { type: 'json' } })`).length,
+    ).toBeGreaterThan(0);
+    expect(forbiddenIn(`import /* 'note' */ x from '../domain/foo.js';`).length).toBeGreaterThan(0);
+    expect(extractModuleSpecifiers(`import http from 'node:http';`)).toContain('node:http');
     expect(extractModuleSpecifiers(`import { r } from '../cockpit/index.js';`)).toContain(
       '../cockpit/index.js',
     );
