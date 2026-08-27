@@ -2015,7 +2015,17 @@ describe('D3 host consolidated purity hardening (A/B/C/D)', () => {
       const repoName = segments[segments.length - 3] ?? '';
       const parentName = segments[segments.length - 4] ?? '';
       const overClimb = '../'.repeat(segments.length + 3);
-      const reentry = `${overClimb}${parentName}/${repoName}/src/cockpit-host/escape.js`;
+      // Put the repeated names below a root-level fixture directory that cannot
+      // be the checkout's first directory. Without this distinct prefix, a
+      // shallow checkout such as `/workspace/agentbridge` is reconstructed
+      // exactly after excessive `..` segments clamp at `/`.
+      const rootDirectoryIndex = /^[A-Za-z]:$/.test(segments[0] ?? '') ? 1 : 0;
+      const firstRootDirectory = segments[rootDirectoryIndex] ?? '';
+      const fixturePrefix =
+        firstRootDirectory === 'agentbridge-purity-outside'
+          ? 'agentbridge-purity-other'
+          : 'agentbridge-purity-outside';
+      const reentry = `${overClimb}${fixturePrefix}/${parentName}/${repoName}/src/cockpit-host/escape.js`;
       expect(accepts('server.ts', reentry)).toBe(false);
       // A sibling that shares the real repository name as a prefix is likewise out.
       expect(accepts('server.ts', `../../../${repoName}-sibling/src/cockpit-host/escape.js`)).toBe(
