@@ -37,7 +37,7 @@ function hostSources(): readonly { readonly file: string; readonly text: string 
  */
 type EsmToken =
   | { readonly t: 'str'; readonly v: string; readonly template: boolean; readonly hasSubstitution: boolean }
-  | { readonly t: 'id'; readonly v: string }
+  | { readonly t: 'id'; readonly v: string; readonly restrictedLabel?: boolean }
   | { readonly t: 'punct'; readonly v: string; readonly controlHeader?: boolean }
   | { readonly t: 'num' }
   | { readonly t: 'regex' };
@@ -62,6 +62,29 @@ const REGEX_CONTEXT_KEYWORDS: ReadonlySet<string> = new Set([
   'yield',
   'await',
   'throw',
+]);
+
+// Restricted-production statement keywords: `break`/`continue`. Their grammar has
+// a `[no LineTerminator here]` before the optional label, so a newline after the
+// bare keyword triggers ASI and closes the statement — the next line then begins a
+// fresh statement whose first token may be a regex literal (`break \n /re/.test(x)`).
+// A `/` can therefore never be division after a *bare* `break`/`continue` (a
+// same-line `break /…` is a syntax error — a `/` is not a legal label), so a
+// following `/` is always a regex opener there. This is unlike REGEX_CONTEXT_KEYWORDS
+// because `break`/`continue` are *statements*, not expression operators, and — being
+// reserved words that are still legal member names — they must stay value contexts
+// when spelled as a member (`obj.break / 2` is division), which `regexCanFollow`
+// enforces with a `.`-member guard (D3-CR-BREAK-CONTINUE-ASI). Kept separate from
+// REGEX_CONTEXT_KEYWORDS so `endsValue` still treats them as value-ending, which is
+// correct for the only reachable `!` case, the non-null member form `obj.break!`.
+// The statement also carries one *optional* label (`break outer`); the label id is
+// marked `restrictedLabel` at tokenize time (bare keyword, no intervening
+// LineTerminator) so a `/` after it is likewise a regex opener — a newline between
+// the keyword and the id triggers ASI, making the id a fresh statement where a
+// following `/` stays division (D3-CR-BREAK-CONTINUE-LABEL-ASI).
+const RESTRICTED_STATEMENT_KEYWORDS: ReadonlySet<string> = new Set([
+  'break',
+  'continue',
 ]);
 
 // Keywords whose parenthesised head is a *control-flow header* — `if (…)`,
@@ -100,6 +123,14 @@ function tokenizeEsm(source: string): readonly EsmToken[] {
   let index = 0;
   let previous: EsmToken | null = null;
 
+  // Whether a LineTerminator has appeared in the trivia (whitespace or a block
+  // comment's interior) since the last emitted token. Used only to tell a
+  // `break`/`continue` *label* — same line as the keyword — from a fresh statement
+  // begun after an ASI-closing newline (D3-CR-BREAK-CONTINUE-LABEL-ASI). Reset to
+  // false whenever a token is emitted, so it always reflects the gap before the
+  // *next* token.
+  let pendingNewline = false;
+
   // Brace-depth stack for the currently open `${ ... }` template substitutions.
   // Empty means ordinary code; a top value of 0 means the next unmatched `}`
   // closes the current substitution and resumes the enclosing template's text.
@@ -132,7 +163,28 @@ function tokenizeEsm(source: string): readonly EsmToken[] {
     if (previous === null) return true;
     switch (previous.t) {
       case 'id':
-        return REGEX_CONTEXT_KEYWORDS.has(previous.v);
+        if (REGEX_CONTEXT_KEYWORDS.has(previous.v)) return true;
+        // A *bare* `break`/`continue` closes its statement (ASI at the newline),
+        // so a following `/` opens a regex, not division — a fake regex after it
+        // otherwise swallowed a later real import (false negative) or fabricated a
+        // dependency from an `import('…')` in the regex body (false positive). When
+        // spelled as a member name (`obj.break`, `obj?.continue`), it is a value and
+        // a following `/` is division, so guard on a preceding `.` (D3-CR-BREAK-
+        // CONTINUE-ASI). `previous` is the keyword (`tokens[len-1]`), so
+        // `tokens[len-2]` is the token before it; a leading `.` marks member access.
+        if (RESTRICTED_STATEMENT_KEYWORDS.has(previous.v)) {
+          const before = tokens[tokens.length - 2];
+          return !(before?.t === 'punct' && before.v === '.');
+        }
+        // A *label* completing a `break`/`continue` statement (`break outer`,
+        // `continue outer`) also ends a restricted statement, so a following `/`
+        // opens a regex, not division. The label id was marked `restrictedLabel`
+        // when it was emitted directly after a bare keyword with no intervening
+        // LineTerminator; a newline there instead begins a fresh statement (an
+        // ordinary id) whose following `/` stays division (D3-CR-BREAK-CONTINUE-
+        // LABEL-ASI).
+        if (previous.restrictedLabel === true) return true;
+        return false;
       case 'num':
       case 'str':
       case 'regex':
@@ -195,9 +247,23 @@ function tokenizeEsm(source: string): readonly EsmToken[] {
     if (beforePrevious?.t === 'punct' && beforePrevious.v === '.') return false;
     return true;
   };
+  // Whether an identifier scanned *now* is the optional label of a just-emitted
+  // bare `break`/`continue` (`break outer`). True only when the keyword is the
+  // immediately previous token, is bare (not a member — guard the token before it),
+  // and no LineTerminator separated them (`pendingNewline`). Read inside this arrow
+  // so `previous` narrows over its declared `EsmToken | null` type, as in
+  // `regexCanFollow`/`previousOpensControlHeader` (D3-CR-BREAK-CONTINUE-LABEL-ASI).
+  const previousIsBareRestrictedKeyword = (): boolean => {
+    if (pendingNewline) return false;
+    if (previous === null || previous.t !== 'id') return false;
+    if (!RESTRICTED_STATEMENT_KEYWORDS.has(previous.v)) return false;
+    const beforeKeyword = tokens[tokens.length - 2];
+    return !(beforeKeyword?.t === 'punct' && beforeKeyword.v === '.');
+  };
   const emit = (token: EsmToken): void => {
     tokens.push(token);
     previous = token;
+    pendingNewline = false;
   };
 
   // Scan a template literal's *text* run starting at `from` (the character just
@@ -235,6 +301,7 @@ function tokenizeEsm(source: string): readonly EsmToken[] {
 
     // insignificant whitespace
     if (c === ' ' || c === '\t' || c === '\r' || c === '\n') {
+      if (c === '\n' || c === '\r') pendingNewline = true;
       index += 1;
       continue;
     }
@@ -244,10 +311,15 @@ function tokenizeEsm(source: string): readonly EsmToken[] {
       while (index < length && source.charAt(index) !== '\n') index += 1;
       continue;
     }
-    // block comment — trivia, consumed whole as one unit (may span lines)
+    // block comment — trivia, consumed whole as one unit (may span lines). A
+    // LineTerminator *inside* the comment still counts as one between the tokens it
+    // separates, so it is recorded like ordinary-whitespace newline for the
+    // restricted-statement label check (`break /*\n*/ outer` is ASI, not a label).
     if (c === '/' && source.charAt(index + 1) === '*') {
       index += 2;
       while (index < length && !(source.charAt(index) === '*' && source.charAt(index + 1) === '/')) {
+        const inner = source.charAt(index);
+        if (inner === '\n' || inner === '\r') pendingNewline = true;
         index += 1;
       }
       index += 2;
@@ -373,7 +445,17 @@ function tokenizeEsm(source: string): readonly EsmToken[] {
     if (isIdentifierStart(c)) {
       let cursor = index + 1;
       while (cursor < length && isIdentifierPart(source.charAt(cursor))) cursor += 1;
-      emit({ t: 'id', v: source.slice(index, cursor) });
+      // A bare `break`/`continue` immediately followed — with no intervening
+      // LineTerminator — by this identifier makes it the statement's optional
+      // *label* (`break outer`). Mark it so a `/` after the label opens a regex
+      // (the restricted statement is complete), mirroring the bare-keyword case.
+      // `pendingNewline` guards the `[no LineTerminator here]` restriction: a
+      // newline between the keyword and the id triggers ASI, so the id is a fresh
+      // statement, not a label. The keyword must be *bare*, not a member
+      // (`obj.break`), so guard on the token before it (`tokens[len-2]`, since
+      // `previous`/`tokens[len-1]` is the keyword) — D3-CR-BREAK-CONTINUE-LABEL-ASI.
+      const restrictedLabel = previousIsBareRestrictedKeyword();
+      emit({ t: 'id', v: source.slice(index, cursor), restrictedLabel });
       index = cursor;
       continue;
     }
@@ -1578,6 +1660,305 @@ describe('D3 host import scanner recognizes `for await (…)` as a control heade
     const many =
       "async function f() { for await (const y of xs) /[']/.test(y); }\n".repeat(2000) +
       "import '../domain/foo.js';";
+    const start = performance.now();
+    expect(extractModuleSpecifiers(many)).toEqual(['../domain/foo.js']);
+    expect(performance.now() - start).toBeLessThan(1000);
+  });
+});
+
+describe('D3 host import scanner classifies `/` after a restricted-statement keyword as a regex (D3-CR-BREAK-CONTINUE-ASI)', () => {
+  const forbiddenIn = (source: string): readonly string[] =>
+    extractModuleSpecifiers(source).filter((s) => /\.\.\/(?:domain|adapters)\//.test(s));
+
+  // `break`/`continue` are restricted productions — a `[no LineTerminator here]`
+  // precedes the optional label — so a newline after the bare keyword triggers ASI
+  // and the next line begins a fresh statement whose first token may be a regex
+  // literal. Before this fix the keyword was read as an ordinary value-ending
+  // identifier, so `regexCanFollow()` returned false and the leading `/` was treated
+  // as division. A quote inside the regex then opened a spurious string that could
+  // swallow a following real import (false negative), and an `import('…')` in the
+  // regex body could be tokenized as code (false positive). The `/` is now a regex
+  // opener after a *bare* `break`/`continue`; a `.`-member form stays division.
+
+  // False positive: an `import('…')` buried in a regex body after a bare
+  // `break`/`continue` + newline must NOT surface (this was the reproduced defect —
+  // the exact newline fixtures A/B returned the right set only accidentally, because
+  // a single-quoted string dies at the line end, but C/D fabricated `evil`).
+  it('does not fabricate a module from an import call in a regex after `break` + newline', () => {
+    const source = ['while (ok) {', '  break', "  /import('../domain/evil.js')/.test(x);", '}'].join(
+      '\n',
+    );
+    expect(extractModuleSpecifiers(source)).toEqual([]);
+    expect(forbiddenIn(source)).toEqual([]);
+  });
+
+  it('does not fabricate a module from an import call in a regex after `continue` + newline', () => {
+    const source = ['while (ok) {', '  continue', "  /import('../domain/evil.js')/.test(x);", '}'].join(
+      '\n',
+    );
+    expect(extractModuleSpecifiers(source)).toEqual([]);
+    expect(forbiddenIn(source)).toEqual([]);
+  });
+
+  // False negative: a quote-bearing regex after the keyword must not swallow a
+  // later real import. The exact Codex newline fixtures (import on its own line)
+  // pass either way — the load-bearing form places the import on the regex's line,
+  // where the old spurious string ran straight through it.
+  it('surfaces a real import after a `break`-newline quote-bearing regex (same line)', () => {
+    const source = "while (ok) { break\n/[']/.test(x); import '../domain/foo.js'; }";
+    expect(extractModuleSpecifiers(source)).toEqual(['../domain/foo.js']);
+    expect(forbiddenIn(source).length).toBeGreaterThan(0);
+  });
+
+  it('surfaces a real import after a `continue`-newline quote-bearing regex (same line)', () => {
+    const source = "while (ok) { continue\n/[']/.test(x); import '../domain/foo.js'; }";
+    expect(extractModuleSpecifiers(source)).toEqual(['../domain/foo.js']);
+    expect(forbiddenIn(source).length).toBeGreaterThan(0);
+  });
+
+  // The exact Codex fixtures (A/B): import on a separate line — must stay correct.
+  it('surfaces a real import on a separate line after break/continue + newline regex', () => {
+    for (const kw of ['break', 'continue']) {
+      const source = ['while (ok) {', `  ${kw}`, "  /[']/.test(x);", '}', "import '../domain/foo.js';"].join(
+        '\n',
+      );
+      expect(extractModuleSpecifiers(source)).toEqual(['../domain/foo.js']);
+    }
+  });
+
+  // Regex-vs-division context matrix after the keyword: a leading `/` is a regex,
+  // so a trailing real import always survives (no spurious string ran on).
+  it('recognizes a regex after break/continue across newline, CRLF, and comment separators', () => {
+    const bodies: readonly string[] = [
+      'break\n/[\']/.test(x);',
+      'continue\n/[\']/.test(x);',
+      'break\r\n/[\']/.test(x);',
+      'continue\r\n/[\']/.test(x);',
+      'break /* c */\n/[\']/.test(x);',
+      'continue /* c */\n/[\']/.test(x);',
+      'break // c\n/[\']/.test(x);',
+      'continue // c\n/[\']/.test(x);',
+    ];
+    for (const body of bodies) {
+      const source = `while (ok) { ${body} }\nimport '../domain/foo.js';`;
+      expect(extractModuleSpecifiers(source)).toEqual(['../domain/foo.js']);
+    }
+  });
+
+  // A regex body holding an `import('…')` must not fabricate a dependency across any
+  // of those same separators.
+  it('never fabricates a module from an import-bearing regex across separators', () => {
+    const bodies: readonly string[] = [
+      "break\n/import('../domain/evil.js')/.test(x);",
+      "continue\n/import('../domain/evil.js')/.test(x);",
+      "break\r\n/import('../domain/evil.js')/.test(x);",
+      "continue /* c */\n/import('../domain/evil.js')/.test(x);",
+      "break // c\n/import('../domain/evil.js')/.test(x);",
+    ];
+    for (const body of bodies) {
+      expect(extractModuleSpecifiers(`while (ok) { ${body} }`)).toEqual([]);
+    }
+  });
+
+  // Member guard: a control/restricted keyword spelled as a *member name* is a
+  // value, so a following `/` is division, not a regex — otherwise the fake regex
+  // would swallow the later real import (false negative). Covers `.` and `?.`.
+  it('keeps division after a `break`/`continue` used as a member name', () => {
+    for (const access of ['obj.break', 'obj.continue', 'obj?.break', 'obj?.continue']) {
+      const source = `const r = ${access} / 2; import '../domain/foo.js';`;
+      expect(extractModuleSpecifiers(source)).toEqual(['../domain/foo.js']);
+      expect(extractModuleSpecifiers(`const r = ${access} / 2;\nimport '../domain/foo.js';`)).toEqual([
+        '../domain/foo.js',
+      ]);
+    }
+  });
+
+  it('fabricates no module from a bare `obj.break` / `obj.continue` division', () => {
+    expect(extractModuleSpecifiers('const r = obj.break / 2;')).toEqual([]);
+    expect(extractModuleSpecifiers('const r = obj.continue / 2;')).toEqual([]);
+  });
+
+  // The `!` lookback must still read `obj.break!` as a non-null assertion (value),
+  // so the following `/` is division — `break`/`continue` stay value-ending in
+  // `endsValue`, unlike REGEX_CONTEXT_KEYWORDS.
+  it('keeps division after a non-null member assertion `obj.break!`', () => {
+    expect(extractModuleSpecifiers("const r = obj.break! / 2; import '../domain/foo.js';")).toEqual([
+      '../domain/foo.js',
+    ]);
+    expect(extractModuleSpecifiers('const r = obj.break! / 2;')).toEqual([]);
+  });
+
+  // Preservation: a labelled `break`/`continue`, an explicit-semicolon form, and the
+  // untouched `return`/`throw` restricted keywords all keep working.
+  it('preserves labelled, explicit-semicolon, and return/throw forms', () => {
+    expect(
+      extractModuleSpecifiers("outer: while (ok) { break outer; } import '../domain/foo.js';"),
+    ).toEqual(['../domain/foo.js']);
+    expect(
+      extractModuleSpecifiers("outer: while (ok) { continue outer; } import '../domain/foo.js';"),
+    ).toEqual(['../domain/foo.js']);
+    expect(
+      extractModuleSpecifiers("while (ok) { break;\n/[']/.test(x); } import '../domain/foo.js';"),
+    ).toEqual(['../domain/foo.js']);
+    expect(
+      extractModuleSpecifiers("function f() { return\n/[']/.test(v); } import '../domain/foo.js';"),
+    ).toEqual(['../domain/foo.js']);
+  });
+
+  // Liveness: many restricted-statement regex lines scan in bounded linear time; a
+  // regression to rescanning would blow vitest's per-test timeout.
+  it('scans many `break`-newline regex statements in bounded, linear time', () => {
+    const many = "while (ok) { break\n/[']/.test(x); }\n".repeat(2000) + "import '../domain/foo.js';";
+    const start = performance.now();
+    expect(extractModuleSpecifiers(many)).toEqual(['../domain/foo.js']);
+    expect(performance.now() - start).toBeLessThan(1000);
+  });
+});
+
+describe('D3 host import scanner classifies `/` after a labelled restricted statement as a regex (D3-CR-BREAK-CONTINUE-LABEL-ASI)', () => {
+  const forbiddenIn = (source: string): readonly string[] =>
+    extractModuleSpecifiers(source).filter((s) => /\.\.\/(?:domain|adapters)\//.test(s));
+
+  // `break outer` / `continue outer` carry the statement's optional label on the
+  // *same* line as the keyword; the statement is then complete, so a `/` beginning
+  // the next line is a regex opener, not division. The token immediately before that
+  // `/` is the *label* id (not the keyword), so the bare-keyword guard alone missed
+  // it: before this fix `regexCanFollow()` read the label as an ordinary value and
+  // classified the `/` as division. An `import('…')` in the regex body then
+  // fabricated a dependency (false positive) and a quote-bearing regex could swallow
+  // a following same-line import (false negative). The label is now marked
+  // `restrictedLabel` when it directly follows a bare `break`/`continue` with no
+  // intervening LineTerminator; a newline in between is ASI, leaving the id an
+  // ordinary fresh statement whose `/` stays division.
+
+  // False positive: an `import('…')` in a regex body after `break <label>` + newline
+  // must NOT surface. (This is the load-bearing case — the separate-line quote
+  // fixtures below pass either way, since a spurious string dies at the line end.)
+  it('does not fabricate a module from an import call in a regex after `break <label>` + newline', () => {
+    const source = ['outer: while (ok) {', '  break outer', "  /import('../domain/evil.js')/.test(x);", '}'].join(
+      '\n',
+    );
+    expect(extractModuleSpecifiers(source)).toEqual([]);
+    expect(forbiddenIn(source)).toEqual([]);
+  });
+
+  it('does not fabricate a module from an import call in a regex after `continue <label>` + newline', () => {
+    const source = ['outer: while (ok) {', '  continue outer', "  /import('../domain/evil.js')/.test(x);", '}'].join(
+      '\n',
+    );
+    expect(extractModuleSpecifiers(source)).toEqual([]);
+    expect(forbiddenIn(source)).toEqual([]);
+  });
+
+  // False negative: a quote-bearing regex after `break <label>` + newline must not
+  // swallow a later real import placed on the regex's own line.
+  it('surfaces a real import after a `break <label>`-newline quote-bearing regex (same line)', () => {
+    const source = "outer: while (ok) { break outer\n/[']/.test(x); import '../domain/foo.js'; }";
+    expect(extractModuleSpecifiers(source)).toEqual(['../domain/foo.js']);
+    expect(forbiddenIn(source).length).toBeGreaterThan(0);
+  });
+
+  it('surfaces a real import after a `continue <label>`-newline quote-bearing regex (same line)', () => {
+    const source = "outer: while (ok) { continue outer\n/[']/.test(x); import '../domain/foo.js'; }";
+    expect(extractModuleSpecifiers(source)).toEqual(['../domain/foo.js']);
+    expect(forbiddenIn(source).length).toBeGreaterThan(0);
+  });
+
+  // The exact validator fixtures (import on a separate line) — must stay correct.
+  it('surfaces a real import on a separate line after `break`/`continue <label>` + newline regex', () => {
+    for (const kw of ['break', 'continue']) {
+      const source = ['outer: while (ok) {', `  ${kw} outer`, "  /[']/.test(x);", '}', "import '../domain/foo.js';"].join(
+        '\n',
+      );
+      expect(extractModuleSpecifiers(source)).toEqual(['../domain/foo.js']);
+    }
+  });
+
+  // Regex-vs-division matrix after a labelled keyword across newline, CRLF, block and
+  // line comments (the comment/newline follows the label, so the statement is already
+  // complete): a leading `/` is a regex, so a trailing real import survives.
+  it('recognizes a regex after a labelled break/continue across newline, CRLF, and comment separators', () => {
+    const heads: readonly string[] = [
+      'break outer\n',
+      'continue outer\n',
+      'break outer\r\n',
+      'continue outer\r\n',
+      'break outer /* c */\n',
+      'continue outer /* c */\n',
+      'break outer // c\n',
+      'continue outer // c\n',
+    ];
+    for (const head of heads) {
+      const source = `outer: while (ok) { ${head}/[']/.test(x); }\nimport '../domain/foo.js';`;
+      expect(extractModuleSpecifiers(source)).toEqual(['../domain/foo.js']);
+    }
+  });
+
+  it('never fabricates a module from an import-bearing regex after a labelled break/continue', () => {
+    const heads: readonly string[] = [
+      'break outer\n',
+      'continue outer\n',
+      'break outer\r\n',
+      'continue outer /* c */\n',
+      'break outer // c\n',
+    ];
+    for (const head of heads) {
+      const source = `outer: while (ok) { ${head}/import('../domain/evil.js')/.test(x); }`;
+      expect(extractModuleSpecifiers(source)).toEqual([]);
+    }
+  });
+
+  // Nested labels: `break inner` / `continue outer` inside `outer: inner: …` are each
+  // valid labelled restricted statements, so the following `/` is still a regex.
+  it('handles nested labels', () => {
+    const inner = ['outer: inner: while (ok) {', '  break inner', "  /import('../domain/evil.js')/.test(x);", '}'].join(
+      '\n',
+    );
+    expect(extractModuleSpecifiers(inner)).toEqual([]);
+    const out = ['outer: inner: while (ok) {', '  continue outer', "  /[']/.test(x); import '../domain/foo.js';", '}'].join(
+      '\n',
+    );
+    expect(extractModuleSpecifiers(out)).toEqual(['../domain/foo.js']);
+  });
+
+  // The label marker must NOT leak to a fresh statement: a LineTerminator between the
+  // keyword and the id is ASI, so the id (`outer` here) is an ordinary statement and a
+  // following `/` is division — exactly as `x \n / 2` is division. A regex
+  // misclassification here would swallow the trailing real import.
+  it('keeps a newline-separated id after break/continue as a fresh statement (division)', () => {
+    const fresh = "while (ok) { break\nouter\n/ 2; } import '../domain/foo.js';";
+    expect(extractModuleSpecifiers(fresh)).toEqual(['../domain/foo.js']);
+    const fresh2 = "while (ok) { continue\nouter\n/ 2; } import '../domain/foo.js';";
+    expect(extractModuleSpecifiers(fresh2)).toEqual(['../domain/foo.js']);
+  });
+
+  // Ordinary identifier / call / member division across a newline stays division — the
+  // labelled repair must never turn general newline ASI into a regex context.
+  it('keeps ordinary identifier, call, and member division across a newline', () => {
+    for (const expr of ['x\n/ 2', 'value\n/ divisor', 'obj.value\n/ 2', 'fn()\n/ 2']) {
+      expect(extractModuleSpecifiers(`const r = ${expr}; import '../domain/foo.js';`)).toEqual(['../domain/foo.js']);
+    }
+  });
+
+  // A block comment carrying a LineTerminator *between* the keyword and the id is a
+  // terminator too, so the id is not a label and the following `/` stays division.
+  it('treats a block-comment newline between keyword and id as ASI (division), not a label', () => {
+    const source = "while (ok) { break /*\n*/ outer\n/ 2; } import '../domain/foo.js';";
+    expect(extractModuleSpecifiers(source)).toEqual(['../domain/foo.js']);
+  });
+
+  // Member `.break` / `.continue` are values, never restricted statements, so a
+  // following id is not a label and the division rule is unchanged.
+  it('does not treat a member `.break`/`.continue` as heading a labelled statement', () => {
+    expect(extractModuleSpecifiers("const r = obj.break outer / 2; import '../domain/foo.js';")).toEqual([
+      '../domain/foo.js',
+    ]);
+  });
+
+  // Liveness: many labelled-restricted regex lines scan in bounded linear time.
+  it('scans many labelled `break`-newline regex statements in bounded, linear time', () => {
+    const many =
+      "outer: while (ok) { break outer\n/[']/.test(x); }\n".repeat(2000) + "import '../domain/foo.js';";
     const start = performance.now();
     expect(extractModuleSpecifiers(many)).toEqual(['../domain/foo.js']);
     expect(performance.now() - start).toBeLessThan(1000);
