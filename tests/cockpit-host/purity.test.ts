@@ -1,6 +1,6 @@
 import { readdirSync, readFileSync } from 'node:fs';
-import { join, posix } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
@@ -47,38 +47,32 @@ function hostSources(): readonly { readonly file: string; readonly text: string 
  * resolves it — `new URL(specifier, importerFileUrl)` then a Node-compatible
  * file-URL→path conversion — before the segment-aware containment rule runs.
  */
-const HOST_ROOT = 'src/cockpit-host';
-const COCKPIT_BOUNDARY = 'src/cockpit';
-
-// ESM/NodeNext specifiers and `readdirSync`'s OS-separated file names are folded
-// to '/'-separated form so a literal backslash cannot smuggle an escape past the
-// resolver, and Windows `fileURLToPath` output (which uses '\\') compares
-// like-for-like with the POSIX boundaries below.
+// Windows `fileURLToPath` output uses '\\'; folding a resolved path to
+// '/'-separated form lets a `file:`-URL pathname compare like-for-like with the
+// URL-derived boundaries below. Retained for the percent-filename assertion in the
+// F1 suite; the confinement engine itself now compares `file:` URLs directly.
 const toPosix = (value: string): string => value.replace(/\\/g, '/');
 
-// A stable *synthetic* repository root used only to resolve relative specifiers
-// the way Node does; it is never touched on disk. The drive letter is load-
-// bearing: a drive-less `file:///…` URL is rejected outright by the Win32 branch
-// of `fileURLToPath`, so a bare `file:///virtual/…` root would throw for every
-// specifier on Windows. With a drive letter the URL converts on both platforms.
-const VIRTUAL_REPO_URL = new URL('file:///C:/agentbridge-virtual/');
+// The real host root and its sibling Cockpit boundary are derived from the *very*
+// `hostDir` the sources are enumerated from — a single source of truth, so the
+// guard's containment and the source reader agree by construction (D3-CX-POLICY-1).
+// There is no synthetic root: a specifier is judged against where the host
+// actually lives, so a path that exits the real repository and then re-enters a
+// directory literally named like an allowed one (the `agentbridge-virtual/src/
+// cockpit-host/…` re-entry, or a `<repo>-sibling/src/cockpit-host/…` prefix
+// collision) can never be read as in-host. `hostDir` ends with a separator (it
+// came from a trailing-slash URL), so `pathToFileURL` yields a directory URL
+// ending in '/', and the Cockpit boundary is its real sibling `src/cockpit/`.
+const HOST_ROOT_URL = pathToFileURL(hostDir);
+const COCKPIT_BOUNDARY_URL = new URL('../cockpit/', HOST_ROOT_URL);
 
-// A path under the synthetic root, taken through the *same* URL→path pipeline as
-// resolved specifiers, so its string form carries whatever platform formatting
-// `fileURLToPath` emits (drive, leading slash, separators) and segment-prefix
-// containment compares like-for-like on Windows and POSIX alike.
-const virtualPath = (relFromRepoRoot: string): string =>
-  posix.normalize(toPosix(fileURLToPath(new URL(relFromRepoRoot, VIRTUAL_REPO_URL))));
-
-const HOST_ROOT_ABS = virtualPath(HOST_ROOT);
-const COCKPIT_BOUNDARY_ABS = virtualPath(COCKPIT_BOUNDARY);
-
-// Segment-aware containment: an exact match, or a genuine sub-path (guarded by a
-// trailing `/`), so a sibling such as `src/cockpit-host-evil/` is never read as
-// inside `src/cockpit-host`, and a host path is never read as inside
-// `src/cockpit`.
-const isWithin = (candidate: string, boundary: string): boolean =>
-  candidate === boundary || candidate.startsWith(`${boundary}/`);
+// Segment-aware containment on the resolved `file:` URL: an exact match, or a
+// genuine sub-path guarded by the boundary's trailing '/', so a sibling such as
+// `src/cockpit-host-evil/` is never read as inside `src/cockpit-host`, and a host
+// path is never read as inside `src/cockpit`. `file:` URL hrefs carry a stable
+// percent-encoding, so the comparison is identical on POSIX and Windows.
+const isWithin = (candidate: URL, boundary: URL): boolean =>
+  candidate.href === boundary.href || candidate.href.startsWith(boundary.href);
 
 // `fileURLToPath` rejects `%2f` on every platform but `%5c` only on Win32; on a
 // POSIX runner a `%5c` would otherwise decode to a literal backslash and fold
@@ -88,34 +82,54 @@ const isWithin = (candidate: string, boundary: string): boolean =>
 const ENCODED_SEPARATOR = /%2f|%5c/i;
 
 /**
- * Resolve a *relative* module specifier against its importing host file and
- * report whether the resolved destination remains within the host tree or the
- * Cockpit boundary — resolved exactly as Node's ESM loader would.
+ * Resolve a *relative* module specifier against its importing host file — using
+ * the *real* host location, exactly as Node's ESM loader would — and report
+ * whether the resolved destination remains within the host tree or the Cockpit
+ * boundary.
  *
- * The specifier is resolved with `new URL(specifier, importerFileUrl)` (WHATWG
- * URL resolution: it folds `.`/`..` *and* their case-insensitive `%2e`-encoded
- * forms, keeps an encoded `/`/`\` intact within a segment, treats a literal
- * backslash as a separator for the special `file:` scheme, and drops any
- * query/fragment from the path), then converted with `fileURLToPath` — which
- * decodes the path exactly once (never `decodeURIComponent` on the whole path
- * twice) and so preserves a legitimate percent-containing filename. This is pure
- * URL/path arithmetic — no file-system access — so synthetic fixture (importer,
- * specifier) pairs resolve identically to real ones. It fails closed (returns
- * `false`) on any resolution failure: an encoded separator, a malformed percent
- * escape that makes the decode throw, or an invalid URL/file-URL conversion.
+ * The importer URL is built with native path→file-URL semantics
+ * (`pathToFileURL(join(hostDir, importerRelPath))`); the importer relative path is
+ * NOT folded through `toPosix` first, so a literal backslash in a POSIX filename
+ * (`a\b.ts`, a single legal filename there) stays one segment and is percent-
+ * encoded (`%5C`) rather than smuggled in as a directory separator — the earlier
+ * `toPosix(importerRelPath)` fold deepened the importer's directory by a level and
+ * let `../index.js` reach `src/index.js`, the domain re-export barrel, while the
+ * guard reported in-host (D3-CX-POLICY-B). On Windows `join` keeps native
+ * separators, so a real Windows path resolves natively. The specifier is then
+ * resolved with `new URL(specifier, importerFileUrl)` (WHATWG resolution: it folds
+ * `.`/`..` *and* their case-insensitive `%2e`-encoded forms, keeps an encoded
+ * `/`/`\` intact within a segment, treats a literal backslash as a separator for
+ * the special `file:` scheme, and drops any query/fragment from the path). This is
+ * pure URL/path arithmetic — no file-system access — so synthetic fixture
+ * (importer, specifier) pairs resolve identically to real ones. It fails closed
+ * (returns `false`) on any resolution failure: an encoded separator, or a
+ * malformed percent escape that makes the `fileURLToPath` decode throw (that
+ * round-trip is performed for its throwing side effect, so a bad escape is
+ * rejected exactly as before).
  */
 const relativeImportStaysInBoundary = (importerRelPath: string, specifier: string): boolean => {
-  const importerFileUrl = new URL(`${HOST_ROOT}/${toPosix(importerRelPath)}`, VIRTUAL_REPO_URL);
-  let resolvedPath: string;
+  let resolvedUrl: URL;
   try {
-    const resolvedUrl = new URL(specifier, importerFileUrl);
+    const importerFileUrl = pathToFileURL(join(hostDir, importerRelPath));
+    resolvedUrl = new URL(specifier, importerFileUrl);
     if (ENCODED_SEPARATOR.test(resolvedUrl.pathname)) return false;
-    resolvedPath = posix.normalize(toPosix(fileURLToPath(resolvedUrl)));
+    // Round-trip through `fileURLToPath` so a malformed percent escape (`%2`,
+    // `%zz`) throws and fails closed, matching the real loader; the decoded path
+    // is not otherwise needed because containment compares `file:` URLs.
+    fileURLToPath(resolvedUrl);
   } catch {
     return false;
   }
-  return isWithin(resolvedPath, HOST_ROOT_ABS) || isWithin(resolvedPath, COCKPIT_BOUNDARY_ABS);
+  return isWithin(resolvedUrl, HOST_ROOT_URL) || isWithin(resolvedUrl, COCKPIT_BOUNDARY_URL);
 };
+
+// The host's production `node:*` needs are exactly these two (verified across
+// `src/cockpit-host/**`); every other builtin — `node:fs`, `node:child_process`,
+// `node:os`, `node:process`, `node:fs/promises`, … — is refused, so a "read-only"
+// host cannot reach filesystem-mutation or process authority through a builtin
+// (D3-CX-POLICY-3). This replaces the former blanket `specifier.startsWith('node:')`.
+const ALLOWED_NODE_BUILTINS: ReadonlySet<string> = new Set(['node:http', 'node:url']);
+const isAllowedNodeBuiltin = (specifier: string): boolean => ALLOWED_NODE_BUILTINS.has(specifier);
 
 /**
  * Extract every static-graph module specifier from TypeScript/NodeNext ESM
@@ -203,6 +217,42 @@ function extractModuleSpecifiers(source: string): readonly string[] {
   return specifiers;
 }
 
+/**
+ * Report whether the source contains a dynamic `import(...)` whose target is not a
+ * statically verifiable string (D3-CX-POLICY-2). A computed argument — an
+ * identifier, a concatenation, or a substituted template — cannot be confined by
+ * `relativeImportStaysInBoundary`, so the import-discipline check must fail closed
+ * on it rather than (as `extractModuleSpecifiers` structurally must) silently omit
+ * it. Enforcing the rule here, in the discipline layer, keeps the extractor's
+ * established contract — surface only static specifiers — unchanged.
+ *
+ * This uses the identical node discrimination as the extractor's dynamic-import
+ * branch (a call whose callee is the `import` keyword), so it never fires on
+ * `import.meta` (a meta-property, not a call), `obj.import(…)` (a property call),
+ * or a member/property/class field named `import` — none of which is an import
+ * call. A static `import('S')` or a substitution-free `` import(`S`) `` (both
+ * `isStringLiteralLike`) is verifiable and does not trip it.
+ */
+const hasUnverifiableDynamicImport = (source: string): boolean => {
+  const sourceFile = ts.createSourceFile(
+    'module.ts',
+    source,
+    ts.ScriptTarget.Latest,
+    /* setParentNodes */ false,
+    ts.ScriptKind.TS,
+  );
+  let found = false;
+  const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+      const arg = node.arguments[0];
+      if (arg === undefined || !ts.isStringLiteralLike(arg)) found = true;
+    }
+    ts.forEachChild(node, visit);
+  };
+  ts.forEachChild(sourceFile, visit);
+  return found;
+};
+
 describe('D3 host has no mutation, subprocess, secret, or Git capability', () => {
   it('references no subprocess, environment, or Git operation', () => {
     const forbidden: readonly RegExp[] = [
@@ -225,16 +275,26 @@ describe('D3 host has no mutation, subprocess, secret, or Git capability', () =>
 });
 
 describe('D3 host import discipline', () => {
-  it('imports only node builtins, itself, or the Cockpit boundary', () => {
+  it('imports only allow-listed node builtins, itself, or the Cockpit boundary', () => {
     for (const { file, text } of hostSources()) {
+      // Fail closed: a dynamic `import(...)` whose target is not a static string
+      // cannot be confined, so the host must contain none (D3-CX-POLICY-2). The
+      // extractor necessarily omits such a computed specifier, so this is the
+      // layer that must reject it.
+      expect(
+        hasUnverifiableDynamicImport(text),
+        `${file} contains an unverifiable (computed) dynamic import`,
+      ).toBe(false);
       for (const specifier of extractModuleSpecifiers(text)) {
         // A relative specifier is accepted only when its resolved destination is
         // confined to the host tree or the Cockpit boundary (D3-CX-POLICY-1); a
         // raw `./`/`../cockpit/` string prefix let a redundant escape like
-        // `./../index.js` reach `src/index.ts` (the domain re-export barrel).
+        // `./../index.js` reach `src/index.ts` (the domain re-export barrel). A
+        // `node:*` builtin is accepted only when on the exact production allowlist
+        // (D3-CX-POLICY-3), not by a blanket `node:` prefix.
         const isRelative = specifier.startsWith('./') || specifier.startsWith('../');
         const allowed =
-          specifier.startsWith('node:') ||
+          isAllowedNodeBuiltin(specifier) ||
           (isRelative && relativeImportStaysInBoundary(file, specifier));
         expect(allowed, `${file} imports forbidden specifier: ${specifier}`).toBe(true);
       }
@@ -260,7 +320,7 @@ describe('D3 host relative-import confinement rejects boundary escapes (D3-CX-PO
   const accepts = (importer: string, specifier: string): boolean => {
     const isRelative = specifier.startsWith('./') || specifier.startsWith('../');
     return (
-      specifier.startsWith('node:') ||
+      isAllowedNodeBuiltin(specifier) ||
       (isRelative && relativeImportStaysInBoundary(importer, specifier))
     );
   };
@@ -342,12 +402,13 @@ describe('D3 host relative-import confinement rejects boundary escapes (D3-CX-PO
     expect(accepts('fixtures/stage-a.ts', '../../cockpit/index.js')).toBe(true);
   });
 
-  it('leaves node: builtin acceptance unchanged (POLICY-3 out of scope)', () => {
+  it('restricts node: builtins to the exact production allowlist (POLICY-3)', () => {
     expect(accepts('server.ts', 'node:http')).toBe(true);
     expect(accepts('server.ts', 'node:url')).toBe(true);
-    // node:* handling is preserved exactly as-is by this repair; POLICY-3 is a
-    // separate finding and is intentionally NOT addressed here.
-    expect(accepts('server.ts', 'node:fs')).toBe(true);
+    // Every non-allowlisted builtin is now refused (previously the blanket `node:`
+    // prefix accepted them all): a "read-only" host cannot reach filesystem-
+    // mutation or process authority through `node:*`.
+    expect(accepts('server.ts', 'node:fs')).toBe(false);
   });
 
   // Integration: check #1 now catches the escape, and the forbidden-module check
@@ -384,7 +445,7 @@ describe('D3 host confinement resolves percent-encoded URL dot-segments like Nod
   const accepts = (importer: string, specifier: string): boolean => {
     const isRelative = specifier.startsWith('./') || specifier.startsWith('../');
     return (
-      specifier.startsWith('node:') ||
+      isAllowedNodeBuiltin(specifier) ||
       (isRelative && relativeImportStaysInBoundary(importer, specifier))
     );
   };
@@ -401,7 +462,7 @@ describe('D3 host confinement resolves percent-encoded URL dot-segments like Nod
       // Identical to check #1 in `D3 host import discipline`.
       const isRelative = specifier.startsWith('./') || specifier.startsWith('../');
       const allowed =
-        specifier.startsWith('node:') ||
+        isAllowedNodeBuiltin(specifier) ||
         (isRelative && relativeImportStaysInBoundary('server.ts', specifier));
       expect(allowed, `integrated path must reject: ${specifier}`).toBe(false);
     }
@@ -1044,8 +1105,13 @@ describe('D3 host import scanner handles template literals and import context (D
   });
 
   it('does NOT surface a template dynamic import that carries a substitution (R1 negative)', () => {
+    // The extractor omits a computed specifier by contract (it surfaces only
+    // static ones). Security is not "silent omission": the import-discipline check
+    // treats such an unverifiable dynamic import as a rejection via
+    // `hasUnverifiableDynamicImport` — see the D3-CX-POLICY-2 regression block.
     const source = 'import(' + BT + '../domain/${name}.js' + BT + ');';
     expect(extractModuleSpecifiers(source)).toEqual([]);
+    expect(hasUnverifiableDynamicImport(source)).toBe(true);
   });
 
   it('does NOT accept a template after `from` or as a bare specifier (syntax-invalid forms)', () => {
@@ -1897,5 +1963,159 @@ describe('D3 host import scanner classifies `/` after a labelled restricted stat
     const start = performance.now();
     expect(extractModuleSpecifiers(many)).toEqual(['../domain/foo.js']);
     expect(performance.now() - start).toBeLessThan(1000);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Consolidated purity-guard hardening — adversarial regression matrix for the
+// four CURRENT findings closed on PR #61:
+//   A  synthetic-root re-entry            (POLICY-1, was fail-open/soundness)
+//   B  POSIX literal-backslash importer   (POLICY-F1, was fail-open, POSIX-only)
+//   C  computed dynamic-import blind spot (POLICY-2, was fail-open by omission)
+//   D  blanket `node:*` allowance         (POLICY-3, was fail-open)
+// All resolution below is pure path/URL arithmetic against the *real* `hostDir`;
+// no fixture file is created and no module is loaded.
+// ---------------------------------------------------------------------------
+describe('D3 host consolidated purity hardening (A/B/C/D)', () => {
+  const BT = '`';
+
+  // Mirror of the real check #1 acceptance predicate for a single specifier
+  // (`node:*` allowlist OR real-root relative confinement).
+  const accepts = (importer: string, specifier: string): boolean => {
+    const isRelative = specifier.startsWith('./') || specifier.startsWith('../');
+    return (
+      isAllowedNodeBuiltin(specifier) ||
+      (isRelative && relativeImportStaysInBoundary(importer, specifier))
+    );
+  };
+
+  // End-to-end discipline decision over source text: fail closed on an
+  // unverifiable dynamic import, else every surfaced specifier must be accepted.
+  const disciplineAccepts = (source: string, importer = 'server.ts'): boolean => {
+    if (hasUnverifiableDynamicImport(source)) return false;
+    return extractModuleSpecifiers(source).every((specifier) => accepts(importer, specifier));
+  };
+
+  // --- A: synthetic-root re-entry -----------------------------------------
+  describe('A — synthetic-root re-entry is judged against the real repository', () => {
+    it('rejects the exact Codex witness `../../../agentbridge-virtual/src/cockpit-host/escape.js`', () => {
+      expect(accepts('server.ts', '../../../agentbridge-virtual/src/cockpit-host/escape.js')).toBe(
+        false,
+      );
+    });
+
+    it('rejects a path that climbs above the real repository and repeats its real directory names', () => {
+      // Derive the real repository and its parent directory name from the same
+      // `hostDir` the guard resolves against: `[…, <parent>, <repo>, 'src',
+      // 'cockpit-host']`. Over-climb to the filesystem root (clamped), then
+      // re-enter directories that repeat those real names — the absolute prefix no
+      // longer matches the real host root, so it must be rejected.
+      const segments = HOST_ROOT_URL.pathname.split('/').filter((s) => s.length > 0);
+      // `hostDir` is always at least `<parent>/<repo>/src/cockpit-host`.
+      const repoName = segments[segments.length - 3] ?? '';
+      const parentName = segments[segments.length - 4] ?? '';
+      const overClimb = '../'.repeat(segments.length + 3);
+      const reentry = `${overClimb}${parentName}/${repoName}/src/cockpit-host/escape.js`;
+      expect(accepts('server.ts', reentry)).toBe(false);
+      // A sibling that shares the real repository name as a prefix is likewise out.
+      expect(accepts('server.ts', `../../../${repoName}-sibling/src/cockpit-host/escape.js`)).toBe(
+        false,
+      );
+    });
+
+    it('preserves the legitimate host-local and Cockpit-boundary controls', () => {
+      expect(accepts('render.ts', './escape.js')).toBe(true);
+      expect(accepts('server.ts', '../cockpit/index.js')).toBe(true);
+    });
+  });
+
+  // --- B: POSIX literal-backslash importer --------------------------------
+  describe('B — a literal backslash in a POSIX importer filename is one encoded segment', () => {
+    // `a\b.ts` is a single legal POSIX filename; `readdirSync` lists it as one
+    // entry. The importer URL must keep it one percent-encoded segment so
+    // `../index.js` resolves to `src/index.js` (the domain barrel), OUT of host —
+    // not, as the removed `toPosix(importerRelPath)` fold made it,
+    // `src/cockpit-host/index.js`. On Windows `\` is a native separator, so this
+    // path-arithmetic case is POSIX-gated (it cannot exist as a Windows filename).
+    const itPosix = process.platform === 'win32' ? it.skip : it;
+    itPosix('rejects importer `a\\b.ts` -> `../index.js` (resolves to src/index.js, out of host)', () => {
+      expect(accepts('a\\b.ts', '../index.js')).toBe(false);
+    });
+
+    it('preserves the normal nested control `sub/b.ts` -> `../x.js` (stays in host)', () => {
+      expect(accepts('sub/b.ts', '../x.js')).toBe(true);
+    });
+  });
+
+  // --- C: computed dynamic imports fail closed ----------------------------
+  describe('C — a computed dynamic import is rejected, not silently omitted', () => {
+    it('rejects an identifier target `import(t)`', () => {
+      const source = "const t = './../index.js';\nawait import(t);";
+      expect(hasUnverifiableDynamicImport(source)).toBe(true);
+      expect(disciplineAccepts(source)).toBe(false);
+    });
+
+    it('rejects a concatenated target `import(\'../domain/\' + name)`', () => {
+      const source = "await import('../domain/' + name);";
+      expect(hasUnverifiableDynamicImport(source)).toBe(true);
+      expect(disciplineAccepts(source)).toBe(false);
+    });
+
+    it('rejects a substituted template target `import(`../domain/${name}.js`)`', () => {
+      const source = 'await import(' + BT + '../domain/${name}.js' + BT + ');';
+      expect(hasUnverifiableDynamicImport(source)).toBe(true);
+      expect(disciplineAccepts(source)).toBe(false);
+    });
+
+    it('preserves a static string target `import(\'./local.js\')`', () => {
+      const source = "await import('./local.js');";
+      expect(hasUnverifiableDynamicImport(source)).toBe(false);
+      expect(extractModuleSpecifiers(source)).toContain('./local.js');
+      expect(disciplineAccepts(source)).toBe(true);
+    });
+
+    it('preserves a no-substitution template target `import(`../cockpit/index.js`)`', () => {
+      const source = 'await import(' + BT + '../cockpit/index.js' + BT + ');';
+      expect(hasUnverifiableDynamicImport(source)).toBe(false);
+      expect(extractModuleSpecifiers(source)).toContain('../cockpit/index.js');
+      expect(disciplineAccepts(source)).toBe(true);
+    });
+
+    it('does not fire on `import.meta`, member calls, or object/class members named `import`', () => {
+      const exclusions: readonly string[] = [
+        'const isEntry = import.meta.url === x;',
+        "obj.import('../domain/foo.js');",
+        'const y = obj.import;',
+        "const config = { import: '../domain/foo.js' };",
+        "const o = { \"import\": '../domain/foo.js' };",
+        "const obj = { import() { return '../domain/foo.js'; } };",
+        "class C { import = '../domain/foo.js'; }",
+        "class C { static import = '../domain/foo.js'; }",
+        "const importX = '../domain/foo.js';",
+      ];
+      for (const source of exclusions) {
+        expect(hasUnverifiableDynamicImport(source), `must not fire on: ${source}`).toBe(false);
+      }
+    });
+  });
+
+  // --- D: exact node builtin allowlist ------------------------------------
+  describe('D — node builtins are restricted to the exact production allowlist', () => {
+    for (const spec of ['node:http', 'node:url']) {
+      it(`accepts allow-listed ${spec}`, () => {
+        expect(accepts('server.ts', spec)).toBe(true);
+      });
+    }
+    for (const spec of [
+      'node:fs',
+      'node:fs/promises',
+      'node:child_process',
+      'node:os',
+      'node:process',
+    ]) {
+      it(`rejects non-allow-listed ${spec}`, () => {
+        expect(accepts('server.ts', spec)).toBe(false);
+      });
+    }
   });
 });
