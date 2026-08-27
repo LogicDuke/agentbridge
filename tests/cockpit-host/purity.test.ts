@@ -38,7 +38,7 @@ function hostSources(): readonly { readonly file: string; readonly text: string 
 type EsmToken =
   | { readonly t: 'str'; readonly v: string; readonly template: boolean; readonly hasSubstitution: boolean }
   | { readonly t: 'id'; readonly v: string }
-  | { readonly t: 'punct'; readonly v: string }
+  | { readonly t: 'punct'; readonly v: string; readonly controlHeader?: boolean }
   | { readonly t: 'num' }
   | { readonly t: 'regex' };
 
@@ -62,6 +62,21 @@ const REGEX_CONTEXT_KEYWORDS: ReadonlySet<string> = new Set([
   'yield',
   'await',
   'throw',
+]);
+
+// Keywords whose parenthesised head is a *control-flow header* — `if (…)`,
+// `while (…)`, `for (…)`, `with (…)`. The `)` that closes such a header is
+// followed by a statement, whose first token may legally be a regex literal
+// (`if (ok) /re/.test(x);`). This is unlike a value-producing `)` (`fn()`,
+// `(x)`), after which a `/` is division. The distinction is carried on the
+// closing `)` token via `controlHeader` so `regexCanFollow()` classifies the
+// next `/` correctly (D3-CR-B); it is orthogonal to the object-literal `}`
+// division case (C2), which is deliberately left unchanged.
+const CONTROL_HEADER_KEYWORDS: ReadonlySet<string> = new Set([
+  'if',
+  'while',
+  'for',
+  'with',
 ]);
 
 /**
@@ -90,6 +105,12 @@ function tokenizeEsm(source: string): readonly EsmToken[] {
   // closes the current substitution and resumes the enclosing template's text.
   const substitutionStack: number[] = [];
 
+  // Parenthesis-context stack: each open `(` pushes whether it began a
+  // control-flow header (`if`/`while`/`for`/`with`). The matching `)` pops it and
+  // records the flag on the emitted token, so a `/` right after the `)` is
+  // classified as a regex (control header) or division (value paren).
+  const parenStack: boolean[] = [];
+
   const regexCanFollow = (): boolean => {
     if (previous === null) return true;
     switch (previous.t) {
@@ -100,8 +121,34 @@ function tokenizeEsm(source: string): readonly EsmToken[] {
       case 'regex':
         return false;
       case 'punct':
-        return previous.v !== ')' && previous.v !== ']';
+        // A `)` closing a control-flow header (`if (…)`) may be followed by a
+        // regex; a value-producing `)` (`fn()`, `(x)`) means division. `]` is
+        // always a value (index/array), so a following `/` is division.
+        if (previous.v === ')') return previous.controlHeader === true;
+        return previous.v !== ']';
     }
+  };
+  // Whether the token before an opening `(` is a control-flow keyword — read
+  // inside this helper (not inline in the main loop) so `previous` keeps its
+  // declared `EsmToken | null` type and narrows over the full token union, as in
+  // `regexCanFollow`.
+  const previousOpensControlHeader = (): boolean => {
+    if (previous === null || previous.t !== 'id' || !CONTROL_HEADER_KEYWORDS.has(previous.v)) {
+      return false;
+    }
+    // A control keyword spelled as a *member name* — `obj.for(…)`, `Symbol.for(…)`,
+    // `obj.if(…)` — is a value-producing method call, not a control-flow header:
+    // its closing `)` must stay a value paren so a following `/` is division, not
+    // a regex (which would swallow a later real import — D3-CR-B2). The keyword
+    // heads a control statement only when it is *bare*, i.e. not immediately
+    // preceded by a `.` member-access punctuator. `previous` is the just-emitted
+    // keyword (`tokens[len-1]`), so `tokens[len-2]` is the token before it; a
+    // leading `.` (including the `.` of `?.`) marks member access. Computed access
+    // (`obj['for'](…)`) already fails the `previous.t === 'id'` check above, since
+    // the token before `(` is then `]`.
+    const beforePrevious = tokens[tokens.length - 2];
+    if (beforePrevious?.t === 'punct' && beforePrevious.v === '.') return false;
+    return true;
   };
   const emit = (token: EsmToken): void => {
     tokens.push(token);
@@ -293,6 +340,22 @@ function tokenizeEsm(source: string): readonly EsmToken[] {
       index = cursor;
       continue;
     }
+    // `(` / `)` — tracked so a control-flow header's closing `)` is distinguished
+    // from a value-producing `)` when the next `/` is classified. Any `(`/`)`
+    // reaching here is genuine code punctuation: those inside strings, comments,
+    // regex bodies, and template text were already consumed above.
+    if (c === '(') {
+      parenStack.push(previousOpensControlHeader());
+      emit({ t: 'punct', v: '(' });
+      index += 1;
+      continue;
+    }
+    if (c === ')') {
+      const controlHeader = parenStack.pop() ?? false;
+      emit({ t: 'punct', v: ')', controlHeader });
+      index += 1;
+      continue;
+    }
     // any other single character is punctuation / operator
     emit({ t: 'punct', v: c });
     index += 1;
@@ -352,8 +415,14 @@ function extractModuleSpecifiers(source: string): readonly string[] {
       if (prev?.t === 'punct' && prev.v === '.') continue;
       // `import.meta.*` — not a module specifier.
       if (next?.t === 'punct' && next.v === '.') continue;
-      // `{ import: ... }` — a property keyed `import`, not an import statement.
-      if (next?.t === 'punct' && next.v === ':') continue;
+      // A member named `import` — `{ import: ... }` (object property keyed
+      // `import`) or `class C { import = … }` (a class field whose name is the
+      // reserved word `import`). Neither is an ESM import: `:` introduces the
+      // property value and `=` the field initializer, so the following string is
+      // data, not a module specifier (D3-CR-C3/A). A real import is never
+      // immediately followed by `:` or `=` (`import x = require(…)` puts an
+      // identifier after `import`, not `=`).
+      if (next?.t === 'punct' && (next.v === ':' || next.v === '=')) continue;
       // dynamic `import( 'S' … )` — the specifier, if a literal, is the first
       // token inside the parens. A plain string or a substitution-free template
       // is a fixed specifier; a template that carries `${ }` substitutions is a
@@ -1115,6 +1184,233 @@ describe('D3 host import scanner treats a `${` substitution as expression-start 
     const start = performance.now();
     expect(extractModuleSpecifiers(many)).toEqual(['../domain/foo.js']);
     expect(extractModuleSpecifiers(nestedSource)).toEqual(['../domain/foo.js']);
+    expect(performance.now() - start).toBeLessThan(1000);
+  });
+});
+
+describe('D3 host import scanner rejects a class field named `import` (D3-CR-A)', () => {
+  // `import` is a reserved word, but reserved words are legal member names, so a
+  // class field may be named `import`. Its `=` initializer is data, not a module
+  // specifier — the scanner must not fabricate a dependency from it. Reported
+  // independently by both Codex and CodeRabbit as the same false positive.
+  it('does not treat a one-line class field `import = …` as an import', () => {
+    expect(extractModuleSpecifiers("class Config { import = '../domain/foo.js'; }")).toEqual([]);
+  });
+
+  it('does not treat a multi-line class field `import = …` as an import', () => {
+    const source = ['class Config {', "  import = '../domain/foo.js';", '}'].join('\n');
+    expect(extractModuleSpecifiers(source)).toEqual([]);
+  });
+
+  it('does not treat an `import` field beside other fields as an import', () => {
+    const source = ['class Config {', "  import = '../domain/foo.js';", '  other = 1;', '}'].join(
+      '\n',
+    );
+    expect(extractModuleSpecifiers(source)).toEqual([]);
+  });
+
+  it('does not treat a typed or static class field named `import` as an import', () => {
+    // `import: string = …` is caught by the `:` guard; `static import = …` still
+    // lands on the `=` guard, since the field-name token is `import`.
+    expect(extractModuleSpecifiers("class C { import: string = '../domain/foo.js'; }")).toEqual([]);
+    expect(extractModuleSpecifiers("class C { static import = '../domain/foo.js'; }")).toEqual([]);
+  });
+
+  // Preservation: the `=` guard must not blind the scanner to genuine imports,
+  // which never place `=` immediately after the `import` keyword.
+  it('still surfaces every genuine import form under the `=` guard', () => {
+    expect(extractModuleSpecifiers("import '../domain/foo.js';")).toEqual(['../domain/foo.js']);
+    expect(extractModuleSpecifiers("import x from '../domain/foo.js';")).toEqual([
+      '../domain/foo.js',
+    ]);
+    expect(extractModuleSpecifiers("import { x } from '../domain/foo.js';")).toEqual([
+      '../domain/foo.js',
+    ]);
+    expect(extractModuleSpecifiers("import type { T } from '../domain/foo.js';")).toEqual([
+      '../domain/foo.js',
+    ]);
+    expect(extractModuleSpecifiers("import('../domain/foo.js');")).toEqual(['../domain/foo.js']);
+    expect(
+      extractModuleSpecifiers("import('../domain/foo.js', { with: { type: 'json' } });"),
+    ).toContain('../domain/foo.js');
+  });
+
+  // Preservation: the other `import`-member exclusions are unaffected.
+  it('keeps excluding property/method/member/prefixed `import` forms', () => {
+    expect(extractModuleSpecifiers("const o = { import: '../domain/foo.js' };")).toEqual([]);
+    expect(
+      extractModuleSpecifiers("const o = { import() { return '../domain/foo.js'; } };"),
+    ).toEqual([]);
+    expect(extractModuleSpecifiers("obj.import('../domain/foo.js');")).toEqual([]);
+    expect(extractModuleSpecifiers('const o = { "import": ' + "'../domain/foo.js' };")).toEqual([]);
+    expect(extractModuleSpecifiers("const importX = '../domain/foo.js';")).toEqual([]);
+    expect(extractModuleSpecifiers('const isEntry = import.meta.url === x;')).toEqual([]);
+  });
+});
+
+describe('D3 host import scanner classifies `/` after a control-flow header as a regex (D3-CR-B)', () => {
+  const forbiddenIn = (source: string): readonly string[] =>
+    extractModuleSpecifiers(source).filter((s) => /\.\.\/(?:domain|adapters)\//.test(s));
+
+  // The `)` that closes `if (…)` / `while (…)` / `for (…)` / `with (…)` is a
+  // control-flow header, whose statement body may start with a regex literal
+  // (`if (ok) /re/.test(x);`). Before this fix that `)` was read as a
+  // value-producing close, so `regexCanFollow()` returned false and the `/` was
+  // treated as division. A quote inside the regex could then open a spurious
+  // string (swallowing a following real import — false negative), and an
+  // `import('…')` inside the regex body could be tokenized as code (fabricating
+  // a dependency — false positive). This is distinct from the object-literal
+  // `}` division case (C2), which is left unchanged.
+
+  // False negative: a regex whose class holds a quote must not swallow a later
+  // import (single-line form is load-bearing).
+  it('surfaces a real import after a control-flow-header regex on the same line (B false negative)', () => {
+    const source = "if (ok) /[']/.test(value); import '../domain/foo.js';";
+    expect(extractModuleSpecifiers(source)).toEqual(['../domain/foo.js']);
+    expect(forbiddenIn(source).length).toBeGreaterThan(0);
+  });
+
+  it('surfaces a real import after a control-flow-header regex on the next line (B false negative)', () => {
+    const source = ["if (ok) /[']/.test(value);", "import '../domain/foo.js';"].join('\n');
+    expect(extractModuleSpecifiers(source)).toEqual(['../domain/foo.js']);
+  });
+
+  // False positive: an `import('…')` buried in a regex body after a control
+  // header must NOT surface.
+  it('does not fabricate a module from an import call inside a control-flow-header regex (B false positive)', () => {
+    expect(extractModuleSpecifiers("if (ok) /import('../domain/evil.js')/.test(value);")).toEqual(
+      [],
+    );
+    expect(extractModuleSpecifiers("if (ok) /import('evil')/.test(value);")).toEqual([]);
+  });
+
+  // Context matrix: a regex is recognised after every control-flow header, so a
+  // trailing real import is always surfaced (proving no spurious string ran on).
+  it('recognizes a regex after if/while/for/with headers and preserves the trailing import', () => {
+    const withImport = (stmt: string): string => stmt + " import '../domain/z.js';";
+    for (const stmt of [
+      "if (ok) /abc/.test(x);",
+      "if (ok) /[']/.test(x);",
+      'if (ok) /["]/.test(x);',
+      "while (ok) /[']/.test(x);",
+      "for (; ok;) /[']/.test(x);",
+      "for (let i = 0; i < n; i += 1) /[']/.test(x);",
+      "if (a && b) /[']/.test(x);",
+      "if (f(x)) /[']/.test(x);", // nested value paren inside the control header
+      "if ((a)) /[']/.test(x);",
+    ]) {
+      expect(extractModuleSpecifiers(withImport(stmt))).toEqual(['../domain/z.js']);
+      expect(extractModuleSpecifiers(stmt + "\nimport '../domain/z.js';")).toEqual([
+        '../domain/z.js',
+      ]);
+    }
+  });
+
+  // Preservation: a `/` after a value-producing `)` or `]` stays division, so no
+  // phantom module is fabricated and a following real import is still surfaced.
+  it('keeps division after value-producing parens and brackets', () => {
+    expect(extractModuleSpecifiers('const r = fn() / 2;')).toEqual([]);
+    expect(extractModuleSpecifiers('const r = (x) / 2;')).toEqual([]);
+    expect(extractModuleSpecifiers('const r = arr[0] / 2;')).toEqual([]);
+    expect(extractModuleSpecifiers('const r = (a + b) / c;')).toEqual([]);
+    expect(extractModuleSpecifiers('function f() { return (x) / 2; }')).toEqual([]);
+    expect(extractModuleSpecifiers("const r = fn() / 2;\nimport '../domain/z.js';")).toEqual([
+      '../domain/z.js',
+    ]);
+  });
+
+  // The object-literal `}` division case (C2) is deliberately untouched: the
+  // same-line form still swallows and the next-line form still surfaces, exactly
+  // as before this fix.
+  it('leaves the object-literal `}` division case (C2) unchanged', () => {
+    expect(extractModuleSpecifiers("const ratio = {} / value; import '../domain/foo.js';")).toEqual(
+      [],
+    );
+    expect(
+      extractModuleSpecifiers("const ratio = {} / value;\nimport '../domain/foo.js';"),
+    ).toEqual(['../domain/foo.js']);
+  });
+
+  // Member-guard (D3-CR-B2): a control keyword spelled as a member/property name
+  // (`Symbol.for(…)`, `obj.if(…)`) opens a value-producing call, not a control
+  // header, so its `)` stays a value paren and a following `/` is division. Before
+  // this guard, such a `)` was stamped `controlHeader`, the `/` began a regex, and
+  // the regex swallowed the later real import (false negative — dependency skipped).
+  it('does not treat a control keyword used as a member name as a control header', () => {
+    for (const call of [
+      "Symbol.for('x')",
+      'obj.for(x)',
+      'obj.if(x)',
+      'a.while(y)',
+      'a.with(y)',
+      'foo.bar.for(x)',
+      'ns.Symbol.for(x)',
+    ]) {
+      const source = call + " / 2; import '../domain/foo.js';";
+      expect(extractModuleSpecifiers(source)).toEqual(['../domain/foo.js']);
+      // next-line form too — the trailing import must survive regardless of layout
+      expect(extractModuleSpecifiers(call + " / 2;\nimport '../domain/foo.js';")).toEqual([
+        '../domain/foo.js',
+      ]);
+    }
+  });
+
+  // Member-guard, computed / optional / prefixed forms must likewise never be
+  // read as control headers (none should even reach the keyword-member check, but
+  // pin the behaviour so a future tokenizer change can't silently regress it).
+  it('keeps division after computed, optional, and control-word-prefixed member calls', () => {
+    for (const call of [
+      "obj['for'](x)",
+      'obj["if"](x)',
+      'obj?.for(x)',
+      'obj?.if(x)',
+      'beforeThing(x)',
+      'format(x)',
+      'different(x)',
+      'whileX(x)',
+      'ifX(x)',
+    ]) {
+      expect(extractModuleSpecifiers(call + " / 2; import '../domain/foo.js';")).toEqual([
+        '../domain/foo.js',
+      ]);
+    }
+  });
+
+  // Preservation of the genuine fix: a *bare* control-flow header still allows a
+  // following regex, so the false-positive and false-negative B cases stay fixed.
+  it('still treats a bare control-flow header regex correctly after the member guard', () => {
+    expect(extractModuleSpecifiers("if (ok) /import('../domain/evil.js')/.test(value);")).toEqual(
+      [],
+    );
+    expect(
+      extractModuleSpecifiers("if (ok) /[']/.test(value); import '../domain/foo.js';"),
+    ).toEqual(['../domain/foo.js']);
+    expect(
+      extractModuleSpecifiers("while (ok) /[']/.test(value); import '../domain/foo.js';"),
+    ).toEqual(['../domain/foo.js']);
+    expect(
+      extractModuleSpecifiers("for (; ok;) /[']/.test(value); import '../domain/foo.js';"),
+    ).toEqual(['../domain/foo.js']);
+  });
+
+  // No stale marker leak: a member call named like a control keyword nested inside
+  // a genuine control header must not corrupt the header's own `)` classification.
+  it('keeps a genuine header regex working when it wraps a control-word member call', () => {
+    expect(
+      extractModuleSpecifiers("if (Symbol.for('x')) /[']/.test(value); import '../domain/foo.js';"),
+    ).toEqual(['../domain/foo.js']);
+    // …and a member call after the header body still divides, not regexes.
+    expect(
+      extractModuleSpecifiers("if (ok) { obj.for(x) / 2; } import '../domain/foo.js';"),
+    ).toEqual(['../domain/foo.js']);
+  });
+
+  // Liveness: many control-flow-header regex statements scan in bounded linear
+  // time; a regression to rescanning would blow vitest's per-test timeout.
+  it('scans many control-flow-header regex statements in bounded, linear time', () => {
+    const many = "if (ok) /[']/.test(x);\n".repeat(2000) + "import '../domain/foo.js';";
+    const start = performance.now();
+    expect(extractModuleSpecifiers(many)).toEqual(['../domain/foo.js']);
     expect(performance.now() - start).toBeLessThan(1000);
   });
 });
