@@ -25,13 +25,18 @@ function hostSources(): readonly { readonly file: string; readonly text: string 
 
 /**
  * A single ESM lexical token. Comments and whitespace are trivia and are never
- * emitted; strings (including template literals) are emitted whole so their
- * contents can never be mistaken for code. `num`/`regex` carry no value — they
- * exist only so a following `/` is disambiguated between division and a regex
- * literal, and so a quote inside a regex body is never read as a string.
+ * emitted; a `'`/`"` string is emitted whole so its contents can never be
+ * mistaken for code. A template literal's text is likewise opaque, but its
+ * `${ ... }` substitutions are executable code and are tokenized inline, so an
+ * `import` hidden in a substitution is still seen. `template` marks a string that
+ * came from backticks; `hasSubstitution` marks a template that carried a `${ }`
+ * (so it is a computed value, not a fixed module specifier). `num`/`regex` carry
+ * no value — they exist only so a following `/` is disambiguated between division
+ * and a regex literal, and so a quote inside a regex body is never read as a
+ * string.
  */
 type EsmToken =
-  | { readonly t: 'str'; readonly v: string; readonly template: boolean }
+  | { readonly t: 'str'; readonly v: string; readonly template: boolean; readonly hasSubstitution: boolean }
   | { readonly t: 'id'; readonly v: string }
   | { readonly t: 'punct'; readonly v: string }
   | { readonly t: 'num' }
@@ -80,6 +85,11 @@ function tokenizeEsm(source: string): readonly EsmToken[] {
   let index = 0;
   let previous: EsmToken | null = null;
 
+  // Brace-depth stack for the currently open `${ ... }` template substitutions.
+  // Empty means ordinary code; a top value of 0 means the next unmatched `}`
+  // closes the current substitution and resumes the enclosing template's text.
+  const substitutionStack: number[] = [];
+
   const regexCanFollow = (): boolean => {
     if (previous === null) return true;
     switch (previous.t) {
@@ -96,6 +106,36 @@ function tokenizeEsm(source: string): readonly EsmToken[] {
   const emit = (token: EsmToken): void => {
     tokens.push(token);
     previous = token;
+  };
+
+  // Scan a template literal's *text* run starting at `from` (the character just
+  // past an opening backtick or past a substitution's closing `}`). Returns
+  // where scanning stopped, whether a `${` substitution was opened there, and
+  // the literal text consumed. `\`` and `\${` escapes are honoured so they never
+  // open a substitution or end the template. Each character is read once, so the
+  // scan is linear.
+  const scanTemplateText = (
+    from: number,
+  ): { readonly end: number; readonly opened: boolean; readonly literal: string } => {
+    let cursor = from;
+    let literal = '';
+    while (cursor < length) {
+      const d = source.charAt(cursor);
+      if (d === '\\') {
+        literal += source.charAt(cursor + 1);
+        cursor += 2;
+        continue;
+      }
+      if (d === '`') {
+        return { end: cursor + 1, opened: false, literal };
+      }
+      if (d === '$' && source.charAt(cursor + 1) === '{') {
+        return { end: cursor + 2, opened: true, literal };
+      }
+      literal += d;
+      cursor += 1;
+    }
+    return { end: cursor, opened: false, literal };
   };
 
   while (index < length) {
@@ -143,32 +183,67 @@ function tokenizeEsm(source: string): readonly EsmToken[] {
         value += d;
         cursor += 1;
       }
-      emit({ t: 'str', v: value, template: false });
+      emit({ t: 'str', v: value, template: false, hasSubstitution: false });
       index = cursor;
       continue;
     }
-    // template literal — also an atomic string token, but flagged: only a plain
-    // `'`/`"` string is a literal module specifier, so a template (`import(`...`)`
-    // with substitutions) is never surfaced, exactly as before.
+    // template literal — its text is opaque, but any `${ ... }` substitution is
+    // executable code and is tokenized inline (via the main loop, guarded by the
+    // substitution-brace stack), so a dynamic import hidden inside a substitution
+    // is still surfaced (D3-CR-C1). A substitution-free template is a valid fixed
+    // dynamic-import specifier (D3-CR-R1); a template that *has* substitutions is
+    // flagged so it is never taken as a fixed specifier.
     if (c === '`') {
-      let cursor = index + 1;
-      let value = '';
-      while (cursor < length) {
-        const d = source.charAt(cursor);
-        if (d === '\\') {
-          value += source.charAt(cursor + 1);
-          cursor += 2;
-          continue;
-        }
-        if (d === '`') {
-          cursor += 1;
-          break;
-        }
-        value += d;
-        cursor += 1;
+      const run = scanTemplateText(index + 1);
+      index = run.end;
+      if (run.opened) {
+        emit({ t: 'str', v: run.literal, template: true, hasSubstitution: true });
+        substitutionStack.push(0);
+        // A `${ ... }` substitution begins a fresh JavaScript expression, so its
+        // first executable token is at expression-start: a leading `/` is a regex
+        // literal, not division. `emit` above set `previous` to the template
+        // prefix `str`, which would wrongly make regexCanFollow() report a value
+        // context; clear it so expression-start (regex allowed) holds (D3-CR-S1).
+        previous = null;
+      } else {
+        emit({ t: 'str', v: run.literal, template: true, hasSubstitution: false });
       }
-      emit({ t: 'str', v: value, template: true });
-      index = cursor;
+      continue;
+    }
+    // `{` / `}` inside an active substitution: track depth so a `}` that closes
+    // the `${ ... }` resumes the enclosing template's text instead of being read
+    // as code. Braces that belong to nested objects/blocks within the
+    // substitution stay ordinary punctuation.
+    if (substitutionStack.length > 0 && c === '{') {
+      const top = substitutionStack.length - 1;
+      substitutionStack[top] = (substitutionStack[top] ?? 0) + 1;
+      emit({ t: 'punct', v: '{' });
+      index += 1;
+      continue;
+    }
+    if (substitutionStack.length > 0 && c === '}') {
+      const top = substitutionStack.length - 1;
+      const depth = substitutionStack[top] ?? 0;
+      if (depth === 0) {
+        substitutionStack.pop();
+        const run = scanTemplateText(index + 1);
+        index = run.end;
+        if (run.opened) {
+          substitutionStack.push(0);
+          // another substitution opens immediately (`} … ${`); it too begins a
+          // fresh expression, so restore expression-start rather than inheriting
+          // the just-closed substitution's last token (D3-CR-S1).
+          previous = null;
+        } else {
+          // the enclosing template is now fully closed and is a value, so a
+          // following `/` is division, not the start of a regex.
+          previous = { t: 'str', v: '', template: true, hasSubstitution: false };
+        }
+        continue;
+      }
+      substitutionStack[top] = depth - 1;
+      emit({ t: 'punct', v: '}' });
+      index += 1;
       continue;
     }
     // regex literal — only where a regex may legally begin, so `a / b` division
@@ -271,14 +346,21 @@ function extractModuleSpecifiers(source: string): readonly string[] {
     if (token === undefined || token.t !== 'id') continue;
 
     if (token.v === 'import') {
+      const prev = tokens[i - 1];
       const next = tokens[i + 1];
+      // `obj.import` / `obj.import(...)` — a member access, not an ESM import.
+      if (prev?.t === 'punct' && prev.v === '.') continue;
       // `import.meta.*` — not a module specifier.
       if (next?.t === 'punct' && next.v === '.') continue;
+      // `{ import: ... }` — a property keyed `import`, not an import statement.
+      if (next?.t === 'punct' && next.v === ':') continue;
       // dynamic `import( 'S' … )` — the specifier, if a literal, is the first
-      // token inside the parens.
+      // token inside the parens. A plain string or a substitution-free template
+      // is a fixed specifier; a template that carries `${ }` substitutions is a
+      // computed value and is not surfaced.
       if (next?.t === 'punct' && next.v === '(') {
         const arg = tokens[i + 2];
-        if (arg?.t === 'str' && !arg.template) specifiers.push(arg.v);
+        if (arg?.t === 'str' && !arg.hasSubstitution) specifiers.push(arg.v);
         continue;
       }
       // static (`import … from 'S'`) or side-effect (`import 'S'`).
@@ -791,6 +873,248 @@ describe('D3 host import scanner is comment/string-aware across the whole family
     const start = performance.now();
     expect(extractModuleSpecifiers(heavyImport)).toEqual(['../domain/foo.js']);
     expect(extractModuleSpecifiers(heavyClause)).toEqual(['../domain/foo.js']);
+    expect(performance.now() - start).toBeLessThan(1000);
+  });
+});
+
+describe('D3 host import scanner handles template literals and import context (D3-CR-C1/C3/R1)', () => {
+  // A backtick built without a template literal, so the source fixtures below can
+  // embed real backticks and `${ }` sequences as plain text.
+  const BT = '`';
+  const forbiddenIn = (source: string): readonly string[] =>
+    extractModuleSpecifiers(source).filter((s) => /\.\.\/(?:domain|adapters)\//.test(s));
+
+  // --- C1: executable code inside a `${ }` substitution is still scanned ---
+  it('surfaces a dynamic import hidden inside a template substitution (C1)', () => {
+    const source = 'const text = ' + BT + "${import('../domain/foo.js')}" + BT + ';';
+    expect(extractModuleSpecifiers(source)).toEqual(['../domain/foo.js']);
+    expect(forbiddenIn(source).length).toBeGreaterThan(0);
+  });
+
+  it('surfaces a dynamic import inside a nested template substitution (C1)', () => {
+    const source = 'const t = ' + BT + '${ f(' + BT + '${import("../domain/foo.js")}' + BT + ') }' + BT + ';';
+    expect(extractModuleSpecifiers(source)).toEqual(['../domain/foo.js']);
+  });
+
+  it('does not fabricate a specifier from a substitution that holds no import (C1 safety)', () => {
+    const source = 'const t = ' + BT + '${ compute(x) + y }' + BT + ';';
+    expect(extractModuleSpecifiers(source)).toEqual([]);
+  });
+
+  // --- R1: a substitution-free template is a valid fixed dynamic specifier ---
+  it('surfaces a substitution-free template dynamic import specifier (R1)', () => {
+    const source = 'import(' + BT + '../domain/foo.js' + BT + ');';
+    expect(extractModuleSpecifiers(source)).toEqual(['../domain/foo.js']);
+  });
+
+  it('surfaces a substitution-free template dynamic import with options (R1)', () => {
+    const source = 'import(' + BT + '../domain/foo.js' + BT + ", { with: { type: 'json' } });";
+    expect(extractModuleSpecifiers(source)).toContain('../domain/foo.js');
+  });
+
+  it('does NOT surface a template dynamic import that carries a substitution (R1 negative)', () => {
+    const source = 'import(' + BT + '../domain/${name}.js' + BT + ');';
+    expect(extractModuleSpecifiers(source)).toEqual([]);
+  });
+
+  it('does NOT accept a template after `from` or as a bare specifier (syntax-invalid forms)', () => {
+    // `import x from ` template ` ` and `import ` template ` ` are not legal ESM;
+    // the scanner must not surface them.
+    expect(extractModuleSpecifiers('import x from ' + BT + '../domain/foo.js' + BT + ';')).toEqual([]);
+    expect(extractModuleSpecifiers('import ' + BT + '../domain/foo.js' + BT + ';')).toEqual([]);
+  });
+
+  // --- C3: `import` only counts in a genuine import context ---
+  it('does not treat a property keyed `import` as an import (C3)', () => {
+    expect(extractModuleSpecifiers("const config = { import: '../domain/foo.js' };")).toEqual([]);
+    expect(extractModuleSpecifiers("const config = { import : '../domain/foo.js' };")).toEqual([]);
+  });
+
+  it('does not treat a method named `import` as an import (C3)', () => {
+    expect(extractModuleSpecifiers('const obj = { import() { return 1; } };')).toEqual([]);
+    expect(
+      extractModuleSpecifiers("const obj = { import() { return '../domain/foo.js'; } };"),
+    ).toEqual([]);
+  });
+
+  it('does not treat member access `obj.import(...)` as a dynamic import (C3)', () => {
+    expect(extractModuleSpecifiers("obj.import('../domain/foo.js');")).toEqual([]);
+    expect(extractModuleSpecifiers('const x = obj.import;')).toEqual([]);
+  });
+
+  it('does not treat a quoted `"import"` key or `import`-prefixed identifier as an import (C3)', () => {
+    expect(extractModuleSpecifiers('const o = { "import": \'../domain/foo.js\' };')).toEqual([]);
+    expect(extractModuleSpecifiers("const importX = '../domain/foo.js';")).toEqual([]);
+    expect(extractModuleSpecifiers("const reimport = '../domain/foo.js';")).toEqual([]);
+  });
+
+  // --- Adversarial template tokenizer state ---
+  it('keeps tokenizer state correct across template escapes, comments, strings, and regex', () => {
+    const F = '../domain/foo.js';
+    const cases: readonly string[] = [
+      'const t = ' + BT + 'a\\' + BT + 'b' + BT + "; import '" + F + "';", // escaped backtick
+      'const t = ' + BT + '\\${import("x")}' + BT + "; import '" + F + "';", // escaped ${ is text
+      'const t = ' + BT + '${ {a:1} }' + BT + "; import '" + F + "';", // object braces in subst
+      'const t = ' + BT + '${ "}" + import(\'' + F + '\') }' + BT + ';', // string holding } in subst
+      'const t = ' + BT + '${ /* } */ import(\'' + F + '\') }' + BT + ';', // comment holding } in subst
+      'const t = ' + BT + '${ /[}]/g.test(x) }' + BT + "; import '" + F + "';", // regex holding } in subst
+    ];
+    // Every case links exactly one real forbidden import (the trailing/inner one).
+    for (const source of cases) {
+      expect(forbiddenIn(source).length).toBeGreaterThan(0);
+    }
+    // Escaped-`${` and object-brace cases must not themselves fabricate a module.
+    expect(extractModuleSpecifiers('const t = ' + BT + '\\${import("../domain/x.js")}' + BT + ';')).toEqual(
+      [],
+    );
+  });
+
+  it('scans substitution-heavy and deeply-nested templates in bounded, linear time', () => {
+    const many = 'const t = ' + BT + '${x}'.repeat(600) + BT + "; import '../domain/foo.js';";
+    let nested = "import('../domain/foo.js')";
+    for (let k = 0; k < 600; k += 1) nested = BT + '${' + nested + '}' + BT;
+    const nestedSource = 'const t = ' + nested + ';';
+    const start = performance.now();
+    expect(extractModuleSpecifiers(many)).toEqual(['../domain/foo.js']);
+    expect(extractModuleSpecifiers(nestedSource)).toEqual(['../domain/foo.js']);
+    expect(performance.now() - start).toBeLessThan(1000);
+  });
+});
+
+describe('D3 host import scanner treats a `${` substitution as expression-start (D3-CR-S1)', () => {
+  // A `${ ... }` substitution begins a fresh JavaScript expression. The prior
+  // template-substitution tokenizer left `previous` pointing at the template
+  // prefix `str`, so regexCanFollow() reported a *value* context and a leading
+  // `/` inside the substitution was mis-tokenized as division. A quote in the
+  // resulting "regex-as-division" text then opened a spurious string that either
+  // swallowed a following real import (false negative) or exposed a fake one
+  // buried in the regex body (false positive). The fix resets `previous` to
+  // expression-start whenever a substitution opens (both `\`${` and `}…${`).
+  const BT = '`';
+  const forbiddenIn = (source: string): readonly string[] =>
+    extractModuleSpecifiers(source).filter((s) => /\.\.\/(?:domain|adapters)\//.test(s));
+
+  // --- S1-A: a regex whose class holds a quote must not swallow a later import.
+  // Single-line form is load-bearing: with the defect the spurious string runs
+  // to the real import's quote and the specifier is lost (returns []).
+  it('surfaces a real import after a `${ /[\']/ }` regex on the same line (S1-A)', () => {
+    const source = 'const t = ' + BT + "${ /[']/.test(x) }" + BT + "; import '../domain/secret.js';";
+    expect(extractModuleSpecifiers(source)).toEqual(['../domain/secret.js']);
+    expect(forbiddenIn(source).length).toBeGreaterThan(0);
+  });
+
+  it('surfaces a real import after a `${ /[\']/ }` regex on the next line (S1-A)', () => {
+    const source = ['const t = ' + BT + "${ /[']/.test(x) }" + BT + ';', "import '../domain/secret.js';"].join(
+      '\n',
+    );
+    expect(extractModuleSpecifiers(source)).toEqual(['../domain/secret.js']);
+  });
+
+  // --- S1-B: a fake `import('...')` buried inside a regex body must NOT surface.
+  it('does not fabricate a module from an import call inside a `${ /.../ }` regex body (S1-B)', () => {
+    const source = 'const t = ' + BT + "${ /import('../domain/evil.js')/ }" + BT + ';';
+    expect(extractModuleSpecifiers(source)).toEqual([]);
+    expect(forbiddenIn(source)).toEqual([]);
+  });
+
+  // --- S1-C: a leading regex followed by a ternary must not hide a later import.
+  it('surfaces a real import after a `${ /\\s+/ ? .. : .. }` ternary regex (S1-C)', () => {
+    const source = 'const t = ' + BT + '${ /\\s+/.test(x) ? "a" : "b" }' + BT + "; import '../domain/z.js';";
+    expect(extractModuleSpecifiers(source)).toEqual(['../domain/z.js']);
+    expect(forbiddenIn(source).length).toBeGreaterThan(0);
+  });
+
+  // --- Regex-vs-division context matrix. Each `${` independently begins an
+  // expression, so a leading `/` is a regex; after a value-producing token a `/`
+  // is division. A trailing real import proves no spurious string swallowed it.
+  it('reads a `/` at expression-start inside `${` as a regex literal', () => {
+    const withImport = (subst: string): string =>
+      'const t = ' + BT + subst + BT + "; import '../domain/z.js';";
+    // leading / parenthesised / unary / ternary / logical / assignment regex
+    expect(extractModuleSpecifiers(withImport('${ /abc/.test(x) }'))).toEqual(['../domain/z.js']);
+    expect(extractModuleSpecifiers(withImport('${ /a\\/b/.test(x) }'))).toEqual(['../domain/z.js']);
+    expect(extractModuleSpecifiers(withImport('${ /[\'"]/.test(x) }'))).toEqual(['../domain/z.js']);
+    expect(extractModuleSpecifiers(withImport('${ (/abc/).test(x) }'))).toEqual(['../domain/z.js']);
+    expect(extractModuleSpecifiers(withImport('${ !/abc/.test(x) }'))).toEqual(['../domain/z.js']);
+    expect(extractModuleSpecifiers(withImport('${ x ? /a/ : /b/ }'))).toEqual(['../domain/z.js']);
+    expect(extractModuleSpecifiers(withImport('${ x && /a/.test(y) }'))).toEqual(['../domain/z.js']);
+    expect(extractModuleSpecifiers(withImport('${ (r = /a/) }'))).toEqual(['../domain/z.js']);
+  });
+
+  it('reads a `/` after a value-producing token inside `${` as division', () => {
+    // No import is present, so a mis-read regex (which would eat to the next `/`)
+    // could only ADD a phantom; each of these must stay empty.
+    expect(extractModuleSpecifiers('const t = ' + BT + '${ x / 2 }' + BT + ';')).toEqual([]);
+    expect(extractModuleSpecifiers('const t = ' + BT + '${ 4 / 2 }' + BT + ';')).toEqual([]);
+    expect(extractModuleSpecifiers('const t = ' + BT + '${ fn() / 2 }' + BT + ';')).toEqual([]);
+    expect(extractModuleSpecifiers('const t = ' + BT + '${ arr[0] / 2 }' + BT + ';')).toEqual([]);
+    expect(extractModuleSpecifiers('const t = ' + BT + '${ ({ x: 1 }).x / 2 }' + BT + ';')).toEqual([]);
+  });
+
+  // --- Each `${` in a multi-substitution template independently resets context.
+  it('gives every substitution its own expression-start (regex then division)', () => {
+    const a = 'const t = ' + BT + '${ /a/.test(x) }-${ /b/.test(y) }' + BT + "; import '../domain/z.js';";
+    expect(extractModuleSpecifiers(a)).toEqual(['../domain/z.js']);
+    // second substitution is a division context and must not fabricate a module
+    const b = 'const t = ' + BT + '${ /a/.test(x) }-${ y / 2 }' + BT + ';';
+    expect(extractModuleSpecifiers(b)).toEqual([]);
+  });
+
+  // --- A nested template restores expression-start for its own substitution and
+  // then correctly resumes division in the outer expression on return.
+  it('resets and restores context correctly across nested template substitutions', () => {
+    const source =
+      'const t = ' + BT + '${ ' + BT + 'x ${ /a/.test(p) }' + BT + ' + q / 2 }' + BT + "; import '../domain/z.js';";
+    expect(extractModuleSpecifiers(source)).toEqual(['../domain/z.js']);
+  });
+
+  // --- A regex body may hold quotes, `//`, `}`, or a `${` sequence without
+  // desyncing the substitution depth or fabricating a fake dependency.
+  it('keeps substitution depth intact when a regex body holds quotes, comments, or `${`', () => {
+    const withImport = (subst: string): string =>
+      'const t = ' + BT + subst + BT + "; import '../domain/z.js';";
+    expect(extractModuleSpecifiers(withImport('${ /a"b/.test(x) }'))).toEqual(['../domain/z.js']);
+    expect(extractModuleSpecifiers(withImport("${ /a'b/.test(x) }"))).toEqual(['../domain/z.js']);
+    expect(extractModuleSpecifiers(withImport('${ /a\\/\\/b/.test(x) }'))).toEqual(['../domain/z.js']);
+    expect(extractModuleSpecifiers(withImport('${ /a${b}/.test(x) }'))).toEqual(['../domain/z.js']);
+    expect(extractModuleSpecifiers(withImport('${ /[}]/g.test(x) }'))).toEqual(['../domain/z.js']);
+    // fake import/export text living inside a regex body must never surface
+    expect(
+      extractModuleSpecifiers('const t = ' + BT + "${ /from '..\\/domain\\/evil.js'/.test(x) }" + BT + ';'),
+    ).toEqual([]);
+    expect(
+      extractModuleSpecifiers(
+        'const t = ' + BT + "${ /export y from '..\\/domain\\/e.js'/.test(x) }" + BT + ';',
+      ),
+    ).toEqual([]);
+  });
+
+  // --- Preservation: C1/C3/R1 remain fixed under the expression-start change.
+  it('preserves C1 substitution imports, R1 template specifiers, and C3 non-imports', () => {
+    expect(extractModuleSpecifiers('const text = ' + BT + "${import('../domain/foo.js')}" + BT + ';')).toEqual([
+      '../domain/foo.js',
+    ]);
+    expect(
+      extractModuleSpecifiers('const t = ' + BT + '${ f(' + BT + '${import("../domain/foo.js")}' + BT + ') }' + BT + ';'),
+    ).toEqual(['../domain/foo.js']);
+    expect(extractModuleSpecifiers('import(' + BT + '../domain/foo.js' + BT + ');')).toEqual([
+      '../domain/foo.js',
+    ]);
+    expect(extractModuleSpecifiers('import(' + BT + '../domain/${name}.js' + BT + ');')).toEqual([]);
+    expect(extractModuleSpecifiers("const config = { import: '../domain/foo.js' };")).toEqual([]);
+  });
+
+  // --- Liveness: many regex-leading substitutions and nested templates scan in
+  // bounded linear time; a regression to rescanning would blow the timeout.
+  it('scans many regex-leading substitutions in bounded, linear time', () => {
+    const many =
+      'const t = ' + BT + '${ /a/.test(x) }'.repeat(600) + BT + "; import '../domain/foo.js';";
+    let nested = "import('../domain/foo.js')";
+    for (let k = 0; k < 600; k += 1) nested = BT + '${ /q/.test(z) || ' + nested + ' }' + BT;
+    const nestedSource = 'const t = ' + nested + ';';
+    const start = performance.now();
+    expect(extractModuleSpecifiers(many)).toEqual(['../domain/foo.js']);
+    expect(extractModuleSpecifiers(nestedSource)).toEqual(['../domain/foo.js']);
     expect(performance.now() - start).toBeLessThan(1000);
   });
 });
