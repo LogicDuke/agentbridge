@@ -2,6 +2,7 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 
 /**
@@ -24,588 +25,88 @@ function hostSources(): readonly { readonly file: string; readonly text: string 
 }
 
 /**
- * A single ESM lexical token. Comments and whitespace are trivia and are never
- * emitted; a `'`/`"` string is emitted whole so its contents can never be
- * mistaken for code. A template literal's text is likewise opaque, but its
- * `${ ... }` substitutions are executable code and are tokenized inline, so an
- * `import` hidden in a substitution is still seen. `template` marks a string that
- * came from backticks; `hasSubstitution` marks a template that carried a `${ }`
- * (so it is a computed value, not a fixed module specifier). `num`/`regex` carry
- * no value — they exist only so a following `/` is disambiguated between division
- * and a regex literal, and so a quote inside a regex body is never read as a
- * string.
- */
-type EsmToken =
-  | { readonly t: 'str'; readonly v: string; readonly template: boolean; readonly hasSubstitution: boolean }
-  | { readonly t: 'id'; readonly v: string; readonly restrictedLabel?: boolean }
-  | { readonly t: 'punct'; readonly v: string; readonly controlHeader?: boolean }
-  | { readonly t: 'num' }
-  | { readonly t: 'regex' };
-
-const isIdentifierStart = (c: string): boolean => /[A-Za-z_$]/.test(c);
-const isIdentifierPart = (c: string): boolean => /[A-Za-z0-9_$]/.test(c);
-
-// Keywords after which a `/` begins a regex literal rather than division. Any
-// other identifier (a value, including `from`/`fromValues`) means division.
-const REGEX_CONTEXT_KEYWORDS: ReadonlySet<string> = new Set([
-  'return',
-  'typeof',
-  'instanceof',
-  'in',
-  'of',
-  'new',
-  'delete',
-  'void',
-  'do',
-  'else',
-  'case',
-  'yield',
-  'await',
-  'throw',
-]);
-
-// Restricted-production statement keywords: `break`/`continue`. Their grammar has
-// a `[no LineTerminator here]` before the optional label, so a newline after the
-// bare keyword triggers ASI and closes the statement — the next line then begins a
-// fresh statement whose first token may be a regex literal (`break \n /re/.test(x)`).
-// A `/` can therefore never be division after a *bare* `break`/`continue` (a
-// same-line `break /…` is a syntax error — a `/` is not a legal label), so a
-// following `/` is always a regex opener there. This is unlike REGEX_CONTEXT_KEYWORDS
-// because `break`/`continue` are *statements*, not expression operators, and — being
-// reserved words that are still legal member names — they must stay value contexts
-// when spelled as a member (`obj.break / 2` is division), which `regexCanFollow`
-// enforces with a `.`-member guard (D3-CR-BREAK-CONTINUE-ASI). Kept separate from
-// REGEX_CONTEXT_KEYWORDS so `endsValue` still treats them as value-ending, which is
-// correct for the only reachable `!` case, the non-null member form `obj.break!`.
-// The statement also carries one *optional* label (`break outer`); the label id is
-// marked `restrictedLabel` at tokenize time (bare keyword, no intervening
-// LineTerminator) so a `/` after it is likewise a regex opener — a newline between
-// the keyword and the id triggers ASI, making the id a fresh statement where a
-// following `/` stays division (D3-CR-BREAK-CONTINUE-LABEL-ASI).
-const RESTRICTED_STATEMENT_KEYWORDS: ReadonlySet<string> = new Set([
-  'break',
-  'continue',
-]);
-
-// Keywords whose parenthesised head is a *control-flow header* — `if (…)`,
-// `while (…)`, `for (…)`, `with (…)`. The `)` that closes such a header is
-// followed by a statement, whose first token may legally be a regex literal
-// (`if (ok) /re/.test(x);`). This is unlike a value-producing `)` (`fn()`,
-// `(x)`), after which a `/` is division. The distinction is carried on the
-// closing `)` token via `controlHeader` so `regexCanFollow()` classifies the
-// next `/` correctly (D3-CR-B); it is orthogonal to the object-literal `}`
-// division case (C2), which is deliberately left unchanged.
-const CONTROL_HEADER_KEYWORDS: ReadonlySet<string> = new Set([
-  'if',
-  'while',
-  'for',
-  'with',
-]);
-
-/**
- * Tokenize TypeScript/NodeNext ESM source with a single linear, comment- and
- * string-aware pass — a tiny state machine over four conceptual states (CODE,
- * LINE_COMMENT, BLOCK_COMMENT, STRING). Each character is consumed exactly once
- * and every inner scan advances monotonically, so the pass is O(n): there is no
- * regex backtracking and therefore no catastrophic (ReDoS) blow-up on
- * comment-heavy input.
- *
- * Trivia (whitespace, line comments, and block comments) is dropped while
- * statement structure is preserved. A `//` or a block-comment opener occurring
- * *inside* a string or a regex literal is ordinary text, never a comment. Because comments
- * are gone before any specifier is read, no comment-contained `from` can ever
- * fabricate a dependency (D3-CX-F8), and no comment position can hide a real one
- * (D3-CR-F4/F5/F6/F7 and line comments inside a re-export clause).
- */
-function tokenizeEsm(source: string): readonly EsmToken[] {
-  const tokens: EsmToken[] = [];
-  const length = source.length;
-  let index = 0;
-  let previous: EsmToken | null = null;
-
-  // Whether a LineTerminator has appeared in the trivia (whitespace or a block
-  // comment's interior) since the last emitted token. Used only to tell a
-  // `break`/`continue` *label* — same line as the keyword — from a fresh statement
-  // begun after an ASI-closing newline (D3-CR-BREAK-CONTINUE-LABEL-ASI). Reset to
-  // false whenever a token is emitted, so it always reflects the gap before the
-  // *next* token.
-  let pendingNewline = false;
-
-  // Brace-depth stack for the currently open `${ ... }` template substitutions.
-  // Empty means ordinary code; a top value of 0 means the next unmatched `}`
-  // closes the current substitution and resumes the enclosing template's text.
-  const substitutionStack: number[] = [];
-
-  // Parenthesis-context stack: each open `(` pushes whether it began a
-  // control-flow header (`if`/`while`/`for`/`with`). The matching `)` pops it and
-  // records the flag on the emitted token, so a `/` right after the `)` is
-  // classified as a regex (control header) or division (value paren).
-  const parenStack: boolean[] = [];
-
-  // Whether a `/` immediately after `tok` is division — i.e. `tok` ends a value/
-  // expression — rather than a regex opener. Mirrors `regexCanFollow`'s per-token
-  // logic; used for the single look-back the postfix-`!` disambiguation needs.
-  const endsValue = (tok: EsmToken | undefined): boolean => {
-    if (tok === undefined) return false;
-    switch (tok.t) {
-      case 'id':
-        return !REGEX_CONTEXT_KEYWORDS.has(tok.v);
-      case 'num':
-      case 'str':
-      case 'regex':
-        return true;
-      case 'punct':
-        if (tok.v === ')') return tok.controlHeader !== true;
-        return tok.v === ']' || tok.v === '++' || tok.v === '--';
-    }
-  };
-  const regexCanFollow = (): boolean => {
-    if (previous === null) return true;
-    switch (previous.t) {
-      case 'id':
-        if (REGEX_CONTEXT_KEYWORDS.has(previous.v)) return true;
-        // A *bare* `break`/`continue` closes its statement (ASI at the newline),
-        // so a following `/` opens a regex, not division — a fake regex after it
-        // otherwise swallowed a later real import (false negative) or fabricated a
-        // dependency from an `import('…')` in the regex body (false positive). When
-        // spelled as a member name (`obj.break`, `obj?.continue`), it is a value and
-        // a following `/` is division, so guard on a preceding `.` (D3-CR-BREAK-
-        // CONTINUE-ASI). `previous` is the keyword (`tokens[len-1]`), so
-        // `tokens[len-2]` is the token before it; a leading `.` marks member access.
-        if (RESTRICTED_STATEMENT_KEYWORDS.has(previous.v)) {
-          const before = tokens[tokens.length - 2];
-          return !(before?.t === 'punct' && before.v === '.');
-        }
-        // A *label* completing a `break`/`continue` statement (`break outer`,
-        // `continue outer`) also ends a restricted statement, so a following `/`
-        // opens a regex, not division. The label id was marked `restrictedLabel`
-        // when it was emitted directly after a bare keyword with no intervening
-        // LineTerminator; a newline there instead begins a fresh statement (an
-        // ordinary id) whose following `/` stays division (D3-CR-BREAK-CONTINUE-
-        // LABEL-ASI).
-        if (previous.restrictedLabel === true) return true;
-        return false;
-      case 'num':
-      case 'str':
-      case 'regex':
-        return false;
-      case 'punct':
-        // A `)` closing a control-flow header (`if (…)`) may be followed by a
-        // regex; a value-producing `)` (`fn()`, `(x)`) means division. `]` is
-        // always a value (index/array), so a following `/` is division.
-        if (previous.v === ')') return previous.controlHeader === true;
-        if (previous.v === ']') return false;
-        // Postfix `++`/`--` (emitted as one token, maximal-munch, below) end a
-        // value, so a following `/` is division. A prefix `++x`/`--x` never puts
-        // the operator immediately before a `/` (the operand does), so this only
-        // ever fires for the postfix form. Missing this let a fake regex swallow a
-        // later real import (D3-CR postfix).
-        if (previous.v === '++' || previous.v === '--') return false;
-        // `!` is either the TS non-null assertion (`x!` — a value, so `/` is
-        // division) or logical-not (`!/re/` — a prefix operator, so `/` opens a
-        // regex). It is the non-null form exactly when it follows a value-ending
-        // token; otherwise it is logical-not and a regex may follow.
-        if (previous.v === '!') return !endsValue(tokens[tokens.length - 2]);
-        return true;
-    }
-  };
-  // Whether the token before an opening `(` is a control-flow keyword — read
-  // inside this helper (not inline in the main loop) so `previous` keeps its
-  // declared `EsmToken | null` type and narrows over the full token union, as in
-  // `regexCanFollow`.
-  const previousOpensControlHeader = (): boolean => {
-    if (previous === null || previous.t !== 'id') return false;
-    // `for await (…)` — the async-iteration header. The token before `(` is the
-    // `await` keyword, itself preceded by a *bare* `for`; that parenthesised head
-    // is a control-flow header exactly like `for (…)`, so its closing `)` may be
-    // followed by a regex. `await` anywhere else (`await fn()`, `obj.await(…)`, a
-    // bare `await (expr)`) is a value/member call, not a header, so it must not
-    // open one (D3-CR for-await). The `for` must be bare — not a member name
-    // (`obj.for await` is not valid, but pin the `.` guard for symmetry with the
-    // keyword-member check below).
-    if (previous.v === 'await') {
-      const beforeAwait = tokens[tokens.length - 2];
-      const beforeFor = tokens[tokens.length - 3];
-      return (
-        beforeAwait?.t === 'id' &&
-        beforeAwait.v === 'for' &&
-        !(beforeFor?.t === 'punct' && beforeFor.v === '.')
-      );
-    }
-    if (!CONTROL_HEADER_KEYWORDS.has(previous.v)) return false;
-    // A control keyword spelled as a *member name* — `obj.for(…)`, `Symbol.for(…)`,
-    // `obj.if(…)` — is a value-producing method call, not a control-flow header:
-    // its closing `)` must stay a value paren so a following `/` is division, not
-    // a regex (which would swallow a later real import — D3-CR-B2). The keyword
-    // heads a control statement only when it is *bare*, i.e. not immediately
-    // preceded by a `.` member-access punctuator. `previous` is the just-emitted
-    // keyword (`tokens[len-1]`), so `tokens[len-2]` is the token before it; a
-    // leading `.` (including the `.` of `?.`) marks member access. Computed access
-    // (`obj['for'](…)`) already fails the `previous.t === 'id'` check above, since
-    // the token before `(` is then `]`.
-    const beforePrevious = tokens[tokens.length - 2];
-    if (beforePrevious?.t === 'punct' && beforePrevious.v === '.') return false;
-    return true;
-  };
-  // Whether an identifier scanned *now* is the optional label of a just-emitted
-  // bare `break`/`continue` (`break outer`). True only when the keyword is the
-  // immediately previous token, is bare (not a member — guard the token before it),
-  // and no LineTerminator separated them (`pendingNewline`). Read inside this arrow
-  // so `previous` narrows over its declared `EsmToken | null` type, as in
-  // `regexCanFollow`/`previousOpensControlHeader` (D3-CR-BREAK-CONTINUE-LABEL-ASI).
-  const previousIsBareRestrictedKeyword = (): boolean => {
-    if (pendingNewline) return false;
-    if (previous === null || previous.t !== 'id') return false;
-    if (!RESTRICTED_STATEMENT_KEYWORDS.has(previous.v)) return false;
-    const beforeKeyword = tokens[tokens.length - 2];
-    return !(beforeKeyword?.t === 'punct' && beforeKeyword.v === '.');
-  };
-  const emit = (token: EsmToken): void => {
-    tokens.push(token);
-    previous = token;
-    pendingNewline = false;
-  };
-
-  // Scan a template literal's *text* run starting at `from` (the character just
-  // past an opening backtick or past a substitution's closing `}`). Returns
-  // where scanning stopped, whether a `${` substitution was opened there, and
-  // the literal text consumed. `\`` and `\${` escapes are honoured so they never
-  // open a substitution or end the template. Each character is read once, so the
-  // scan is linear.
-  const scanTemplateText = (
-    from: number,
-  ): { readonly end: number; readonly opened: boolean; readonly literal: string } => {
-    let cursor = from;
-    let literal = '';
-    while (cursor < length) {
-      const d = source.charAt(cursor);
-      if (d === '\\') {
-        literal += source.charAt(cursor + 1);
-        cursor += 2;
-        continue;
-      }
-      if (d === '`') {
-        return { end: cursor + 1, opened: false, literal };
-      }
-      if (d === '$' && source.charAt(cursor + 1) === '{') {
-        return { end: cursor + 2, opened: true, literal };
-      }
-      literal += d;
-      cursor += 1;
-    }
-    return { end: cursor, opened: false, literal };
-  };
-
-  while (index < length) {
-    const c = source.charAt(index);
-
-    // insignificant whitespace
-    if (c === ' ' || c === '\t' || c === '\r' || c === '\n') {
-      if (c === '\n' || c === '\r') pendingNewline = true;
-      index += 1;
-      continue;
-    }
-    // line comment — trivia, consumed to end of line (the newline stays)
-    if (c === '/' && source.charAt(index + 1) === '/') {
-      index += 2;
-      while (index < length && source.charAt(index) !== '\n') index += 1;
-      continue;
-    }
-    // block comment — trivia, consumed whole as one unit (may span lines). A
-    // LineTerminator *inside* the comment still counts as one between the tokens it
-    // separates, so it is recorded like ordinary-whitespace newline for the
-    // restricted-statement label check (`break /*\n*/ outer` is ASI, not a label).
-    if (c === '/' && source.charAt(index + 1) === '*') {
-      index += 2;
-      while (index < length && !(source.charAt(index) === '*' && source.charAt(index + 1) === '/')) {
-        const inner = source.charAt(index);
-        if (inner === '\n' || inner === '\r') pendingNewline = true;
-        index += 1;
-      }
-      index += 2;
-      continue;
-    }
-    // single- or double-quoted string — one atomic token; `//`, `/*`, and the
-    // word `from` inside it are ordinary text and cannot start a comment or a
-    // re-export clause.
-    if (c === "'" || c === '"') {
-      const quote = c;
-      let cursor = index + 1;
-      let value = '';
-      while (cursor < length) {
-        const d = source.charAt(cursor);
-        if (d === '\\') {
-          value += source.charAt(cursor + 1);
-          cursor += 2;
-          continue;
-        }
-        if (d === quote) {
-          cursor += 1;
-          break;
-        }
-        if (d === '\n') break; // an unterminated single/double string ends at the line
-        value += d;
-        cursor += 1;
-      }
-      emit({ t: 'str', v: value, template: false, hasSubstitution: false });
-      index = cursor;
-      continue;
-    }
-    // template literal — its text is opaque, but any `${ ... }` substitution is
-    // executable code and is tokenized inline (via the main loop, guarded by the
-    // substitution-brace stack), so a dynamic import hidden inside a substitution
-    // is still surfaced (D3-CR-C1). A substitution-free template is a valid fixed
-    // dynamic-import specifier (D3-CR-R1); a template that *has* substitutions is
-    // flagged so it is never taken as a fixed specifier.
-    if (c === '`') {
-      const run = scanTemplateText(index + 1);
-      index = run.end;
-      if (run.opened) {
-        emit({ t: 'str', v: run.literal, template: true, hasSubstitution: true });
-        substitutionStack.push(0);
-        // A `${ ... }` substitution begins a fresh JavaScript expression, so its
-        // first executable token is at expression-start: a leading `/` is a regex
-        // literal, not division. `emit` above set `previous` to the template
-        // prefix `str`, which would wrongly make regexCanFollow() report a value
-        // context; clear it so expression-start (regex allowed) holds (D3-CR-S1).
-        previous = null;
-      } else {
-        emit({ t: 'str', v: run.literal, template: true, hasSubstitution: false });
-      }
-      continue;
-    }
-    // `{` / `}` inside an active substitution: track depth so a `}` that closes
-    // the `${ ... }` resumes the enclosing template's text instead of being read
-    // as code. Braces that belong to nested objects/blocks within the
-    // substitution stay ordinary punctuation.
-    if (substitutionStack.length > 0 && c === '{') {
-      const top = substitutionStack.length - 1;
-      substitutionStack[top] = (substitutionStack[top] ?? 0) + 1;
-      emit({ t: 'punct', v: '{' });
-      index += 1;
-      continue;
-    }
-    if (substitutionStack.length > 0 && c === '}') {
-      const top = substitutionStack.length - 1;
-      const depth = substitutionStack[top] ?? 0;
-      if (depth === 0) {
-        substitutionStack.pop();
-        const run = scanTemplateText(index + 1);
-        index = run.end;
-        if (run.opened) {
-          substitutionStack.push(0);
-          // another substitution opens immediately (`} … ${`); it too begins a
-          // fresh expression, so restore expression-start rather than inheriting
-          // the just-closed substitution's last token (D3-CR-S1).
-          previous = null;
-        } else {
-          // the enclosing template is now fully closed and is a value, so a
-          // following `/` is division, not the start of a regex.
-          previous = { t: 'str', v: '', template: true, hasSubstitution: false };
-        }
-        continue;
-      }
-      substitutionStack[top] = depth - 1;
-      emit({ t: 'punct', v: '}' });
-      index += 1;
-      continue;
-    }
-    // regex literal — only where a regex may legally begin, so `a / b` division
-    // is not mistaken for one. Its body (which may hold quotes, `//`, or `from`)
-    // is opaque and yields no specifier.
-    if (c === '/' && regexCanFollow()) {
-      let cursor = index + 1;
-      let inClass = false;
-      let closed = false;
-      while (cursor < length) {
-        const d = source.charAt(cursor);
-        if (d === '\\') {
-          cursor += 2;
-          continue;
-        }
-        if (d === '\n') break;
-        if (d === '[') inClass = true;
-        else if (d === ']') inClass = false;
-        else if (d === '/' && !inClass) {
-          cursor += 1;
-          closed = true;
-          break;
-        }
-        cursor += 1;
-      }
-      if (closed) {
-        while (cursor < length && isIdentifierPart(source.charAt(cursor))) cursor += 1; // flags
-        emit({ t: 'regex' });
-        index = cursor;
-        continue;
-      }
-      // not a terminated regex — fall through and treat `/` as punctuation
-    }
-    // identifier / keyword
-    if (isIdentifierStart(c)) {
-      let cursor = index + 1;
-      while (cursor < length && isIdentifierPart(source.charAt(cursor))) cursor += 1;
-      // A bare `break`/`continue` immediately followed — with no intervening
-      // LineTerminator — by this identifier makes it the statement's optional
-      // *label* (`break outer`). Mark it so a `/` after the label opens a regex
-      // (the restricted statement is complete), mirroring the bare-keyword case.
-      // `pendingNewline` guards the `[no LineTerminator here]` restriction: a
-      // newline between the keyword and the id triggers ASI, so the id is a fresh
-      // statement, not a label. The keyword must be *bare*, not a member
-      // (`obj.break`), so guard on the token before it (`tokens[len-2]`, since
-      // `previous`/`tokens[len-1]` is the keyword) — D3-CR-BREAK-CONTINUE-LABEL-ASI.
-      const restrictedLabel = previousIsBareRestrictedKeyword();
-      emit({ t: 'id', v: source.slice(index, cursor), restrictedLabel });
-      index = cursor;
-      continue;
-    }
-    // numeric literal (coarse — only needs to block a following `/` regex)
-    if (c >= '0' && c <= '9') {
-      let cursor = index + 1;
-      while (cursor < length && /[0-9a-fA-FxXbBoOeE._]/.test(source.charAt(cursor))) cursor += 1;
-      emit({ t: 'num' });
-      index = cursor;
-      continue;
-    }
-    // `(` / `)` — tracked so a control-flow header's closing `)` is distinguished
-    // from a value-producing `)` when the next `/` is classified. Any `(`/`)`
-    // reaching here is genuine code punctuation: those inside strings, comments,
-    // regex bodies, and template text were already consumed above.
-    if (c === '(') {
-      parenStack.push(previousOpensControlHeader());
-      emit({ t: 'punct', v: '(' });
-      index += 1;
-      continue;
-    }
-    if (c === ')') {
-      const controlHeader = parenStack.pop() ?? false;
-      emit({ t: 'punct', v: ')', controlHeader });
-      index += 1;
-      continue;
-    }
-    // `++` / `--` — combined into one token (maximal munch, as JS lexes), so a
-    // following `/` is classified as division rather than a regex opener. These
-    // are value contexts: postfix on the preceding operand, or prefix on the
-    // following one. Any other `+`/`-` (binary, unary, `+=`) stays single.
-    if ((c === '+' || c === '-') && source.charAt(index + 1) === c) {
-      emit({ t: 'punct', v: c + c });
-      index += 2;
-      continue;
-    }
-    // any other single character is punctuation / operator
-    emit({ t: 'punct', v: c });
-    index += 1;
-  }
-  return tokens;
-}
-
-/**
- * Extract every module specifier from TypeScript/NodeNext ESM source.
+ * Extract every static-graph module specifier from TypeScript/NodeNext ESM
+ * source, using the TypeScript compiler's own parser as the single source of
+ * truth.
  *
  * The import-discipline checks below judge *specifiers*, so a specifier this
- * helper fails to surface is silently exempt from the boundary, and any string
- * it wrongly surfaces would fabricate a phantom dependency. It therefore covers
- * every static-graph import/re-export form this project can use, in either quote
- * style, with comments and quoted export names treated as trivia:
+ * helper fails to surface is silently exempt from the boundary, and any string it
+ * wrongly surfaces would fabricate a phantom dependency. Earlier revisions
+ * hand-rolled a lexer to decide, per `/`, whether it opened a regex or was
+ * division, plus ASI, member-keyword, postfix, non-null, and control-header
+ * special cases. That heuristic family regenerated a new corner case on almost
+ * every review round, so it is replaced here by structural parsing: the same
+ * `typescript` package the build already depends on parses the source once into
+ * an AST, and a single walk collects specifiers only from the structural
+ * import/export forms. Regex-vs-division, ASI, keyword-named members, non-null
+ * assertions, and template context are then decided by the compiler's grammar,
+ * not by us — so a `/` in `obj.return / 2`, a `debugger`/`break`/`continue`
+ * statement boundary, or an `x!!` chain can never be misread, and an `import('…')`
+ * sitting inside a regex or template *text* is opaque data, never a call node.
+ * Because this is the parser the host is type-checked with, the scanner's notion
+ * of "an import" is definitionally the one that actually loads a module.
  *
- *   - static:       `import x from '...'` / `import x from "..."`
- *                   (including multi-line `import type { ... } from '...'`)
- *   - side-effect:  `import '...'` / `import "..."`
- *   - dynamic:      `import('...')` / `import("...")`, with or without a second
- *                   options argument (`import('...', { with: { type: 'json' } })`)
- *   - re-export:    `export { x } from '...'` / `export * from "..."`,
- *                   including quoted export names (`export { "x" as y } from …`)
+ * Collected forms (each only when the specifier is a *static* string):
+ *   - `import … from 'S'` / side-effect `import 'S'` / `import type … from 'S'`
+ *     — an `ts.ImportDeclaration`;
+ *   - `export … from 'S'` / `export * from 'S'` / `export type … from 'S'`,
+ *     including quoted export names — an `ts.ExportDeclaration` (a local
+ *     `export { x }` with no `from` has no moduleSpecifier and is skipped);
+ *   - `import x = require('S')` — an `ts.ImportEqualsDeclaration` whose reference
+ *     is an external-module reference (`import x = ns.y` is an alias and skipped);
+ *   - dynamic `import('S')` / `import('S', { … })` — a call whose callee is the
+ *     `import` keyword; its first argument surfaces only as a `StringLiteral` or a
+ *     substitution-free `NoSubstitutionTemplateLiteral`, never a substituted
+ *     `TemplateExpression` (a computed specifier).
  *
- * It runs over the token stream from {@link tokenizeEsm}, not the raw text, so
- * comments in any position are already gone and strings are atomic. That single
- * mechanism replaces the earlier trio of hand-tuned regexes and closes the whole
- * scanner family at once: block/line comments as trivia (D3-CR-F4..F7), quoted
- * export names, no comment-contained `from` fabricating a dependency (D3-CX-F8),
- * no cross-statement capture, no duplicate extraction, and linear-time scanning
- * with no catastrophic backtracking.
- *
- * The specifier of a static import or a re-export is the string that follows the
- * `from` keyword (so a quoted export name before `from` is skipped); a
- * side-effect import has no `from`, so its specifier is its first string. A
- * scan is bounded by the statement (`;`, or the next `import`/`export`), so a
- * following statement can never be captured. `import.meta.*` is excluded: the
- * `import` keyword there is followed by `.`, which starts neither a static
- * import nor a `(` dynamic import. This is a bounded lexical scan, not a
- * parser — no AST dependency is introduced.
+ * Excluded structurally, with no special-casing: `import.meta` (a meta-property,
+ * not a call), `obj.import(…)` (a property call), a plain `require(…)`, and a
+ * member/property/class-field named `import` (`{ import: 'S' }`,
+ * `class C { import = 'S' }`) — none of which is an import node. Specifiers are
+ * returned in source order (a pre-order walk); repeats are kept, since each
+ * import site is a distinct occurrence. This is a pure syntactic parse — no
+ * binder, type-checker, module resolution, or file-system access.
  */
 function extractModuleSpecifiers(source: string): readonly string[] {
-  const tokens = tokenizeEsm(source);
+  const sourceFile = ts.createSourceFile(
+    'module.ts',
+    source,
+    ts.ScriptTarget.Latest,
+    /* setParentNodes */ false,
+    ts.ScriptKind.TS,
+  );
   const specifiers: string[] = [];
-  const isStatementBoundary = (tok: EsmToken): boolean =>
-    (tok.t === 'punct' && tok.v === ';') ||
-    (tok.t === 'id' && (tok.v === 'import' || tok.v === 'export'));
+  // The module specifier of a *static* import/export/`require` is grammatically a
+  // `StringLiteral` — never a template. `import x from ` + backtick or
+  // `import ` + backtick is a syntax error, and the parser's error recovery must
+  // not let such a template be surfaced as a dependency, so require a real
+  // `StringLiteral` here (`ts.isStringLiteral`, not `isStringLiteralLike`).
+  const stringLiteralText = (node: ts.Node | undefined): string | null =>
+    node !== undefined && ts.isStringLiteral(node) ? node.text : null;
 
-  for (let i = 0; i < tokens.length; i += 1) {
-    const token = tokens[i];
-    if (token === undefined || token.t !== 'id') continue;
-
-    if (token.v === 'import') {
-      const prev = tokens[i - 1];
-      const next = tokens[i + 1];
-      // `obj.import` / `obj.import(...)` — a member access, not an ESM import.
-      if (prev?.t === 'punct' && prev.v === '.') continue;
-      // `import.meta.*` — not a module specifier.
-      if (next?.t === 'punct' && next.v === '.') continue;
-      // A member named `import` — `{ import: ... }` (object property keyed
-      // `import`) or `class C { import = … }` (a class field whose name is the
-      // reserved word `import`). Neither is an ESM import: `:` introduces the
-      // property value and `=` the field initializer, so the following string is
-      // data, not a module specifier (D3-CR-C3/A). A real import is never
-      // immediately followed by `:` or `=` (`import x = require(…)` puts an
-      // identifier after `import`, not `=`).
-      if (next?.t === 'punct' && (next.v === ':' || next.v === '=')) continue;
-      // dynamic `import( 'S' … )` — the specifier, if a literal, is the first
-      // token inside the parens. A plain string or a substitution-free template
-      // is a fixed specifier; a template that carries `${ }` substitutions is a
-      // computed value and is not surfaced.
-      if (next?.t === 'punct' && next.v === '(') {
-        const arg = tokens[i + 2];
-        if (arg?.t === 'str' && !arg.hasSubstitution) specifiers.push(arg.v);
-        continue;
-      }
-      // static (`import … from 'S'`) or side-effect (`import 'S'`).
-      let fromSpecifier: string | null = null;
-      let firstString: string | null = null;
-      for (let j = i + 1; j < tokens.length; j += 1) {
-        const scan = tokens[j];
-        if (scan === undefined) break;
-        if (j > i + 1 && isStatementBoundary(scan)) break;
-        if (scan.t === 'str' && !scan.template && firstString === null) firstString = scan.v;
-        const after = tokens[j + 1];
-        if (scan.t === 'id' && scan.v === 'from' && after?.t === 'str' && !after.template) {
-          fromSpecifier = after.v;
-          break;
-        }
-      }
-      const specifier = fromSpecifier ?? firstString;
+  const visit = (node: ts.Node): void => {
+    if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
+      const specifier = stringLiteralText(node.moduleSpecifier);
       if (specifier !== null) specifiers.push(specifier);
-      continue;
-    }
-
-    if (token.v === 'export') {
-      // re-export: the specifier is the string immediately after the `from`
-      // keyword. Requiring a string right after `from` distinguishes the clause
-      // keyword from an identifier that merely starts with `from`, and from a
-      // `from` used as an exported binding name. The scan stops at `;` or the
-      // next statement, so no following statement is captured.
-      for (let j = i + 1; j < tokens.length; j += 1) {
-        const scan = tokens[j];
-        if (scan === undefined) break;
-        if (scan.t === 'punct' && scan.v === ';') break;
-        if (scan.t === 'id' && (scan.v === 'import' || scan.v === 'export')) break;
-        const after = tokens[j + 1];
-        if (scan.t === 'id' && scan.v === 'from' && after?.t === 'str' && !after.template) {
-          specifiers.push(after.v);
-          break;
-        }
+    } else if (ts.isImportEqualsDeclaration(node)) {
+      // `import x = require('S')` — an external-module reference.
+      if (ts.isExternalModuleReference(node.moduleReference)) {
+        const specifier = stringLiteralText(node.moduleReference.expression);
+        if (specifier !== null) specifiers.push(specifier);
       }
+    } else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+      // Dynamic `import('S' … )`: the specifier is the first argument, surfaced
+      // only when static — a `StringLiteral` or a substitution-free
+      // `NoSubstitutionTemplateLiteral` (both are `isStringLiteralLike`), never a
+      // substituted `TemplateExpression` (a computed value). A second options
+      // argument is ignored; `import.meta` is a MetaProperty, not a call, so it
+      // never reaches this branch.
+      const arg = node.arguments[0];
+      if (arg !== undefined && ts.isStringLiteralLike(arg)) specifiers.push(arg.text);
     }
-  }
+    ts.forEachChild(node, visit);
+  };
+  ts.forEachChild(sourceFile, visit);
   return specifiers;
 }
 
@@ -1455,13 +956,16 @@ describe('D3 host import scanner classifies `/` after a control-flow header as a
     ]);
   });
 
-  // The object-literal `}` division case (C2) is deliberately untouched: the
-  // same-line form still swallows and the next-line form still surfaces, exactly
-  // as before this fix.
-  it('leaves the object-literal `}` division case (C2) unchanged', () => {
-    expect(extractModuleSpecifiers("const ratio = {} / value; import '../domain/foo.js';")).toEqual(
-      [],
-    );
+  // C2 reconciliation: `const ratio = {} / value;` is object-literal division in
+  // expression position, so a following `import '…'` is a real dependency in
+  // *both* the same-line and next-line forms. The removed hand-lexer classified a
+  // `/` after `}` as a regex opener and let the same-line fake regex swallow the
+  // import — a false negative it deliberately preserved. The structural parser
+  // reads the division correctly, so the specifier now surfaces on both forms.
+  it('surfaces the import across an object-literal `}` division (C2)', () => {
+    expect(extractModuleSpecifiers("const ratio = {} / value; import '../domain/foo.js';")).toEqual([
+      '../domain/foo.js',
+    ]);
     expect(
       extractModuleSpecifiers("const ratio = {} / value;\nimport '../domain/foo.js';"),
     ).toEqual(['../domain/foo.js']);
@@ -1947,12 +1451,18 @@ describe('D3 host import scanner classifies `/` after a labelled restricted stat
     expect(extractModuleSpecifiers(source)).toEqual(['../domain/foo.js']);
   });
 
-  // Member `.break` / `.continue` are values, never restricted statements, so a
-  // following id is not a label and the division rule is unchanged.
-  it('does not treat a member `.break`/`.continue` as heading a labelled statement', () => {
-    expect(extractModuleSpecifiers("const r = obj.break outer / 2; import '../domain/foo.js';")).toEqual([
+  // Member `.break` / `.continue` are ordinary property accesses (values), so a
+  // following `/` is division and a later real import still surfaces. (The prior
+  // fixture used the syntactically invalid `obj.break outer / 2`, which only
+  // probed an internal state of the removed hand-lexer; valid member-access
+  // division is the stronger, structurally meaningful check.)
+  it('treats a member `.break`/`.continue` as a value, keeping division', () => {
+    expect(extractModuleSpecifiers("const r = obj.break / 2; import '../domain/foo.js';")).toEqual([
       '../domain/foo.js',
     ]);
+    expect(
+      extractModuleSpecifiers("const r = obj.continue / 2; import '../domain/foo.js';"),
+    ).toEqual(['../domain/foo.js']);
   });
 
   // Liveness: many labelled-restricted regex lines scan in bounded linear time.
