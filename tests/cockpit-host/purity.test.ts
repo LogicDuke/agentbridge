@@ -36,9 +36,42 @@ function hostSources(): readonly { readonly file: string; readonly text: string 
  * its *resolved* destination relative to the importing host file, and accepted
  * only when that destination stays inside the host tree or enters the explicit
  * sibling Cockpit boundary (`src/cockpit/`).
+ *
+ * The resolution must model the ESM loader, not literal string arithmetic
+ * (D3-CX-POLICY-F1). An earlier revision joined/normalized the specifier *text*
+ * with `posix.join`/`posix.normalize`, which treats a percent-encoded dot
+ * segment such as `%2e%2e` as an ordinary directory name and so accepted
+ * `./%2e%2e/index.js` as in-host — yet WHATWG/Node resolution decodes `%2e%2e`
+ * to `..` and lands that specifier on `src/index.js`, the domain re-export
+ * barrel. Every specifier is therefore resolved exactly as Node's ESM loader
+ * resolves it — `new URL(specifier, importerFileUrl)` then a Node-compatible
+ * file-URL→path conversion — before the segment-aware containment rule runs.
  */
 const HOST_ROOT = 'src/cockpit-host';
 const COCKPIT_BOUNDARY = 'src/cockpit';
+
+// ESM/NodeNext specifiers and `readdirSync`'s OS-separated file names are folded
+// to '/'-separated form so a literal backslash cannot smuggle an escape past the
+// resolver, and Windows `fileURLToPath` output (which uses '\\') compares
+// like-for-like with the POSIX boundaries below.
+const toPosix = (value: string): string => value.replace(/\\/g, '/');
+
+// A stable *synthetic* repository root used only to resolve relative specifiers
+// the way Node does; it is never touched on disk. The drive letter is load-
+// bearing: a drive-less `file:///…` URL is rejected outright by the Win32 branch
+// of `fileURLToPath`, so a bare `file:///virtual/…` root would throw for every
+// specifier on Windows. With a drive letter the URL converts on both platforms.
+const VIRTUAL_REPO_URL = new URL('file:///C:/agentbridge-virtual/');
+
+// A path under the synthetic root, taken through the *same* URL→path pipeline as
+// resolved specifiers, so its string form carries whatever platform formatting
+// `fileURLToPath` emits (drive, leading slash, separators) and segment-prefix
+// containment compares like-for-like on Windows and POSIX alike.
+const virtualPath = (relFromRepoRoot: string): string =>
+  posix.normalize(toPosix(fileURLToPath(new URL(relFromRepoRoot, VIRTUAL_REPO_URL))));
+
+const HOST_ROOT_ABS = virtualPath(HOST_ROOT);
+const COCKPIT_BOUNDARY_ABS = virtualPath(COCKPIT_BOUNDARY);
 
 // Segment-aware containment: an exact match, or a genuine sub-path (guarded by a
 // trailing `/`), so a sibling such as `src/cockpit-host-evil/` is never read as
@@ -47,20 +80,41 @@ const COCKPIT_BOUNDARY = 'src/cockpit';
 const isWithin = (candidate: string, boundary: string): boolean =>
   candidate === boundary || candidate.startsWith(`${boundary}/`);
 
+// `fileURLToPath` rejects `%2f` on every platform but `%5c` only on Win32; on a
+// POSIX runner a `%5c` would otherwise decode to a literal backslash and fold
+// back into an in-host segment. Reject both, case-insensitively, on both
+// platforms so an encoded separator can never be read as in-host — matching how
+// Node (which folds neither into a path separator) fails closed on Windows.
+const ENCODED_SEPARATOR = /%2f|%5c/i;
+
 /**
  * Resolve a *relative* module specifier against its importing host file and
- * report whether the normalized destination remains within the host tree or the
- * Cockpit boundary. ESM/NodeNext module specifiers are POSIX ('/'-separated); a
- * backslash is folded to '/' first so it cannot smuggle an escape past the
- * resolver on Windows or POSIX, and `readdirSync`'s OS-separated file names are
- * folded the same way. This is pure path arithmetic — no file-system access — so
- * synthetic fixture (importer, specifier) pairs resolve identically to real ones.
+ * report whether the resolved destination remains within the host tree or the
+ * Cockpit boundary — resolved exactly as Node's ESM loader would.
+ *
+ * The specifier is resolved with `new URL(specifier, importerFileUrl)` (WHATWG
+ * URL resolution: it folds `.`/`..` *and* their case-insensitive `%2e`-encoded
+ * forms, keeps an encoded `/`/`\` intact within a segment, treats a literal
+ * backslash as a separator for the special `file:` scheme, and drops any
+ * query/fragment from the path), then converted with `fileURLToPath` — which
+ * decodes the path exactly once (never `decodeURIComponent` on the whole path
+ * twice) and so preserves a legitimate percent-containing filename. This is pure
+ * URL/path arithmetic — no file-system access — so synthetic fixture (importer,
+ * specifier) pairs resolve identically to real ones. It fails closed (returns
+ * `false`) on any resolution failure: an encoded separator, a malformed percent
+ * escape that makes the decode throw, or an invalid URL/file-URL conversion.
  */
 const relativeImportStaysInBoundary = (importerRelPath: string, specifier: string): boolean => {
-  const toPosix = (value: string): string => value.replace(/\\/g, '/');
-  const importerDir = posix.dirname(posix.join(HOST_ROOT, toPosix(importerRelPath)));
-  const resolved = posix.normalize(posix.join(importerDir, toPosix(specifier)));
-  return isWithin(resolved, HOST_ROOT) || isWithin(resolved, COCKPIT_BOUNDARY);
+  const importerFileUrl = new URL(`${HOST_ROOT}/${toPosix(importerRelPath)}`, VIRTUAL_REPO_URL);
+  let resolvedPath: string;
+  try {
+    const resolvedUrl = new URL(specifier, importerFileUrl);
+    if (ENCODED_SEPARATOR.test(resolvedUrl.pathname)) return false;
+    resolvedPath = posix.normalize(toPosix(fileURLToPath(resolvedUrl)));
+  } catch {
+    return false;
+  }
+  return isWithin(resolvedPath, HOST_ROOT_ABS) || isWithin(resolvedPath, COCKPIT_BOUNDARY_ABS);
 };
 
 /**
@@ -309,6 +363,215 @@ describe('D3 host relative-import confinement rejects boundary escapes (D3-CX-PO
   });
 
   // The real host sources still satisfy check #1 under the confinement predicate.
+  it('accepts every specifier the real host sources actually import', () => {
+    for (const { file, text } of hostSources()) {
+      for (const specifier of extractModuleSpecifiers(text)) {
+        expect(accepts(file, specifier), `${file} -> ${specifier}`).toBe(true);
+      }
+    }
+  });
+});
+
+describe('D3 host confinement resolves percent-encoded URL dot-segments like Node (D3-CX-POLICY-F1)', () => {
+  // The confinement helper used to join/normalize the specifier *text*, so a
+  // percent-encoded dot segment (`%2e%2e`) was read as an ordinary directory name
+  // and `import('./%2e%2e/index.js')` was accepted as in-host — while WHATWG/Node
+  // ESM resolution decodes `%2e%2e` to `..` and lands it on `src/index.js`, the
+  // domain re-export barrel. The helper now resolves every specifier through
+  // `new URL` + `fileURLToPath` before the containment rule, so its verdict tracks
+  // the real loader. These fixtures are synthetic; no production file is created
+  // and no module is loaded — the helper performs pure URL/path arithmetic.
+  const accepts = (importer: string, specifier: string): boolean => {
+    const isRelative = specifier.startsWith('./') || specifier.startsWith('../');
+    return (
+      specifier.startsWith('node:') ||
+      (isRelative && relativeImportStaysInBoundary(importer, specifier))
+    );
+  };
+
+  // --- The exact original bypass, proven against the INTEGRATED policy path ---
+  // Not a mirrored helper in isolation: the real scanner surfaces the specifier
+  // from a real `import(...)` statement, and the exact check-#1 discipline
+  // predicate then rejects it — parser through confinement, end to end.
+  it('the integrated import-discipline path rejects the original `./%2e%2e/index.js` bypass', () => {
+    const source = `import('./%2e%2e/index.js');`;
+    const specifiers = extractModuleSpecifiers(source);
+    expect(specifiers).toContain('./%2e%2e/index.js'); // the scanner surfaces it verbatim
+    for (const specifier of specifiers) {
+      // Identical to check #1 in `D3 host import discipline`.
+      const isRelative = specifier.startsWith('./') || specifier.startsWith('../');
+      const allowed =
+        specifier.startsWith('node:') ||
+        (isRelative && relativeImportStaysInBoundary('server.ts', specifier));
+      expect(allowed, `integrated path must reject: ${specifier}`).toBe(false);
+    }
+    // check #2 (forbidden-term text match) does NOT catch this specifier, proving
+    // check #1's URL-aware confinement is the load-bearing defense here.
+    expect(
+      /adapter|transport|authorization|repair-job|permit|\.\.\/domain\//i.test('./%2e%2e/index.js'),
+    ).toBe(false);
+  });
+
+  // --- Cross-check against the runtime resolution model (WHATWG URL) ---
+  // Independent of the helper's internals: `new URL` is the same algorithm Node's
+  // ESM loader resolves specifiers with, so pinning the resolved pathname proves
+  // the policy verdict cannot silently drift from real resolution.
+  it('tracks Node URL resolution: encoded double-dot escapes onto the src barrel', () => {
+    const spec = './%2e%2e/index.js';
+    expect(new URL(spec, 'file:///r/src/cockpit-host/server.ts').pathname).toBe('/r/src/index.js');
+    expect(accepts('server.ts', spec)).toBe(false);
+  });
+
+  it('tracks Node URL resolution: encoded double-dot then legitimate re-entry stays in host', () => {
+    const spec = './%2e%2e/cockpit-host/index.js';
+    expect(new URL(spec, 'file:///r/src/cockpit-host/server.ts').pathname).toBe(
+      '/r/src/cockpit-host/index.js',
+    );
+    expect(accepts('server.ts', spec)).toBe(true);
+  });
+
+  it('tracks Node URL resolution: a query holding `%2e%2e` never changes the file path', () => {
+    const spec = './local.js?x=%2e%2e';
+    const resolved = new URL(spec, 'file:///r/src/cockpit-host/server.ts');
+    expect(resolved.pathname).toBe('/r/src/cockpit-host/local.js');
+    expect(resolved.search).toBe('?x=%2e%2e');
+    expect(accepts('server.ts', spec)).toBe(true);
+  });
+
+  it('fileURLToPath decodes a legitimate percent filename exactly once', () => {
+    // Drive-lettered URL so `fileURLToPath` accepts it on Windows and POSIX alike.
+    // `%2525` decodes ONCE to `%25`, never twice to `%`, preserving the filename.
+    const resolved = fileURLToPath(new URL('./file%2525.js', 'file:///C:/r/src/cockpit-host/a.ts'));
+    expect(toPosix(resolved).endsWith('/src/cockpit-host/file%25.js')).toBe(true);
+    expect(accepts('server.ts', './file%2525.js')).toBe(true);
+  });
+
+  // --- Rejection: the full encoded-dot-segment matrix (every ASCII case form) ---
+  const rejectedEncodedTraversal: readonly { readonly importer: string; readonly spec: string }[] = [
+    { importer: 'server.ts', spec: './%2e%2e/index.js' }, // lower
+    { importer: 'server.ts', spec: './%2E%2E/index.js' }, // upper
+    { importer: 'server.ts', spec: './%2e%2E/index.js' }, // mixed
+    { importer: 'server.ts', spec: './%2E%2e/index.js' }, // mixed (other order)
+    { importer: 'server.ts', spec: './%2e./index.js' }, // encoded + literal dot
+    { importer: 'server.ts', spec: './.%2e/index.js' }, // literal + encoded dot
+    { importer: 'server.ts', spec: './%2e%2e//index.js' }, // trailing empty segment
+    { importer: 'server.ts', spec: './%2e%2e/%2e%2e/index.js' }, // two encoded hops
+    // Encoded traversal from a NESTED importing file (fixtures/ -> src/index.js).
+    { importer: 'fixtures/stage-a.ts', spec: './%2e%2e/%2e%2e/index.js' },
+    // Encoded traversal followed by a misleading sibling-PREFIX destination:
+    // resolves to `src/cockpit-host-evil/x.js`, which merely begins with the host
+    // dir name and must not be read as inside it.
+    { importer: 'server.ts', spec: './%2e%2e/cockpit-host-evil/x.js' },
+    // Encoded traversal straight into the domain kernel.
+    { importer: 'server.ts', spec: './%2e%2e/domain/index.js' },
+  ];
+  for (const { importer, spec } of rejectedEncodedTraversal) {
+    it(`rejects encoded traversal ${JSON.stringify(spec)} from ${importer}`, () => {
+      expect(accepts(importer, spec)).toBe(false);
+    });
+  }
+
+  // --- Rejection: encoded separators and malformed escapes fail closed ---
+  const rejectedInvalid: readonly string[] = [
+    './%2f/x.js', // encoded '/'
+    './..%2f/x.js', // literal `..` fused to an encoded '/'
+    './%2F/x.js', // encoded '/' (upper)
+    './%5c/x.js', // encoded '\'
+    './%5C/x.js', // encoded '\' (upper)
+    './%2e%2e%2fx.js', // encoded '/' after an encoded double-dot
+    './%2/x.js', // truncated percent escape
+    './%zz/x.js', // non-hex percent escape
+    './%gg%2e/x.js', // non-hex escape beside an encoded dot
+  ];
+  for (const spec of rejectedInvalid) {
+    it(`fails closed on ${JSON.stringify(spec)}`, () => {
+      expect(accepts('server.ts', spec)).toBe(false);
+    });
+  }
+
+  // --- Preservation: correct verdicts that must NOT regress ---
+  const preserved: readonly {
+    readonly importer: string;
+    readonly spec: string;
+    readonly verdict: boolean;
+  }[] = [
+    { importer: 'server.ts', spec: './%2e/index.js', verdict: true }, // single encoded dot == ./index.js
+    { importer: 'server.ts', spec: './%2E/local.js', verdict: true }, // single encoded dot (upper)
+    { importer: 'server.ts', spec: './%2e%2e/cockpit-host/index.js', verdict: true }, // traversal + re-entry
+    { importer: 'server.ts', spec: './%252e%252e/index.js', verdict: true }, // double-encoded: literal `%2e%2e` dir
+    { importer: 'server.ts', spec: './file%20name.js', verdict: true }, // legitimate percent (space) filename
+    { importer: 'server.ts', spec: './file%2525.js', verdict: true }, // decode-once percent filename -> file%25.js
+    { importer: 'server.ts', spec: './local.js?x=%2e%2e', verdict: true }, // query with %2e%2e is ignored
+    { importer: 'server.ts', spec: './local.js#%2e%2e', verdict: true }, // fragment with %2e%2e is ignored
+    { importer: 'server.ts', spec: './local.js', verdict: true }, // plain unencoded local import
+    { importer: 'fixtures/stage-a.ts', spec: '../local.js', verdict: true }, // nested parent nav stays in host
+    // Top-level and nested encoded imports into the Cockpit boundary.
+    { importer: 'server.ts', spec: './%2e%2e/cockpit/index.js', verdict: true },
+    { importer: 'fixtures/stage-a.ts', spec: './%2e%2e/%2e%2e/cockpit/index.js', verdict: true },
+  ];
+  for (const { importer, spec, verdict } of preserved) {
+    it(`preserves the ${verdict ? 'accept' : 'reject'} verdict for ${JSON.stringify(spec)} from ${importer}`, () => {
+      expect(accepts(importer, spec)).toBe(verdict);
+    });
+  }
+
+  // --- No silent drift: the policy verdict equals an independent runtime oracle ---
+  // The oracle re-derives containment from `new URL` + `fileURLToPath` under a
+  // DIFFERENT synthetic root and DIFFERENT containment string logic than the
+  // helper, so a change that decoupled the policy from real resolution would make
+  // these disagree and fail the test.
+  const runtimeOracleStaysInBoundary = (importer: string, specifier: string): boolean => {
+    const importerUrl = new URL(
+      `src/cockpit-host/${importer.replace(/\\/g, '/')}`,
+      'file:///D:/oracle-root/',
+    );
+    try {
+      const u = new URL(specifier, importerUrl);
+      if (/%2f|%5c/i.test(u.pathname)) return false;
+      // fileURLToPath emits a drive-prefixed `D:\…` on Windows and `/D:/…` on
+      // POSIX; anchor on the unique synthetic-root marker and match the segments
+      // *below* it, so the comparison is independent of platform path formatting.
+      const full = fileURLToPath(u)
+        .replace(/\\/g, '/')
+        .replace(/\/{2,}/g, '/');
+      const marker = '/oracle-root/';
+      const at = full.indexOf(marker);
+      if (at < 0) return false; // resolved above the synthetic repo root entirely
+      const rel = full.slice(at + marker.length);
+      const inside = (base: string): boolean => rel === base || rel.startsWith(`${base}/`);
+      return inside('src/cockpit-host') || inside('src/cockpit');
+    } catch {
+      return false;
+    }
+  };
+
+  it('agrees with an independent `new URL` + `fileURLToPath` oracle across the matrix', () => {
+    const specimens: readonly { readonly importer: string; readonly spec: string }[] = [
+      ...rejectedEncodedTraversal,
+      ...rejectedInvalid.map((spec) => ({ importer: 'server.ts', spec })),
+      ...preserved.map(({ importer, spec }) => ({ importer, spec })),
+      { importer: 'server.ts', spec: './../index.js' }, // unencoded escape still rejected
+      { importer: 'server.ts', spec: '../cockpit/index.js' }, // unencoded cockpit still accepted
+    ];
+    for (const { importer, spec } of specimens) {
+      expect(accepts(importer, spec), `policy vs oracle drift: ${importer} -> ${spec}`).toBe(
+        runtimeOracleStaysInBoundary(importer, spec),
+      );
+    }
+  });
+
+  // --- Preservation: the unencoded POLICY-1 behavior is unchanged ---
+  it('preserves the original unencoded confinement verdicts', () => {
+    expect(accepts('server.ts', './../index.js')).toBe(false);
+    expect(accepts('server.ts', './../domain/index.js')).toBe(false);
+    expect(accepts('server.ts', '../cockpit-host-evil/x.js')).toBe(false);
+    expect(accepts('server.ts', '.\\..\\index.js')).toBe(false); // backslash-smuggled escape
+    expect(accepts('server.ts', './local.js')).toBe(true);
+    expect(accepts('server.ts', '../cockpit/index.js')).toBe(true);
+    expect(accepts('server.ts', 'node:http')).toBe(true);
+  });
+
+  // --- Preservation: real host sources still satisfy the URL-aware confinement ---
   it('accepts every specifier the real host sources actually import', () => {
     for (const { file, text } of hostSources()) {
       for (const specifier of extractModuleSpecifiers(text)) {
