@@ -1,5 +1,5 @@
 import { readdirSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, posix } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import ts from 'typescript';
@@ -23,6 +23,45 @@ function hostSources(): readonly { readonly file: string; readonly text: string 
     .filter((name) => name.endsWith('.ts'))
     .map((name) => ({ file: name, text: readFileSync(join(hostDir, name), 'utf8') }));
 }
+
+/**
+ * Relative-import confinement for the host boundary (D3-CX-POLICY-1).
+ *
+ * The import-discipline check below used to accept any specifier beginning `./`
+ * (`specifier.startsWith('./')`). A redundant escaping form such as
+ * `./../index.js` begins `./` yet, resolved from a file under
+ * `src/cockpit-host/`, lands on `src/index.ts` — a re-export of the domain
+ * kernel — and the literal forbidden-term check missed it because the specifier
+ * text contains no `../domain/`. A relative specifier is therefore judged here by
+ * its *resolved* destination relative to the importing host file, and accepted
+ * only when that destination stays inside the host tree or enters the explicit
+ * sibling Cockpit boundary (`src/cockpit/`).
+ */
+const HOST_ROOT = 'src/cockpit-host';
+const COCKPIT_BOUNDARY = 'src/cockpit';
+
+// Segment-aware containment: an exact match, or a genuine sub-path (guarded by a
+// trailing `/`), so a sibling such as `src/cockpit-host-evil/` is never read as
+// inside `src/cockpit-host`, and a host path is never read as inside
+// `src/cockpit`.
+const isWithin = (candidate: string, boundary: string): boolean =>
+  candidate === boundary || candidate.startsWith(`${boundary}/`);
+
+/**
+ * Resolve a *relative* module specifier against its importing host file and
+ * report whether the normalized destination remains within the host tree or the
+ * Cockpit boundary. ESM/NodeNext module specifiers are POSIX ('/'-separated); a
+ * backslash is folded to '/' first so it cannot smuggle an escape past the
+ * resolver on Windows or POSIX, and `readdirSync`'s OS-separated file names are
+ * folded the same way. This is pure path arithmetic — no file-system access — so
+ * synthetic fixture (importer, specifier) pairs resolve identically to real ones.
+ */
+const relativeImportStaysInBoundary = (importerRelPath: string, specifier: string): boolean => {
+  const toPosix = (value: string): string => value.replace(/\\/g, '/');
+  const importerDir = posix.dirname(posix.join(HOST_ROOT, toPosix(importerRelPath)));
+  const resolved = posix.normalize(posix.join(importerDir, toPosix(specifier)));
+  return isWithin(resolved, HOST_ROOT) || isWithin(resolved, COCKPIT_BOUNDARY);
+};
 
 /**
  * Extract every static-graph module specifier from TypeScript/NodeNext ESM
@@ -135,10 +174,14 @@ describe('D3 host import discipline', () => {
   it('imports only node builtins, itself, or the Cockpit boundary', () => {
     for (const { file, text } of hostSources()) {
       for (const specifier of extractModuleSpecifiers(text)) {
+        // A relative specifier is accepted only when its resolved destination is
+        // confined to the host tree or the Cockpit boundary (D3-CX-POLICY-1); a
+        // raw `./`/`../cockpit/` string prefix let a redundant escape like
+        // `./../index.js` reach `src/index.ts` (the domain re-export barrel).
+        const isRelative = specifier.startsWith('./') || specifier.startsWith('../');
         const allowed =
           specifier.startsWith('node:') ||
-          specifier.startsWith('./') ||
-          specifier.startsWith('../cockpit/');
+          (isRelative && relativeImportStaysInBoundary(file, specifier));
         expect(allowed, `${file} imports forbidden specifier: ${specifier}`).toBe(true);
       }
     }
@@ -151,6 +194,125 @@ describe('D3 host import discipline', () => {
           /adapter|transport|authorization|repair-job|permit|\.\.\/domain\//i.test(specifier),
           `${file} imports forbidden module: ${specifier}`,
         ).toBe(false);
+      }
+    }
+  });
+});
+
+describe('D3 host relative-import confinement rejects boundary escapes (D3-CX-POLICY-1)', () => {
+  // Mirror of the check-#1 acceptance predicate, exercised directly on synthetic
+  // (importer, specifier) pairs. No production file is created; the bounded policy
+  // helper is pure path arithmetic, so fixture paths resolve exactly as real ones.
+  const accepts = (importer: string, specifier: string): boolean => {
+    const isRelative = specifier.startsWith('./') || specifier.startsWith('../');
+    return (
+      specifier.startsWith('node:') ||
+      (isRelative && relativeImportStaysInBoundary(importer, specifier))
+    );
+  };
+
+  // --- Rejections: every relative path whose resolved destination leaves the host ---
+  it('rejects the redundant `./`-prefixed parent escape to the barrel', () => {
+    expect(accepts('server.ts', './../index.js')).toBe(false);
+  });
+
+  it('rejects a redundant `./`-prefixed escape straight into the domain kernel', () => {
+    expect(accepts('server.ts', './../domain/index.js')).toBe(false);
+  });
+
+  it('rejects a deeper `../../src/index.js` traversal escape', () => {
+    expect(accepts('server.ts', './../../src/index.js')).toBe(false);
+    expect(accepts('server.ts', '../../src/index.js')).toBe(false);
+  });
+
+  it('rejects redundant dot segments that normalize outside the host', () => {
+    expect(accepts('server.ts', './cockpit/../../index.js')).toBe(false);
+    expect(accepts('server.ts', './././../adapters/foo.js')).toBe(false);
+  });
+
+  it('rejects an escape from a nested host file', () => {
+    expect(accepts('fixtures/stage-a.ts', '../../index.js')).toBe(false);
+    expect(accepts('fixtures/stage-a.ts', './../../domain/index.js')).toBe(false);
+  });
+
+  it('rejects a sibling directory whose name merely begins with the host dir name', () => {
+    // `src/cockpit-host/../cockpit-host-evil/x.js` -> `src/cockpit-host-evil/x.js`
+    expect(accepts('server.ts', '../cockpit-host-evil/x.js')).toBe(false);
+  });
+
+  it('rejects a sibling `cockpit-*` directory that is not the Cockpit boundary', () => {
+    // `src/cockpit-host/../cockpit-secrets/x.js` -> `src/cockpit-secrets/x.js`;
+    // must not be read as inside `src/cockpit`.
+    expect(accepts('server.ts', '../cockpit-secrets/x.js')).toBe(false);
+  });
+
+  it('rejects a path with misleading allowed text before escaping', () => {
+    // Threads through `cockpit/` yet resolves to `src/index.js`.
+    expect(accepts('server.ts', './cockpit/../../index.js')).toBe(false);
+    // Re-enters a `cockpit-host/`-named segment yet escapes above `src`.
+    expect(accepts('server.ts', '../../cockpit-host/../index.js')).toBe(false);
+  });
+
+  it('rejects a backslash-smuggled escape, folded to `/` (POSIX/Windows-consistent)', () => {
+    expect(accepts('server.ts', '.\\..\\index.js')).toBe(false);
+    expect(accepts('server.ts', './..\\domain\\index.js')).toBe(false);
+  });
+
+  it('rejects a bare or plain-parent specifier that is not node: and not confined', () => {
+    expect(accepts('server.ts', '../index.js')).toBe(false); // plain parent to the barrel
+    expect(accepts('server.ts', '../domain/index.js')).toBe(false);
+    expect(accepts('server.ts', 'typescript')).toBe(false);
+  });
+
+  // --- Preservations: every legitimate host / Cockpit import still accepted ---
+  it('accepts a same-directory local import from a top-level host file', () => {
+    expect(accepts('server.ts', './local.js')).toBe(true);
+    expect(accepts('render.ts', './escape.js')).toBe(true);
+  });
+
+  it('accepts a nested local import', () => {
+    expect(accepts('server.ts', './nested/local.js')).toBe(true);
+    expect(accepts('server.ts', './fixtures/stage-a.js')).toBe(true);
+  });
+
+  it('accepts legitimate parent navigation that stays inside the host', () => {
+    expect(accepts('fixtures/stage-a.ts', '../local.js')).toBe(true);
+    expect(accepts('fixtures/stage-a.ts', '../render.js')).toBe(true);
+  });
+
+  it('accepts the explicit sibling Cockpit boundary from a top-level host file', () => {
+    expect(accepts('server.ts', '../cockpit/index.js')).toBe(true);
+  });
+
+  it('accepts a legitimate Cockpit import from a nested host file', () => {
+    expect(accepts('fixtures/stage-a.ts', '../../cockpit/index.js')).toBe(true);
+  });
+
+  it('leaves node: builtin acceptance unchanged (POLICY-3 out of scope)', () => {
+    expect(accepts('server.ts', 'node:http')).toBe(true);
+    expect(accepts('server.ts', 'node:url')).toBe(true);
+    // node:* handling is preserved exactly as-is by this repair; POLICY-3 is a
+    // separate finding and is intentionally NOT addressed here.
+    expect(accepts('server.ts', 'node:fs')).toBe(true);
+  });
+
+  // Integration: check #1 now catches the escape, and the forbidden-module check
+  // (check #2) remains an independent defense whose behavior is unchanged.
+  it('check #1 rejects `./../index.js` while the forbidden-module defense stays independent', () => {
+    const spec = './../index.js';
+    expect(accepts('server.ts', spec)).toBe(false); // now caught by check #1
+    // check #2 independently does NOT match this specifier text, proving check #1
+    // is the load-bearing defense here and check #2 is untouched by this repair.
+    expect(/adapter|transport|authorization|repair-job|permit|\.\.\/domain\//i.test(spec)).toBe(
+      false,
+    );
+  });
+
+  // The real host sources still satisfy check #1 under the confinement predicate.
+  it('accepts every specifier the real host sources actually import', () => {
+    for (const { file, text } of hostSources()) {
+      for (const specifier of extractModuleSpecifiers(text)) {
+        expect(accepts(file, specifier), `${file} -> ${specifier}`).toBe(true);
       }
     }
   });
