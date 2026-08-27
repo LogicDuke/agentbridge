@@ -111,6 +111,23 @@ function tokenizeEsm(source: string): readonly EsmToken[] {
   // classified as a regex (control header) or division (value paren).
   const parenStack: boolean[] = [];
 
+  // Whether a `/` immediately after `tok` is division — i.e. `tok` ends a value/
+  // expression — rather than a regex opener. Mirrors `regexCanFollow`'s per-token
+  // logic; used for the single look-back the postfix-`!` disambiguation needs.
+  const endsValue = (tok: EsmToken | undefined): boolean => {
+    if (tok === undefined) return false;
+    switch (tok.t) {
+      case 'id':
+        return !REGEX_CONTEXT_KEYWORDS.has(tok.v);
+      case 'num':
+      case 'str':
+      case 'regex':
+        return true;
+      case 'punct':
+        if (tok.v === ')') return tok.controlHeader !== true;
+        return tok.v === ']' || tok.v === '++' || tok.v === '--';
+    }
+  };
   const regexCanFollow = (): boolean => {
     if (previous === null) return true;
     switch (previous.t) {
@@ -125,7 +142,19 @@ function tokenizeEsm(source: string): readonly EsmToken[] {
         // regex; a value-producing `)` (`fn()`, `(x)`) means division. `]` is
         // always a value (index/array), so a following `/` is division.
         if (previous.v === ')') return previous.controlHeader === true;
-        return previous.v !== ']';
+        if (previous.v === ']') return false;
+        // Postfix `++`/`--` (emitted as one token, maximal-munch, below) end a
+        // value, so a following `/` is division. A prefix `++x`/`--x` never puts
+        // the operator immediately before a `/` (the operand does), so this only
+        // ever fires for the postfix form. Missing this let a fake regex swallow a
+        // later real import (D3-CR postfix).
+        if (previous.v === '++' || previous.v === '--') return false;
+        // `!` is either the TS non-null assertion (`x!` — a value, so `/` is
+        // division) or logical-not (`!/re/` — a prefix operator, so `/` opens a
+        // regex). It is the non-null form exactly when it follows a value-ending
+        // token; otherwise it is logical-not and a regex may follow.
+        if (previous.v === '!') return !endsValue(tokens[tokens.length - 2]);
+        return true;
     }
   };
   // Whether the token before an opening `(` is a control-flow keyword — read
@@ -133,9 +162,25 @@ function tokenizeEsm(source: string): readonly EsmToken[] {
   // declared `EsmToken | null` type and narrows over the full token union, as in
   // `regexCanFollow`.
   const previousOpensControlHeader = (): boolean => {
-    if (previous === null || previous.t !== 'id' || !CONTROL_HEADER_KEYWORDS.has(previous.v)) {
-      return false;
+    if (previous === null || previous.t !== 'id') return false;
+    // `for await (…)` — the async-iteration header. The token before `(` is the
+    // `await` keyword, itself preceded by a *bare* `for`; that parenthesised head
+    // is a control-flow header exactly like `for (…)`, so its closing `)` may be
+    // followed by a regex. `await` anywhere else (`await fn()`, `obj.await(…)`, a
+    // bare `await (expr)`) is a value/member call, not a header, so it must not
+    // open one (D3-CR for-await). The `for` must be bare — not a member name
+    // (`obj.for await` is not valid, but pin the `.` guard for symmetry with the
+    // keyword-member check below).
+    if (previous.v === 'await') {
+      const beforeAwait = tokens[tokens.length - 2];
+      const beforeFor = tokens[tokens.length - 3];
+      return (
+        beforeAwait?.t === 'id' &&
+        beforeAwait.v === 'for' &&
+        !(beforeFor?.t === 'punct' && beforeFor.v === '.')
+      );
     }
+    if (!CONTROL_HEADER_KEYWORDS.has(previous.v)) return false;
     // A control keyword spelled as a *member name* — `obj.for(…)`, `Symbol.for(…)`,
     // `obj.if(…)` — is a value-producing method call, not a control-flow header:
     // its closing `)` must stay a value paren so a following `/` is division, not
@@ -354,6 +399,15 @@ function tokenizeEsm(source: string): readonly EsmToken[] {
       const controlHeader = parenStack.pop() ?? false;
       emit({ t: 'punct', v: ')', controlHeader });
       index += 1;
+      continue;
+    }
+    // `++` / `--` — combined into one token (maximal munch, as JS lexes), so a
+    // following `/` is classified as division rather than a regex opener. These
+    // are value contexts: postfix on the preceding operand, or prefix on the
+    // following one. Any other `+`/`-` (binary, unary, `+=`) stays single.
+    if ((c === '+' || c === '-') && source.charAt(index + 1) === c) {
+      emit({ t: 'punct', v: c + c });
+      index += 2;
       continue;
     }
     // any other single character is punctuation / operator
@@ -1409,6 +1463,121 @@ describe('D3 host import scanner classifies `/` after a control-flow header as a
   // time; a regression to rescanning would blow vitest's per-test timeout.
   it('scans many control-flow-header regex statements in bounded, linear time', () => {
     const many = "if (ok) /[']/.test(x);\n".repeat(2000) + "import '../domain/foo.js';";
+    const start = performance.now();
+    expect(extractModuleSpecifiers(many)).toEqual(['../domain/foo.js']);
+    expect(performance.now() - start).toBeLessThan(1000);
+  });
+});
+
+describe('D3 host import scanner classifies `/` after a postfix operator as division (D3-CR postfix)', () => {
+  // `x++` / `x--` / TS non-null `x!` end a value, so the following `/` is
+  // division. Before this fix the tokenizer saw the bare trailing operator and
+  // `regexCanFollow()` opened a regex; a quote inside that fake regex ran on and
+  // swallowed a later real import (false negative). `++`/`--` are now emitted as
+  // one maximal-munch token, and `!` is disambiguated from logical-not by the
+  // token it follows.
+  it('surfaces a real import after `++`/`--`/`!` postfix division', () => {
+    expect(extractModuleSpecifiers("let x = 0; const r = x++ / 2; import '../domain/foo.js';")).toEqual([
+      '../domain/foo.js',
+    ]);
+    expect(extractModuleSpecifiers("let x = 0; const r = x-- / 2; import '../domain/foo.js';")).toEqual([
+      '../domain/foo.js',
+    ]);
+    expect(extractModuleSpecifiers("const r = x! / 2; import '../domain/foo.js';")).toEqual([
+      '../domain/foo.js',
+    ]);
+  });
+
+  it('surfaces a real import after postfix on member/index/call targets', () => {
+    for (const lhs of ['arr[i]++', 'obj.value--', 'fn()!', 'arr[i]!']) {
+      expect(extractModuleSpecifiers(`const r = ${lhs} / 2;\nimport '../domain/foo.js';`)).toEqual([
+        '../domain/foo.js',
+      ]);
+    }
+  });
+
+  it('never fabricates a module from the fake regex a postfix `/` used to open', () => {
+    expect(extractModuleSpecifiers("let x = 0; const r = x++ / 2;")).toEqual([]);
+    expect(extractModuleSpecifiers("const r = x! / 2;")).toEqual([]);
+  });
+
+  // Preservation: a *prefix* `++x`/`--x` puts the operand (not the operator)
+  // immediately before the `/`, so division is already correct there; and a
+  // genuine regex after a real prefix operator / operator position must still be
+  // recognised (logical-not `!/re/`, binary `+ /re/`, `return /re/`).
+  it('keeps prefix increment as division and prefix/operator regex as regex', () => {
+    expect(extractModuleSpecifiers("let x = 0; const r = ++x / 2;\nimport '../domain/foo.js';")).toEqual([
+      '../domain/foo.js',
+    ]);
+    expect(extractModuleSpecifiers("let x = 0; const r = --x / 2;\nimport '../domain/foo.js';")).toEqual([
+      '../domain/foo.js',
+    ]);
+    expect(extractModuleSpecifiers("if (!/[']/.test(v)) {} import '../domain/foo.js';")).toEqual([
+      '../domain/foo.js',
+    ]);
+    expect(extractModuleSpecifiers("const r = a + /[']/.source; import '../domain/foo.js';")).toEqual([
+      '../domain/foo.js',
+    ]);
+    expect(extractModuleSpecifiers("function f() { return /[']/.test(v); } import '../domain/foo.js';")).toEqual([
+      '../domain/foo.js',
+    ]);
+  });
+
+  it('scans many postfix-division statements in bounded, linear time', () => {
+    const many = "let x = 0; const r = x++ / 2;\n".repeat(2000) + "import '../domain/foo.js';";
+    const start = performance.now();
+    expect(extractModuleSpecifiers(many)).toEqual(['../domain/foo.js']);
+    expect(performance.now() - start).toBeLessThan(1000);
+  });
+});
+
+describe('D3 host import scanner recognizes `for await (…)` as a control header (D3-CR for-await)', () => {
+  // `for await (…)` is the async-iteration header: the token before `(` is
+  // `await`, not `for`, so the base control-header check missed it and its `)`
+  // was read as a value paren — a following regex became division, its quote ran
+  // on, and a later real import was swallowed (false negative); an `import('…')`
+  // inside that regex body was tokenized as code (false positive). The header is
+  // now recognised only for the exact bare `for` + `await` + `(` sequence.
+  it('surfaces a real import after a `for await` header regex', () => {
+    const source = "async function f() { for await (const y of xs) /[']/.test(y); }\nimport '../domain/foo.js';";
+    expect(extractModuleSpecifiers(source)).toEqual(['../domain/foo.js']);
+  });
+
+  it('does not fabricate a module from an import call inside a `for await` header regex', () => {
+    expect(
+      extractModuleSpecifiers("async function f() { for await (const y of xs) /import('../domain/evil.js')/.test(y); }"),
+    ).toEqual([]);
+  });
+
+  // Preservation: `await` in any non-header position is a value/member call, not a
+  // control header, so a following `/` stays division and a later import surfaces.
+  it('keeps `await` value/member forms as value contexts, not headers', () => {
+    expect(
+      extractModuleSpecifiers("async function f() { const r = await fn() / 2; import '../domain/foo.js'; }"),
+    ).toEqual(['../domain/foo.js']);
+    expect(extractModuleSpecifiers("const r = obj.await(x) / 2;\nimport '../domain/foo.js';")).toEqual([
+      '../domain/foo.js',
+    ]);
+    expect(
+      extractModuleSpecifiers("async function f() { const r = await (y) / 2; import '../domain/foo.js'; }"),
+    ).toEqual(['../domain/foo.js']);
+  });
+
+  // Preservation: a plain `for (…)` and the other headers keep working, and a
+  // keyword-member (`obj.for`) nested in a `for await` condition still divides.
+  it('keeps plain `for`/`if`/`while` headers and nested keyword-member division working', () => {
+    expect(extractModuleSpecifiers("for (let i = 0; i < n; i += 1) /[']/.test(x); import '../domain/foo.js';")).toEqual([
+      '../domain/foo.js',
+    ]);
+    expect(
+      extractModuleSpecifiers("async function f() { for await (const y of obj.for(x)) /[']/.test(y); }\nimport '../domain/foo.js';"),
+    ).toEqual(['../domain/foo.js']);
+  });
+
+  it('scans many `for await` header regex statements in bounded, linear time', () => {
+    const many =
+      "async function f() { for await (const y of xs) /[']/.test(y); }\n".repeat(2000) +
+      "import '../domain/foo.js';";
     const start = performance.now();
     expect(extractModuleSpecifiers(many)).toEqual(['../domain/foo.js']);
     expect(performance.now() - start).toBeLessThan(1000);
