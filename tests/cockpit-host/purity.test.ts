@@ -774,6 +774,305 @@ const acquiresHiddenBuiltin = (source: string): boolean => {
   return found;
 };
 
+/**
+ * NET — reject outbound network egress at its use/acquisition site
+ * (D3-CX-POLICY-NET).
+ *
+ * The D3 contract forbids network egress ("no network egress"; "not a
+ * collector"; Stage A is "not live"). The import allowlist already blocks
+ * `node:https` / `node:net` / `node:tls` (they are not on the exact
+ * `{node:http, node:url}` allowlist — D3-CX-POLICY-3), but two egress routes
+ * survive every other existing check:
+ *   - the global `fetch` — a global, so it needs no import and the specifier
+ *     allowlist never sees it;
+ *   - `request()` / `get()` reached through the legitimately-allowed `node:http`
+ *     import — the very module the host needs for `http.createServer`.
+ *
+ * This detector closes exactly those two, decided by LEXICAL BINDING IDENTITY —
+ * the binding visible at each occurrence, never mere identifier text — so
+ * shadowing neither hides a real capability nor false-positives a same-named
+ * local (NET-S1/NET-S2):
+ *   - global `fetch`: a `<global>.fetch` member (globalThis/window/self/global
+ *     receiver, incl. a statically-resolved `<global>['fetch']`), a destructuring
+ *     of `fetch` OFF a global receiver, or a bare `fetch` reference that is FREE
+ *     at that occurrence (no lexical binding named `fetch` is visible). An alias
+ *     `const f = fetch` is caught at the `fetch` reference; forwarding a global
+ *     receiver (`const g = globalThis`) is already rejected by RC (e).
+ *   - node:http client APIs: `request` / `get` reached through a binding THIS
+ *     module imported from `node:http` — a default or namespace binding
+ *     (`http.request`, `h.get`), a named import used bare (`request()`), an
+ *     aliased named import (`req()` from `{ request as req }`), or an
+ *     import-equals binding — where the receiver/name still LEXICALLY resolves to
+ *     that import. `createServer` is never in the rejected member set, so the real
+ *     host server is preserved, and `map.get(...)` / `obj.request(...)` on any
+ *     non-node:http receiver is untouched.
+ *
+ * Binding identity is resolved by a bounded lexical ENVIRONMENT STACK tied to the
+ * AST walk: each scope (module, function/arrow/method params, block, for-header,
+ * catch) pushes a frame naming its own declarations; an occurrence resolves to the
+ * nearest enclosing frame that binds the name. A module-declared `fetch`
+ * (`function fetch(){}`, `const fetch = …`) is legal (unlike `eval`) and shadows
+ * the global where it is visible; a sibling scope's local `fetch` does not, and a
+ * shadow disappears once its scope closes — while `globalThis.fetch` stays a
+ * member call. Structural and finite: one parse, one traversal with balanced
+ * push/pop and Set/Map lookups (no fixpoint, no re-scan, no value resolution),
+ * reusing `memberNameOf` / `isGlobalReceiver` / `isValueReference` / `unwrapExpr` /
+ * `bindingPropertyName`. This is a development-time SOURCE-POLICY guard, not a
+ * runtime sandbox. NOT decided (bounded gaps, not sandbox claims): alias-via-
+ * assignment (`const h = http; h.request()`), method extraction (`const r =
+ * http.request`), runtime reassignment, computed/dynamic forwarding, and runtime-
+ * generated code (RC/HA cover codegen). `node:https`/`net`/`tls` stay out of scope
+ * — the import allowlist already blocks them.
+ */
+const HTTP_CLIENT_MEMBERS: ReadonlySet<string> = new Set(['request', 'get']);
+const NETWORK_GLOBAL_NAMES: ReadonlySet<string> = new Set(['fetch']);
+
+interface HttpBindings {
+  // Local names bound to the node:http MODULE (`import http` / `import * as h` /
+  // `import http = require('node:http')`), used as `binding.request(...)`.
+  readonly namespaceOrDefault: ReadonlySet<string>;
+  // Local names bound to a node:http CLIENT MEMBER (`import { request, get as g }`),
+  // used bare as `request(...)` / `g(...)`. A named `createServer` is deliberately
+  // NOT collected — it is legitimate.
+  readonly namedClient: ReadonlySet<string>;
+}
+
+// Discover, structurally, the local bindings this module introduces from
+// `node:http`. Keyed on the exact specifier `node:http`, so a plain local object
+// named `http` (no such import) yields no binding and is never treated as the
+// network module.
+const collectHttpBindings = (sourceFile: ts.SourceFile): HttpBindings => {
+  const NODE_HTTP = 'node:http';
+  const namespaceOrDefault = new Set<string>();
+  const namedClient = new Set<string>();
+  const visit = (node: ts.Node): void => {
+    if (
+      ts.isImportDeclaration(node) &&
+      ts.isStringLiteral(node.moduleSpecifier) &&
+      node.moduleSpecifier.text === NODE_HTTP &&
+      node.importClause !== undefined
+    ) {
+      const clause = node.importClause;
+      // `import http from 'node:http'` — default binding.
+      if (clause.name !== undefined) namespaceOrDefault.add(clause.name.text);
+      const bindings = clause.namedBindings;
+      if (bindings !== undefined) {
+        if (ts.isNamespaceImport(bindings)) {
+          // `import * as http from 'node:http'`.
+          namespaceOrDefault.add(bindings.name.text);
+        } else {
+          // `import { request, get as g } from 'node:http'` — collect only the
+          // client members, under their LOCAL name (`el.name`).
+          for (const el of bindings.elements) {
+            const imported = (el.propertyName ?? el.name).text;
+            if (HTTP_CLIENT_MEMBERS.has(imported)) namedClient.add(el.name.text);
+          }
+        }
+      }
+    } else if (
+      ts.isImportEqualsDeclaration(node) &&
+      ts.isExternalModuleReference(node.moduleReference) &&
+      ts.isStringLiteral(node.moduleReference.expression) &&
+      node.moduleReference.expression.text === NODE_HTTP
+    ) {
+      // `import http = require('node:http')`.
+      namespaceOrDefault.add(node.name.text);
+    }
+    ts.forEachChild(node, visit);
+  };
+  ts.forEachChild(sourceFile, visit);
+  return { namespaceOrDefault, namedClient };
+};
+
+// A lexical binding kind for the identity-sensitive detection below. `HTTP_NS` and
+// `HTTP_CLIENT` mark the module-level node:http import bindings (namespace/default,
+// and named `request`/`get` respectively); `LOCAL` marks any OTHER declaration
+// (parameter, const/let/var, function/class, catch, or unrelated import) that
+// SHADOWS an outer binding of the same name. Capability identity is therefore the
+// binding VISIBLE at an occurrence, never mere identifier text (NET-S1/NET-S2).
+type BindingKind = 'HTTP_NS' | 'HTTP_CLIENT' | 'LOCAL';
+
+// Collect every identifier a binding name introduces — a plain identifier or a
+// (possibly nested) destructuring pattern — into `sink`. Bounded by the finite
+// binding-pattern tree; performs no value resolution.
+const eachBoundName = (name: ts.BindingName, sink: (text: string) => void): void => {
+  if (ts.isIdentifier(name)) {
+    sink(name.text);
+    return;
+  }
+  for (const element of name.elements) {
+    if (ts.isBindingElement(element)) eachBoundName(element.name, sink);
+  }
+};
+
+// The names a single statement declares DIRECTLY in its own scope — const/let/var
+// declarations and function/class declaration names — with no descent into nested
+// blocks or functions (those get their own frames). The required matrices exercise
+// only const/let/params, so `var`'s function-hoisting is a stated bounded gap that
+// cannot make a covered case wrong.
+const declaredByStatement = (statement: ts.Statement, sink: (text: string) => void): void => {
+  if (ts.isVariableStatement(statement)) {
+    for (const decl of statement.declarationList.declarations) eachBoundName(decl.name, sink);
+  } else if (
+    (ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement)) &&
+    statement.name !== undefined
+  ) {
+    sink(statement.name.text);
+  }
+};
+
+// The module (top-level) lexical frame: node:http import bindings tagged with their
+// capability kind, every other top-level binding tagged LOCAL. This is the outermost
+// frame for the whole file, so a genuine module-level `const fetch` shadows the
+// global `fetch` module-wide (NET-S2), while `globalThis.fetch` stays a member call.
+const buildModuleFrame = (sourceFile: ts.SourceFile, http: HttpBindings): Map<string, BindingKind> => {
+  const frame = new Map<string, BindingKind>();
+  for (const statement of sourceFile.statements) {
+    declaredByStatement(statement, (text) => frame.set(text, 'LOCAL'));
+    if (ts.isImportDeclaration(statement) && statement.importClause !== undefined) {
+      const clause = statement.importClause;
+      if (clause.name !== undefined) frame.set(clause.name.text, 'LOCAL');
+      const bindings = clause.namedBindings;
+      if (bindings !== undefined) {
+        if (ts.isNamespaceImport(bindings)) {
+          frame.set(bindings.name.text, 'LOCAL');
+        } else {
+          for (const el of bindings.elements) frame.set(el.name.text, 'LOCAL');
+        }
+      }
+    } else if (ts.isImportEqualsDeclaration(statement)) {
+      frame.set(statement.name.text, 'LOCAL');
+    }
+  }
+  // Capability override: the node:http import bindings win their specific kind over
+  // the generic LOCAL tag applied above.
+  for (const name of http.namespaceOrDefault) frame.set(name, 'HTTP_NS');
+  for (const name of http.namedClient) frame.set(name, 'HTTP_CLIENT');
+  return frame;
+};
+
+// Whether an object-binding element destructures OFF a global receiver, i.e.
+// `const { fetch: f } = globalThis`. Restricts the destructuring rule to the real
+// global so `const { fetch } = someLocalConfig` is not a false positive.
+const destructuresGlobalReceiver = (el: ts.BindingElement): boolean => {
+  const decl = el.parent.parent;
+  return ts.isVariableDeclaration(decl) && decl.initializer !== undefined && isGlobalReceiver(decl.initializer);
+};
+
+const usesOutboundNetwork = (source: string): boolean => {
+  const sourceFile = ts.createSourceFile(
+    'module.ts',
+    source,
+    ts.ScriptTarget.Latest,
+    /* setParentNodes */ true,
+    ts.ScriptKind.TS,
+  );
+  const constMap = collectStringConsts(sourceFile);
+  const http = collectHttpBindings(sourceFile);
+
+  // Lexical environment: a stack of frames, innermost last. `resolve` returns the
+  // kind of the NEAREST visible binding of a name, or undefined when the name is
+  // FREE at that occurrence (an unshadowed global such as `fetch`). Frames are
+  // pushed on scope entry and popped on scope exit, so sibling scopes are
+  // independent and an inner shadow vanishes once its scope closes.
+  const scopes: Map<string, BindingKind>[] = [buildModuleFrame(sourceFile, http)];
+  const resolve = (name: string): BindingKind | undefined => {
+    for (let i = scopes.length - 1; i >= 0; i--) {
+      const kind = scopes[i]?.get(name);
+      if (kind !== undefined) return kind;
+    }
+    return undefined;
+  };
+
+  // The frame a scope-introducing node contributes, or null when it is not one.
+  // Function-likes contribute their parameters; blocks their direct lexical
+  // declarations; for-headers their loop variables; catch clauses their variable.
+  const frameFor = (node: ts.Node): Map<string, BindingKind> | null => {
+    if (
+      ts.isFunctionDeclaration(node) ||
+      ts.isFunctionExpression(node) ||
+      ts.isArrowFunction(node) ||
+      ts.isMethodDeclaration(node) ||
+      ts.isConstructorDeclaration(node) ||
+      ts.isGetAccessorDeclaration(node) ||
+      ts.isSetAccessorDeclaration(node)
+    ) {
+      const frame = new Map<string, BindingKind>();
+      for (const param of node.parameters) eachBoundName(param.name, (t) => frame.set(t, 'LOCAL'));
+      return frame;
+    }
+    if (ts.isBlock(node) || ts.isModuleBlock(node)) {
+      const frame = new Map<string, BindingKind>();
+      for (const statement of node.statements) declaredByStatement(statement, (t) => frame.set(t, 'LOCAL'));
+      return frame;
+    }
+    if (ts.isForStatement(node) || ts.isForInStatement(node) || ts.isForOfStatement(node)) {
+      const frame = new Map<string, BindingKind>();
+      const init = node.initializer;
+      if (init !== undefined && ts.isVariableDeclarationList(init)) {
+        for (const decl of init.declarations) eachBoundName(decl.name, (t) => frame.set(t, 'LOCAL'));
+      }
+      return frame;
+    }
+    if (ts.isCatchClause(node)) {
+      const frame = new Map<string, BindingKind>();
+      if (node.variableDeclaration !== undefined) {
+        eachBoundName(node.variableDeclaration.name, (t) => frame.set(t, 'LOCAL'));
+      }
+      return frame;
+    }
+    return null;
+  };
+
+  let found = false;
+  const visit = (node: ts.Node): void => {
+    const frame = frameFor(node);
+    if (frame !== null) scopes.push(frame);
+
+    if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+      const member = memberNameOf(node, constMap);
+      if (member !== null) {
+        // (a) `<global>.fetch` / statically-keyed `<global>['fetch']` — a global
+        //     RECEIVER, independent of any `fetch` binding.
+        if (NETWORK_GLOBAL_NAMES.has(member) && isGlobalReceiver(node.expression)) found = true;
+        // (d) `<binding>.request` / `.get` only when the receiver identifier
+        //     LEXICALLY resolves to the module's node:http namespace/default import
+        //     (not a shadowing local). `createServer` is never a client member.
+        const recv = unwrapExpr(node.expression);
+        if (HTTP_CLIENT_MEMBERS.has(member) && ts.isIdentifier(recv) && resolve(recv.text) === 'HTTP_NS') {
+          found = true;
+        }
+      }
+    }
+    // (b) destructuring `fetch` off a global receiver.
+    if (ts.isBindingElement(node)) {
+      const name = bindingPropertyName(node);
+      if (name !== null && NETWORK_GLOBAL_NAMES.has(name) && destructuresGlobalReceiver(node)) found = true;
+    }
+    if (ts.isIdentifier(node) && isValueReference(node)) {
+      // The `key` in a destructuring `const { key: local } = …` is a binding
+      // PROPERTY name, not an expression read (handled receiver-scoped by rule (b)),
+      // so it must not be mistaken for a bare reference to the global.
+      const isBindingPropertyKey = ts.isBindingElement(node.parent) && node.parent.propertyName === node;
+      if (!isBindingPropertyKey) {
+        const kind = resolve(node.text);
+        // (c) a bare `fetch` reference that is FREE here — no lexical binding named
+        //     `fetch` is visible — so it is the global. A local shadow resolves to
+        //     LOCAL and is allowed; `const f = fetch` is still caught at `fetch`.
+        if (NETWORK_GLOBAL_NAMES.has(node.text) && kind === undefined) found = true;
+        // (e) a bare reference that lexically resolves to a node:http named client
+        //     import (`request(...)`, `req(...)`); a shadowing local resolves LOCAL.
+        if (kind === 'HTTP_CLIENT') found = true;
+      }
+    }
+
+    ts.forEachChild(node, visit);
+    if (frame !== null) scopes.pop();
+  };
+  ts.forEachChild(sourceFile, visit);
+  return found;
+};
+
 describe('D3 host has no mutation, subprocess, secret, or Git capability', () => {
   it('references no subprocess, environment, or Git operation', () => {
     const forbidden: readonly RegExp[] = [
@@ -3359,5 +3658,188 @@ describe('D3 host rejects symlink escapes under the Cockpit boundary (D3-CX-POLI
     // fails closed on a Cockpit-boundary symlink exactly as it does on a host one.
     expect(() => hostSources()).not.toThrow();
     expect(hostSources().length).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// NET — the host must perform no outbound network egress (D3-CX-POLICY-NET).
+// The two routes that survive every OTHER purity check are the global `fetch`
+// (needs no import) and `request`/`get` reached through the already-allowed
+// `node:http` module. `usesOutboundNetwork` closes exactly those, receiver-scoped,
+// while preserving `http.createServer` and every unrelated `.get`/`.request`.
+// node:https/net/tls stay covered by the import allowlist (D3-CX-POLICY-3), not
+// here — see the detector's doc comment.
+// ---------------------------------------------------------------------------
+describe('D3 host forbids outbound network egress (D3-CX-POLICY-NET)', () => {
+  it('accepts every real host source (no egress is present today)', () => {
+    for (const { file, text } of hostSources()) {
+      expect(usesOutboundNetwork(text), `${file} performs outbound network egress`).toBe(false);
+    }
+  });
+
+  // --- MUST REJECT: global fetch, at every bounded acquisition/use site ---
+  const rejectFetch: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a bare global fetch call', source: `export async function p() { await fetch('https://example.com/'); }` },
+    { form: 'globalThis.fetch', source: `globalThis.fetch('https://example.com/');` },
+    { form: 'a statically-keyed globalThis["fetch"]', source: `globalThis['fetch']('https://example.com/');` },
+    { form: 'a window.fetch receiver', source: `window.fetch('https://example.com/');` },
+    { form: 'a self.fetch receiver', source: `self.fetch('https://example.com/');` },
+    { form: 'an aliased global fetch acquisition (const f = fetch)', source: `const f = fetch;\nf('https://example.com/');` },
+    {
+      form: 'a destructured global fetch acquisition',
+      source: `const { fetch: f } = globalThis;\nf('https://example.com/');`,
+    },
+  ];
+  for (const { form, source } of rejectFetch) {
+    it(`rejects ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // --- MUST REJECT: node:http client APIs, bound specifically to node:http ---
+  const rejectHttp: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a default node:http binding .request', source: `import http from 'node:http';\nhttp.request('http://example.com/');` },
+    { form: 'a default node:http binding .get', source: `import http from 'node:http';\nhttp.get('http://example.com/');` },
+    { form: 'a namespace node:http binding .request', source: `import * as http from 'node:http';\nhttp.request('http://example.com/');` },
+    { form: 'a namespace-ALIAS binding .request', source: `import * as h from 'node:http';\nh.request('http://example.com/');` },
+    { form: 'a namespace-ALIAS binding .get', source: `import * as h from 'node:http';\nh.get('http://example.com/');` },
+    { form: 'a statically-keyed member on a node:http binding', source: `import * as http from 'node:http';\nhttp['request']('http://example.com/');` },
+    { form: 'a named request import used bare', source: `import { request } from 'node:http';\nrequest('http://example.com/');` },
+    { form: 'a named get import used bare', source: `import { get } from 'node:http';\nget('http://example.com/');` },
+    { form: 'an aliased named request import', source: `import { request as req } from 'node:http';\nreq('http://example.com/');` },
+    { form: 'an aliased named get import', source: `import { get as httpGet } from 'node:http';\nhttpGet('http://example.com/');` },
+    { form: 'an import-equals node:http binding .request', source: `import http = require('node:http');\nhttp.request('http://example.com/');` },
+  ];
+  for (const { form, source } of rejectHttp) {
+    it(`rejects ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // --- MUST ALLOW: createServer and every unrelated member/name ---
+  const allow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'http.createServer on a default binding', source: `import http from 'node:http';\nhttp.createServer(() => {});` },
+    { form: 'createServer on a namespace alias', source: `import * as h from 'node:http';\nh.createServer(() => {});` },
+    { form: 'a named createServer import used bare', source: `import { createServer } from 'node:http';\ncreateServer(() => {});` },
+    { form: 'Map.get / map.get', source: `const m = new Map<string, number>();\nvoid m.get('k');` },
+    {
+      form: '.get / .request on an unrelated local object',
+      source: `const api = { get(x: string) { return x; }, request(x: string) { return x; } };\nvoid api.get('a');\nvoid api.request('b');`,
+    },
+    {
+      form: '.fetch on an ordinary local object (non-global receiver)',
+      source: `const store = { fetch(x: string) { return x; } };\nvoid store.fetch('a');`,
+    },
+    {
+      form: 'a member named request on a plain local object also named http',
+      source: `const http = { request(x: string) { return x; } };\nvoid http.request('a');`,
+    },
+    { form: 'a local non-network function named fetch', source: `function fetch(x: string) { return x; }\nvoid fetch('a');` },
+    { form: 'a local non-network const named request', source: `const request = (x: string) => x;\nvoid request('a');` },
+    { form: 'a local non-network const named get', source: `const get = (x: string) => x;\nvoid get('a');` },
+    {
+      form: 'the real server.ts createServer shape (handler param named request)',
+      source:
+        `import http from 'node:http';\n` +
+        `export function make() {\n` +
+        `  return http.createServer((request: http.IncomingMessage, response: http.ServerResponse) => {\n` +
+        `    const method = request.method ?? '';\n` +
+        `    void method;\n` +
+        `    void response;\n` +
+        `  });\n` +
+        `}`,
+    },
+  ];
+  for (const { form, source } of allow) {
+    it(`allows ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+
+  // --- FALSE-POSITIVE attack: strings / comments / regex must not fabricate egress ---
+  it('does not fire on egress-looking text inside strings, comments, regex, or templates', () => {
+    expect(usesOutboundNetwork(`const s = "fetch('https://x/')";\nvoid s;`)).toBe(false);
+    expect(usesOutboundNetwork(`// fetch('https://x/') and http.request('http://x/')\nexport const ok = true;`)).toBe(false);
+    expect(usesOutboundNetwork(`/* http.get('http://x/') */\nexport const ok = true;`)).toBe(false);
+    expect(usesOutboundNetwork(`const re = /fetch\\(/;\nvoid re;`)).toBe(false);
+    expect(usesOutboundNetwork(`const t = \`http.request('\${'http://x/'}')\`;\nvoid t;`)).toBe(false);
+  });
+
+  it('does not treat destructuring `fetch` off a local (non-global) object as egress', () => {
+    expect(usesOutboundNetwork(`const cfg = { fetch: (x: string) => x };\nconst { fetch: f } = cfg;\nvoid f('a');`)).toBe(false);
+  });
+
+  // --- FALSE-NEGATIVE attack: the rule must not depend on the literal name `http` ---
+  it('still fires when the node:http namespace binding is renamed', () => {
+    expect(usesOutboundNetwork(`import * as anyName from 'node:http';\nanyName.get('http://example.com/');`)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// NET lexical-binding identity (NET-S1 / NET-S2). Capability identity is the
+// binding VISIBLE at an occurrence, not identifier text: a same-named local
+// (const/let/var/param/catch/destructuring, in any nested or sibling scope) shadows
+// the node:http import or the global `fetch` only inside its own scope, and the
+// outer binding is restored on scope exit. `usesOutboundNetwork` decides this with a
+// bounded lexical environment stack over one AST traversal — see the detector's doc.
+// ---------------------------------------------------------------------------
+describe('D3 host network egress uses lexical binding identity, not name text (D3-CX-POLICY-NET-SHADOW)', () => {
+  // NET-S1 — a local binding that shadows the node:http import is ALLOWED.
+  const s1Allow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a namespace import shadowed by a function-local const', source: `import * as http from 'node:http';\nfunction f() {\n  const http = { request(v: string) { return v; } };\n  return http.request('local');\n}` },
+    { form: 'a namespace import shadowed by a parameter', source: `import * as http from 'node:http';\nfunction f(http: { request(v: string): string }) {\n  return http.request('local');\n}` },
+    { form: 'a named request import shadowed by a function-local const', source: `import { request } from 'node:http';\nfunction f() {\n  const request = (x: string) => x;\n  return request('local');\n}` },
+    { form: 'a named request import shadowed by a parameter', source: `import { request } from 'node:http';\nfunction f(request: (x: string) => string) {\n  return request('local');\n}` },
+    { form: 'a named get import shadowed by a parameter', source: `import { get } from 'node:http';\nfunction f(get: (x: string) => string) {\n  return get('local');\n}` },
+    { form: 'a namespace import shadowed in a nested block, used inside that block', source: `import * as http from 'node:http';\nfunction f() {\n  {\n    const http = { request(v: string) { return v; } };\n    http.request('local');\n  }\n}` },
+    { form: 'a named import shadowed by a catch binding', source: `import { get } from 'node:http';\nfunction f() {\n  try {\n    /* work */\n  } catch (get) {\n    (get as (x: string) => string)('local');\n  }\n}` },
+    { form: 'a named import shadowed by a destructuring parameter', source: `import { request } from 'node:http';\nfunction f({ request }: { request: (x: string) => string }) {\n  return request('local');\n}` },
+    { form: 'only the inner shadowed use (outer binding never called)', source: `import * as http from 'node:http';\nfunction local() {\n  const http = { request(v: string) { return v; } };\n  return http.request('local');\n}` },
+  ];
+  for (const { form, source } of s1Allow) {
+    it(`ALLOWS ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+
+  // NET-S1 — the imported capability is still REJECTED where it is actually visible.
+  const s1Reject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'the imported namespace binding after a sibling function shadows the name', source: `import * as http from 'node:http';\nfunction local() {\n  const http = { request(v: string) { return v; } };\n  http.request('local');\n}\nhttp.request('https://evil/');` },
+    { form: 'the imported binding after a nested block shadows then closes', source: `import * as http from 'node:http';\nfunction f() {\n  {\n    const http = { request(v: string) { return v; } };\n    http.request('local');\n  }\n  http.request('https://evil/');\n}` },
+    { form: 'a sibling function that does NOT shadow the named import', source: `import { get } from 'node:http';\nfunction outer() {\n  function inner() {\n    return get('https://evil/');\n  }\n  return inner;\n}` },
+  ];
+  for (const { form, source } of s1Reject) {
+    it(`REJECTS ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // NET-S2 — a local `fetch` shadows the global only inside its own scope.
+  it('ALLOWS a function-local fetch used only within that function', () => {
+    expect(usesOutboundNetwork(`function helper() {\n  const fetch = (x: string) => x;\n  return fetch('local');\n}`)).toBe(false);
+  });
+  it('ALLOWS a parameter-shadowed fetch used only within that function', () => {
+    expect(usesOutboundNetwork(`function helper(fetch: (x: string) => string) {\n  return fetch('local');\n}`)).toBe(false);
+  });
+  it('ALLOWS a genuine module-level local fetch used bare across the module', () => {
+    expect(usesOutboundNetwork(`const fetch = (x: string) => x;\nfetch('local');`)).toBe(false);
+  });
+  it('REJECTS a bare global fetch in a sibling function, despite a local fetch elsewhere', () => {
+    expect(
+      usesOutboundNetwork(
+        `function helper() {\n  const fetch = (x: string) => x;\n  return fetch('local');\n}\nexport function leak() {\n  return fetch('https://evil.example/');\n}`,
+      ),
+    ).toBe(true);
+  });
+  it('REJECTS a bare global fetch after a parameter-shadowed scope closes', () => {
+    expect(usesOutboundNetwork(`function helper(fetch: (x: string) => string) {\n  return fetch('local');\n}\nfetch('https://evil/');`)).toBe(true);
+  });
+  it('REJECTS globalThis.fetch even when a module-level local fetch exists', () => {
+    expect(usesOutboundNetwork(`const fetch = (x: string) => x;\nvoid fetch('local');\nglobalThis.fetch('https://evil/');`)).toBe(true);
+  });
+
+  // Sibling scopes with the same binding name do not contaminate one another.
+  it('keeps sibling function scopes independent (both shadow, both allowed)', () => {
+    expect(usesOutboundNetwork(`import * as http from 'node:http';\nfunction a(http: { request(v: string): string }) {\n  return http.request('a');\n}\nfunction b(http: { get(v: string): string }) {\n  return http.get('b');\n}`)).toBe(false);
   });
 });
