@@ -115,9 +115,11 @@ describe('Cockpit D3 finding binding (D3-CODEX-F1)', () => {
     return row as string;
   };
 
-  it('labels PR, Reviewed commit, and Advisory freshness as distinct columns', () => {
+  it('labels finding identity and reviewer attribution as distinct columns', () => {
     expect(headerRow).toContain('<th>PR</th>');
     expect(headerRow).toContain('<th>Reviewed commit</th>');
+    expect(headerRow).toContain('<th>Provider</th>');
+    expect(headerRow).toContain('<th>Reviewer</th>');
     expect(headerRow).toContain('<th>Advisory freshness</th>');
     // "Reviewed commit" is the load-bearing label: it must not collapse to a
     // bare "Commit", which would blur it against the repository Observed HEAD
@@ -141,6 +143,20 @@ describe('Cockpit D3 finding binding (D3-CODEX-F1)', () => {
     const row = rowFor('f-003');
     expect(row).toContain('pr-43');
     expect(row).toContain(HEAD_SHA);
+  });
+
+  it('attributes claims from different providers to their exact reviewers', () => {
+    const claudeRow = rowFor('f-001');
+    expect(claudeRow).toContain('claude');
+    expect(claudeRow).toContain('claude-review-bot');
+
+    const codexRow = rowFor('f-002');
+    expect(codexRow).toContain('codex');
+    expect(codexRow).toContain('codex-review-bot');
+
+    const coderabbitRow = rowFor('f-004');
+    expect(coderabbitRow).toContain('coderabbit');
+    expect(coderabbitRow).toContain('coderabbit-bot');
   });
 
   it('keeps two same-PR findings distinguishable by reviewed commit', () => {

@@ -188,6 +188,8 @@ function findingsSection(findings: readonly CockpitFindingReadModel[]): string {
         <td class="mono">${text(finding.findingId)}</td>
         <td class="mono">${text(finding.pullRequestId)}</td>
         <td class="mono">${text(finding.reviewedCommitSha)}</td>
+        <td>${text(finding.provider)}</td>
+        <td class="mono">${text(finding.reviewerId)}</td>
         <td><span class="tag sev-${finding.severity}">${text(finding.severity)}</span></td>
         <td>${text(finding.classification)}</td>
         <td>${text(finding.status)}</td>
@@ -204,7 +206,7 @@ function findingsSection(findings: readonly CockpitFindingReadModel[]): string {
     <h2>Findings <span class="section-cat cat cat-claim">claim</span></h2>
     <p class="empty">A finding is a reviewer/agent claim. Advisory freshness is a recomputable echo (derived judgment), never authority.</p>
     <table>
-      <thead><tr><th>ID</th><th>PR</th><th>Reviewed commit</th><th>Severity</th><th>Classification</th><th>Status</th><th>Disposition</th><th>Title</th><th>Message</th><th>File</th><th>Advisory freshness</th></tr></thead>
+      <thead><tr><th>ID</th><th>PR</th><th>Reviewed commit</th><th>Provider</th><th>Reviewer</th><th>Severity</th><th>Classification</th><th>Status</th><th>Disposition</th><th>Title</th><th>Message</th><th>File</th><th>Advisory freshness</th></tr></thead>
       <tbody>${rows}</tbody>
     </table>
   </section>`;
