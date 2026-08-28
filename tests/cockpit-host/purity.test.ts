@@ -421,6 +421,8 @@ const collectStringConsts = (sourceFile: ts.SourceFile): Map<string, string> => 
       if (node.name !== undefined) bindName(node.name.text);
     } else if (ts.isNamespaceImport(node) || ts.isImportSpecifier(node)) {
       bindName(node.name.text);
+    } else if (ts.isImportEqualsDeclaration(node)) {
+      bindName(node.name.text);
     } else if (
       ts.isFunctionDeclaration(node) ||
       ts.isFunctionExpression(node) ||
@@ -3134,6 +3136,15 @@ describe('D3 host static-const resolver is scope-sensitive (D3-CX-POLICY-F1)', (
       // Repeated same-name bindings are UNKNOWN even with identical initial values.
       form: 'the same name is const-bound twice with the identical harmless value',
       source: `const key = 'console';\n{ const key = 'console'; }\n(globalThis as any)[key]${RC_LAUNDER};`,
+    },
+    {
+      // Parse-only: an `import key = N.value` alias inside a namespace binds the
+      // text `key` a second time, so the outer immutable `const key = 'console'`
+      // is no longer unique and must fold to UNKNOWN. Without counting
+      // ImportEqualsDeclaration the resolver would inherit the harmless outer value
+      // while the runtime alias resolves to `N.value` (`'eval'`).
+      form: 'an import-equals alias rebinds an outer const name (import-equals inventory)',
+      source: `const key = 'console';\nnamespace N { export const value = 'eval'; }\nnamespace M {\n  import key = N.value;\n  (globalThis as any)[key]${RC_LAUNDER};\n}`,
     },
   ];
   for (const { form, source } of mustReject) {
