@@ -1,4 +1,13 @@
-import { lstatSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -17,6 +26,13 @@ import { afterAll, describe, expect, it } from 'vitest';
  */
 
 const hostDir = fileURLToPath(new URL('../../src/cockpit-host/', import.meta.url));
+
+// The sibling Cockpit boundary is a *second* allowed source root the host may
+// import from (`../cockpit/`). `tsc`/`readFileSync` follow symlinks under it just
+// as they do under the host root, so it must receive the same fail-closed symlink
+// scan (D3-CX-POLICY-FB). Derived from the same `import.meta.url` anchor as
+// `hostDir`, so the two roots agree by construction.
+const cockpitDir = fileURLToPath(new URL('../../src/cockpit/', import.meta.url));
 
 /**
  * Fail closed on any symlink entry under a host tree (D3-CX-POLICY-SYMLINK).
@@ -42,8 +58,13 @@ function assertNoSymlinkEntries(root: string): void {
 }
 
 function hostSources(): readonly { readonly file: string; readonly text: string }[] {
-  // Reject symlink escapes before any read (D3-CX-POLICY-SYMLINK).
+  // Reject symlink escapes beneath EITHER allowed source root before any read or
+  // containment decision is trusted (D3-CX-POLICY-SYMLINK / -FB). A symlink under
+  // `src/cockpit/` — e.g. `bridge.ts -> ../domain/actions.ts` — would let a host
+  // `../cockpit/bridge.js` import reach the domain kernel while lexical URL
+  // containment still passes and `tsc` emits the linked kernel into `dist/`.
   assertNoSymlinkEntries(hostDir);
+  assertNoSymlinkEntries(cockpitDir);
   return readdirSync(hostDir, { recursive: true })
     .map((entry) => String(entry))
     .filter((name) => name.endsWith('.ts'))
@@ -272,6 +293,368 @@ const hasUnverifiableDynamicImport = (source: string): boolean => {
     if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
       const arg = node.arguments[0];
       if (arg === undefined || !ts.isStringLiteralLike(arg)) found = true;
+    }
+    ts.forEachChild(node, visit);
+  };
+  ts.forEachChild(sourceFile, visit);
+  return found;
+};
+
+// ---------------------------------------------------------------------------
+// Shared structural helpers for the acquisition-site RC/HA detectors
+// (D3-CX-POLICY-RC / -HA). These reason over parented AST nodes so a capability
+// is caught where its name first appears — as a value reference, a member access,
+// or a destructuring property — rather than only at a final call after limited
+// alias tracing. Forwarding a captured value through an object, array, return, or
+// argument therefore cannot hide it, because the capability had to be *named* at
+// its source site, which these helpers see. No substring text matching is used;
+// comments and string/template literals are not identifier or access nodes and so
+// are never matched. This is a finite, conservative structural policy — not an
+// interprocedural taint engine — safe here because the real host and Cockpit
+// sources use none of these capability names (verified by the enforcement `it`s
+// below that run every detector over the real sources).
+// ---------------------------------------------------------------------------
+
+// Global-object receiver identifiers. A member named `eval`/`Function`/`process`
+// read off one of these is the real global authority; the same name read off an
+// unrelated local object is not.
+const GLOBAL_RECEIVER_NAMES: ReadonlySet<string> = new Set(['globalThis', 'window', 'self', 'global']);
+
+// Unwrap the expression wrappers that do not change identity: parentheses, `as`
+// casts, `!` non-null, `satisfies`, and old-style `<T>` assertions. So
+// `(globalThis as any)['eval']` and `(process as any).binding` are seen through.
+const unwrapExpr = (node: ts.Expression): ts.Expression => {
+  let cur: ts.Expression = node;
+  while (
+    ts.isParenthesizedExpression(cur) ||
+    ts.isAsExpression(cur) ||
+    ts.isNonNullExpression(cur) ||
+    ts.isSatisfiesExpression(cur) ||
+    ts.isTypeAssertionExpression(cur)
+  ) {
+    cur = cur.expression;
+  }
+  return cur;
+};
+
+const isGlobalReceiver = (node: ts.Expression): boolean => {
+  const n = unwrapExpr(node);
+  return ts.isIdentifier(n) && GLOBAL_RECEIVER_NAMES.has(n.text);
+};
+
+// The statically-provable string value of an expression: a string literal or
+// substitution-free template, a `+` concatenation of such, or a local `const`
+// bound (to a fixpoint, see collectStringConsts) to one — else null. This resolves
+// `'ev' + 'al'` and `const m = 'getBuiltin' + 'Module'; obj[m]` to `eval` /
+// `getBuiltinModule`, so a computed-but-static property name cannot launder a
+// reserved capability past the member-name check.
+const staticStringOf = (node: ts.Expression, constMap: ReadonlyMap<string, string>): string | null => {
+  const n = unwrapExpr(node);
+  if (ts.isStringLiteralLike(n)) return n.text;
+  if (ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+    const left = staticStringOf(n.left, constMap);
+    const right = staticStringOf(n.right, constMap);
+    return left !== null && right !== null ? left + right : null;
+  }
+  if (ts.isIdentifier(n)) {
+    const value = constMap.get(n.text);
+    return value !== undefined ? value : null;
+  }
+  return null;
+};
+
+// Collect `const/let/var x = <static string>` bindings to a fixpoint (bounded by
+// the number of declarations), so a computed key built from a local string const
+// still folds.
+const collectStringConsts = (sourceFile: ts.SourceFile): Map<string, string> => {
+  const map = new Map<string, string>();
+  const pass = (): boolean => {
+    let changed = false;
+    const visit = (node: ts.Node): void => {
+      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer !== undefined) {
+        const value = staticStringOf(node.initializer, map);
+        if (value !== null && map.get(node.name.text) !== value) {
+          map.set(node.name.text, value);
+          changed = true;
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    ts.forEachChild(sourceFile, visit);
+    return changed;
+  };
+  while (pass()) {
+    /* fixpoint over simple string-const chains */
+  }
+  return map;
+};
+
+// The member name of a property/element access — a property identifier, or a
+// statically-resolved element key — else null.
+const memberNameOf = (node: ts.Node, constMap: ReadonlyMap<string, string>): string | null => {
+  if (ts.isPropertyAccessExpression(node)) return node.name.text;
+  if (ts.isElementAccessExpression(node)) return staticStringOf(node.argumentExpression, constMap);
+  return null;
+};
+
+// The SOURCE property name read by a destructuring binding element: `{ x }` and
+// `{ x: y }` both read property `x`. Handles a quoted key `{ 'x': y }`.
+const bindingPropertyName = (node: ts.BindingElement): string | null => {
+  const key = node.propertyName ?? node.name;
+  if (ts.isIdentifier(key)) return key.text;
+  if (ts.isStringLiteralLike(key)) return key.text;
+  return null;
+};
+
+// Whether an identifier is a *value reference* (a read of the binding) rather than
+// a name being declared, an object-literal key, a member name, or a type name.
+// Conservative: anything not in the small excluded set of name-only positions is
+// treated as a reference, so the fail-closed rules err toward rejection.
+const isValueReference = (id: ts.Identifier): boolean => {
+  const p = id.parent as ts.Node | undefined;
+  if (p === undefined) return true;
+  const named = p as { name?: ts.Node };
+  if (
+    (ts.isVariableDeclaration(p) ||
+      ts.isParameter(p) ||
+      ts.isBindingElement(p) ||
+      ts.isFunctionDeclaration(p) ||
+      ts.isClassDeclaration(p) ||
+      ts.isMethodDeclaration(p) ||
+      ts.isPropertyDeclaration(p) ||
+      ts.isGetAccessorDeclaration(p) ||
+      ts.isSetAccessorDeclaration(p) ||
+      ts.isEnumDeclaration(p) ||
+      ts.isModuleDeclaration(p) ||
+      ts.isTypeAliasDeclaration(p) ||
+      ts.isInterfaceDeclaration(p) ||
+      ts.isTypeParameterDeclaration(p) ||
+      ts.isImportClause(p) ||
+      ts.isNamespaceImport(p) ||
+      ts.isImportSpecifier(p) ||
+      ts.isExportSpecifier(p)) &&
+    named.name === id
+  ) {
+    return false;
+  }
+  if (ts.isPropertyAssignment(p) && p.name === id) return false; // object-literal key
+  if (ts.isPropertyAccessExpression(p) && p.name === id) return false; // member name
+  if (ts.isPropertySignature(p) && p.name === id) return false;
+  if (ts.isQualifiedName(p) && p.right === id) return false;
+  if (ts.isTypeReferenceNode(p)) return false;
+  return true;
+};
+
+// Whether a node ultimately serves as the object being accessed by an enclosing
+// member/element access (through identity-preserving wrappers). `process` in
+// `process.argv[1]` and `(process as any).cwd()` serves as an access object — a
+// direct operation — whereas `process` stored in `[process]` or `{ p: process }`
+// does not, so the latter is caught as forwarding.
+const servesAsAccessObject = (node: ts.Node): boolean => {
+  let cur: ts.Node = node;
+  let p = cur.parent as ts.Node | undefined;
+  while (
+    p !== undefined &&
+    ((ts.isParenthesizedExpression(p) && p.expression === cur) ||
+      (ts.isAsExpression(p) && p.expression === cur) ||
+      (ts.isNonNullExpression(p) && p.expression === cur) ||
+      (ts.isSatisfiesExpression(p) && p.expression === cur) ||
+      (ts.isTypeAssertionExpression(p) && p.expression === cur))
+  ) {
+    cur = p;
+    p = cur.parent as ts.Node | undefined;
+  }
+  if (p === undefined) return false;
+  return (ts.isPropertyAccessExpression(p) || ts.isElementAccessExpression(p)) && p.expression === cur;
+};
+
+/**
+ * RC — reject runtime code generation at its acquisition site (D3-CX-POLICY-RC v2).
+ *
+ * The import scanner reasons over *import AST nodes*; a string handed to a runtime
+ * code-generation primitive is opaque to it, so `eval("import('../domain/x.js')")`
+ * builds and Node 24 executes the hidden domain import while every specifier check
+ * sees nothing. The v1 detector only recognized the final call after simple
+ * `const x = eval` alias tracing, so the same primitive laundered through a
+ * destructuring, an object property, an array element, or a function return
+ * bypassed it. v2 rejects the capability where it is *named*, not where it is
+ * called — forwarding cannot hide what was already named at its source.
+ *
+ * Rejected, structurally (never by substring text):
+ *   - (a) any member access named `constructor` — property or statically-computed
+ *     element key, any receiver — the `(async () => {}).constructor` /
+ *     `(function*(){}).constructor` chain to the Async/Generator/AsyncGenerator
+ *     function constructors, including extraction to a variable before invocation;
+ *   - (b) any member access named `eval` / `Function` read off a global receiver
+ *     (`globalThis`/`window`/`self`/`global`, through `as`/paren wrappers), e.g.
+ *     `globalThis.eval`, `globalThis['ev' + 'al']`, `(globalThis as any)['eval']`;
+ *   - (c) any destructuring of a property named `eval` / `Function`
+ *     (`const { eval: e } = globalThis`);
+ *   - (d) any *value reference* to the global `eval` / `Function` primitive — as a
+ *     call callee, initializer, object-property value, array element, return
+ *     value, or argument — so `[eval]`, `{ e: eval }`, `return eval` are caught at
+ *     the reference site regardless of how the value is later invoked.
+ *
+ * A member named `eval`/`Function` read off a NON-global local object
+ * (`cfg.eval`) is not the global primitive and is preserved. Class constructor
+ * *declarations* and ordinary `new C()` contain no `.constructor` access and are
+ * preserved. Comments, strings, and longer identifiers (`evaluate`) are never
+ * matched. Fail-closed and finite; the real host sources reference none of these.
+ */
+const RC_PRIMITIVE_NAMES: ReadonlySet<string> = new Set(['eval', 'Function']);
+
+const usesRuntimeCodeGeneration = (source: string): boolean => {
+  const sourceFile = ts.createSourceFile(
+    'module.ts',
+    source,
+    ts.ScriptTarget.Latest,
+    /* setParentNodes */ true,
+    ts.ScriptKind.TS,
+  );
+  const constMap = collectStringConsts(sourceFile);
+
+  let found = false;
+  const visit = (node: ts.Node): void => {
+    if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+      const member = memberNameOf(node, constMap);
+      // (a) `.constructor` on any receiver — the function-constructor chain.
+      if (member === 'constructor') found = true;
+      // (b) `.eval` / `.Function` off a global receiver.
+      else if (member !== null && RC_PRIMITIVE_NAMES.has(member) && isGlobalReceiver(node.expression)) {
+        found = true;
+      }
+    }
+    // (c) destructuring a property named eval / Function.
+    if (ts.isBindingElement(node)) {
+      const name = bindingPropertyName(node);
+      if (name !== null && RC_PRIMITIVE_NAMES.has(name)) found = true;
+    }
+    // (d) a value reference to the global eval / Function primitive.
+    if (ts.isIdentifier(node) && RC_PRIMITIVE_NAMES.has(node.text) && isValueReference(node)) {
+      found = true;
+    }
+    // (e) forwarding a recognized global-authority object (`globalThis`/`global`/
+    //     `window`/`self`) as a value — an initializer, object value, array element,
+    //     return, or argument — i.e. any use that is NOT a direct member access on
+    //     it. This is the acquisition-site closure of the global-alias route: once
+    //     `const g = globalThis` is rejected, an alias `g.eval` / `g.Function` /
+    //     `g.process` can never be created, so no deep flow tracing is needed. A
+    //     direct `globalThis.console` / `globalThis.process.cwd()` (where the global
+    //     serves as the access object, through `as`/paren wrappers) is preserved.
+    if (
+      ts.isIdentifier(node) &&
+      GLOBAL_RECEIVER_NAMES.has(node.text) &&
+      isValueReference(node) &&
+      !servesAsAccessObject(node)
+    ) {
+      found = true;
+    }
+    // (f) a computed element access on a recognized global receiver whose key is not
+    //     statically resolvable — a runtime-built key (`['e','v','a','l'].join('')`,
+    //     `String.fromCharCode(...)`) could acquire `eval`/`Function`/`process` off
+    //     the global object without ever exposing the property name to static
+    //     inspection. A statically-resolved global member (`globalThis['console']`,
+    //     `globalThis['ev' + 'al']`) is not caught here (the latter is caught by (b)).
+    if (
+      ts.isElementAccessExpression(node) &&
+      isGlobalReceiver(node.expression) &&
+      staticStringOf(node.argumentExpression, constMap) === null
+    ) {
+      found = true;
+    }
+    ts.forEachChild(node, visit);
+  };
+  ts.forEachChild(sourceFile, visit);
+  return found;
+};
+
+/**
+ * HA — reject hidden Node-builtin acquisition at its acquisition site
+ * (D3-CX-POLICY-HA v2).
+ *
+ * `process.getBuiltinModule('fs')` and the legacy `process.binding('…')` return a
+ * builtin with NO module specifier, so the exact `{node:http, node:url}` import
+ * allowlist never sees them and a "read-only" host can still reach
+ * `fs`/`child_process` authority. The v1 detector recognized the acquisition only
+ * when the receiver was a directly-traced `process` alias, so forwarding `process`
+ * — or the bound method itself — through a destructuring, object, array, or return
+ * bypassed it. v2 reserves the capability *names* and rejects forwarding of the
+ * `process` global, catching every route at the site where the name appears.
+ *
+ * Rejected, structurally (never by substring text):
+ *   - (a) any member access — property or statically-computed element key, on ANY
+ *     receiver — named `getBuiltinModule` or `binding`. Reserving the names
+ *     receiver-independently is what closes forwarding: `{ acquire:
+ *     process.getBuiltinModule }` and `(process as any)['getBuiltin' + 'Module']`
+ *     are both caught where `getBuiltinModule` is named. This is an intentional
+ *     fail-closed reservation for this narrow host boundary — see the preservation
+ *     note in the HA suite about unrelated methods that happen to share the name.
+ *   - (b) any destructuring of a property named `getBuiltinModule` / `binding`
+ *     (`const { getBuiltinModule } = process`, `const { binding: b } = process`);
+ *   - (c) forwarding the `process` global as a value — as an initializer, object
+ *     property value, array element, return value, or argument — i.e. any use that
+ *     is NOT a direct `process.<op>` operation. A direct operation such as
+ *     `process.argv[1]` or `process.cwd()` (where `process` is the object of the
+ *     access, through `as`/paren wrappers) is preserved.
+ *
+ * The static import allowlist is neither weakened nor replaced — `node:http` /
+ * `node:url` stay allowed, `node:fs` stays rejected — this only closes the
+ * specifier-less side channel and its forwarding variants. Finite and
+ * conservative; the real host and Cockpit sources use none of these names and only
+ * the direct `process.argv[1]` operation, which is preserved.
+ */
+const HIDDEN_BUILTIN_METHODS: ReadonlySet<string> = new Set(['getBuiltinModule', 'binding']);
+
+// A node denoting the `process` global as a value: the bare `process` identifier
+// used as a reference, or `globalThis.process` / `globalThis['process']` read off a
+// global receiver. A `.process` member on an unrelated local object is NOT this.
+const isProcessValue = (node: ts.Node, constMap: ReadonlyMap<string, string>): boolean => {
+  if (ts.isIdentifier(node)) return node.text === 'process' && isValueReference(node);
+  if (ts.isPropertyAccessExpression(node)) {
+    return node.name.text === 'process' && isGlobalReceiver(node.expression);
+  }
+  if (ts.isElementAccessExpression(node)) {
+    return staticStringOf(node.argumentExpression, constMap) === 'process' && isGlobalReceiver(node.expression);
+  }
+  return false;
+};
+
+const acquiresHiddenBuiltin = (source: string): boolean => {
+  const sourceFile = ts.createSourceFile(
+    'module.ts',
+    source,
+    ts.ScriptTarget.Latest,
+    /* setParentNodes */ true,
+    ts.ScriptKind.TS,
+  );
+  const constMap = collectStringConsts(sourceFile);
+
+  let found = false;
+  const visit = (node: ts.Node): void => {
+    // (a) member access named getBuiltinModule / binding — any receiver.
+    if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+      const member = memberNameOf(node, constMap);
+      if (member !== null && HIDDEN_BUILTIN_METHODS.has(member)) found = true;
+    }
+    // (b) destructuring a property named getBuiltinModule / binding.
+    if (ts.isBindingElement(node)) {
+      const name = bindingPropertyName(node);
+      if (name !== null && HIDDEN_BUILTIN_METHODS.has(name)) found = true;
+    }
+    // (c) forwarding the process global as a value (not a direct process operation).
+    if (isProcessValue(node, constMap) && !servesAsAccessObject(node)) found = true;
+    // (d) a computed element access on the process global whose key is not statically
+    //     resolvable — a runtime-built key (`(process as any)[['g','e',…].join('')]`)
+    //     could name `getBuiltinModule`/`binding` without exposing it to (a). This is
+    //     the same finite rule as RC (f), applied to the authority object HA governs.
+    //     `process.argv[1]` is unaffected: its `[1]` receiver is `process.argv`, not
+    //     the process object, so this never fires on it.
+    if (
+      ts.isElementAccessExpression(node) &&
+      isProcessValue(unwrapExpr(node.expression), constMap) &&
+      staticStringOf(node.argumentExpression, constMap) === null
+    ) {
+      found = true;
     }
     ts.forEachChild(node, visit);
   };
@@ -2249,6 +2632,428 @@ describe('D3 host purity rejects symlink escapes (D3-CX-POLICY-SYMLINK)', () => 
     expect(() => {
       assertNoSymlinkEntries(hostDir);
     }).not.toThrow();
+    expect(hostSources().length).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// RC — runtime code generation is forbidden (D3-CX-POLICY-RC).
+// The import scanner cannot see an import built from a string handed to a
+// runtime code-generation primitive, so the host must use none.
+// ---------------------------------------------------------------------------
+describe('D3 host forbids runtime code generation (D3-CX-POLICY-RC)', () => {
+  // Enforcement over the real host tree: no production source constructs code at
+  // runtime, so the discipline is satisfied today and stays satisfied.
+  it('accepts every real host source (none uses runtime code generation)', () => {
+    for (const { file, text } of hostSources()) {
+      expect(usesRuntimeCodeGeneration(text), `${file} uses runtime code generation`).toBe(false);
+    }
+  });
+
+  // --- Rejections: each required witness constructs the hidden domain import ---
+  const rejected: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'direct eval', source: `eval("import('../domain/actions.js')");` },
+    {
+      form: 'aliased eval',
+      source: `const evaluate = eval;\nevaluate("import('../domain/actions.js')");`,
+    },
+    { form: 'globalThis.eval', source: `globalThis.eval("import('../domain/actions.js')");` },
+    {
+      form: 'globalThis["eval"] (string-keyed)',
+      source: `globalThis["eval"]("import('../domain/actions.js')");`,
+    },
+    { form: 'Function call', source: `Function('return import("../domain/actions.js")')();` },
+    { form: 'new Function', source: `new Function('return import("../domain/actions.js")');` },
+    {
+      form: 'async-arrow constructor chain',
+      source: `(async () => {}).constructor('return import("../domain/actions.js")')();`,
+    },
+    {
+      form: 'generator constructor chain',
+      source: `(function* () {}).constructor('return import("../domain/actions.js")')();`,
+    },
+    {
+      form: 'chained alias of eval',
+      source: `const a = eval;\nconst b = a;\nb("import('../domain/actions.js')");`,
+    },
+  ];
+  for (const { form, source } of rejected) {
+    it(`rejects ${form}`, () => {
+      expect(usesRuntimeCodeGeneration(source)).toBe(true);
+    });
+  }
+
+  // --- False-positive controls: text that merely mentions the primitives ---
+  const accepted: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'line comment mentioning eval/Function', source: `const x = 1; // eval("nope") new Function()` },
+    {
+      form: 'block comment mentioning the primitives',
+      source: `/* do not eval(...) or new Function(...) here */\nexport const ok = true;`,
+    },
+    {
+      form: 'string data containing the words',
+      source: `const s = "eval('x')";\nconst t = 'Function';\nconst u = \`eval\`;`,
+    },
+    {
+      form: 'identifiers whose names merely contain the substrings',
+      source: `const evaluate = (a: number) => a;\nconst functionalValue = 2;\nevaluate(functionalValue);`,
+    },
+    {
+      form: 'domain-style evaluate call (not a codegen alias)',
+      source: `import { evaluateEvidenceSet } from '../cockpit/index.js';\nevaluateEvidenceSet([], {});`,
+    },
+    {
+      form: 'a class with a constructor declaration and ordinary new',
+      source: `class C { constructor() {} }\nconst c = new C();\nconst u = new URL('http://x');`,
+    },
+    {
+      form: 'a property literally named eval that is never called',
+      source: `const cfg = { eval: false, Function: 'x' };\nconst y = cfg.eval;`,
+    },
+  ];
+  for (const { form, source } of accepted) {
+    it(`does not flag ${form}`, () => {
+      expect(usesRuntimeCodeGeneration(source)).toBe(false);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// HA — hidden Node-builtin acquisition is forbidden (D3-CX-POLICY-HA).
+// A builtin obtained without an import specifier bypasses the exact allowlist.
+// ---------------------------------------------------------------------------
+describe('D3 host forbids hidden builtin acquisition (D3-CX-POLICY-HA)', () => {
+  // Enforcement over the real host tree: no production source acquires a builtin
+  // through a specifier-less side channel.
+  it('accepts every real host source (none hides a builtin acquisition)', () => {
+    for (const { file, text } of hostSources()) {
+      expect(acquiresHiddenBuiltin(text), `${file} hides a builtin acquisition`).toBe(false);
+    }
+  });
+
+  // --- Rejections: each required specifier-less acquisition route ---
+  const rejected: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'direct process.getBuiltinModule', source: `const fs = process.getBuiltinModule('fs');` },
+    {
+      form: 'globalThis.process.getBuiltinModule',
+      source: `const cp = globalThis.process.getBuiltinModule('child_process');`,
+    },
+    {
+      form: 'string-keyed getBuiltinModule',
+      source: `const fs = process['getBuiltinModule']('fs');`,
+    },
+    {
+      form: 'simple process alias',
+      source: `const proc = process;\nconst fs = proc.getBuiltinModule('fs');`,
+    },
+    {
+      form: 'simple method alias',
+      source: `const getBuiltin = process.getBuiltinModule;\nconst fs = getBuiltin('fs');`,
+    },
+    { form: 'direct process.binding', source: `const fs = process.binding('fs');` },
+    {
+      form: 'globalThis.process.binding',
+      source: `const n = globalThis.process.binding('natives');`,
+    },
+    {
+      form: 'aliased process.binding',
+      source: `const proc = process;\nconst n = proc.binding('natives');`,
+    },
+  ];
+  for (const { form, source } of rejected) {
+    it(`rejects ${form}`, () => {
+      expect(acquiresHiddenBuiltin(source)).toBe(true);
+    });
+  }
+
+  // --- False-positive controls: unrelated process/binding text ---
+  const notHidden: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'process.env access (a different concern)', source: `const p = process.env.PORT;` },
+    { form: 'process.exitCode assignment', source: `process.exitCode = 0;` },
+    { form: 'process.cwd() call', source: `const d = process.cwd();` },
+    { form: 'comment mentioning getBuiltinModule', source: `// process.getBuiltinModule('fs') is banned\nexport const ok = true;` },
+    { form: 'string containing the method name', source: `const s = "getBuiltinModule";\nconst t = 'binding';` },
+    { form: 'identifier named binding, unrelated', source: `const binding = 1;\nconst z = binding + 2;` },
+    { form: 'direct process.argv[1] operation (as the real host uses)', source: `const entry = process.argv[1];\nvoid entry;` },
+  ];
+  for (const { form, source } of notHidden) {
+    it(`does not flag ${form}`, () => {
+      expect(acquiresHiddenBuiltin(source)).toBe(false);
+    });
+  }
+
+  // INTENTIONAL RESERVATION (v2, documented): the v1 control that asserted an
+  // unrelated object method named `getBuiltinModule`/`binding` is NOT flagged is
+  // inverted here. The v2 positive contract reserves those capability names
+  // receiver-independently, which is what lets it catch a forwarded acquisition
+  // (`{ acquire: process.getBuiltinModule }`) at the site where the name appears.
+  // The real host and Cockpit sources define no such method, so the reservation is
+  // safe — see the "accepts every real host source" enforcement above.
+  it('reserves getBuiltinModule / binding as capability names on any receiver', () => {
+    expect(
+      acquiresHiddenBuiltin(`const svc = { getBuiltinModule(x: string) { return x; } };\nsvc.getBuiltinModule('ok');`),
+    ).toBe(true);
+    expect(acquiresHiddenBuiltin(`const svc = { binding(x: string) { return x; } };\nsvc.binding('ok');`)).toBe(
+      true,
+    );
+  });
+
+  // --- Preservation: the static builtin allowlist is untouched by this repair ---
+  it('keeps the exact `{node:http, node:url}` allowlist and still rejects node:fs', () => {
+    expect(isAllowedNodeBuiltin('node:http')).toBe(true);
+    expect(isAllowedNodeBuiltin('node:url')).toBe(true);
+    expect(isAllowedNodeBuiltin('node:fs')).toBe(false);
+    // A hidden acquisition is not an import specifier, so it never appears in the
+    // extractor's output — the allowlist alone could not have caught it.
+    expect(extractModuleSpecifiers(`const fs = process.getBuiltinModule('fs');`)).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// RC v2 — forwarding closure. The v1 detector missed a code-generation primitive
+// laundered through destructuring, an object, an array, or a function return; v2
+// catches it at the naming site. Every witness below typechecks under the repo's
+// strict NodeNext config (verified by an out-of-worktree harness) and reaches
+// runtime code generation on Node 24.
+// ---------------------------------------------------------------------------
+describe('D3 host RC forwarding closure rejects laundered code generation (D3-CX-POLICY-RC v2)', () => {
+  const rejected: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'destructured eval', source: `const { eval: e } = globalThis;\ne("import('../domain/actions.js')");` },
+    { form: 'renamed destructured eval', source: `const { eval: evaluate } = globalThis;\nevaluate("import('../domain/actions.js')");` },
+    { form: 'eval in an object property', source: `const o = { e: eval };\no.e("import('../domain/actions.js')");` },
+    { form: 'eval in an array invoked with [0]!', source: `const a = [eval];\na[0]!("import('../domain/actions.js')");` },
+    { form: 'eval returned from a function', source: `function f() { return eval; }\nf()("import('../domain/actions.js')");` },
+    { form: 'eval passed through a function argument', source: `function run(fn: (s: string) => unknown) { fn("import('../domain/actions.js')"); }\nrun(eval);` },
+    { form: 'destructured Function', source: `const { Function: F } = globalThis;\nF('return import("../domain/actions.js")')();` },
+    { form: 'Function in an object property', source: `const o = { c: Function };\no.c('return import("../domain/actions.js")')();` },
+    { form: 'Function returned from a function', source: `function f() { return Function; }\nf()('return import("../domain/actions.js")')();` },
+    { form: "globalThis['ev' + 'al'] via as-any cast", source: `(globalThis as any)['ev' + 'al']("import('../domain/actions.js')");` },
+    { form: "globalThis['Fun' + 'ction'] via as-any cast", source: `(globalThis as any)['Fun' + 'ction']('return import("../domain/actions.js")')();` },
+    { form: 'extracted async-function constructor', source: `const F = (async () => {}).constructor;\nF('return import("../domain/actions.js")')();` },
+    { form: 'extracted generator-function constructor', source: `const F = (function* () {}).constructor;\nF('return import("../domain/actions.js")')();` },
+    { form: 'statically-computed constructor member access', source: `const obj = (async () => {}) as any;\nconst C = obj['con' + 'structor'];\nC('return import("../domain/actions.js")')();` },
+  ];
+  for (const { form, source } of rejected) {
+    it(`rejects ${form}`, () => {
+      expect(usesRuntimeCodeGeneration(source)).toBe(true);
+    });
+  }
+
+  // Preservation: forms that name none of the primitives at a value/member site.
+  it('preserves local `.eval`, class constructors, and unrelated identifiers', () => {
+    expect(usesRuntimeCodeGeneration(`const cfg = { eval: false };\nconst y = cfg.eval;`)).toBe(false);
+    expect(usesRuntimeCodeGeneration(`class C { constructor() {} }\nconst c = new C();\nconst u = new URL('http://x');`)).toBe(false);
+    expect(usesRuntimeCodeGeneration(`const evaluate = (x: number) => x;\nconst functionalValue = 2;\nevaluate(functionalValue);`)).toBe(false);
+    // v3 note: a bare `const g = globalThis` value is now REJECTED as global-object
+    // forwarding (see the RC v3 suite); a DIRECT global member access stays allowed.
+    expect(usesRuntimeCodeGeneration(`globalThis.console.log('x');`)).toBe(false);
+    expect(usesRuntimeCodeGeneration(`globalThis.setTimeout(() => {}, 0);`)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// HA v2 — forwarding closure. The v1 detector missed a hidden acquisition
+// laundered by forwarding `process` or the bound method through a destructuring,
+// object, array, or return; v2 reserves the capability names and rejects process
+// forwarding. Every witness typechecks under the repo config and is
+// capability-relevant on Node 24.
+// ---------------------------------------------------------------------------
+describe('D3 host HA forwarding closure rejects laundered builtin acquisition (D3-CX-POLICY-HA v2)', () => {
+  const rejected: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'destructured getBuiltinModule', source: `const { getBuiltinModule } = process;\nconst m = getBuiltinModule('fs');\nvoid m;` },
+    { form: 'renamed destructured getBuiltinModule', source: `const { getBuiltinModule: acquire } = process;\nconst m = acquire('fs');\nvoid m;` },
+    { form: 'process in an object property', source: `const o = { p: process };\nconst m = o.p.getBuiltinModule('fs');\nvoid m;` },
+    { form: 'process in an array using [0]!', source: `const a = [process];\nconst m = a[0]!.getBuiltinModule('fs');\nvoid m;` },
+    { form: 'process returned from a function', source: `function f() { return process; }\nconst m = f().getBuiltinModule('fs');\nvoid m;` },
+    { form: 'process passed through a function argument', source: `function run(p: NodeJS.Process) { p.getBuiltinModule('fs'); }\nrun(process);` },
+    { form: 'getBuiltinModule stored in an object', source: `const o = { acquire: process.getBuiltinModule };\nconst m = o.acquire('fs');\nvoid m;` },
+    { form: 'getBuiltinModule stored in an array', source: `const a = [process.getBuiltinModule];\nconst m = a[0]!('fs');\nvoid m;` },
+    { form: 'getBuiltinModule returned from a function', source: `function f() { return process.getBuiltinModule; }\nconst m = f()('fs');\nvoid m;` },
+    { form: 'computed process access via as-any', source: `const m = (process as any)['getBuiltin' + 'Module']('fs');\nvoid m;` },
+    { form: "statically-computed 'getBuiltin' + 'Module'", source: `const method = 'getBuiltin' + 'Module';\nconst m = (process as any)[method]('fs');\nvoid m;` },
+    { form: 'direct process.binding via as-any', source: `const internal = (process as any).binding('fs');\nvoid internal;` },
+    { form: 'destructured binding via as-any', source: `const { binding: acquireBinding } = process as any;\nconst internal = acquireBinding('fs');\nvoid internal;` },
+  ];
+  for (const { form, source } of rejected) {
+    it(`rejects ${form}`, () => {
+      expect(acquiresHiddenBuiltin(source)).toBe(true);
+    });
+  }
+
+  // Preservation: direct process operations and unrelated text remain accepted.
+  it('preserves direct process.argv[1] / process.cwd() and unrelated text', () => {
+    expect(acquiresHiddenBuiltin(`const entry = process.argv[1];\nvoid entry;`)).toBe(false);
+    expect(acquiresHiddenBuiltin(`const d = process.cwd();\nvoid d;`)).toBe(false);
+    expect(acquiresHiddenBuiltin(`(process as any).exitCode = 0;`)).toBe(false);
+    expect(acquiresHiddenBuiltin(`// process.getBuiltinModule('fs') and process.binding are banned\nexport const ok = true;`)).toBe(false);
+    expect(acquiresHiddenBuiltin(`const s = 'getBuiltinModule';\nconst t = \`binding\`;\nvoid s;\nvoid t;`)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// RC v3 — global-object forwarding closure. v2 rejected `.eval`/`.Function` only
+// off a *named* global receiver, so aliasing the global object to a non-reserved
+// name (`const g = globalThis; g.eval(...)`) evaded it. v3 rejects forwarding a
+// recognized global-authority object as a value, and rejects an unresolved
+// computed access on a global receiver — so the alias can never be created and a
+// runtime-built property name cannot launder the acquisition. Every witness
+// typechecks under strict NodeNext (verified by an out-of-worktree harness).
+// ---------------------------------------------------------------------------
+describe('D3 host RC global-object forwarding closure (D3-CX-POLICY-RC v3)', () => {
+  const rejected: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'direct globalThis alias then eval', source: `const g = globalThis;\ng.eval("import('../domain/actions.js')");` },
+    { form: 'globalThis forwarded through an object', source: `const holder = { g: globalThis };\nholder.g.eval("import('../domain/actions.js')");` },
+    { form: 'globalThis forwarded through an array', source: `const holders = [globalThis];\nholders[0]!.eval("import('../domain/actions.js')");` },
+    { form: 'globalThis returned from a function', source: `function obtainGlobal() { return globalThis; }\nobtainGlobal().eval("import('../domain/actions.js')");` },
+    { form: 'globalThis passed as a function argument', source: `function consume(x: typeof globalThis) { void x; }\nconsume(globalThis);` },
+    { form: 'node global alias then eval', source: `const g = global;\ng.eval("import('../domain/actions.js')");` },
+    { form: 'window alias then eval (type-valid synthetic)', source: `declare const window: typeof globalThis;\nconst g = window;\ng.eval("import('../domain/actions.js')");` },
+    { form: 'self alias then eval (type-valid synthetic)', source: `declare const self: typeof globalThis;\nconst g = self;\ng.eval("import('../domain/actions.js')");` },
+    { form: 'aliased globalThis then Function', source: `const g = globalThis;\ng.Function('return import("../domain/actions.js")')();` },
+    { form: 'aliased globalThis then process.getBuiltinModule', source: `const g = globalThis;\nconst m = g.process.getBuiltinModule('fs');\nvoid m;` },
+    { form: "runtime-computed global lookup via .join('')", source: `const key = ['e', 'v', 'a', 'l'].join('');\n(globalThis as any)[key]("import('../domain/actions.js')");` },
+    { form: 'runtime-computed global lookup via String.fromCharCode', source: `const key = String.fromCharCode(101, 118, 97, 108);\n(globalThis as any)[key]("import('../domain/actions.js')");` },
+    { form: "statically-computed global lookup ['ev' + 'al']", source: `(globalThis as any)['ev' + 'al']("import('../domain/actions.js')");` },
+    // Deeper alias chains — rejected at the ORIGINAL global acquisition/forwarding
+    // site, with no deep flow tracing.
+    { form: 'two-hop globalThis alias chain', source: `const a = globalThis;\nconst b = a;\nb.eval("import('../domain/actions.js')");` },
+    { form: 'globalThis via object then extracted', source: `const a = { global: globalThis };\nconst b = a.global;\nb.Function('return 1')();` },
+  ];
+  for (const { form, source } of rejected) {
+    it(`rejects ${form}`, () => {
+      expect(usesRuntimeCodeGeneration(source)).toBe(true);
+    });
+  }
+
+  // Preservation: a global object that DIRECTLY serves as a member-access receiver
+  // is a normal, harmless operation and must remain accepted.
+  it('preserves direct harmless global member access', () => {
+    expect(usesRuntimeCodeGeneration(`globalThis.console.log('x');`)).toBe(false);
+    expect(usesRuntimeCodeGeneration(`globalThis.setTimeout(() => {}, 0);`)).toBe(false);
+    expect(usesRuntimeCodeGeneration(`const d = globalThis.process.cwd();\nvoid d;`)).toBe(false);
+    expect(usesRuntimeCodeGeneration(`const c = globalThis['console'];\nvoid c;`)).toBe(false); // statically resolved
+    expect(usesRuntimeCodeGeneration(`const p = process.cwd();\nvoid p;`)).toBe(false);
+  });
+
+  // The aliased-globalThis-then-getBuiltinModule witness is ALSO independently
+  // caught by the HA reserved-name rule — either detector rejecting the source is
+  // sufficient for the enforcement `it`s that check both.
+  it('HA independently rejects the aliased-global getBuiltinModule witness', () => {
+    expect(acquiresHiddenBuiltin(`const g = globalThis;\nconst m = g.process.getBuiltinModule('fs');\nvoid m;`)).toBe(
+      true,
+    );
+  });
+
+  // The runtime-computed process lookup (HA (d)) — reserved-name laundering through
+  // a non-static key on the process object — is closed too.
+  it('HA rejects a runtime-computed process element access', () => {
+    expect(
+      acquiresHiddenBuiltin(`const key = ['g', 'e', 't'].join('');\nconst m = (process as any)[key]('fs');\nvoid m;`),
+    ).toBe(true);
+    // Preservation: the real host's direct `process.argv[1]` (numeric key on
+    // `process.argv`, not on `process`) is unaffected.
+    expect(acquiresHiddenBuiltin(`const e = process.argv[1];\nvoid e;`)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FB — the symlink boundary covers BOTH allowed source roots (D3-CX-POLICY-FB).
+// A symlink under src/cockpit could redirect a `../cockpit/…` host import onto
+// the domain kernel; `assertNoSymlinkEntries` must guard that root too.
+// ---------------------------------------------------------------------------
+describe('D3 host rejects symlink escapes under the Cockpit boundary (D3-CX-POLICY-FB)', () => {
+  // Symlink-capability probe, identical in spirit to the host-root suite: Windows
+  // without Developer Mode/admin throws EPERM, so the symlink-creation cases are
+  // capability-gated while the ordinary-file and real-tree controls always run.
+  // Authoritative Linux CI always supports symlinks and runs every case.
+  const symlinksSupported = ((): boolean => {
+    try {
+      const probe = mkdtempSync(join(tmpdir(), 'd3-fb-symlink-probe-'));
+      try {
+        symlinkSync('target', join(probe, 'link'));
+        return true;
+      } finally {
+        rmSync(probe, { recursive: true, force: true });
+      }
+    } catch {
+      return false;
+    }
+  })();
+  const itSymlink = symlinksSupported ? it : it.skip;
+
+  const tempRoots: string[] = [];
+  const makeRoot = (): string => {
+    const root = mkdtempSync(join(tmpdir(), 'd3-cockpit-symlink-'));
+    tempRoots.push(root);
+    return root;
+  };
+  afterAll(() => {
+    for (const root of tempRoots) rmSync(root, { recursive: true, force: true });
+  });
+
+  it('accepts a tree of ordinary Cockpit-boundary files (control, all platforms)', () => {
+    const root = makeRoot();
+    writeFileSync(join(root, 'index.ts'), "export { x } from '../domain/actions.js';\n");
+    writeFileSync(join(root, 'read-model.ts'), 'export const model = {};\n');
+    expect(() => {
+      assertNoSymlinkEntries(root);
+    }).not.toThrow();
+  });
+
+  itSymlink('rejects a Cockpit-boundary file symlink to ../domain/actions.ts', () => {
+    const root = makeRoot();
+    writeFileSync(join(root, 'index.ts'), "export { x } from './bridge.js';\n");
+    // A Cockpit-local name whose target escapes the boundary; left DANGLING so a
+    // follow would surface ENOENT instead of the clean symlink rejection.
+    symlinkSync(join('..', 'domain', 'actions.ts'), join(root, 'bridge.ts'));
+    expect(() => {
+      assertNoSymlinkEntries(root);
+    }).toThrow(/symlink entry is forbidden/i);
+  });
+
+  itSymlink('rejects a symlinked directory under the Cockpit boundary', () => {
+    const root = makeRoot();
+    writeFileSync(join(root, 'index.ts'), 'export const ok = true;\n');
+    symlinkSync(join('..', 'domain'), join(root, 'linked-dir'));
+    expect(() => {
+      assertNoSymlinkEntries(root);
+    }).toThrow(/symlink entry is forbidden/i);
+  });
+
+  itSymlink('rejects a nested Cockpit-boundary symlink at any depth', () => {
+    const root = makeRoot();
+    mkdirSync(join(root, 'nested'), { recursive: true });
+    writeFileSync(join(root, 'nested', 'index.ts'), 'export const ok = true;\n');
+    symlinkSync(join('..', '..', 'domain', 'actions.ts'), join(root, 'nested', 'bridge.ts'));
+    expect(() => {
+      assertNoSymlinkEntries(root);
+    }).toThrow(/symlink entry is forbidden/i);
+  });
+
+  itSymlink('rejects a dangling Cockpit-boundary symlink without leaking ENOENT', () => {
+    const root = makeRoot();
+    symlinkSync(join('..', 'nowhere', 'gone.ts'), join(root, 'bridge.ts'));
+    let error: unknown;
+    try {
+      assertNoSymlinkEntries(root);
+    } catch (e) {
+      error = e;
+    }
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toMatch(/symlink entry is forbidden/i);
+    expect((error as Error).message).not.toMatch(/ENOENT/i);
+  });
+
+  it('leaves the real Cockpit boundary passing (no symlink is present today)', () => {
+    expect(() => {
+      assertNoSymlinkEntries(cockpitDir);
+    }).not.toThrow();
+  });
+
+  it('applies the Cockpit-boundary scan through the shared hostSources() reader', () => {
+    // hostSources() now scans BOTH roots before returning any source, so the guard
+    // fails closed on a Cockpit-boundary symlink exactly as it does on a host one.
+    expect(() => hostSources()).not.toThrow();
     expect(hostSources().length).toBeGreaterThan(0);
   });
 });
