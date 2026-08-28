@@ -1,9 +1,10 @@
-import { readdirSync, readFileSync } from 'node:fs';
+import { lstatSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import ts from 'typescript';
-import { describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it } from 'vitest';
 
 /**
  * Cockpit D3 host purity, bounded to `src/cockpit-host/`.
@@ -17,7 +18,32 @@ import { describe, expect, it } from 'vitest';
 
 const hostDir = fileURLToPath(new URL('../../src/cockpit-host/', import.meta.url));
 
+/**
+ * Fail closed on any symlink entry under a host tree (D3-CX-POLICY-SYMLINK).
+ *
+ * `readdirSync`/`readFileSync` — and `tsc` — follow symbolic links, so a
+ * committed `src/cockpit-host/domain.ts -> ../domain/actions.ts` (imported as
+ * `./domain.js`) would read/emit forbidden kernel code while the lexical URL
+ * containment check still sees an in-host path and the forbidden-specifier check
+ * sees only a local import. `lstatSync` does NOT follow the link, so each
+ * enumerated entry — file or directory, at any depth — is stat-checked and the
+ * scan throws on the first symlink *before* any content is read or any
+ * URL-containment verdict is formed. Node's recursive `readdirSync` does not
+ * descend into a symlinked directory, so a symlinked directory surfaces as a
+ * leaf entry and is rejected here the same way.
+ */
+function assertNoSymlinkEntries(root: string): void {
+  for (const entry of readdirSync(root, { recursive: true })) {
+    const name = String(entry);
+    if (lstatSync(join(root, name)).isSymbolicLink()) {
+      throw new Error(`D3 host purity: symlink entry is forbidden under the host tree: ${name}`);
+    }
+  }
+}
+
 function hostSources(): readonly { readonly file: string; readonly text: string }[] {
+  // Reject symlink escapes before any read (D3-CX-POLICY-SYMLINK).
+  assertNoSymlinkEntries(hostDir);
   return readdirSync(hostDir, { recursive: true })
     .map((entry) => String(entry))
     .filter((name) => name.endsWith('.ts'))
@@ -2127,5 +2153,102 @@ describe('D3 host consolidated purity hardening (A/B/C/D)', () => {
         expect(accepts('server.ts', spec)).toBe(false);
       });
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Symlink-escape rejection (D3-CX-POLICY-SYMLINK).
+// `readdirSync`/`readFileSync` and `tsc` follow symlinks, so a committed symlink
+// under src/cockpit-host could point at forbidden code outside the host boundary
+// while lexical URL containment still passes. `assertNoSymlinkEntries` fails
+// closed via `lstatSync` (no follow) before any read. These tests exercise it on
+// an isolated temp tree — no fixture is created under src/**.
+// ---------------------------------------------------------------------------
+describe('D3 host purity rejects symlink escapes (D3-CX-POLICY-SYMLINK)', () => {
+  // Probe whether this platform/user can create symlinks. Windows without
+  // Developer Mode/admin throws EPERM; the authoritative Linux CI always can, so
+  // the symlink-rejection cases run there. Where unavailable we still assert the
+  // regular-file control below and skip only the cases that require creating a
+  // symlink — never weakening Linux CI coverage.
+  const symlinksSupported = ((): boolean => {
+    try {
+      const probe = mkdtempSync(join(tmpdir(), 'd3-symlink-probe-'));
+      try {
+        symlinkSync('target', join(probe, 'link'));
+        return true;
+      } finally {
+        rmSync(probe, { recursive: true, force: true });
+      }
+    } catch {
+      return false;
+    }
+  })();
+  const itSymlink = symlinksSupported ? it : it.skip;
+
+  const tempRoots: string[] = [];
+  const makeRoot = (): string => {
+    const root = mkdtempSync(join(tmpdir(), 'd3-host-symlink-'));
+    tempRoots.push(root);
+    return root;
+  };
+  afterAll(() => {
+    for (const root of tempRoots) rmSync(root, { recursive: true, force: true });
+  });
+
+  it('accepts a tree of ordinary regular files (control, all platforms)', () => {
+    const root = makeRoot();
+    writeFileSync(join(root, 'server.ts'), "import http from 'node:http';\n");
+    writeFileSync(join(root, 'render.ts'), "import { e } from './escape.js';\n");
+    expect(() => {
+      assertNoSymlinkEntries(root);
+    }).not.toThrow();
+  });
+
+  itSymlink('rejects a host-local-looking symlink to ../domain/actions.ts', () => {
+    const root = makeRoot();
+    writeFileSync(join(root, 'server.ts'), "import './domain.js';\n");
+    // A host-local name whose target escapes the boundary. The target is left
+    // DANGLING (never created), so if the guard followed the link it would throw
+    // an ENOENT read error instead of our clean symlink rejection.
+    symlinkSync(join('..', 'domain', 'actions.ts'), join(root, 'domain.ts'));
+    expect(() => {
+      assertNoSymlinkEntries(root);
+    }).toThrow(/symlink entry is forbidden/i);
+  });
+
+  itSymlink('rejects before reading or following the symlink (no ENOENT leak)', () => {
+    const root = makeRoot();
+    symlinkSync(join('..', '..', 'domain', 'actions.ts'), join(root, 'domain.ts'));
+    let error: unknown;
+    try {
+      assertNoSymlinkEntries(root);
+    } catch (e) {
+      error = e;
+    }
+    // The rejection is our lstat-based symlink error, proving no read/follow of
+    // the dangling target occurred (a follow would surface ENOENT instead).
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toMatch(/symlink entry is forbidden/i);
+    expect((error as Error).message).not.toMatch(/ENOENT/i);
+  });
+
+  itSymlink('rejects a symlinked directory that could redirect recursive enumeration', () => {
+    const root = makeRoot();
+    writeFileSync(join(root, 'server.ts'), "import './escape.js';\n");
+    // A symlinked directory (dangling target) surfaces as a leaf entry under the
+    // non-following recursive `readdirSync` and must still be rejected.
+    symlinkSync(join('..', 'domain'), join(root, 'linked-dir'));
+    expect(() => {
+      assertNoSymlinkEntries(root);
+    }).toThrow(/symlink entry is forbidden/i);
+  });
+
+  it('leaves the real host tree passing (no symlink is present today)', () => {
+    // Preservation: the production host tree contains no symlink, so the guard
+    // does not throw and every existing POLICY-1/2/3 check still reads it.
+    expect(() => {
+      assertNoSymlinkEntries(hostDir);
+    }).not.toThrow();
+    expect(hostSources().length).toBeGreaterThan(0);
   });
 });
