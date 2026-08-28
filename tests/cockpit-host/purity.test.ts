@@ -344,7 +344,7 @@ const isGlobalReceiver = (node: ts.Expression): boolean => {
 
 // The statically-provable string value of an expression: a string literal or
 // substitution-free template, a `+` concatenation of such, or a local `const`
-// bound (to a fixpoint, see collectStringConsts) to one — else null. This resolves
+// bound (conservatively, see collectStringConsts) to one — else null. This resolves
 // `'ev' + 'al'` and `const m = 'getBuiltin' + 'Module'; obj[m]` to `eval` /
 // `getBuiltinModule`, so a computed-but-static property name cannot launder a
 // reserved capability past the member-name check.
@@ -363,30 +363,140 @@ const staticStringOf = (node: ts.Expression, constMap: ReadonlyMap<string, strin
   return null;
 };
 
-// Collect `const/let/var x = <static string>` bindings to a fixpoint (bounded by
-// the number of declarations), so a computed key built from a local string const
-// still folds.
+// Collect the identifier texts that provably denote a single immutable string
+// constant, resolved conservatively and in FINITE time over the already-parsed
+// AST. This replaces an earlier scope-insensitive `while (pass())` fixpoint that
+// (F1) let a mutable, shadowed, or parameter binding inherit another binding's
+// static value by matching on identifier text alone, and (F2) could fail to
+// terminate when two scopes declared the same name with different values, each
+// pass overwriting the name-only map and re-setting `changed`.
+//
+// Eligibility (else the text is UNKNOWN): the WHOLE SourceFile contains exactly
+// one binding of that text; that sole binding is a simple `const <id> = <init>`
+// declaration with an initializer; and the text is never an assignment,
+// compound-assignment, increment, or decrement target. Any repeated binding —
+// even same-name/same-value — any non-const or destructuring binding, any
+// parameter/catch/function/class/import/type/module binding of the same text, or
+// any mutation, makes it UNKNOWN. Unique immutable names with equal values stay
+// independently resolvable; unique immutable `+`-concatenation chains still fold.
+//
+// Resolution is a memoized depth-first search with explicit per-name states
+// (UNVISITED = absent from `memo`, RESOLVING, RESOLVED(string), UNKNOWN). Entering
+// a name that is already RESOLVING is a dependency cycle and yields UNKNOWN. Each
+// eligible name is evaluated at most once and then read from `memo`, so the search
+// visits every name a bounded number of times and always terminates.
 const collectStringConsts = (sourceFile: ts.SourceFile): Map<string, string> => {
-  const map = new Map<string, string>();
-  const pass = (): boolean => {
-    let changed = false;
-    const visit = (node: ts.Node): void => {
-      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer !== undefined) {
-        const value = staticStringOf(node.initializer, map);
-        if (value !== null && map.get(node.name.text) !== value) {
-          map.set(node.name.text, value);
-          changed = true;
+  // --- Phase 1: one complete AST inventory ---------------------------------
+  // How many times each identifier text is *bound* anywhere (any binding form).
+  const bindingCounts = new Map<string, number>();
+  const bindName = (text: string): void => {
+    bindingCounts.set(text, (bindingCounts.get(text) ?? 0) + 1);
+  };
+  // Identifier texts that are ever an assignment/update target — not immutable.
+  const mutated = new Set<string>();
+  // The initializer of a simple `const <id> = <init>` declaration, by text. A text
+  // with more than one binding is disqualified by `bindingCounts` below, so a later
+  // overwrite here is harmless: the entry is consulted only when the text is unique.
+  const constInit = new Map<string, ts.Expression>();
+
+  const inventory = (node: ts.Node): void => {
+    // Binding sites, counted by the identifier name(s) they directly introduce.
+    if (ts.isVariableDeclaration(node)) {
+      if (ts.isIdentifier(node.name)) {
+        bindName(node.name.text);
+        const list = node.parent;
+        if (
+          node.initializer !== undefined &&
+          ts.isVariableDeclarationList(list) &&
+          (list.flags & ts.NodeFlags.Const) !== 0
+        ) {
+          constInit.set(node.name.text, node.initializer);
         }
       }
-      ts.forEachChild(node, visit);
-    };
-    ts.forEachChild(sourceFile, visit);
-    return changed;
+    } else if (ts.isBindingElement(node)) {
+      if (ts.isIdentifier(node.name)) bindName(node.name.text);
+    } else if (ts.isParameter(node)) {
+      if (ts.isIdentifier(node.name)) bindName(node.name.text);
+    } else if (ts.isImportClause(node)) {
+      if (node.name !== undefined) bindName(node.name.text);
+    } else if (ts.isNamespaceImport(node) || ts.isImportSpecifier(node)) {
+      bindName(node.name.text);
+    } else if (
+      ts.isFunctionDeclaration(node) ||
+      ts.isFunctionExpression(node) ||
+      ts.isClassDeclaration(node) ||
+      ts.isClassExpression(node) ||
+      ts.isEnumDeclaration(node) ||
+      ts.isModuleDeclaration(node) ||
+      ts.isTypeAliasDeclaration(node) ||
+      ts.isInterfaceDeclaration(node) ||
+      ts.isTypeParameterDeclaration(node)
+    ) {
+      if (node.name !== undefined && ts.isIdentifier(node.name)) bindName(node.name.text);
+    }
+
+    // Mutation sites: `x = …` / `x += …` / … and `++x` / `x--`.
+    if (ts.isBinaryExpression(node)) {
+      const kind = node.operatorToken.kind;
+      if (kind >= ts.SyntaxKind.FirstAssignment && kind <= ts.SyntaxKind.LastAssignment) {
+        const target = unwrapExpr(node.left);
+        if (ts.isIdentifier(target)) mutated.add(target.text);
+      }
+    } else if (ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) {
+      if (node.operator === ts.SyntaxKind.PlusPlusToken || node.operator === ts.SyntaxKind.MinusMinusToken) {
+        const target = unwrapExpr(node.operand);
+        if (ts.isIdentifier(target)) mutated.add(target.text);
+      }
+    }
+
+    ts.forEachChild(node, inventory);
   };
-  while (pass()) {
-    /* fixpoint over simple string-const chains */
+  ts.forEachChild(sourceFile, inventory);
+
+  // --- Phase 2: finite memoized resolution ---------------------------------
+  type State =
+    | { readonly kind: 'RESOLVING' }
+    | { readonly kind: 'RESOLVED'; readonly value: string }
+    | { readonly kind: 'UNKNOWN' };
+  const memo = new Map<string, State>();
+
+  const isEligible = (text: string): boolean =>
+    bindingCounts.get(text) === 1 && !mutated.has(text) && constInit.has(text);
+
+  const resolveExpr = (node: ts.Expression): string | null => {
+    const n = unwrapExpr(node);
+    if (ts.isStringLiteralLike(n)) return n.text;
+    if (ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+      const left = resolveExpr(n.left);
+      if (left === null) return null;
+      const right = resolveExpr(n.right);
+      if (right === null) return null;
+      return left + right;
+    }
+    if (ts.isIdentifier(n)) return resolveName(n.text);
+    return null;
+  };
+
+  function resolveName(text: string): string | null {
+    const seen = memo.get(text);
+    if (seen !== undefined) return seen.kind === 'RESOLVED' ? seen.value : null;
+    if (!isEligible(text)) {
+      memo.set(text, { kind: 'UNKNOWN' });
+      return null;
+    }
+    memo.set(text, { kind: 'RESOLVING' }); // re-entry before completion is a cycle
+    const init = constInit.get(text);
+    const value = init === undefined ? null : resolveExpr(init);
+    memo.set(text, value === null ? { kind: 'UNKNOWN' } : { kind: 'RESOLVED', value });
+    return value;
   }
-  return map;
+
+  const resolved = new Map<string, string>();
+  for (const text of constInit.keys()) {
+    const value = resolveName(text);
+    if (value !== null) resolved.set(text, value);
+  }
+  return resolved;
 };
 
 // The member name of a property/element access — a property identifier, or a
@@ -2954,6 +3064,189 @@ describe('D3 host RC global-object forwarding closure (D3-CX-POLICY-RC v3)', () 
     // `process.argv`, not on `process`) is unaffected.
     expect(acquiresHiddenBuiltin(`const e = process.argv[1];\nvoid e;`)).toBe(false);
   });
+});
+
+// ---------------------------------------------------------------------------
+// F1/F2 — the shared static-const resolver (collectStringConsts) must be
+// scope-sensitive and total. These suites drive the resolver THROUGH the RC/HA
+// detectors, the way the rest of this file does, using an identifier-keyed
+// `(globalThis as any)[k]` / `(process as any)[k]` as the verdict lever:
+//
+//   - if `k` resolves to a benign string (e.g. 'console'), the key is non-null and
+//     harmless, so RC/HA ACCEPT (`false`);
+//   - if `k` is UNKNOWN, the computed global/authority key is not statically
+//     resolvable, so the fail-closed rule rejects (`true`).
+//
+// So `toBe(true)` on an F1 witness whose value would be the *harmless* string
+// means the name did NOT inherit that static value from another binding — the F1
+// invariant. `toBe(false)` on a genuinely unique immutable const means it still
+// resolves. The F2 suite asserts every conflicting/cyclic shape simply RETURNS a
+// verdict — with the old `while (pass())` fixpoint these sources looped forever.
+// ---------------------------------------------------------------------------
+
+const RC_LAUNDER = `("import('../domain/actions.js')")`;
+
+describe('D3 host static-const resolver is scope-sensitive (D3-CX-POLICY-F1)', () => {
+  // Each source resolves its key to the HARMLESS 'console' if (and only if) the
+  // resolver wrongly inherits a static value across a shadow/mutation/rebinding.
+  // The correct verdict is UNKNOWN -> fail-closed rejection (`true`).
+  const mustReject: readonly { readonly form: string; readonly source: string }[] = [
+    {
+      form: 'a parameter shadows an outer const of the same name',
+      source: `const key = 'console';\nfunction run(key: string) { (globalThis as any)[key]${RC_LAUNDER}; }\nrun('eval');`,
+    },
+    {
+      form: 'a nested block const shadows an outer const',
+      source: `const key = 'console';\n{\n  const key = 'eval';\n  (globalThis as any)[key]${RC_LAUNDER};\n}`,
+    },
+    {
+      form: 'a mutable let is reassigned before use',
+      source: `let key = 'console';\nkey = 'eval';\n(globalThis as any)[key]${RC_LAUNDER};`,
+    },
+    {
+      form: 'a mutable let is compound-assigned before use',
+      source: `let key = 'con';\nkey += 'sole';\n(globalThis as any)[key]${RC_LAUNDER};`,
+    },
+    {
+      // Parse-only, deliberately type-invalid: exercises the ++/-- update-target
+      // inventory. A benign const that is ever an increment/decrement target is
+      // mutable and must not fold to its harmless initializer.
+      form: 'a const is an increment target (update-target inventory)',
+      source: `const key = 'console';\nkey++;\n(globalThis as any)[key]${RC_LAUNDER};`,
+    },
+    {
+      form: 'a const is a decrement target (update-target inventory)',
+      source: `const key = 'console';\n--key;\n(globalThis as any)[key]${RC_LAUNDER};`,
+    },
+    {
+      form: 'a destructuring binding rebinds an outer const name',
+      source: `const key = 'console';\nconst holder = { key: 'eval' } as any;\nconst { key } = holder;\n(globalThis as any)[key]${RC_LAUNDER};`,
+    },
+    {
+      form: 'a catch binding rebinds an outer const name',
+      source: `const err = 'console';\ntry {\n  doWork();\n} catch (err) {\n  (globalThis as any)[err]${RC_LAUNDER};\n}`,
+    },
+    {
+      form: 'the same text is bound as a const in two disjoint function scopes',
+      source: `function a() { const key = 'console'; return key; }\nfunction b() { (globalThis as any)[key]${RC_LAUNDER}; const key = 'eval'; }`,
+    },
+    {
+      // Repeated same-name bindings are UNKNOWN even with identical initial values.
+      form: 'the same name is const-bound twice with the identical harmless value',
+      source: `const key = 'console';\n{ const key = 'console'; }\n(globalThis as any)[key]${RC_LAUNDER};`,
+    },
+  ];
+  for (const { form, source } of mustReject) {
+    it(`does not inherit a static value when ${form}`, () => {
+      expect(usesRuntimeCodeGeneration(source)).toBe(true);
+    });
+  }
+
+  // Preservation — genuinely unique, immutable, unmutated consts still resolve.
+  it('resolves two distinct unique consts that share the same value, independently', () => {
+    // Both resolve to the harmless 'console' -> accepted. If either had collapsed
+    // to UNKNOWN, the fail-closed rule would have rejected.
+    const source = `const a = 'console';\nconst b = 'console';\nvoid (globalThis as any)[a];\nvoid (globalThis as any)[b];`;
+    expect(usesRuntimeCodeGeneration(source)).toBe(false);
+  });
+
+  it('folds a unique immutable `+`-concatenation chain to its real value', () => {
+    // Benign chain resolves (accepted); dangerous chain folds to 'eval' and is
+    // rejected on the RESOLVED name (not merely fail-closed).
+    expect(usesRuntimeCodeGeneration(`const part = 'con';\nconst full = part + 'sole';\nvoid (globalThis as any)[full];`)).toBe(
+      false,
+    );
+    expect(usesRuntimeCodeGeneration(`const a = 'ev';\nconst b = a + 'al';\n(globalThis as any)[b]${RC_LAUNDER};`)).toBe(true);
+    // HA folds a two-token concatenation to a reserved builtin method name too.
+    expect(
+      acquiresHiddenBuiltin(`const method = 'getBuiltin' + 'Module';\nconst m = (process as any)[method]('fs');\nvoid m;`),
+    ).toBe(true);
+  });
+
+  it('accepts unrelated harmless local member access resolved from a local const', () => {
+    // A local const key on a NON-authority object is resolved and harmless.
+    expect(usesRuntimeCodeGeneration(`const key = 'log';\nconst o = { log(x: string) { return x; } } as any;\no[key]('hi');`)).toBe(
+      false,
+    );
+    // A `.eval` property read off a non-global local object is not the primitive.
+    expect(usesRuntimeCodeGeneration(`const cfg = { eval: false };\nconst y = cfg.eval;\nvoid y;`)).toBe(false);
+  });
+});
+
+describe('D3 host static-const resolver terminates on every finite source (D3-CX-POLICY-F2)', () => {
+  // The old name-only fixpoint looped forever whenever two scopes declared the
+  // same name with different values. Each case here must return a verdict; the
+  // explicit per-test timeout turns any reintroduced non-termination into a fast,
+  // localized failure rather than a silent CI hang.
+  const TERMINATION_BUDGET_MS = 2000;
+
+  it(
+    'terminates (as UNKNOWN) on conflicting same-name declarations',
+    () => {
+      const source = `const x = 'a';\n{ const x = 'b'; }\n(globalThis as any)[x]${RC_LAUNDER};`;
+      expect(usesRuntimeCodeGeneration(source)).toBe(true);
+    },
+    TERMINATION_BUDGET_MS,
+  );
+
+  it(
+    'terminates (as UNKNOWN) on same-name/same-value declarations',
+    () => {
+      // Identical values, benign: a wrong fold would ACCEPT; the correct UNKNOWN
+      // fail-closes to reject. Either way it must terminate.
+      const source = `const x = 'console';\n{ const x = 'console'; }\n(globalThis as any)[x]${RC_LAUNDER};`;
+      expect(usesRuntimeCodeGeneration(source)).toBe(true);
+    },
+    TERMINATION_BUDGET_MS,
+  );
+
+  it(
+    'terminates normally when all declared names are different',
+    () => {
+      const source = `const x = 'console';\nconst y = 'setTimeout';\nvoid (globalThis as any)[x];\nvoid (globalThis as any)[y];`;
+      expect(usesRuntimeCodeGeneration(source)).toBe(false);
+    },
+    TERMINATION_BUDGET_MS,
+  );
+
+  it(
+    'resolves a long finite immutable dependency chain',
+    () => {
+      const chain =
+        `const s0 = 'console';\n` +
+        Array.from({ length: 40 }, (_, i) => `const s${String(i + 1)} = s${String(i)};`).join('\n') +
+        `\nvoid (globalThis as any)[s40];`;
+      // The 41-deep chain resolves to the harmless 'console' -> accepted.
+      expect(usesRuntimeCodeGeneration(chain)).toBe(false);
+    },
+    TERMINATION_BUDGET_MS,
+  );
+
+  it(
+    'terminates (as UNKNOWN) on a cyclic const dependency',
+    () => {
+      // Parse-only TDZ cycle a -> b -> a. Resolution must break the cycle, not spin.
+      const source = `const a = b;\nconst b = a;\n(globalThis as any)[a]${RC_LAUNDER};`;
+      expect(usesRuntimeCodeGeneration(source)).toBe(true);
+    },
+    TERMINATION_BUDGET_MS,
+  );
+
+  it(
+    'terminates in BOTH the RC and HA consumers on a conflicting-name source',
+    () => {
+      const source = `const p = 'a';\n{ const p = 'b'; }\nvoid (globalThis as any)[p];\nvoid (process as any)[p];`;
+      let rcVerdict: boolean | undefined;
+      let haVerdict: boolean | undefined;
+      expect(() => {
+        rcVerdict = usesRuntimeCodeGeneration(source);
+        haVerdict = acquiresHiddenBuiltin(source);
+      }).not.toThrow();
+      expect(typeof rcVerdict).toBe('boolean');
+      expect(typeof haVerdict).toBe('boolean');
+    },
+    TERMINATION_BUDGET_MS,
+  );
 });
 
 // ---------------------------------------------------------------------------
