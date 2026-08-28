@@ -785,55 +785,63 @@ const acquiresHiddenBuiltin = (source: string): boolean => {
  * survive every other existing check:
  *   - the global `fetch` — a global, so it needs no import and the specifier
  *     allowlist never sees it;
- *   - `request()` / `get()` reached through the legitimately-allowed `node:http`
- *     import — the very module the host needs for `http.createServer`.
+ *   - `request()` / `get()` / `new ClientRequest()` reached through the
+ *     legitimately-allowed `node:http` import — the very module the host needs for
+ *     `http.createServer`.
  *
  * This detector closes exactly those two, decided by LEXICAL BINDING IDENTITY —
  * the binding visible at each occurrence, never mere identifier text — so
  * shadowing neither hides a real capability nor false-positives a same-named
  * local (NET-S1/NET-S2):
- *   - global `fetch`: a `<global>.fetch` member (globalThis/window/self/global
- *     receiver, incl. a statically-resolved `<global>['fetch']`), a destructuring
- *     of `fetch` OFF a global receiver, or a bare `fetch` reference that is FREE
- *     at that occurrence (no lexical binding named `fetch` is visible). An alias
- *     `const f = fetch` is caught at the `fetch` reference; forwarding a global
- *     receiver (`const g = globalThis`) is already rejected by RC (e).
- *   - node:http client APIs: `request` / `get` reached through a binding THIS
- *     module imported from `node:http` — a default or namespace binding
- *     (`http.request`, `h.get`), a named import used bare (`request()`), an
- *     aliased named import (`req()` from `{ request as req }`), or an
- *     import-equals binding — where the receiver/name still LEXICALLY resolves to
- *     that import. `createServer` is never in the rejected member set, so the real
- *     host server is preserved, and `map.get(...)` / `obj.request(...)` on any
- *     non-node:http receiver is untouched.
+ *   - global `fetch`: a `<global>.fetch` member on a global receiver name
+ *     (globalThis/window/self/global, incl. a statically-resolved `<global>['fetch']`)
+ *     that is itself FREE here — a lexically-shadowing local receiver
+ *     (`function f(globalThis){ globalThis.fetch(...) }`) is an ordinary object and is
+ *     allowed; a destructuring of `fetch` OFF such a free global receiver; or a bare
+ *     `fetch` reference that is FREE at that occurrence (no lexical binding named
+ *     `fetch` is visible). An alias `const f = fetch` is caught at the `fetch`
+ *     reference; forwarding a global receiver (`const g = globalThis`) is already
+ *     rejected by RC (e).
+ *   - node:http client APIs: `request` / `get` / `ClientRequest` reached through a
+ *     binding THIS module imported from `node:http` — a default or namespace binding
+ *     (`http.request`, `h.get`, `new http.ClientRequest()`), a named import used bare
+ *     (`request()`, `new ClientRequest()`), an aliased named import (`req()` from
+ *     `{ request as req }`), or an import-equals binding — where the receiver/name
+ *     still LEXICALLY resolves to that import. `createServer` is never in the rejected
+ *     member set, so the real host server is preserved, and `map.get(...)` /
+ *     `obj.request(...)` / an unrelated local `new ClientRequest()` on any
+ *     non-node:http binding is untouched.
  *
  * Binding identity is resolved by a bounded lexical ENVIRONMENT STACK tied to the
  * AST walk: each scope (module, function/arrow/method params, block, for-header,
  * catch) pushes a frame naming its own declarations; an occurrence resolves to the
- * nearest enclosing frame that binds the name. A module-declared `fetch`
- * (`function fetch(){}`, `const fetch = …`) is legal (unlike `eval`) and shadows
- * the global where it is visible; a sibling scope's local `fetch` does not, and a
- * shadow disappears once its scope closes — while `globalThis.fetch` stays a
- * member call. Structural and finite: one parse, one traversal with balanced
- * push/pop and Set/Map lookups (no fixpoint, no re-scan, no value resolution),
- * reusing `memberNameOf` / `isGlobalReceiver` / `isValueReference` / `unwrapExpr` /
- * `bindingPropertyName`. This is a development-time SOURCE-POLICY guard, not a
+ * nearest enclosing frame that binds the name. A NAMED function expression also
+ * binds its own name inside its body (so `const helper = function request(){ return
+ * request(); }` resolves the inner call to that self-binding, not the import). A
+ * module-declared `fetch` (`function fetch(){}`, `const fetch = …`) is legal (unlike
+ * `eval`) and shadows the global where it is visible; a sibling scope's local `fetch`
+ * does not, and a shadow disappears once its scope closes — while a FREE-receiver
+ * `globalThis.fetch` stays a member call. Structural and finite: one parse, one
+ * traversal with balanced push/pop and Set/Map lookups (no fixpoint, no re-scan, no
+ * value resolution), reusing `memberNameOf` / `GLOBAL_RECEIVER_NAMES` (resolved
+ * lexically here) / `isValueReference` / `unwrapExpr` / `bindingPropertyName`. This is
+ * a development-time SOURCE-POLICY guard, not a
  * runtime sandbox. NOT decided (bounded gaps, not sandbox claims): alias-via-
  * assignment (`const h = http; h.request()`), method extraction (`const r =
  * http.request`), runtime reassignment, computed/dynamic forwarding, and runtime-
  * generated code (RC/HA cover codegen). `node:https`/`net`/`tls` stay out of scope
  * — the import allowlist already blocks them.
  */
-const HTTP_CLIENT_MEMBERS: ReadonlySet<string> = new Set(['request', 'get']);
+const HTTP_CLIENT_MEMBERS: ReadonlySet<string> = new Set(['request', 'get', 'ClientRequest']);
 const NETWORK_GLOBAL_NAMES: ReadonlySet<string> = new Set(['fetch']);
 
 interface HttpBindings {
   // Local names bound to the node:http MODULE (`import http` / `import * as h` /
   // `import http = require('node:http')`), used as `binding.request(...)`.
   readonly namespaceOrDefault: ReadonlySet<string>;
-  // Local names bound to a node:http CLIENT MEMBER (`import { request, get as g }`),
-  // used bare as `request(...)` / `g(...)`. A named `createServer` is deliberately
-  // NOT collected — it is legitimate.
+  // Local names bound to a node:http CLIENT capability (`import { request, get as g,
+  // ClientRequest }`), used bare as `request(...)` / `g(...)` / `new ClientRequest()`.
+  // A named `createServer` is deliberately NOT collected — it is legitimate.
   readonly namedClient: ReadonlySet<string>;
 }
 
@@ -886,7 +894,8 @@ const collectHttpBindings = (sourceFile: ts.SourceFile): HttpBindings => {
 
 // A lexical binding kind for the identity-sensitive detection below. `HTTP_NS` and
 // `HTTP_CLIENT` mark the module-level node:http import bindings (namespace/default,
-// and named `request`/`get` respectively); `LOCAL` marks any OTHER declaration
+// and named `request`/`get`/`ClientRequest` respectively); `LOCAL` marks any OTHER
+// declaration
 // (parameter, const/let/var, function/class, catch, or unrelated import) that
 // SHADOWS an outer binding of the same name. Capability identity is therefore the
 // binding VISIBLE at an occurrence, never mere identifier text (NET-S1/NET-S2).
@@ -951,14 +960,6 @@ const buildModuleFrame = (sourceFile: ts.SourceFile, http: HttpBindings): Map<st
   return frame;
 };
 
-// Whether an object-binding element destructures OFF a global receiver, i.e.
-// `const { fetch: f } = globalThis`. Restricts the destructuring rule to the real
-// global so `const { fetch } = someLocalConfig` is not a false positive.
-const destructuresGlobalReceiver = (el: ts.BindingElement): boolean => {
-  const decl = el.parent.parent;
-  return ts.isVariableDeclaration(decl) && decl.initializer !== undefined && isGlobalReceiver(decl.initializer);
-};
-
 const usesOutboundNetwork = (source: string): boolean => {
   const sourceFile = ts.createSourceFile(
     'module.ts',
@@ -984,6 +985,18 @@ const usesOutboundNetwork = (source: string): boolean => {
     return undefined;
   };
 
+  // A receiver is the REAL global object only when its identifier is a global name
+  // (globalThis/window/self/global) AND no lexical binding shadows it at this
+  // occurrence — identifier text is not binding identity. So
+  // `function f(globalThis) { globalThis.fetch('local'); }` resolves the receiver to
+  // the LOCAL parameter and is NOT the global, while an unshadowed `globalThis.fetch`
+  // (FREE receiver) stays a real global member. Uses the same scope stack as `resolve`
+  // rather than the RC-shared text-only `isGlobalReceiver`, so this stays local to NET.
+  const isLexicalGlobalReceiver = (expr: ts.Expression): boolean => {
+    const recv = unwrapExpr(expr);
+    return ts.isIdentifier(recv) && GLOBAL_RECEIVER_NAMES.has(recv.text) && resolve(recv.text) === undefined;
+  };
+
   // The frame a scope-introducing node contributes, or null when it is not one.
   // Function-likes contribute their parameters; blocks their direct lexical
   // declarations; for-headers their loop variables; catch clauses their variable.
@@ -999,6 +1012,16 @@ const usesOutboundNetwork = (source: string): boolean => {
     ) {
       const frame = new Map<string, BindingKind>();
       for (const param of node.parameters) eachBoundName(param.name, (t) => frame.set(t, 'LOCAL'));
+      // A NAMED function EXPRESSION binds its own name inside its body only (unlike a
+      // function DECLARATION, whose name lives in the enclosing scope and is already
+      // recorded there by `declaredByStatement`). Recording the self-binding in this
+      // frame lets `const helper = function request() { return request(); }` resolve
+      // the inner recursive call to the LOCAL self-binding, shadowing an imported
+      // `request`; the frame is popped on scope exit, so it never leaks to siblings or
+      // to the enclosing scope, where the import must still be rejected.
+      if (ts.isFunctionExpression(node) && node.name !== undefined) {
+        frame.set(node.name.text, 'LOCAL');
+      }
       return frame;
     }
     if (ts.isBlock(node) || ts.isModuleBlock(node)) {
@@ -1032,22 +1055,32 @@ const usesOutboundNetwork = (source: string): boolean => {
     if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
       const member = memberNameOf(node, constMap);
       if (member !== null) {
-        // (a) `<global>.fetch` / statically-keyed `<global>['fetch']` — a global
-        //     RECEIVER, independent of any `fetch` binding.
-        if (NETWORK_GLOBAL_NAMES.has(member) && isGlobalReceiver(node.expression)) found = true;
-        // (d) `<binding>.request` / `.get` only when the receiver identifier
-        //     LEXICALLY resolves to the module's node:http namespace/default import
-        //     (not a shadowing local). `createServer` is never a client member.
+        // (a) `<global>.fetch` / statically-keyed `<global>['fetch']` — only when the
+        //     receiver identifier is a global name that is FREE here (no local binding
+        //     shadows it). A shadowing local (param/const/…) makes it an ordinary
+        //     object, so `function f(globalThis) { globalThis.fetch(...) }` is allowed.
+        if (NETWORK_GLOBAL_NAMES.has(member) && isLexicalGlobalReceiver(node.expression)) found = true;
+        // (d) `<binding>.request` / `.get` / `.ClientRequest` only when the receiver
+        //     identifier LEXICALLY resolves to the module's node:http namespace/default
+        //     import (not a shadowing local). `createServer` is never a client member.
         const recv = unwrapExpr(node.expression);
         if (HTTP_CLIENT_MEMBERS.has(member) && ts.isIdentifier(recv) && resolve(recv.text) === 'HTTP_NS') {
           found = true;
         }
       }
     }
-    // (b) destructuring `fetch` off a global receiver.
+    // (b) destructuring `fetch` off a global receiver, i.e. `const { fetch: f } =
+    //     globalThis` — but only when that receiver is the FREE global (a shadowing
+    //     local `globalThis`/… makes it an ordinary object, and `const { fetch } =
+    //     someLocalConfig` is untouched).
     if (ts.isBindingElement(node)) {
       const name = bindingPropertyName(node);
-      if (name !== null && NETWORK_GLOBAL_NAMES.has(name) && destructuresGlobalReceiver(node)) found = true;
+      const decl = node.parent.parent;
+      const offGlobalReceiver =
+        ts.isVariableDeclaration(decl) &&
+        decl.initializer !== undefined &&
+        isLexicalGlobalReceiver(decl.initializer);
+      if (name !== null && NETWORK_GLOBAL_NAMES.has(name) && offGlobalReceiver) found = true;
     }
     if (ts.isIdentifier(node) && isValueReference(node)) {
       // The `key` in a destructuring `const { key: local } = …` is a binding
@@ -3709,6 +3742,12 @@ describe('D3 host forbids outbound network egress (D3-CX-POLICY-NET)', () => {
     { form: 'an aliased named request import', source: `import { request as req } from 'node:http';\nreq('http://example.com/');` },
     { form: 'an aliased named get import', source: `import { get as httpGet } from 'node:http';\nhttpGet('http://example.com/');` },
     { form: 'an import-equals node:http binding .request', source: `import http = require('node:http');\nhttp.request('http://example.com/');` },
+    { form: 'a named ClientRequest import constructed', source: `import { ClientRequest } from 'node:http';\nnew ClientRequest('http://example.com/').end();` },
+    { form: 'an aliased named ClientRequest import constructed', source: `import { ClientRequest as CR } from 'node:http';\nnew CR('http://example.com/').end();` },
+    { form: 'a namespace node:http binding new .ClientRequest', source: `import * as http from 'node:http';\nnew http.ClientRequest('http://example.com/').end();` },
+    { form: 'a default node:http binding new .ClientRequest', source: `import http from 'node:http';\nnew http.ClientRequest('http://example.com/').end();` },
+    { form: 'an import-equals node:http binding new .ClientRequest', source: `import http = require('node:http');\nnew http.ClientRequest('http://example.com/').end();` },
+    { form: 'a statically-keyed ClientRequest member on a node:http binding', source: `import * as http from 'node:http';\nnew http['ClientRequest']('http://example.com/').end();` },
   ];
   for (const { form, source } of rejectHttp) {
     it(`rejects ${form}`, () => {
@@ -3737,6 +3776,9 @@ describe('D3 host forbids outbound network egress (D3-CX-POLICY-NET)', () => {
     { form: 'a local non-network function named fetch', source: `function fetch(x: string) { return x; }\nvoid fetch('a');` },
     { form: 'a local non-network const named request', source: `const request = (x: string) => x;\nvoid request('a');` },
     { form: 'a local non-network const named get', source: `const get = (x: string) => x;\nvoid get('a');` },
+    { form: 'an unrelated local class named ClientRequest', source: `class ClientRequest {}\nvoid new ClientRequest();` },
+    { form: 'an unrelated local const constructor named ClientRequest', source: `const LocalCtor = class {};\nconst ClientRequest = LocalCtor;\nvoid new ClientRequest();` },
+    { form: 'a ClientRequest member on a plain local object (non-node:http)', source: `const LocalCtor = class {};\nconst http = { ClientRequest: LocalCtor };\nvoid new http.ClientRequest();` },
     {
       form: 'the real server.ts createServer shape (handler param named request)',
       source:
@@ -3842,4 +3884,59 @@ describe('D3 host network egress uses lexical binding identity, not name text (D
   it('keeps sibling function scopes independent (both shadow, both allowed)', () => {
     expect(usesOutboundNetwork(`import * as http from 'node:http';\nfunction a(http: { request(v: string): string }) {\n  return http.request('a');\n}\nfunction b(http: { get(v: string): string }) {\n  return http.get('b');\n}`)).toBe(false);
   });
+
+  // NET-S3 — a GLOBAL RECEIVER name (globalThis/window/self/global) is the real global
+  // only when it is FREE at the occurrence; a lexically-shadowing local makes it an
+  // ordinary object. Identifier text is not binding identity for receivers either.
+  const receiverAllow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a parameter-shadowed globalThis receiver', source: `function f(globalThis: { fetch: (v: string) => string }) {\n  return globalThis.fetch('local');\n}` },
+    { form: 'a parameter-shadowed window receiver', source: `function f(window: { fetch: (v: string) => string }) {\n  return window.fetch('local');\n}` },
+    { form: 'a parameter-shadowed self receiver', source: `function f(self: { fetch: (v: string) => string }) {\n  return self.fetch('local');\n}` },
+    { form: 'a parameter-shadowed global receiver', source: `function f(global: { fetch: (v: string) => string }) {\n  return global.fetch('local');\n}` },
+    { form: 'a block-shadowed globalThis receiver used within that block', source: `function f() {\n  {\n    const globalThis = { fetch(v: string) { return v; } };\n    globalThis.fetch('local');\n  }\n}` },
+    { form: 'a destructuring of fetch off a shadowed globalThis', source: `function f(globalThis: { fetch: (v: string) => string }) {\n  const { fetch: g } = globalThis;\n  return g('local');\n}` },
+  ];
+  for (const { form, source } of receiverAllow) {
+    it(`ALLOWS ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+
+  const receiverReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a real globalThis.fetch receiver (unshadowed)', source: `globalThis.fetch('https://evil/');` },
+    { form: 'a real window.fetch receiver (unshadowed)', source: `window.fetch('https://evil/');` },
+    { form: 'a real self.fetch receiver (unshadowed)', source: `self.fetch('https://evil/');` },
+    { form: 'a real globalThis.fetch after a shadowing parameter scope closes', source: `function f(globalThis: { fetch: (v: string) => string }) {\n  return globalThis.fetch('local');\n}\nglobalThis.fetch('https://evil/');` },
+    { form: 'a real globalThis.fetch after a shadowing block closes', source: `function f() {\n  {\n    const globalThis = { fetch(v: string) { return v; } };\n    globalThis.fetch('local');\n  }\n  globalThis.fetch('https://evil/');\n}` },
+  ];
+  for (const { form, source } of receiverReject) {
+    it(`REJECTS ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // NET-S4 — a NAMED function EXPRESSION binds its own name inside its body, shadowing
+  // an outer import there, but never outside the expression.
+  const fnExprAllow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a named function-expression request recursion shadowing the import', source: `import { request } from 'node:http';\nconst helper = function request(): unknown {\n  return request();\n};\nvoid helper;` },
+    { form: 'a named function-expression matching an aliased import name', source: `import { request as req } from 'node:http';\nconst helper = function req(): unknown {\n  return req();\n};\nvoid helper;` },
+    { form: 'a named function-expression get recursion shadowing the import', source: `import { get } from 'node:http';\nconst helper = function get(): unknown {\n  return get();\n};\nvoid helper;` },
+    { form: 'a named function-expression fetch recursion shadowing the global', source: `const helper = function fetch(): unknown {\n  return fetch();\n};\nvoid helper;` },
+  ];
+  for (const { form, source } of fnExprAllow) {
+    it(`ALLOWS ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+
+  const fnExprReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'the imported request used OUTSIDE a same-named function expression', source: `import { request } from 'node:http';\nconst helper = function request(): unknown {\n  return request();\n};\nvoid helper;\nrequest('https://evil/');` },
+    { form: 'the imported request in a SIBLING that does not share the fn-expr name', source: `import { request } from 'node:http';\nconst a = function request(): unknown {\n  return request();\n};\nconst b = function other(): unknown {\n  return request('https://evil/');\n};\nvoid a;\nvoid b;` },
+    { form: 'the global fetch OUTSIDE a same-named function expression', source: `const helper = function fetch(): unknown {\n  return fetch();\n};\nvoid helper;\nfetch('https://evil/');` },
+  ];
+  for (const { form, source } of fnExprReject) {
+    it(`REJECTS ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
 });
