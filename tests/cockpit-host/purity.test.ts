@@ -337,6 +337,19 @@ const unwrapExpr = (node: ts.Expression): ts.Expression => {
   return cur;
 };
 
+// Whether an initializer is a STATICALLY-RESOLVED runtime import of node:http —
+// `import('node:http')` or `await import('node:http')` (parens/`as`/await unwrapped).
+// A computed/dynamic specifier is not matched (it is already failed-closed by
+// `hasUnverifiableDynamicImport`); only the exact allow-listed literal acquires the
+// node:http namespace capability, so it gains the SAME identity as `import * as http`.
+const isNodeHttpDynamicImport = (expr: ts.Expression): boolean => {
+  let cur = unwrapExpr(expr);
+  while (ts.isAwaitExpression(cur)) cur = unwrapExpr(cur.expression);
+  if (!ts.isCallExpression(cur) || cur.expression.kind !== ts.SyntaxKind.ImportKeyword) return false;
+  const arg: ts.Expression | undefined = cur.arguments[0];
+  return arg !== undefined && ts.isStringLiteralLike(arg) && arg.text === 'node:http';
+};
+
 const isGlobalReceiver = (node: ts.Expression): boolean => {
   const n = unwrapExpr(node);
   return ts.isIdentifier(n) && GLOBAL_RECEIVER_NAMES.has(n.text);
@@ -578,6 +591,40 @@ const servesAsAccessObject = (node: ts.Node): boolean => {
   }
   if (p === undefined) return false;
   return (ts.isPropertyAccessExpression(p) || ts.isElementAccessExpression(p)) && p.expression === cur;
+};
+
+// NET-LOCAL: whether an HTTP_NS identifier occurrence is a forbidden ESCAPE of the
+// privileged node:http namespace — i.e. NOT one of the three permitted positions:
+//  (1) the access-object receiver of a member/element access (a permitted createServer
+//      access is then decided by the member rule);
+//  (2) the initializer of an object-binding-pattern destructuring (F2 decides members);
+//  (3) a type/non-runtime position — the LEFT of a type QualifiedName, a `typeof` type
+//      query, an import-type, or the operand of the runtime `typeof` operator.
+// Intentionally local to NET; it does NOT change the shared `isValueReference` or RC/HA.
+const isHttpNamespaceEscape = (id: ts.Identifier): boolean => {
+  if (servesAsAccessObject(id)) return false;
+  const par = id.parent as ts.Node | undefined;
+  if (
+    par !== undefined &&
+    ts.isVariableDeclaration(par) &&
+    ts.isObjectBindingPattern(par.name) &&
+    par.initializer === id
+  ) {
+    return false;
+  }
+  let cur: ts.Node = id;
+  let gp = cur.parent as ts.Node | undefined;
+  while (gp !== undefined && ts.isQualifiedName(gp)) {
+    cur = gp;
+    gp = cur.parent as ts.Node | undefined;
+  }
+  if (
+    gp !== undefined &&
+    (ts.isTypeQueryNode(gp) || ts.isTypeReferenceNode(gp) || ts.isImportTypeNode(gp) || ts.isTypeOfExpression(gp))
+  ) {
+    return false;
+  }
+  return true;
 };
 
 /**
@@ -915,6 +962,60 @@ const collectHttpBindings = (sourceFile: ts.SourceFile): HttpBindings => {
   return { namespaceOrDefault, namedClient };
 };
 
+// Design D — node:http capability EXPORT confinement. The privileged node:http
+// namespace/capability may not cross the D3 module boundary: reject any re-export FROM
+// node:http (`export * from 'node:http'`, `export { … } from 'node:http'`) and any export
+// of a LOCAL binding whose lexical identity is HTTP_NS (`export { http }`,
+// `export { http as h }`, `export default http`, `export = http`) — createServer included.
+// Ordinary local exports and type-only exports are untouched. Inspects only THIS module's
+// statements and local binding identity: no cross-module value-flow.
+const exportsHttpCapability = (sourceFile: ts.SourceFile): boolean => {
+  const NODE_HTTP = 'node:http';
+  const httpNs = new Set<string>();
+  for (const s of sourceFile.statements) {
+    if (
+      ts.isImportDeclaration(s) &&
+      ts.isStringLiteral(s.moduleSpecifier) &&
+      s.moduleSpecifier.text === NODE_HTTP &&
+      s.importClause !== undefined
+    ) {
+      const clause = s.importClause;
+      if (clause.name !== undefined) httpNs.add(clause.name.text);
+      if (clause.namedBindings !== undefined && ts.isNamespaceImport(clause.namedBindings)) {
+        httpNs.add(clause.namedBindings.name.text);
+      }
+    } else if (
+      ts.isImportEqualsDeclaration(s) &&
+      ts.isExternalModuleReference(s.moduleReference) &&
+      ts.isStringLiteral(s.moduleReference.expression) &&
+      s.moduleReference.expression.text === NODE_HTTP
+    ) {
+      httpNs.add(s.name.text);
+    } else if (ts.isVariableStatement(s)) {
+      for (const decl of s.declarationList.declarations) {
+        if (ts.isIdentifier(decl.name) && decl.initializer !== undefined && isNodeHttpDynamicImport(decl.initializer)) {
+          httpNs.add(decl.name.text);
+        }
+      }
+    }
+  }
+  for (const s of sourceFile.statements) {
+    // (a) any re-export whose specifier is node:http (`export * from` / `export { … } from`).
+    if (ts.isExportDeclaration(s) && s.moduleSpecifier !== undefined && ts.isStringLiteral(s.moduleSpecifier) && s.moduleSpecifier.text === NODE_HTTP) {
+      return true;
+    }
+    // (b) a local re-export of an HTTP_NS binding (`export { http }` / `export { http as h }`).
+    if (ts.isExportDeclaration(s) && s.moduleSpecifier === undefined && s.exportClause !== undefined && ts.isNamedExports(s.exportClause)) {
+      for (const el of s.exportClause.elements) {
+        if (httpNs.has((el.propertyName ?? el.name).text)) return true;
+      }
+    }
+    // (c) `export default http` / `export = http`.
+    if (ts.isExportAssignment(s) && ts.isIdentifier(s.expression) && httpNs.has(s.expression.text)) return true;
+  }
+  return false;
+};
+
 // A lexical binding kind for the identity-sensitive detection below. `HTTP_NS` and
 // `HTTP_CLIENT` mark the module-level node:http import bindings (namespace/default,
 // and any named node:http value that is not `createServer` respectively); `LOCAL`
@@ -953,6 +1054,52 @@ const declaredByStatement = (statement: ts.Statement, sink: (text: string) => vo
   }
 };
 
+// F1/F2 node:http capability PROPAGATION, reusing binding identity (never text):
+//   F1 `const http = (await) import('node:http')` -> `http` is HTTP_NS, exactly as a
+//       namespace import would be.
+//   F2 `const { request, get: g, createServer: cs } = <HTTP_NS>` -> each destructured
+//       member preserves the namespace capability: `createServer` (the one allowed
+//       server value) stays LOCAL, every other member is HTTP_CLIENT (outbound). The
+//       RHS must LEXICALLY resolve to HTTP_NS, so `const { request } = someLocalObject`
+//       is untouched. Bounded: one binding-pattern level, static keys only; deeper
+//       nesting and genuinely computed keys are unsupported (documented) gaps.
+const propagateHttpCapability = (
+  decl: ts.VariableDeclaration,
+  lookup: (name: string) => BindingKind | undefined,
+  sink: (name: string, kind: BindingKind) => void,
+): void => {
+  if (decl.initializer === undefined) return;
+  if (ts.isIdentifier(decl.name)) {
+    if (isNodeHttpDynamicImport(decl.initializer)) sink(decl.name.text, 'HTTP_NS');
+    return;
+  }
+  if (ts.isObjectBindingPattern(decl.name)) {
+    // The RHS is the node:http namespace when it is a lexically-HTTP_NS identifier
+    // OR the dynamic import itself (`const { request } = await import('node:http')`,
+    // the direct F1+F2 composition).
+    const rhs = unwrapExpr(decl.initializer);
+    const rhsIsHttpNs =
+      isNodeHttpDynamicImport(decl.initializer) || (ts.isIdentifier(rhs) && lookup(rhs.text) === 'HTTP_NS');
+    if (!rhsIsHttpNs) return;
+    for (const el of decl.name.elements) {
+      if (!ts.isIdentifier(el.name)) continue; // nested pattern: unsupported
+      const key = el.propertyName;
+      const member =
+        key === undefined
+          ? el.name.text
+          : ts.isIdentifier(key)
+            ? key.text
+            : ts.isStringLiteralLike(key)
+              ? key.text
+              : ts.isComputedPropertyName(key) && ts.isStringLiteralLike(key.expression)
+                ? key.expression.text
+                : null;
+      if (member === null) continue; // genuinely computed key: unsupported
+      sink(el.name.text, HTTP_SERVER_VALUE_MEMBERS.has(member) ? 'LOCAL' : 'HTTP_CLIENT');
+    }
+  }
+};
+
 // The module (top-level) lexical frame: node:http import bindings tagged with their
 // capability kind, every other top-level binding tagged LOCAL. This is the outermost
 // frame for the whole file, so a genuine module-level `const fetch` shadows the
@@ -980,6 +1127,15 @@ const buildModuleFrame = (sourceFile: ts.SourceFile, http: HttpBindings): Map<st
   // the generic LOCAL tag applied above.
   for (const name of http.namespaceOrDefault) frame.set(name, 'HTTP_NS');
   for (const name of http.namedClient) frame.set(name, 'HTTP_CLIENT');
+  // F1/F2: dynamic-import acquisition and destructuring off HTTP_NS, in source order so
+  // a capability acquired earlier is visible to a later destructuring in the same scope.
+  for (const statement of sourceFile.statements) {
+    if (ts.isVariableStatement(statement)) {
+      for (const decl of statement.declarationList.declarations) {
+        propagateHttpCapability(decl, (n) => frame.get(n), (name, kind) => frame.set(name, kind));
+      }
+    }
+  }
   return frame;
 };
 
@@ -1050,6 +1206,15 @@ const usesOutboundNetwork = (source: string): boolean => {
     if (ts.isBlock(node) || ts.isModuleBlock(node)) {
       const frame = new Map<string, BindingKind>();
       for (const statement of node.statements) declaredByStatement(statement, (t) => frame.set(t, 'LOCAL'));
+      // F1/F2 capability propagation within this block, resolving a destructuring RHS
+      // against this frame first, then the enclosing scopes (outer HTTP_NS imports).
+      for (const statement of node.statements) {
+        if (ts.isVariableStatement(statement)) {
+          for (const decl of statement.declarationList.declarations) {
+            propagateHttpCapability(decl, (n) => frame.get(n) ?? resolve(n), (name, kind) => frame.set(name, kind));
+          }
+        }
+      }
       return frame;
     }
     if (ts.isForStatement(node) || ts.isForInStatement(node) || ts.isForOfStatement(node)) {
@@ -1077,21 +1242,21 @@ const usesOutboundNetwork = (source: string): boolean => {
 
     if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
       const member = memberNameOf(node, constMap);
+      const recv = unwrapExpr(node.expression);
+      const recvIsHttpNs = ts.isIdentifier(recv) && resolve(recv.text) === 'HTTP_NS';
+      // (d/3) an HTTP_NS receiver is permitted ONLY for a statically-PROVEN `createServer`
+      //     member; every other known member (`.request`/`.get`/`.ClientRequest`/`.Agent`/…)
+      //     AND any indeterminate/computed member (`http[dynamicKey]`, member === null) is
+      //     rejected fail-closed. `createServer` is the sole allowed value member; type-only
+      //     `http.ServerResponse` etc. are QualifiedName, not member accesses.
+      const provenCreateServer = member !== null && HTTP_SERVER_VALUE_MEMBERS.has(member);
+      if (recvIsHttpNs && !provenCreateServer) found = true;
       if (member !== null) {
         // (a) `<global>.fetch` / statically-keyed `<global>['fetch']` — only when the
         //     receiver identifier is a global name that is FREE here (no local binding
         //     shadows it). A shadowing local (param/const/…) makes it an ordinary
         //     object, so `function f(globalThis) { globalThis.fetch(...) }` is allowed.
         if (NETWORK_GLOBAL_NAMES.has(member) && isLexicalGlobalReceiver(node.expression)) found = true;
-        // (d) any NON-`createServer` value member (`.request`/`.get`/`.ClientRequest`/
-        //     `.Agent`/…) only when the receiver identifier LEXICALLY resolves to the
-        //     module's node:http namespace/default import (not a shadowing local).
-        //     `createServer` is the sole allowed value member; type-only
-        //     `http.ServerResponse` etc. are QualifiedName, not member accesses.
-        const recv = unwrapExpr(node.expression);
-        if (!HTTP_SERVER_VALUE_MEMBERS.has(member) && ts.isIdentifier(recv) && resolve(recv.text) === 'HTTP_NS') {
-          found = true;
-        }
       }
     }
     // (b) destructuring `fetch` off a global receiver, i.e. `const { fetch: f } =
@@ -1123,6 +1288,13 @@ const usesOutboundNetwork = (source: string): boolean => {
         //     named import (`request(...)`, `req(...)`, `new Agent()`); a shadowing
         //     local resolves LOCAL.
         if (kind === 'HTTP_CLIENT') found = true;
+        // (f) DESIGN A non-escape: an HTTP_NS value reference is permitted ONLY as an
+        //     access-object receiver (rule d/3), a destructuring initializer (F2), or a
+        //     NET-local type/non-runtime position; EVERY other runtime reference is a
+        //     forbidden ESCAPE (`const h = http`, `foo(http)`, `return http`, `[http]`,
+        //     `{ v: http }`, `{ ...http }`, `export default http`) — rejected AT the name,
+        //     so no alias/value-flow tracking is needed.
+        if (kind === 'HTTP_NS' && isHttpNamespaceEscape(node)) found = true;
       }
     }
 
@@ -4020,6 +4192,182 @@ describe('D3 host outbound-network surface is a bounded capability family (D3-CX
   for (const { form, source } of wsAllow) {
     it(`ALLOWS ${form}`, () => {
       expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// NET capability ACQUISITION / PROPAGATION (D3-CX-POLICY-NET-ACQ). node:http is
+// allow-listed, so its capability must be tracked not only through a static import
+// but through the other bounded, statically-resolvable forms that acquire or
+// forward that exact binding: a runtime `await import('node:http')` (F1) yields the
+// same HTTP_NS identity as `import * as http`, and destructuring off an HTTP_NS
+// binding (F2) preserves capability per member — `createServer` stays the one allowed
+// server value, every other member is outbound. Decided by the same lexical binding
+// stack (a local shadow or a non-node:http receiver is untouched); alias-via-plain-
+// assignment and genuinely computed forms remain documented, bounded gaps.
+// ---------------------------------------------------------------------------
+describe('D3 host tracks node:http capability through dynamic import and destructuring (D3-CX-POLICY-NET-ACQ)', () => {
+  // F1 — a statically-resolved `import('node:http')` acquires the namespace capability.
+  const f1Reject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a dynamic-import namespace .request', source: `const http = await import('node:http');\nhttp.request('http://example.com/').end();` },
+    { form: 'a dynamic-import namespace .get', source: `const http = await import('node:http');\nhttp.get('http://example.com/');` },
+    { form: 'a dynamic-import namespace new .ClientRequest', source: `const http = await import('node:http');\nnew http.ClientRequest('http://example.com/');` },
+    { form: 'a dynamic-import namespace new .Agent', source: `const http = await import('node:http');\nvoid new http.Agent();` },
+    { form: 'a dynamic-import namespace statically-keyed member', source: `const http = await import('node:http');\nhttp['request']('http://example.com/');` },
+    { form: 'a parenthesized awaited dynamic import', source: `const http = (await import('node:http'));\nhttp.get('http://example.com/');` },
+  ];
+  for (const { form, source } of f1Reject) {
+    it(`REJECTS ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  const f1Allow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a dynamic-import namespace createServer', source: `const http = await import('node:http');\nhttp.createServer(() => {});` },
+    { form: 'a dynamic-import http shadowed by a nested local', source: `const http = await import('node:http');\nfunction f() {\n  const http = { request(v: string) { return v; } };\n  return http.request('local');\n}\nvoid f;` },
+    { form: 'an unrelated relative dynamic import', source: `const m = await import('./local.js');\nvoid m;` },
+    { form: 'a node:url dynamic import used for pathToFileURL', source: `const u = await import('node:url');\nvoid u.pathToFileURL('x');` },
+  ];
+  for (const { form, source } of f1Allow) {
+    it(`ALLOWS ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+
+  // F2 — destructuring a NON-createServer member off an HTTP_NS binding is outbound.
+  const f2Reject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a destructured request off a namespace import', source: `import * as http from 'node:http';\nconst { request } = http;\nrequest('http://example.com/').end();` },
+    { form: 'a destructured get off a namespace import', source: `import * as http from 'node:http';\nconst { get } = http;\nget('http://example.com/');` },
+    { form: 'a destructured ClientRequest off a namespace import', source: `import * as http from 'node:http';\nconst { ClientRequest } = http;\nnew ClientRequest('http://example.com/');` },
+    { form: 'a destructured Agent off a namespace import', source: `import * as http from 'node:http';\nconst { Agent } = http;\nvoid new Agent();` },
+    { form: 'an aliased destructured request', source: `import * as http from 'node:http';\nconst { request: r } = http;\nr('http://example.com/');` },
+    { form: 'a statically-computed-key destructured request', source: `import * as http from 'node:http';\nconst { ['request']: r } = http;\nr('http://example.com/');` },
+    { form: 'a destructured request off a default import', source: `import http from 'node:http';\nconst { request } = http;\nrequest('http://example.com/');` },
+    { form: 'a destructured request off an import-equals binding', source: `import http = require('node:http');\nconst { request } = http;\nrequest('http://example.com/');` },
+    { form: 'a destructured request off a dynamic-import namespace', source: `const http = await import('node:http');\nconst { request } = http;\nrequest('http://example.com/');` },
+    { form: 'a request destructured DIRECTLY off a dynamic import', source: `const { request } = await import('node:http');\nrequest('http://example.com/');` },
+    { form: 'a destructured request inside a nested block', source: `import * as http from 'node:http';\nfunction f() {\n  const { request } = http;\n  return request('http://example.com/');\n}\nvoid f;` },
+  ];
+  for (const { form, source } of f2Reject) {
+    it(`REJECTS ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  const f2Allow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a destructured createServer off a namespace import', source: `import * as http from 'node:http';\nconst { createServer } = http;\ncreateServer(() => {});` },
+    { form: 'an aliased destructured createServer', source: `import * as http from 'node:http';\nconst { createServer: cs } = http;\ncs(() => {});` },
+    { form: 'createServer destructured DIRECTLY off a dynamic import', source: `const { createServer } = await import('node:http');\ncreateServer(() => {});` },
+    { form: 'a destructured request off a plain local object named http', source: `const http = { request(x: string) { return x; } };\nconst { request } = http;\nvoid request('a');` },
+    { form: 'a destructured request off an unrelated local object', source: `const cfg = { request: (x: string) => x };\nconst { request } = cfg;\nvoid request('a');` },
+    { form: 'a destructured capability that does not leak to a sibling scope', source: `import * as http from 'node:http';\nfunction b(request: (x: string) => string) {\n  return request('local');\n}\nvoid b;` },
+  ];
+  for (const { form, source } of f2Allow) {
+    it(`ALLOWS ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+
+  // Combined: a destructured capability is rejected where visible, without tainting a
+  // same-named local parameter in a sibling scope.
+  it('REJECTS the destructured import use while ALLOWING a same-named sibling param', () => {
+    expect(
+      usesOutboundNetwork(
+        `import * as http from 'node:http';\nfunction a() {\n  const { request } = http;\n  return request('http://example.com/');\n}\nfunction b(request: (x: string) => string) {\n  return request('local');\n}\nvoid a;\nvoid b;`,
+      ),
+    ).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// NET namespace NON-ESCAPE (D3-CX-POLICY-NET-ESCAPE). The privileged node:http
+// namespace (HTTP_NS) may appear at runtime ONLY as a createServer access, a
+// destructuring that extracts createServer, or a type reference. Every other runtime
+// reference — alias, argument, return, array/object element, spread, default-export —
+// is a rejected ESCAPE, decided at the original occurrence (no alias/value-flow).
+// An HTTP_NS member access is permitted only for a statically-proven createServer;
+// an indeterminate/computed member is rejected fail-closed.
+// ---------------------------------------------------------------------------
+describe('D3 host forbids escape of the node:http namespace capability (D3-CX-POLICY-NET-ESCAPE)', () => {
+  const escapeReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'aliasing the namespace to a const', source: `import * as http from 'node:http';\nconst h = http;\nvoid h;` },
+    { form: 'passing the namespace as an argument', source: `import * as http from 'node:http';\ndeclare function foo(x: unknown): void;\nfoo(http);` },
+    { form: 'returning the namespace', source: `import * as http from 'node:http';\nexport function g(): unknown { return http; }` },
+    { form: 'storing the namespace in an array', source: `import * as http from 'node:http';\nconst a = [http];\nvoid a;` },
+    { form: 'storing the namespace in an object property', source: `import * as http from 'node:http';\nconst o = { value: http };\nvoid o;` },
+    { form: 'spreading the namespace into an object', source: `import * as http from 'node:http';\nconst o = { ...http };\nvoid o;` },
+    { form: 'default-exporting the namespace', source: `import * as http from 'node:http';\nexport default http;` },
+    { form: 'aliasing a dynamic-import namespace', source: `const http = await import('node:http');\nconst h = http;\nvoid h;` },
+    { form: 'an indeterminate computed member on the namespace', source: `import * as http from 'node:http';\ndeclare const k: string;\nvoid http[k];` },
+    { form: 'a runtime-conditional computed member on the namespace', source: `import * as http from 'node:http';\nconst k = Math.random() > 0.5 ? 'createServer' : 'request';\nvoid http[k];` },
+  ];
+  for (const { form, source } of escapeReject) {
+    it(`REJECTS ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  const escapeAllow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a createServer access on the namespace', source: `import * as http from 'node:http';\nhttp.createServer(() => {});` },
+    { form: 'a statically-keyed createServer access', source: `import * as http from 'node:http';\nhttp['createServer'](() => {});` },
+    { form: 'extracting createServer to a const via access', source: `import * as http from 'node:http';\nconst cs = http.createServer;\ncs(() => {});` },
+    { form: 'a createServer destructuring', source: `import * as http from 'node:http';\nconst { createServer } = http;\ncreateServer(() => {});` },
+    { form: 'a type reference to the namespace member', source: `import * as http from 'node:http';\nexport type S = http.Server;\nhttp.createServer(() => {});` },
+    { form: 'a typeof type query of the namespace', source: `import * as http from 'node:http';\nexport type T = typeof http;\nhttp.createServer(() => {});` },
+    { form: 'a runtime typeof of the namespace', source: `import * as http from 'node:http';\nconst t = typeof http;\nvoid t;\nhttp.createServer(() => {});` },
+  ];
+  for (const { form, source } of escapeAllow) {
+    it(`ALLOWS ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// NET module-boundary export confinement (D3-CX-POLICY-NET-EXPORT). The privileged
+// node:http capability may not cross the D3 module boundary: no re-export from
+// node:http and no export of a local HTTP_NS binding (createServer included). Ordinary
+// local exports and type-only exports are untouched. `exportsHttpCapability` inspects
+// only THIS module's statements and local binding identity (no cross-module data-flow).
+// ---------------------------------------------------------------------------
+describe('D3 host may not export node:http capability across the module boundary (D3-CX-POLICY-NET-EXPORT)', () => {
+  it('accepts every real host source (no host source exports node:http capability)', () => {
+    for (const { file, text } of hostSources()) {
+      const sf = ts.createSourceFile('module.ts', text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+      expect(exportsHttpCapability(sf), `${file} exports node:http capability`).toBe(false);
+    }
+  });
+
+  const exportReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a star re-export from node:http', source: `export * from 'node:http';` },
+    { form: 'a named re-export from node:http', source: `export { request } from 'node:http';` },
+    { form: 'a createServer re-export from node:http', source: `export { createServer } from 'node:http';` },
+    { form: 'a default-aliased re-export from node:http', source: `export { default as http } from 'node:http';` },
+    { form: 'exporting a namespace import binding', source: `import * as http from 'node:http';\nexport { http };` },
+    { form: 'exporting an aliased namespace binding', source: `import * as http from 'node:http';\nexport { http as h };` },
+    { form: 'default-exporting a namespace binding', source: `import * as http from 'node:http';\nexport default http;` },
+    { form: 'exporting a dynamic-import namespace binding', source: `const http = await import('node:http');\nexport { http };` },
+    { form: 'export-equals of a namespace binding', source: `import http = require('node:http');\nexport = http;` },
+  ];
+  for (const { form, source } of exportReject) {
+    it(`REJECTS ${form}`, () => {
+      const sf = ts.createSourceFile('module.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+      expect(exportsHttpCapability(sf)).toBe(true);
+    });
+  }
+
+  const exportAllow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'an ordinary const export', source: `export const HOST = '127.0.0.1';` },
+    { form: 'an ordinary function export that uses createServer internally', source: `import http from 'node:http';\nexport function make() { return http.createServer(() => {}); }` },
+    { form: 'exporting a created server instance', source: `import http from 'node:http';\nexport const server = http.createServer(() => {});` },
+    { form: 'a relative re-export', source: `export { foo } from './local.js';` },
+    { form: 'a type-only export of a namespace member type', source: `import * as http from 'node:http';\nexport type S = http.Server;` },
+  ];
+  for (const { form, source } of exportAllow) {
+    it(`ALLOWS ${form}`, () => {
+      const sf = ts.createSourceFile('module.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+      expect(exportsHttpCapability(sf)).toBe(false);
     });
   }
 });
