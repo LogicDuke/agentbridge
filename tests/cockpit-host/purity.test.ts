@@ -1262,6 +1262,35 @@ const acquiresInboundServerSocket = (checker: ts.TypeChecker, sourceFile: ts.Sou
         }
       }
     }
+    // RULE A2 (assignment) — an object DESTRUCTURING ASSIGNMENT `({ socket: s } = req)` reads
+    //     the property off the req/res param exactly like a declaration destructuring, but the
+    //     target is an ObjectLiteralExpression (PropertyAssignment / ShorthandPropertyAssignment),
+    //     not a binding pattern, so RULE A (c) / RULE A2 above do not see it. This is bound to the
+    //     req/res initializer symbol identity (NOT global — an unrelated `({ socket: x } = obj)`
+    //     stays allowed): a `socket`/`connection` key is rejected, an indeterminate computed key
+    //     fails closed, and a static harmless key (`method`/`url`) is allowed.
+    if (
+      ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      receiverIsReqRes(node.right)
+    ) {
+      const target = binderUnwrap(node.left);
+      if (ts.isObjectLiteralExpression(target)) {
+        for (const prop of target.properties) {
+          if (ts.isShorthandPropertyAssignment(prop)) {
+            if (SOCKET_CAPABILITY_NAMES.has(prop.name.text)) found = true;
+          } else if (ts.isPropertyAssignment(prop)) {
+            if (ts.isComputedPropertyName(prop.name)) {
+              const key = staticKeyText(prop.name);
+              if (key === null || SOCKET_CAPABILITY_NAMES.has(key)) found = true;
+            } else {
+              const key = staticKeyText(prop.name);
+              if (key !== null && SOCKET_CAPABILITY_NAMES.has(key)) found = true;
+            }
+          }
+        }
+      }
+    }
     // RULE B — BLANKET event-registration ban: any registrar member call, any receiver, any
     //     event name (dotted `.on` or static-key `['on']`).
     if (
@@ -4877,4 +4906,59 @@ describe('D3 host rejects namespace re-export of node:http authority (D3-CX-CODE
   it('PRESERVES an unrelated namespace re-export', () => {
     expect(exportsHttpCapability(sf(`export * as local from './local.js';`))).toBe(false);
   });
+});
+
+// ---------------------------------------------------------------------------
+// Codex P1: object DESTRUCTURING ASSIGNMENT socket acquisition (D3-CX-CODEX-ASSIGN). The
+// permitted createServer path can extract the inbound socket through an assignment-target
+// object pattern — `({ socket: s } = req)` — whose AST is a BinaryExpression over an
+// ObjectLiteralExpression, not the BindingElement/VariableDeclaration forms RULE A(c)/A2
+// recognize. RULE A2 (assignment) closes it, scoped to the req/res initializer symbol identity:
+// a socket/connection key is rejected, an indeterminate computed key fails closed, a static
+// harmless key and any key off an unrelated object stay allowed (no global broadening).
+// ---------------------------------------------------------------------------
+describe('D3 host inspects destructuring assignments for socket acquisition (D3-CX-CODEX-ASSIGN)', () => {
+  const H = `import http from 'node:http';\n`;
+  const handler = (body: string): string =>
+    H + `http.createServer((req: any, res: any): void => {\n${body}\n});`;
+
+  it('rejects the reported ({ socket: s } = req) assignment reproducer', () => {
+    expect(
+      usesOutboundNetwork(
+        handler(`let s: any;\n({ socket: s } = req);\ns.destroy();\nsetTimeout(() => s.connect(80, 'example.com'), 50);`),
+      ),
+    ).toBe(true);
+  });
+
+  const assignReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a ({ socket: s } = req) assignment', source: handler(`let s: any;\n({ socket: s } = req);\nvoid s;`) },
+    { form: 'a ({ connection: c } = req) assignment', source: handler(`let c: any;\n({ connection: c } = req);\nvoid c;`) },
+    { form: 'a ({ socket: s } = res) assignment', source: handler(`let s: any;\n({ socket: s } = res);\nvoid s;`) },
+    { form: 'a ({ connection: c } = res) assignment', source: handler(`let c: any;\n({ connection: c } = res);\nvoid c;`) },
+    { form: 'a shorthand ({ socket } = req) assignment', source: handler(`let socket: any;\n({ socket } = req);\nvoid socket;`) },
+    { form: "a static-computed ({ ['socket']: s } = req)", source: handler(`let s: any;\n({ ['socket']: s } = req);\nvoid s;`) },
+    { form: 'a template-computed ({ [`connection`]: c } = req)', source: handler('let c: any;\n({ [`connection`]: c } = req);\nvoid c;') },
+    { form: 'an indeterminate ({ [key]: x } = req)', source: handler(`let x: any;\nconst key = req.url ?? '';\n({ [key]: x } = req);\nvoid x;`) },
+    { form: "a concatenated ({ ['sock' + 'et']: x } = req)", source: handler(`let x: any;\n({ ['sock' + 'et']: x } = req);\nvoid x;`) },
+    { form: 'a conditional ({ [c ? "socket" : "method"]: x } = res)', source: handler(`let x: any;\nconst c = req.method === 'GET';\n({ [c ? 'socket' : 'method']: x } = res);\nvoid x;`) },
+  ];
+  for (const { form, source } of assignReject) {
+    it(`rejects ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  const assignAllow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a static harmless ({ method: m } = req)', source: handler(`let m: any;\n({ method: m } = req);\nvoid m;`) },
+    { form: 'a static harmless ({ url: u } = req)', source: handler(`let u: any;\n({ url: u } = req);\nvoid u;`) },
+    { form: "a static-computed harmless ({ ['method']: m } = req)", source: handler(`let m: any;\n({ ['method']: m } = req);\nvoid m;`) },
+    { form: 'an unrelated ({ [key]: x } = obj)', source: `const obj: Record<string, unknown> = {};\nconst key = 'x';\nlet x: unknown;\n({ [key]: x } = obj);\nvoid x;` },
+    { form: 'an unrelated ({ value: x } = obj)', source: `const obj = { value: 1 };\nlet x: unknown;\n({ value: x } = obj);\nvoid x;` },
+    { form: 'an unrelated ({ socket: localSocket } = unrelatedObject)', source: `const unrelatedObject = { socket: 1 };\nlet localSocket: unknown;\n({ socket: localSocket } = unrelatedObject);\nvoid localSocket;` },
+  ];
+  for (const { form, source } of assignAllow) {
+    it(`allows ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
 });
