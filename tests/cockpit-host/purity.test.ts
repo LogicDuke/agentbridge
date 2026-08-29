@@ -971,7 +971,10 @@ const collectHttpBindings = (sourceFile: ts.SourceFile): HttpBindings => {
 // statements and local binding identity: no cross-module value-flow.
 const exportsHttpCapability = (sourceFile: ts.SourceFile): boolean => {
   const NODE_HTTP = 'node:http';
+  // Bindings carrying node:http RUNTIME authority: the namespace (HTTP_NS) and any
+  // non-createServer named CLIENT value (HTTP_CLIENT). Type-only imports carry none.
   const httpNs = new Set<string>();
+  const httpClient = new Set<string>();
   for (const s of sourceFile.statements) {
     if (
       ts.isImportDeclaration(s) &&
@@ -980,9 +983,19 @@ const exportsHttpCapability = (sourceFile: ts.SourceFile): boolean => {
       s.importClause !== undefined
     ) {
       const clause = s.importClause;
+      if (clause.phaseModifier === ts.SyntaxKind.TypeKeyword) continue;
       if (clause.name !== undefined) httpNs.add(clause.name.text);
-      if (clause.namedBindings !== undefined && ts.isNamespaceImport(clause.namedBindings)) {
-        httpNs.add(clause.namedBindings.name.text);
+      const bindings = clause.namedBindings;
+      if (bindings !== undefined) {
+        if (ts.isNamespaceImport(bindings)) {
+          httpNs.add(bindings.name.text);
+        } else {
+          for (const el of bindings.elements) {
+            if (el.isTypeOnly) continue;
+            const imported = (el.propertyName ?? el.name).text;
+            if (imported !== 'createServer') httpClient.add(el.name.text);
+          }
+        }
       }
     } else if (
       ts.isImportEqualsDeclaration(s) &&
@@ -999,19 +1012,42 @@ const exportsHttpCapability = (sourceFile: ts.SourceFile): boolean => {
       }
     }
   }
+  const carriesAuthority = (name: string): boolean => httpNs.has(name) || httpClient.has(name);
   for (const s of sourceFile.statements) {
-    // (a) any re-export whose specifier is node:http (`export * from` / `export { … } from`).
-    if (ts.isExportDeclaration(s) && s.moduleSpecifier !== undefined && ts.isStringLiteral(s.moduleSpecifier) && s.moduleSpecifier.text === NODE_HTTP) {
+    // (a) a RUNTIME re-export from node:http (a type-only re-export carries no authority).
+    if (
+      ts.isExportDeclaration(s) &&
+      !s.isTypeOnly &&
+      s.moduleSpecifier !== undefined &&
+      ts.isStringLiteral(s.moduleSpecifier) &&
+      s.moduleSpecifier.text === NODE_HTTP
+    ) {
       return true;
     }
-    // (b) a local re-export of an HTTP_NS binding (`export { http }` / `export { http as h }`).
-    if (ts.isExportDeclaration(s) && s.moduleSpecifier === undefined && s.exportClause !== undefined && ts.isNamedExports(s.exportClause)) {
+    // (b) a local re-export of a binding carrying node:http authority (namespace OR a
+    //     named client value). Type-only export specifiers are skipped.
+    if (ts.isExportDeclaration(s) && !s.isTypeOnly && s.moduleSpecifier === undefined && s.exportClause !== undefined && ts.isNamedExports(s.exportClause)) {
       for (const el of s.exportClause.elements) {
-        if (httpNs.has((el.propertyName ?? el.name).text)) return true;
+        if (!el.isTypeOnly && carriesAuthority((el.propertyName ?? el.name).text)) return true;
       }
     }
     // (c) `export default http` / `export = http`.
-    if (ts.isExportAssignment(s) && ts.isIdentifier(s.expression) && httpNs.has(s.expression.text)) return true;
+    if (ts.isExportAssignment(s) && ts.isIdentifier(s.expression) && carriesAuthority(s.expression.text)) return true;
+    // (d) an EXPORTED runtime declaration that ESTABLISHES node:http authority in the
+    //     same statement (`export const http = await import('node:http')`,
+    //     `export const { request } = http`) — reuse the capability-propagation rule; a
+    //     declaration yielding only createServer/LOCAL is not authority.
+    if (ts.isVariableStatement(s) && ts.getModifiers(s)?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword) === true) {
+      for (const decl of s.declarationList.declarations) {
+        const established: BindingKind[] = [];
+        propagateHttpCapability(
+          decl,
+          (n) => (httpNs.has(n) ? 'HTTP_NS' : httpClient.has(n) ? 'HTTP_CLIENT' : undefined),
+          (_name, kind) => established.push(kind),
+        );
+        if (established.some((k) => k === 'HTTP_NS' || k === 'HTTP_CLIENT')) return true;
+      }
+    }
   }
   return false;
 };
@@ -1243,7 +1279,8 @@ const usesOutboundNetwork = (source: string): boolean => {
     if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
       const member = memberNameOf(node, constMap);
       const recv = unwrapExpr(node.expression);
-      const recvIsHttpNs = ts.isIdentifier(recv) && resolve(recv.text) === 'HTTP_NS';
+      const recvIsHttpNs =
+        (ts.isIdentifier(recv) && resolve(recv.text) === 'HTTP_NS') || isNodeHttpDynamicImport(recv);
       // (d/3) an HTTP_NS receiver is permitted ONLY for a statically-PROVEN `createServer`
       //     member; every other known member (`.request`/`.get`/`.ClientRequest`/`.Agent`/…)
       //     AND any indeterminate/computed member (`http[dynamicKey]`, member === null) is
@@ -4366,6 +4403,71 @@ describe('D3 host may not export node:http capability across the module boundary
   ];
   for (const { form, source } of exportAllow) {
     it(`ALLOWS ${form}`, () => {
+      const sf = ts.createSourceFile('module.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+      expect(exportsHttpCapability(sf)).toBe(false);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// NET direct dynamic-import receiver + runtime-export completeness
+// (D3-CX-POLICY-NET-DIRECT). Finite completeness of the agreed model: a statically-
+// resolved `import('node:http')` is HTTP_NS authority even as a direct expression
+// receiver (no binding); a named node:http CLIENT import and an exported dynamic-import
+// declaration are node:http authority crossing the module boundary. Same lexical
+// binding identity, same createServer-only rule — no new mechanism.
+// ---------------------------------------------------------------------------
+describe('D3 host closes direct dynamic-import receivers and runtime capability exports (D3-CX-POLICY-NET-DIRECT)', () => {
+  const directReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a direct dynamic-import .request', source: `(await import('node:http')).request('http://example.com/').end();` },
+    { form: 'a direct dynamic-import .get', source: `(await import('node:http')).get('http://example.com/');` },
+    { form: 'a direct dynamic-import new .ClientRequest', source: `new (await import('node:http')).ClientRequest('http://example.com/');` },
+    { form: 'a direct dynamic-import new .Agent', source: `void new (await import('node:http')).Agent();` },
+    { form: 'a direct dynamic-import indeterminate member', source: `declare const k: string;\nvoid (await import('node:http'))[k];` },
+  ];
+  for (const { form, source } of directReject) {
+    it(`REJECTS ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+  const directAllow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a direct dynamic-import createServer', source: `(await import('node:http')).createServer(() => {});` },
+    { form: 'a direct dynamic-import statically-keyed createServer', source: `(await import('node:http'))['createServer'](() => {});` },
+    { form: 'a direct dynamic import of an unrelated module', source: `void (await import('node:url')).pathToFileURL('x');` },
+  ];
+  for (const { form, source } of directAllow) {
+    it(`ALLOWS ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+
+  const exportReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a named request import re-exported', source: `import { request } from 'node:http';\nexport { request };` },
+    { form: 'an aliased named request import re-exported', source: `import { request as req } from 'node:http';\nexport { req };` },
+    { form: 'a named get import re-exported', source: `import { get } from 'node:http';\nexport { get };` },
+    { form: 'a named ClientRequest import re-exported', source: `import { ClientRequest } from 'node:http';\nexport { ClientRequest };` },
+    { form: 'a named Agent import re-exported', source: `import { Agent } from 'node:http';\nexport { Agent };` },
+    { form: 'an exported dynamic-import namespace declaration', source: `export const http = await import('node:http');` },
+    { form: 'an exported destructured dynamic-import client member', source: `export const { request } = await import('node:http');` },
+    { form: 'an exported destructured namespace client member', source: `import * as http from 'node:http';\nexport const { request } = http;` },
+  ];
+  for (const { form, source } of exportReject) {
+    it(`REJECTS export of ${form}`, () => {
+      const sf = ts.createSourceFile('module.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+      expect(exportsHttpCapability(sf)).toBe(true);
+    });
+  }
+  const exportAllow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a named createServer import re-exported', source: `import { createServer } from 'node:http';\nexport { createServer };` },
+    { form: 'an exported createServer-derived local', source: `import http from 'node:http';\nexport const server = http.createServer(() => {});` },
+    { form: 'an exported destructured createServer', source: `import * as http from 'node:http';\nexport const { createServer } = http;` },
+    { form: 'a type-only named import re-exported as type', source: `import type { IncomingMessage } from 'node:http';\nexport type { IncomingMessage };` },
+    { form: 'an inline-type named import re-exported', source: `import { type IncomingMessage } from 'node:http';\nexport { type IncomingMessage };` },
+    { form: 'a type-only star re-export from node:http', source: `export type * from 'node:http';` },
+    { form: 'an ordinary application export', source: `export const HOST = '127.0.0.1';` },
+  ];
+  for (const { form, source } of exportAllow) {
+    it(`ALLOWS export of ${form}`, () => {
       const sf = ts.createSourceFile('module.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
       expect(exportsHttpCapability(sf)).toBe(false);
     });
