@@ -1306,6 +1306,75 @@ const acquiresInboundServerSocket = (checker: ts.TypeChecker, sourceFile: ts.Sou
   return found;
 };
 
+// F1/P2 — binder-identity gate for the NET free-global member check (D3-CX-POLICY-NET-BIND).
+//
+// `collectStringConsts` keys a resolved constant by identifier TEXT (under whole-file
+// uniqueness), and `staticStringOf` then substitutes that value for ANY same-text identifier.
+// For the NET free-global member path that is unsound: an element-access key such as
+// `globalThis[Infinity]`, whose `Infinity` reference does NOT lexically resolve to an in-scope
+// `const Infinity = 'fetch'` (a different-scope binding, a free global, a parameter/import
+// shadow), would still be handed the collected `'fetch'` — a PHANTOM member and an
+// outbound-network false positive, even though no fetch/WebSocket capability is acquired.
+// Identifier text equality is not binding identity; the compiler binder is the authority.
+//
+// This gate requires the key Identifier to RESOLVE, via `checker.getSymbolAtLocation`, to the
+// one unique `const <text> = <static string>` declaration that produced the collected value.
+// A key that resolves to a DIFFERENT same-text binding, or to no in-file binding at all, is
+// treated as unresolved for NET (null) — never as the collected const — and is left to the
+// independent fail-closed runtime-code guard. String literals and `+`-folds of literals carry
+// no identifier and are unaffected; a genuine same-binding `const key = 'fetch'; globalThis[key]`
+// still resolves and is still rejected. Bounded to NET: `collectStringConsts` / `staticStringOf`
+// / `memberNameOf` are unchanged, so the RC/HA text-only structural policy is not touched.
+const bindsToCollectedConst = (id: ts.Identifier, checker: ts.TypeChecker): boolean => {
+  const symbol = checker.getSymbolAtLocation(id);
+  if (symbol === undefined || symbol.declarations === undefined || symbol.declarations.length !== 1) {
+    return false;
+  }
+  const decl = symbol.declarations[0];
+  if (decl === undefined || !ts.isVariableDeclaration(decl) || !ts.isIdentifier(decl.name) || decl.name.text !== id.text) {
+    return false;
+  }
+  const list = decl.parent;
+  return ts.isVariableDeclarationList(list) && (list.flags & ts.NodeFlags.Const) !== 0;
+};
+
+// `staticStringOf` restricted, at every Identifier leaf, to the const the binder proves the
+// reference denotes (see `bindsToCollectedConst`). Used ONLY by the NET free-global member
+// path. Structurally identical to `staticStringOf` otherwise — literals and `+`-folds are
+// resolved exactly as before — so literal concatenation and genuine same-binding const keys
+// keep resolving; only a same-text/different-symbol identifier is demoted to unresolved.
+const netStaticStringOf = (
+  node: ts.Expression,
+  constMap: ReadonlyMap<string, string>,
+  checker: ts.TypeChecker,
+): string | null => {
+  const n = unwrapExpr(node);
+  if (ts.isStringLiteralLike(n)) return n.text;
+  if (ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+    const left = netStaticStringOf(n.left, constMap, checker);
+    if (left === null) return null;
+    const right = netStaticStringOf(n.right, constMap, checker);
+    return right === null ? null : left + right;
+  }
+  if (ts.isIdentifier(n)) {
+    const value = constMap.get(n.text);
+    if (value === undefined) return null;
+    return bindsToCollectedConst(n, checker) ? value : null;
+  }
+  return null;
+};
+
+// `memberNameOf` for the NET path: a property name is read directly; an element-access key is
+// resolved with binder-identity gating (`netStaticStringOf`), never by identifier text alone.
+const netMemberNameOf = (
+  node: ts.PropertyAccessExpression | ts.ElementAccessExpression,
+  constMap: ReadonlyMap<string, string>,
+  checker: ts.TypeChecker,
+): string | null => {
+  if (ts.isPropertyAccessExpression(node)) return node.name.text;
+  return netStaticStringOf(node.argumentExpression, constMap, checker);
+};
+
 /**
  * NET — reject outbound network egress, decided by TypeScript BINDER identity
  * (D3-CX-POLICY-NET). Lexical binding identity — nearest visible binding, shadowing,
@@ -1338,11 +1407,15 @@ const usesOutboundNetwork = (source: string): boolean => {
         const member = binderMemberName(node);
         if (member === null || !HTTP_SERVER_VALUE_MEMBERS.has(member)) found = true;
       }
-      // F1 — a free-global network member (`fetch`/`WebSocket`) resolved through the existing
-      //     static-string machinery: a direct literal, a `+`-fold (`'fe' + 'tch'`), or a unique
-      //     immutable `const key = 'fetch'`. A genuinely indeterminate key resolves to `null`
-      //     and is not flagged here (the runtime-code guard rejects it fail-closed).
-      const globalMember = memberNameOf(node, constMap);
+      // F1 — a free-global network member (`fetch`/`WebSocket`) resolved through the static-string
+      //     machinery under a BINDER-IDENTITY gate (P2, `netMemberNameOf`): a direct literal, a
+      //     `+`-fold (`'fe' + 'tch'`), or a unique immutable `const key = 'fetch'` whose reference
+      //     the binder proves denotes that same const. A key whose identifier resolves to a
+      //     different same-text binding (or to no in-file binding) is NOT substituted — it stays
+      //     `null` here, so `globalThis[Infinity]` with an out-of-scope `const Infinity = 'fetch'`
+      //     is not a phantom member. A genuinely indeterminate key likewise resolves to `null` and
+      //     is not flagged here (the runtime-code guard rejects it fail-closed).
+      const globalMember = netMemberNameOf(node, constMap, checker);
       if (globalMember !== null && NETWORK_GLOBAL_NAMES.has(globalMember) && isFreeGlobalReceiver(node.expression, checker, sourceFile)) {
         found = true;
       }
@@ -5031,6 +5104,95 @@ describe('D3 host rejects statically-computed free-global network members (D3-CX
   for (const { form, source } of allowComputed) {
     it(`allows ${form}`, () => {
       expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// P2: the free-global network-member check resolves a computed key through a collected string
+// constant by identifier TEXT (D3-CX-POLICY-NET-BIND). `collectStringConsts` keys a value by
+// text under whole-file uniqueness, so a single out-of-scope `const Infinity = 'fetch'` made
+// `globalThis[Infinity]` — whose `Infinity` reference does NOT resolve to that const — fold to
+// a PHANTOM `'fetch'` member and reject as egress, a false positive that acquires no runtime
+// fetch/WebSocket capability. The member is now resolved with `netMemberNameOf`, which
+// substitutes a collected constant for an Identifier key ONLY when the compiler binder proves
+// the reference denotes that same unique `const` declaration; identifier text equality is not
+// binding identity. Literals and `+`-folds are unchanged, a genuine same-binding const key is
+// still rejected, and a key that cannot be bound stays out of scope for NET and remains rejected
+// fail-closed by the independent runtime-code guard. RC/HA text-only policy is untouched.
+// ---------------------------------------------------------------------------
+describe('D3 host resolves computed network-member keys by binder identity (D3-CX-POLICY-NET-BIND)', () => {
+  // The verified reproducer is a genuine FALSE POSITIVE: NET no longer flags it AND the
+  // runtime-code guard does not either — the source is truly accepted, not merely shifted.
+  it('accepts the verified reproducer (out-of-scope const Infinity) by both guards', () => {
+    const reproducer = `function f() {\n  const Infinity = 'fetch';\n  void Infinity;\n}\nvoid (globalThis as any)[Infinity];`;
+    expect(usesOutboundNetwork(reproducer)).toBe(false);
+    expect(usesRuntimeCodeGeneration(reproducer)).toBe(false);
+  });
+
+  // ALLOW — the collected `const <text> = '<network global>'` exists (unique in the file) but the
+  // element-access key reference does NOT lexically resolve to it, so no substitution is proven.
+  const allowDifferentBinding: readonly { readonly form: string; readonly source: string }[] = [
+    {
+      form: 'a function-scoped const Infinity with an outer key reference',
+      source: `function f() {\n  const Infinity = 'fetch';\n  void Infinity;\n}\nvoid (globalThis as any)[Infinity];`,
+    },
+    {
+      form: 'a block-scoped const Infinity with an outer key reference',
+      source: `{\n  const Infinity = 'fetch';\n}\nvoid globalThis[Infinity];`,
+    },
+    {
+      form: 'a sibling-scope const key that the second scope does not see',
+      source: `function a() {\n  const key = 'fetch';\n  void key;\n}\nfunction b() {\n  void globalThis[key];\n}\nvoid a;\nvoid b;`,
+    },
+    {
+      form: 'an inner-declared const with an outer WebSocket key reference (constructor)',
+      source: `function outer() {\n  function inner() {\n    const wsName = 'WebSocket';\n    void wsName;\n  }\n  void inner;\n  return new globalThis[wsName]('wss://example.com/');\n}\nvoid outer;`,
+    },
+    {
+      form: 'a parameter shadow of the collected const name',
+      source: `const routeName = 'fetch';\nfunction f(routeName: string) {\n  return globalThis[routeName];\n}\nvoid f;`,
+    },
+    {
+      form: 'an imported-name / inner-const same-text key resolving to the import',
+      source: `import { helper } from './x.js';\nfunction f() {\n  const helper = 'fetch';\n  void helper;\n}\nvoid helper;\nvoid globalThis[helper];`,
+    },
+  ];
+  for (const { form, source } of allowDifferentBinding) {
+    it(`ALLOWS ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+
+  // REJECT — genuine egress: literals, `+`-folds, and const keys whose reference the binder DOES
+  // prove denotes the collected const (same-symbol), for both fetch and WebSocket.
+  const rejectGenuine: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a same-binding const key globalThis[key]', source: `const key = 'fetch';\nglobalThis[key]('https://example.com/');` },
+    { form: 'a same-binding const key new globalThis[ws]', source: `const ws = 'WebSocket';\nvoid new globalThis[ws]('wss://example.com/');` },
+    { form: "a same-binding const-prefix globalThis[prefix + 'tch']", source: `const prefix = 'fe';\nglobalThis[prefix + 'tch']('https://example.com/');` },
+    { form: "a literal concatenation globalThis['fe' + 'tch']", source: `globalThis['fe' + 'tch']('https://example.com/');` },
+    { form: 'a dotted globalThis.fetch', source: `globalThis.fetch('https://example.com/');` },
+    { form: 'a dotted new globalThis.WebSocket', source: `void new globalThis.WebSocket('wss://example.com/');` },
+    { form: 'a same-scope const key inside a function (same symbol)', source: `function f() {\n  const key = 'fetch';\n  return globalThis[key]('https://example.com/');\n}\nvoid f;` },
+  ];
+  for (const { form, source } of rejectGenuine) {
+    it(`REJECTS ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // FAIL-CLOSED — a key the NET branch cannot bind (ambient, mutated, or undeclared) is not
+  // flagged by NET but REMAINS rejected fail-closed by the runtime-code guard. Binder-identity
+  // gating narrows NET substitution WITHOUT opening an outbound-network bypass.
+  const failClosed: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'an ambient declare const key globalThis[k]', source: `declare const k: string;\nglobalThis[k]('https://example.com/');` },
+    { form: 'a mutated let key globalThis[k]', source: `let k = 'fetch';\nk = 'other';\nglobalThis[k]('https://example.com/');` },
+    { form: 'an undeclared free-global key globalThis[neverDeclared]', source: `void globalThis[neverDeclared];` },
+  ];
+  for (const { form, source } of failClosed) {
+    it(`keeps ${form} out of NET but rejected by the runtime-code guard`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+      expect(usesRuntimeCodeGeneration(source)).toBe(true);
     });
   }
 });
