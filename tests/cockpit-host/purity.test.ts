@@ -781,36 +781,46 @@ const acquiresHiddenBuiltin = (source: string): boolean => {
  * The D3 contract forbids network egress ("no network egress"; "not a
  * collector"; Stage A is "not live"). The import allowlist already blocks
  * `node:https` / `node:net` / `node:tls` (they are not on the exact
- * `{node:http, node:url}` allowlist — D3-CX-POLICY-3), but two egress routes
- * survive every other existing check:
- *   - the global `fetch` — a global, so it needs no import and the specifier
- *     allowlist never sees it;
- *   - `request()` / `get()` / `new ClientRequest()` reached through the
- *     legitimately-allowed `node:http` import — the very module the host needs for
- *     `http.createServer`.
+ * `{node:http, node:url}` allowlist — D3-CX-POLICY-3), and with `node:net`/`tls`/
+ * `dgram`/`http2` therefore unreachable, the COMPLETE outbound surface that survives
+ * every other check is finite and closed by construction:
+ *   - importless network GLOBALS — `fetch` and (on the Node target) `WebSocket` are
+ *     built-in globals, so they need no import and the specifier allowlist never sees
+ *     them. This is the whole importless-network-global family on the target runtime,
+ *     not an open-ended blacklist: a raw socket needs `node:net`/`tls`, which the
+ *     import allowlist blocks.
+ *   - any NON-`createServer` value reached through the legitimately-allowed
+ *     `node:http` import. The read-only host needs exactly ONE node:http VALUE export
+ *     — the inbound-server constructor `createServer`; every other value member/name
+ *     (`request`, `get`, `ClientRequest`, `Agent`, `Agent.createConnection`, …) is a
+ *     non-server (outbound/connection) capability. So node:http is decided by a finite
+ *     POSITIVE model — allow `createServer`, reject the rest — and a newly-noticed
+ *     client API needs NO new special case.
  *
- * This detector closes exactly those two, decided by LEXICAL BINDING IDENTITY —
+ * This detector closes both families, decided by LEXICAL BINDING IDENTITY —
  * the binding visible at each occurrence, never mere identifier text — so
  * shadowing neither hides a real capability nor false-positives a same-named
  * local (NET-S1/NET-S2):
- *   - global `fetch`: a `<global>.fetch` member on a global receiver name
- *     (globalThis/window/self/global, incl. a statically-resolved `<global>['fetch']`)
- *     that is itself FREE here — a lexically-shadowing local receiver
- *     (`function f(globalThis){ globalThis.fetch(...) }`) is an ordinary object and is
- *     allowed; a destructuring of `fetch` OFF such a free global receiver; or a bare
- *     `fetch` reference that is FREE at that occurrence (no lexical binding named
- *     `fetch` is visible). An alias `const f = fetch` is caught at the `fetch`
- *     reference; forwarding a global receiver (`const g = globalThis`) is already
- *     rejected by RC (e).
- *   - node:http client APIs: `request` / `get` / `ClientRequest` reached through a
- *     binding THIS module imported from `node:http` — a default or namespace binding
- *     (`http.request`, `h.get`, `new http.ClientRequest()`), a named import used bare
- *     (`request()`, `new ClientRequest()`), an aliased named import (`req()` from
- *     `{ request as req }`), or an import-equals binding — where the receiver/name
- *     still LEXICALLY resolves to that import. `createServer` is never in the rejected
- *     member set, so the real host server is preserved, and `map.get(...)` /
- *     `obj.request(...)` / an unrelated local `new ClientRequest()` on any
- *     non-node:http binding is untouched.
+ *   - a network GLOBAL (`fetch`/`WebSocket`): a `<global>.<name>` member on a global
+ *     receiver name (globalThis/window/self/global, incl. a statically-resolved
+ *     `<global>['fetch']`) that is itself FREE here — a lexically-shadowing local
+ *     receiver (`function f(globalThis){ globalThis.fetch(...) }`) is an ordinary
+ *     object and is allowed; a destructuring of the name OFF such a free global
+ *     receiver; or a bare reference (`fetch(...)`, `new WebSocket(...)`) that is FREE
+ *     at that occurrence (no lexical binding of the name is visible). An alias
+ *     `const f = fetch` is caught at the `fetch` reference; forwarding a global
+ *     receiver (`const g = globalThis`) is already rejected by RC (e).
+ *   - node:http value capabilities: any member OTHER than `createServer` reached
+ *     through a binding THIS module imported from `node:http` — a default or namespace
+ *     binding (`http.request`, `h.get`, `new http.ClientRequest()`, `new http.Agent()`),
+ *     a named import used bare (`request()`, `new ClientRequest()`, `new Agent()`), an
+ *     aliased named import (`req()` from `{ request as req }`), or an import-equals
+ *     binding — where the receiver/name still LEXICALLY resolves to that import.
+ *     `createServer` is the sole allowed value member, so the real host server is
+ *     preserved; type-only `http.Server`/`IncomingMessage`/`ServerResponse` are
+ *     QualifiedName nodes (never value member accesses) and stay untouched, as do
+ *     `map.get(...)` / `obj.request(...)` / an unrelated local `new ClientRequest()`
+ *     on any non-node:http binding.
  *
  * Binding identity is resolved by a bounded lexical ENVIRONMENT STACK tied to the
  * AST walk: each scope (module, function/arrow/method params, block, for-header,
@@ -832,16 +842,27 @@ const acquiresHiddenBuiltin = (source: string): boolean => {
  * generated code (RC/HA cover codegen). `node:https`/`net`/`tls` stay out of scope
  * — the import allowlist already blocks them.
  */
-const HTTP_CLIENT_MEMBERS: ReadonlySet<string> = new Set(['request', 'get', 'ClientRequest']);
-const NETWORK_GLOBAL_NAMES: ReadonlySet<string> = new Set(['fetch']);
+// The ONLY node:http VALUE export the read-only host legitimately needs is the
+// inbound-server constructor `createServer`. Every other value member/name reached
+// through a node:http binding is a non-server (outbound/connection) capability and is
+// rejected — a finite POSITIVE model, so a client API noticed later (Agent,
+// ClientRequest, request, get, …) needs no new entry. Type-only references
+// (`http.Server`/`IncomingMessage`/`ServerResponse`) are QualifiedName nodes, never
+// value member accesses, so they are structurally untouched.
+const HTTP_SERVER_VALUE_MEMBERS: ReadonlySet<string> = new Set(['createServer']);
+// Importless network-initiating globals present on the Node target. `node:https`/
+// `net`/`tls`/`dgram`/`http2` are import-blocked by the allowlist, so this is the
+// COMPLETE importless-egress global surface — a bounded family, not an open blacklist.
+const NETWORK_GLOBAL_NAMES: ReadonlySet<string> = new Set(['fetch', 'WebSocket']);
 
 interface HttpBindings {
   // Local names bound to the node:http MODULE (`import http` / `import * as h` /
   // `import http = require('node:http')`), used as `binding.request(...)`.
   readonly namespaceOrDefault: ReadonlySet<string>;
-  // Local names bound to a node:http CLIENT capability (`import { request, get as g,
-  // ClientRequest }`), used bare as `request(...)` / `g(...)` / `new ClientRequest()`.
-  // A named `createServer` is deliberately NOT collected — it is legitimate.
+  // Local names bound to a NON-`createServer` node:http named value (`import
+  // { request, get as g, ClientRequest, Agent }`), used bare as `request(...)` /
+  // `g(...)` / `new ClientRequest()` / `new Agent()`. A named `createServer` is
+  // deliberately NOT collected — it is the one legitimate value export.
   readonly namedClient: ReadonlySet<string>;
 }
 
@@ -869,11 +890,13 @@ const collectHttpBindings = (sourceFile: ts.SourceFile): HttpBindings => {
           // `import * as http from 'node:http'`.
           namespaceOrDefault.add(bindings.name.text);
         } else {
-          // `import { request, get as g } from 'node:http'` — collect only the
-          // client members, under their LOCAL name (`el.name`).
+          // `import { createServer, request, Agent as A } from 'node:http'` — collect
+          // every named import EXCEPT `createServer` (the sole allowed value export),
+          // under its LOCAL name (`el.name`). The positive model treats any other
+          // node:http named value as a non-server capability.
           for (const el of bindings.elements) {
             const imported = (el.propertyName ?? el.name).text;
-            if (HTTP_CLIENT_MEMBERS.has(imported)) namedClient.add(el.name.text);
+            if (!HTTP_SERVER_VALUE_MEMBERS.has(imported)) namedClient.add(el.name.text);
           }
         }
       }
@@ -894,8 +917,8 @@ const collectHttpBindings = (sourceFile: ts.SourceFile): HttpBindings => {
 
 // A lexical binding kind for the identity-sensitive detection below. `HTTP_NS` and
 // `HTTP_CLIENT` mark the module-level node:http import bindings (namespace/default,
-// and named `request`/`get`/`ClientRequest` respectively); `LOCAL` marks any OTHER
-// declaration
+// and any named node:http value that is not `createServer` respectively); `LOCAL`
+// marks any OTHER declaration
 // (parameter, const/let/var, function/class, catch, or unrelated import) that
 // SHADOWS an outer binding of the same name. Capability identity is therefore the
 // binding VISIBLE at an occurrence, never mere identifier text (NET-S1/NET-S2).
@@ -1060,11 +1083,13 @@ const usesOutboundNetwork = (source: string): boolean => {
         //     shadows it). A shadowing local (param/const/…) makes it an ordinary
         //     object, so `function f(globalThis) { globalThis.fetch(...) }` is allowed.
         if (NETWORK_GLOBAL_NAMES.has(member) && isLexicalGlobalReceiver(node.expression)) found = true;
-        // (d) `<binding>.request` / `.get` / `.ClientRequest` only when the receiver
-        //     identifier LEXICALLY resolves to the module's node:http namespace/default
-        //     import (not a shadowing local). `createServer` is never a client member.
+        // (d) any NON-`createServer` value member (`.request`/`.get`/`.ClientRequest`/
+        //     `.Agent`/…) only when the receiver identifier LEXICALLY resolves to the
+        //     module's node:http namespace/default import (not a shadowing local).
+        //     `createServer` is the sole allowed value member; type-only
+        //     `http.ServerResponse` etc. are QualifiedName, not member accesses.
         const recv = unwrapExpr(node.expression);
-        if (HTTP_CLIENT_MEMBERS.has(member) && ts.isIdentifier(recv) && resolve(recv.text) === 'HTTP_NS') {
+        if (!HTTP_SERVER_VALUE_MEMBERS.has(member) && ts.isIdentifier(recv) && resolve(recv.text) === 'HTTP_NS') {
           found = true;
         }
       }
@@ -1089,12 +1114,14 @@ const usesOutboundNetwork = (source: string): boolean => {
       const isBindingPropertyKey = ts.isBindingElement(node.parent) && node.parent.propertyName === node;
       if (!isBindingPropertyKey) {
         const kind = resolve(node.text);
-        // (c) a bare `fetch` reference that is FREE here — no lexical binding named
-        //     `fetch` is visible — so it is the global. A local shadow resolves to
-        //     LOCAL and is allowed; `const f = fetch` is still caught at `fetch`.
+        // (c) a bare network-global reference (`fetch`, `WebSocket`) that is FREE here
+        //     — no lexical binding of the name is visible — so it is the global. A
+        //     local shadow resolves to LOCAL and is allowed; `const f = fetch` is still
+        //     caught at `fetch`.
         if (NETWORK_GLOBAL_NAMES.has(node.text) && kind === undefined) found = true;
-        // (e) a bare reference that lexically resolves to a node:http named client
-        //     import (`request(...)`, `req(...)`); a shadowing local resolves LOCAL.
+        // (e) a bare reference that lexically resolves to a NON-`createServer` node:http
+        //     named import (`request(...)`, `req(...)`, `new Agent()`); a shadowing
+        //     local resolves LOCAL.
         if (kind === 'HTTP_CLIENT') found = true;
       }
     }
@@ -3696,12 +3723,13 @@ describe('D3 host rejects symlink escapes under the Cockpit boundary (D3-CX-POLI
 
 // ---------------------------------------------------------------------------
 // NET — the host must perform no outbound network egress (D3-CX-POLICY-NET).
-// The two routes that survive every OTHER purity check are the global `fetch`
-// (needs no import) and `request`/`get` reached through the already-allowed
-// `node:http` module. `usesOutboundNetwork` closes exactly those, receiver-scoped,
-// while preserving `http.createServer` and every unrelated `.get`/`.request`.
-// node:https/net/tls stay covered by the import allowlist (D3-CX-POLICY-3), not
-// here — see the detector's doc comment.
+// The routes that survive every OTHER purity check are the importless network
+// globals (`fetch`/`WebSocket`) and any NON-`createServer` value reached through the
+// already-allowed `node:http` module. `usesOutboundNetwork` closes both by a finite
+// model — a bounded global family plus a POSITIVE node:http allow of exactly
+// `createServer` — receiver-scoped, while preserving `http.createServer` and every
+// unrelated `.get`/`.request`. node:https/net/tls stay covered by the import allowlist
+// (D3-CX-POLICY-3), not here — see the detector's doc comment.
 // ---------------------------------------------------------------------------
 describe('D3 host forbids outbound network egress (D3-CX-POLICY-NET)', () => {
   it('accepts every real host source (no egress is present today)', () => {
@@ -3748,6 +3776,16 @@ describe('D3 host forbids outbound network egress (D3-CX-POLICY-NET)', () => {
     { form: 'a default node:http binding new .ClientRequest', source: `import http from 'node:http';\nnew http.ClientRequest('http://example.com/').end();` },
     { form: 'an import-equals node:http binding new .ClientRequest', source: `import http = require('node:http');\nnew http.ClientRequest('http://example.com/').end();` },
     { form: 'a statically-keyed ClientRequest member on a node:http binding', source: `import * as http from 'node:http';\nnew http['ClientRequest']('http://example.com/').end();` },
+    // node:http connection APIs beyond the request/get/ClientRequest names — caught by
+    // the POSITIVE model (only `createServer` is allowed) with no per-name entry.
+    { form: 'a namespace node:http binding new .Agent', source: `import * as http from 'node:http';\nvoid new http.Agent();` },
+    { form: 'a default node:http binding new .Agent', source: `import http from 'node:http';\nvoid new http.Agent();` },
+    { form: 'an import-equals node:http binding new .Agent', source: `import http = require('node:http');\nvoid new http.Agent();` },
+    { form: 'an Agent.createConnection outbound chain', source: `import * as http from 'node:http';\nnew http.Agent().createConnection({ host: 'example.com', port: 80 });` },
+    { form: 'a named Agent import constructed bare', source: `import { Agent } from 'node:http';\nvoid new Agent();` },
+    { form: 'an aliased named Agent import constructed bare', source: `import { Agent as A } from 'node:http';\nvoid new A();` },
+    { form: 'a statically-keyed Agent member on a node:http binding', source: `import * as http from 'node:http';\nvoid new http['Agent']();` },
+    { form: 'a namespace node:http binding .globalAgent read', source: `import * as http from 'node:http';\nvoid http.globalAgent;` },
   ];
   for (const { form, source } of rejectHttp) {
     it(`rejects ${form}`, () => {
@@ -3779,6 +3817,11 @@ describe('D3 host forbids outbound network egress (D3-CX-POLICY-NET)', () => {
     { form: 'an unrelated local class named ClientRequest', source: `class ClientRequest {}\nvoid new ClientRequest();` },
     { form: 'an unrelated local const constructor named ClientRequest', source: `const LocalCtor = class {};\nconst ClientRequest = LocalCtor;\nvoid new ClientRequest();` },
     { form: 'a ClientRequest member on a plain local object (non-node:http)', source: `const LocalCtor = class {};\nconst http = { ClientRequest: LocalCtor };\nvoid new http.ClientRequest();` },
+    { form: 'an unrelated local class named Agent', source: `class Agent {}\nvoid new Agent();` },
+    { form: 'an Agent member on a plain local object (non-node:http)', source: `const http = { Agent: class {} };\nvoid new http.Agent();` },
+    { form: 'a named Agent import shadowed by a function-local class', source: `import { Agent } from 'node:http';\nfunction f() { class Agent {} return new Agent(); }\nvoid f;` },
+    { form: 'a type-only http.Agent reference alongside a real createServer', source: `import * as http from 'node:http';\nlet a: http.Agent | null = null;\nvoid a;\nhttp.createServer(() => {});` },
+    { form: 'a type-only named Agent import used only in a type position', source: `import { Agent } from 'node:http';\nlet a: Agent | null = null;\nvoid a;` },
     {
       form: 'the real server.ts createServer shape (handler param named request)',
       source:
@@ -3937,6 +3980,46 @@ describe('D3 host network egress uses lexical binding identity, not name text (D
   for (const { form, source } of fnExprReject) {
     it(`REJECTS ${form}`, () => {
       expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// NET capability-family completeness (D3-CX-POLICY-NET-CAP). The detector's outbound
+// surface is closed by construction, not by an ever-growing blacklist: with the import
+// allowlist blocking node:https/net/tls/dgram/http2, the only importless network route
+// is a built-in network GLOBAL — `fetch` and, on the Node target, `WebSocket` — and the
+// only node:http route is a NON-`createServer` value (decided by the POSITIVE model).
+// These cases pin the second global, `WebSocket`, with the SAME lexical-binding identity
+// used for `fetch`: a free global is rejected, a same-named local shadow is allowed.
+// ---------------------------------------------------------------------------
+describe('D3 host outbound-network surface is a bounded capability family (D3-CX-POLICY-NET-CAP)', () => {
+  const wsReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a bare global WebSocket constructor', source: `new WebSocket('wss://example.com/');` },
+    { form: 'an assigned global WebSocket', source: `const ws = new WebSocket('wss://example.com/');\nvoid ws;` },
+    { form: 'a globalThis.WebSocket receiver', source: `new globalThis.WebSocket('wss://example.com/');` },
+    { form: 'a window.WebSocket receiver', source: `new window.WebSocket('wss://example.com/');` },
+    { form: 'a self.WebSocket receiver', source: `new self.WebSocket('wss://example.com/');` },
+    { form: 'a statically-keyed globalThis["WebSocket"]', source: `new globalThis['WebSocket']('wss://example.com/');` },
+    { form: 'an aliased global WebSocket acquisition (const W = WebSocket)', source: `const W = WebSocket;\nnew W('wss://example.com/');` },
+    { form: 'a real global WebSocket after a shadowing scope closes', source: `function f(WebSocket: new () => unknown) {\n  return new WebSocket();\n}\nnew WebSocket('wss://example.com/');` },
+  ];
+  for (const { form, source } of wsReject) {
+    it(`REJECTS ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  const wsAllow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'an unrelated local class named WebSocket', source: `class WebSocket {}\nvoid new WebSocket();` },
+    { form: 'an unrelated local const constructor named WebSocket', source: `const WebSocket = class {};\nvoid new WebSocket();` },
+    { form: 'a parameter-shadowed WebSocket used within that function', source: `function f(WebSocket: new () => unknown) {\n  return new WebSocket();\n}` },
+    { form: 'a WebSocket member on a plain local object (non-global receiver)', source: `const rt = { WebSocket: class {} };\nvoid new rt.WebSocket();` },
+    { form: 'a named function-expression WebSocket recursion shadowing the global', source: `const helper = function WebSocket(): unknown {\n  return new WebSocket();\n};\nvoid helper;` },
+  ];
+  for (const { form, source } of wsAllow) {
+    it(`ALLOWS ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
     });
   }
 });
