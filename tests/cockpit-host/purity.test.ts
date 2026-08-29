@@ -1321,6 +1321,12 @@ const acquiresInboundServerSocket = (checker: ts.TypeChecker, sourceFile: ts.Sou
  */
 const usesOutboundNetwork = (source: string): boolean => {
   const { checker, sourceFile } = buildBinderProgram(source);
+  // Statically-resolvable string constants for the free-global network-member check (F1):
+  // reuses the existing `collectStringConsts` / `memberNameOf` machinery so a computed member
+  // key that folds to a literal (`'fe' + 'tch'`, a `const key = 'fetch'`) is classified like a
+  // direct literal. A key that does not statically resolve stays `null` here and remains
+  // rejected fail-closed by the independent runtime-code guard — this never weakens that.
+  const constMap = collectStringConsts(sourceFile);
   let found = false;
   const visit = (node: ts.Node): void => {
     // (0) a runtime dynamic `import('node:http')` is prohibited outright, in every context.
@@ -1332,7 +1338,11 @@ const usesOutboundNetwork = (source: string): boolean => {
         const member = binderMemberName(node);
         if (member === null || !HTTP_SERVER_VALUE_MEMBERS.has(member)) found = true;
       }
-      const globalMember = binderMemberName(node);
+      // F1 — a free-global network member (`fetch`/`WebSocket`) resolved through the existing
+      //     static-string machinery: a direct literal, a `+`-fold (`'fe' + 'tch'`), or a unique
+      //     immutable `const key = 'fetch'`. A genuinely indeterminate key resolves to `null`
+      //     and is not flagged here (the runtime-code guard rejects it fail-closed).
+      const globalMember = memberNameOf(node, constMap);
       if (globalMember !== null && NETWORK_GLOBAL_NAMES.has(globalMember) && isFreeGlobalReceiver(node.expression, checker, sourceFile)) {
         found = true;
       }
@@ -4957,6 +4967,68 @@ describe('D3 host inspects destructuring assignments for socket acquisition (D3-
     { form: 'an unrelated ({ socket: localSocket } = unrelatedObject)', source: `const unrelatedObject = { socket: 1 };\nlet localSocket: unknown;\n({ socket: localSocket } = unrelatedObject);\nvoid localSocket;` },
   ];
   for (const { form, source } of assignAllow) {
+    it(`allows ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Codex P1: statically-COMPUTED free-global network members (D3-CX-CODEX-F1-COMPUTED). The
+// free-global network-member check resolved the member with the literal-only `binderMemberName`,
+// so a key that folds to a literal (`globalThis['fe' + 'tch']`, `const key = 'fetch'; globalThis[key]`)
+// escaped `usesOutboundNetwork` while never being a runtime-code-generation capability either.
+// The check now resolves the member through the existing `collectStringConsts` / `memberNameOf`
+// static-string machinery (no new evaluator), so the whole NETWORK_GLOBAL_NAMES family is caught
+// for direct, `+`-folded, and unique-immutable-const keys. A genuinely indeterminate key is not
+// resolved here and remains rejected fail-closed by the runtime-code guard.
+// ---------------------------------------------------------------------------
+describe('D3 host rejects statically-computed free-global network members (D3-CX-CODEX-F1-COMPUTED)', () => {
+  const rejectComputed: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a dotted globalThis.fetch', source: `globalThis.fetch('https://example.com/');` },
+    { form: 'an optional globalThis?.fetch', source: `globalThis?.fetch('https://example.com/');` },
+    { form: "a literal globalThis['fetch']", source: `globalThis['fetch']('https://example.com/');` },
+    { form: 'a template globalThis[`fetch`]', source: 'globalThis[`fetch`]("https://example.com/");' },
+    { form: "a concatenated globalThis['fe' + 'tch']", source: `globalThis['fe' + 'tch']('https://example.com/');` },
+    { form: 'a const-key globalThis[key]', source: `const key = 'fetch';\nglobalThis[key]('https://example.com/');` },
+    { form: "a const-prefix globalThis[prefix + 'tch']", source: `const prefix = 'fe';\nglobalThis[prefix + 'tch']('https://example.com/');` },
+    { form: 'a bare new WebSocket', source: `void new WebSocket('wss://example.com/');` },
+    { form: 'a dotted new globalThis.WebSocket', source: `void new globalThis.WebSocket('wss://example.com/');` },
+    { form: "a literal new globalThis['WebSocket']", source: `void new globalThis['WebSocket']('wss://example.com/');` },
+    { form: "a concatenated new globalThis['Web' + 'Socket']", source: `void new globalThis['Web' + 'Socket']('wss://example.com/');` },
+    { form: 'a const-key new globalThis[w]', source: `const w = 'WebSocket';\nvoid new globalThis[w]('wss://example.com/');` },
+    { form: "a window['fe' + 'tch'] receiver", source: `window['fe' + 'tch']('https://example.com/');` },
+    { form: "a self['We' + 'bSocket'] receiver", source: `void new self['We' + 'bSocket']('wss://example.com/');` },
+  ];
+  for (const { form, source } of rejectComputed) {
+    it(`rejects ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // A genuinely indeterminate free-global member key is NOT resolved by the network branch (it
+  // stays out of scope for this static check) but REMAINS rejected fail-closed by the runtime-
+  // code guard — the overall purity enforcement still rejects it. This proves no weakening.
+  const indeterminate: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a runtime-key globalThis[k] call', source: `declare const k: string;\nglobalThis[k]('https://example.com/');` },
+    { form: 'a runtime-key new globalThis[k]', source: `declare const k: string;\nvoid new globalThis[k]('wss://example.com/');` },
+  ];
+  for (const { form, source } of indeterminate) {
+    it(`keeps ${form} rejected by the runtime-code guard`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+      expect(usesRuntimeCodeGeneration(source)).toBe(true);
+    });
+  }
+
+  // ALLOW / PRESERVE — a computed member that does not fold to a protected network global, and a
+  // local runtime shadow of the receiver, stay allowed.
+  const allowComputed: readonly { readonly form: string; readonly source: string }[] = [
+    { form: "a non-network globalThis['ordinaryLocalMember']", source: `void globalThis['ordinaryLocalMember'];` },
+    { form: "a non-network concatenated globalThis['con' + 'sole']", source: `void globalThis['con' + 'sole'];` },
+    { form: 'a receiver-shadowed globalThis with a computed member', source: `function f(globalThis: { fetch: (v: string) => string }): string {\n  return globalThis['fe' + 'tch']('local');\n}\nvoid f;` },
+    { form: 'a computed member off an unrelated local object', source: `const rt = { fetch: (v: string) => v };\nvoid rt['fe' + 'tch']('local');` },
+  ];
+  for (const { form, source } of allowComputed) {
     it(`allows ${form}`, () => {
       expect(usesOutboundNetwork(source)).toBe(false);
     });
