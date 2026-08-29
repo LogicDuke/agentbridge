@@ -1056,28 +1056,71 @@ const isHttpNsSafePosition = (node: ts.Node): boolean => {
   return false;
 };
 
-// A receiver is the REAL global (globalThis/window/self/global) only when the binder
-// resolves it to NO local binding in this file (an intrinsic globalThis has a symbol but
-// no local declaration; a param/const shadow does). Identifier text is not identity.
+// A declaration EMITS a runtime value binding — and so can shadow a runtime global — only
+// when it is neither ambient (`declare …`, which emits nothing) nor a type-only form
+// (interface / type alias / type-only import). This is the minimal runtime-emission
+// distinction, read from the AST and modifier flags rather than restored as a
+// declaration-kind whitelist: it separates a real local shadow (`const fetch = …`,
+// `function fetch`, `class`, `enum`, a value namespace, `import x = require(...)`, a runtime
+// import binding) from a declaration-only binding (`declare const fetch`, a type-only import)
+// that leaves the runtime global reachable at the call site.
+// Whether a node sits in an ambient (`declare …`) context — itself or any enclosing
+// declaration carries the `declare` modifier (covers `declare const`, `declare function`,
+// and a binding nested in `declare global` / `declare namespace`). Public API only.
+const isInAmbientContext = (node: ts.Node): boolean => {
+  let n: ts.Node | undefined = node;
+  while (n !== undefined) {
+    if (ts.canHaveModifiers(n)) {
+      const mods = ts.getModifiers(n);
+      if (mods !== undefined && mods.some((m) => m.kind === ts.SyntaxKind.DeclareKeyword)) return true;
+    }
+    n = n.parent as ts.Node | undefined;
+  }
+  return false;
+};
+
+// Whether an import binding is type-only — the whole clause (`import type { fetch }`, whose
+// clause carries the `type` phase modifier) or the inline specifier form (`import { type fetch }`).
+const isTypeOnlyImportClause = (clause: ts.ImportClause): boolean => clause.phaseModifier === ts.SyntaxKind.TypeKeyword;
+
+const declarationEmitsRuntimeValue = (d: ts.Declaration): boolean => {
+  if (ts.isInterfaceDeclaration(d) || ts.isTypeAliasDeclaration(d)) return false;
+  if (isInAmbientContext(d)) return false;
+  if (ts.isImportClause(d) && isTypeOnlyImportClause(d)) return false;
+  if (ts.isImportSpecifier(d)) {
+    if (d.isTypeOnly) return false;
+    const clause = d.parent.parent as ts.Node | undefined;
+    if (clause !== undefined && ts.isImportClause(clause) && isTypeOnlyImportClause(clause)) return false;
+  }
+  return true;
+};
+
+// Whether the binder-resolved symbol has, in the analyzed file, at least one declaration that
+// emits a runtime value — i.e. a genuine RUNTIME shadow of a same-named global. A symbol whose
+// only in-file declarations are ambient/type-only is NOT a runtime shadow.
+const hasLocalRuntimeShadow = (symbol: ts.Symbol, sourceFile: ts.SourceFile): boolean =>
+  symbol.declarations !== undefined &&
+  symbol.declarations.some((d) => d.getSourceFile() === sourceFile && declarationEmitsRuntimeValue(d));
+
+// A receiver is the REAL global (globalThis/window/self/global) only when the binder resolves
+// it to NO local RUNTIME binding in this file (an intrinsic globalThis has a symbol but no
+// local declaration; a param/const shadow does). Identifier text is not identity.
 //
-// Local-value shadow rule (no declaration-kind whitelist): the receiver is free/global
-// only when its resolved symbol carries NO declaration belonging to the analyzed source
-// file. Any genuine local VALUE binding of the name — const/let/var, parameter, binding
-// element, function, class, enum, a namespace with a runtime value, import-equals, an
-// import binding, and any other runtime declaration — is a shadow, so the receiver is an
-// ordinary object, not the global. The value/type distinction is delegated to the binder,
-// not re-listed here: at a value-position receiver `checker.getSymbolAtLocation` resolves
-// with VALUE meaning, so a name whose only local declaration is type-only
-// (`interface global` / `type global`) does not resolve to that declaration — the symbol
-// is undefined (or carries no in-file declaration), and the receiver is correctly still
-// the free global. Restoration/nesting/sibling scope are the binder's job as before.
+// Local runtime-shadow rule (no declaration-kind whitelist): the receiver is free/global only
+// when its resolved symbol carries no in-file declaration that EMITS A RUNTIME VALUE. Any
+// genuine runtime binding of the name — const/let/var, parameter, binding element, function,
+// class, enum, a namespace with a runtime value, import-equals, a runtime import — is a shadow,
+// so the receiver is an ordinary object. Two kinds of declaration are correctly NOT shadows:
+// a type-only name (`interface global` / `type global`) does not even resolve at a value
+// position (the binder returns no value symbol), and an ambient `declare const global` resolves
+// but emits nothing at runtime, so the real global is still reached — both leave the receiver
+// free. Restoration/nesting/sibling scope are the binder's job as before.
 const isFreeGlobalReceiver = (expr: ts.Expression, checker: ts.TypeChecker, sourceFile: ts.SourceFile): boolean => {
   const recv = binderUnwrap(expr);
   if (!ts.isIdentifier(recv) || !GLOBAL_RECEIVER_NAMES.has(recv.text)) return false;
   const symbol = checker.getSymbolAtLocation(recv);
-  if (symbol === undefined || symbol.declarations === undefined) return true;
-  const shadowedLocally = symbol.declarations.some((d) => d.getSourceFile() === sourceFile);
-  return !shadowedLocally;
+  if (symbol === undefined) return true;
+  return !hasLocalRuntimeShadow(symbol, sourceFile);
 };
 
 // Whether a call is a runtime dynamic `import('node:http')` (Option B: prohibited outright).
@@ -1197,6 +1240,28 @@ const acquiresInboundServerSocket = (checker: ts.TypeChecker, sourceFile: ts.Sou
       const name = staticKeyText(node.propertyName ?? node.name);
       if (name !== null && SOCKET_CAPABILITY_NAMES.has(name)) found = true;
     }
+    // RULE A2 (destructuring) — an INDETERMINATE computed binding key destructured DIRECTLY
+    //     from a createServer request/response handler parameter fails closed (bound to the
+    //     req/res initializer symbol identity, not globally). A statically resolvable key is
+    //     unaffected here: a `socket`/`connection` name is already rejected by RULE A (c), a
+    //     harmless name (`['method']`) is allowed. `const { ['sock'+'et']: s } = req` and
+    //     `const { [key]: s } = req` are rejected; `const { [key]: s } = unrelated` is not.
+    if (
+      ts.isVariableDeclaration(node) &&
+      ts.isObjectBindingPattern(node.name) &&
+      node.initializer !== undefined &&
+      receiverIsReqRes(node.initializer)
+    ) {
+      for (const el of node.name.elements) {
+        if (
+          el.propertyName !== undefined &&
+          ts.isComputedPropertyName(el.propertyName) &&
+          staticKeyText(el.propertyName) === null
+        ) {
+          found = true;
+        }
+      }
+    }
     // RULE B — BLANKET event-registration ban: any registrar member call, any receiver, any
     //     event name (dotted `.on` or static-key `['on']`).
     if (
@@ -1251,6 +1316,10 @@ const usesOutboundNetwork = (source: string): boolean => {
         const cap = classifyHttpSymbol(symbol, checker);
         if (cap === 'HTTP_CLIENT') found = true;
         if (cap === 'HTTP_NS' && !isHttpNsSafePosition(node)) found = true;
+        // A bare network global (`fetch`/`WebSocket`) whose only in-file declarations emit no
+        // runtime value (an ambient `declare const fetch`, a type-only import) still reaches
+        // the runtime global — reject it. A real local shadow (const/function/class/…) does not.
+        if (NETWORK_GLOBAL_NAMES.has(node.text) && !hasLocalRuntimeShadow(symbol, sourceFile)) found = true;
       } else if (NETWORK_GLOBAL_NAMES.has(node.text)) {
         found = true;
       }
@@ -1294,6 +1363,11 @@ const exportsHttpCapability = (inputSourceFile: ts.SourceFile): boolean => {
       statement.moduleSpecifier.text === 'node:http'
     ) {
       if (statement.exportClause === undefined) return true;
+      // A runtime namespace re-export `export * as http from 'node:http'` binds the whole
+      // node:http namespace under a name another host file can import and call
+      // (`http.request(...)`). The `!statement.isTypeOnly` guard above already excludes the
+      // type-only `export type * as http from 'node:http'`, which emits no runtime authority.
+      if (ts.isNamespaceExport(statement.exportClause)) return true;
       if (ts.isNamedExports(statement.exportClause)) {
         for (const el of statement.exportClause.elements) {
           if (!el.isTypeOnly) return true;
@@ -4717,4 +4791,90 @@ describe('D3 host free-global receiver is a local-value-shadow decision (D3-CX-P
       expect(usesOutboundNetwork(source)).toBe(true);
     });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Exact-head Codex findings (D3-CX-CODEX). F1: an ambient `declare` (or type-only) binding
+// emits no runtime value, so it does NOT shadow a runtime network global — the real global is
+// still reached and must be rejected, while a genuine runtime shadow stays allowed. F2: a
+// computed object-binding key that does not statically resolve, destructured directly from a
+// createServer request/response handler parameter, fails closed. F3: a runtime namespace
+// re-export of node:http (`export * as http`) carries authority and is rejected, while the
+// type-only form is preserved.
+// ---------------------------------------------------------------------------
+describe('D3 host rejects ambient/non-emitting shadows of runtime network globals (D3-CX-CODEX-F1)', () => {
+  // REJECT — a declaration-only binding leaves the runtime global reachable.
+  const ambientReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'an ambient declare const fetch used bare', source: `declare const fetch: (url: string) => Promise<unknown>;\nvoid fetch('https://example.com');` },
+    { form: 'an ambient declare const WebSocket constructed', source: `declare const WebSocket: new (url: string) => unknown;\nvoid new WebSocket('wss://example.com/');` },
+    { form: 'an ambient declare function fetch used bare', source: `declare function fetch(url: string): Promise<unknown>;\nvoid fetch('https://example.com');` },
+    { form: 'a type-only import of fetch used at a value position', source: `import type { fetch } from './x.js';\nvoid fetch('https://example.com');` },
+    { form: 'an ambient declare const global receiver', source: `declare const global: { fetch: (v: string) => void };\nglobal.fetch('https://example.com');` },
+  ];
+  for (const { form, source } of ambientReject) {
+    it(`REJECTS ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // ALLOW — a genuine runtime binding of the name is a real shadow.
+  const runtimeShadowAllow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a const runtime shadow of fetch', source: `const fetch = (u: string): string => u;\nvoid fetch('local');` },
+    { form: 'a function runtime shadow of fetch', source: `function fetch(): void {}\nvoid fetch();` },
+    { form: 'a class runtime shadow of WebSocket', source: `class WebSocket {}\nvoid new WebSocket();` },
+    { form: 'an enum global runtime shadow', source: `enum global { fetch }\nvoid global.fetch;` },
+    { form: 'a value-namespace global runtime shadow', source: `namespace global {\n  export const fetch = (x: string): string => x;\n}\nvoid global.fetch('a');` },
+    { form: 'an import-equals value runtime shadow', source: `import global = require('x');\nvoid global.fetch;` },
+  ];
+  for (const { form, source } of runtimeShadowAllow) {
+    it(`ALLOWS ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+});
+
+describe('D3 host fails closed on computed req/res destructuring keys (D3-CX-CODEX-F2)', () => {
+  const H = `import http from 'node:http';\n`;
+  const handler = (body: string): string =>
+    H + `http.createServer((req: http.IncomingMessage, res: http.ServerResponse) => {\n${body}\n});`;
+  // REJECT — an indeterminate computed binding key off a handler parameter.
+  const computedReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: "the reported const { ['sock' + 'et']: s } = req reproducer", source: handler(`const { ['sock' + 'et']: s } = req;\nvoid s;`) },
+    { form: 'a const { [key]: x } = req with an indeterminate key', source: handler(`const key = req.url ?? '';\nconst { [key]: x } = req;\nvoid x;`) },
+    { form: 'a conditional computed key off req', source: handler(`const c = req.method === 'GET';\nconst { [c ? 'socket' : 'method']: x } = req;\nvoid x;`) },
+    { form: 'an indeterminate computed key off res', source: handler(`const key = req.url ?? '';\nconst { [key]: x } = res;\nvoid x;`) },
+  ];
+  for (const { form, source } of computedReject) {
+    it(`rejects ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+  // ALLOW — a static harmless key off a handler param, and unrelated computed destructuring.
+  const computedAllow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: "a static harmless const { ['method']: m } = req", source: handler(`const { ['method']: m } = req;\nvoid m;`) },
+    { form: 'an unrelated computed destructuring (not a handler param)', source: `const obj: Record<string, unknown> = {};\nconst key = 'x';\nconst { [key]: v } = obj;\nvoid v;` },
+    { form: 'an ordinary static request field destructuring', source: handler(`const { method, url } = req;\nvoid method;\nvoid url;`) },
+  ];
+  for (const { form, source } of computedAllow) {
+    it(`allows ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+});
+
+describe('D3 host rejects namespace re-export of node:http authority (D3-CX-CODEX-F3)', () => {
+  const sf = (source: string): ts.SourceFile =>
+    ts.createSourceFile('module.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  it('REJECTS a runtime `export * as http from node:http`', () => {
+    expect(exportsHttpCapability(sf(`export * as http from 'node:http';`))).toBe(true);
+  });
+  it('REJECTS a runtime `export * as anyName from node:http`', () => {
+    expect(exportsHttpCapability(sf(`export * as h from 'node:http';`))).toBe(true);
+  });
+  it('PRESERVES a type-only `export type * as http from node:http`', () => {
+    expect(exportsHttpCapability(sf(`export type * as http from 'node:http';`))).toBe(false);
+  });
+  it('PRESERVES an unrelated namespace re-export', () => {
+    expect(exportsHttpCapability(sf(`export * as local from './local.js';`))).toBe(false);
+  });
 });
