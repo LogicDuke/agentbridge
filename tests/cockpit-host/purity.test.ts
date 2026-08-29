@@ -337,19 +337,6 @@ const unwrapExpr = (node: ts.Expression): ts.Expression => {
   return cur;
 };
 
-// Whether an initializer is a STATICALLY-RESOLVED runtime import of node:http —
-// `import('node:http')` or `await import('node:http')` (parens/`as`/await unwrapped).
-// A computed/dynamic specifier is not matched (it is already failed-closed by
-// `hasUnverifiableDynamicImport`); only the exact allow-listed literal acquires the
-// node:http namespace capability, so it gains the SAME identity as `import * as http`.
-const isNodeHttpDynamicImport = (expr: ts.Expression): boolean => {
-  let cur = unwrapExpr(expr);
-  while (ts.isAwaitExpression(cur)) cur = unwrapExpr(cur.expression);
-  if (!ts.isCallExpression(cur) || cur.expression.kind !== ts.SyntaxKind.ImportKeyword) return false;
-  const arg: ts.Expression | undefined = cur.arguments[0];
-  return arg !== undefined && ts.isStringLiteralLike(arg) && arg.text === 'node:http';
-};
-
 const isGlobalReceiver = (node: ts.Expression): boolean => {
   const n = unwrapExpr(node);
   return ts.isIdentifier(n) && GLOBAL_RECEIVER_NAMES.has(n.text);
@@ -591,40 +578,6 @@ const servesAsAccessObject = (node: ts.Node): boolean => {
   }
   if (p === undefined) return false;
   return (ts.isPropertyAccessExpression(p) || ts.isElementAccessExpression(p)) && p.expression === cur;
-};
-
-// NET-LOCAL: whether an HTTP_NS identifier occurrence is a forbidden ESCAPE of the
-// privileged node:http namespace — i.e. NOT one of the three permitted positions:
-//  (1) the access-object receiver of a member/element access (a permitted createServer
-//      access is then decided by the member rule);
-//  (2) the initializer of an object-binding-pattern destructuring (F2 decides members);
-//  (3) a type/non-runtime position — the LEFT of a type QualifiedName, a `typeof` type
-//      query, an import-type, or the operand of the runtime `typeof` operator.
-// Intentionally local to NET; it does NOT change the shared `isValueReference` or RC/HA.
-const isHttpNamespaceEscape = (id: ts.Identifier): boolean => {
-  if (servesAsAccessObject(id)) return false;
-  const par = id.parent as ts.Node | undefined;
-  if (
-    par !== undefined &&
-    ts.isVariableDeclaration(par) &&
-    ts.isObjectBindingPattern(par.name) &&
-    par.initializer === id
-  ) {
-    return false;
-  }
-  let cur: ts.Node = id;
-  let gp = cur.parent as ts.Node | undefined;
-  while (gp !== undefined && ts.isQualifiedName(gp)) {
-    cur = gp;
-    gp = cur.parent as ts.Node | undefined;
-  }
-  if (
-    gp !== undefined &&
-    (ts.isTypeQueryNode(gp) || ts.isTypeReferenceNode(gp) || ts.isImportTypeNode(gp) || ts.isTypeOfExpression(gp))
-  ) {
-    return false;
-  }
-  return true;
 };
 
 /**
@@ -902,417 +855,357 @@ const HTTP_SERVER_VALUE_MEMBERS: ReadonlySet<string> = new Set(['createServer'])
 // COMPLETE importless-egress global surface — a bounded family, not an open blacklist.
 const NETWORK_GLOBAL_NAMES: ReadonlySet<string> = new Set(['fetch', 'WebSocket']);
 
-interface HttpBindings {
-  // Local names bound to the node:http MODULE (`import http` / `import * as h` /
-  // `import http = require('node:http')`), used as `binding.request(...)`.
-  readonly namespaceOrDefault: ReadonlySet<string>;
-  // Local names bound to a NON-`createServer` node:http named value (`import
-  // { request, get as g, ClientRequest, Agent }`), used bare as `request(...)` /
-  // `g(...)` / `new ClientRequest()` / `new Agent()`. A named `createServer` is
-  // deliberately NOT collected — it is the one legitimate value export.
-  readonly namedClient: ReadonlySet<string>;
-}
+// A node:http runtime authority capability. `HTTP_NS` is the namespace; `HTTP_CLIENT`
+// any non-createServer node:http value; `CREATE_SERVER` the one permitted capability.
+type HttpCapability = 'HTTP_NS' | 'HTTP_CLIENT' | 'CREATE_SERVER' | 'NONE';
 
-// Discover, structurally, the local bindings this module introduces from
-// `node:http`. Keyed on the exact specifier `node:http`, so a plain local object
-// named `http` (no such import) yields no binding and is never treated as the
-// network module.
-const collectHttpBindings = (sourceFile: ts.SourceFile): HttpBindings => {
-  const NODE_HTTP = 'node:http';
-  const namespaceOrDefault = new Set<string>();
-  const namedClient = new Set<string>();
-  const visit = (node: ts.Node): void => {
-    if (
-      ts.isImportDeclaration(node) &&
-      ts.isStringLiteral(node.moduleSpecifier) &&
-      node.moduleSpecifier.text === NODE_HTTP &&
-      node.importClause !== undefined
-    ) {
-      const clause = node.importClause;
-      // `import http from 'node:http'` — default binding.
-      if (clause.name !== undefined) namespaceOrDefault.add(clause.name.text);
-      const bindings = clause.namedBindings;
-      if (bindings !== undefined) {
-        if (ts.isNamespaceImport(bindings)) {
-          // `import * as http from 'node:http'`.
-          namespaceOrDefault.add(bindings.name.text);
-        } else {
-          // `import { createServer, request, Agent as A } from 'node:http'` — collect
-          // every named import EXCEPT `createServer` (the sole allowed value export),
-          // under its LOCAL name (`el.name`). The positive model treats any other
-          // node:http named value as a non-server capability.
-          for (const el of bindings.elements) {
-            const imported = (el.propertyName ?? el.name).text;
-            if (!HTTP_SERVER_VALUE_MEMBERS.has(imported)) namedClient.add(el.name.text);
-          }
-        }
-      }
-    } else if (
-      ts.isImportEqualsDeclaration(node) &&
-      ts.isExternalModuleReference(node.moduleReference) &&
-      ts.isStringLiteral(node.moduleReference.expression) &&
-      node.moduleReference.expression.text === NODE_HTTP
-    ) {
-      // `import http = require('node:http')`.
-      namespaceOrDefault.add(node.name.text);
-    }
-    ts.forEachChild(node, visit);
+// Build a bounded, in-memory, single-file Program so the compiler BINDER supplies
+// lexical binding identity (Option D). `noLib`+`noResolve`: no filesystem, no module
+// resolution, no network, deterministic. The only file served is the analyzed source;
+// node:http is never loaded — we read the import declaration's specifier TEXT, never its
+// types — so binding identity, not module contents, is all this guard depends on.
+const buildBinderProgram = (source: string): { readonly checker: ts.TypeChecker; readonly sourceFile: ts.SourceFile } => {
+  const fileName = 'module.ts';
+  const parsed = ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const host: ts.CompilerHost = {
+    getSourceFile: (name) => (name === fileName ? parsed : undefined),
+    getDefaultLibFileName: () => 'lib.d.ts',
+    writeFile: () => undefined,
+    getCurrentDirectory: () => '/',
+    getDirectories: () => [],
+    getCanonicalFileName: (f) => f,
+    useCaseSensitiveFileNames: () => true,
+    getNewLine: () => '\n',
+    fileExists: (f) => f === fileName,
+    readFile: (f) => (f === fileName ? source : undefined),
   };
-  ts.forEachChild(sourceFile, visit);
-  return { namespaceOrDefault, namedClient };
+  const program = ts.createProgram(
+    [fileName],
+    { noLib: true, noResolve: true, module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.Latest },
+    host,
+  );
+  const bound = program.getSourceFile(fileName);
+  return { checker: program.getTypeChecker(), sourceFile: bound ?? parsed };
 };
 
-// Design D — node:http capability EXPORT confinement. The privileged node:http
-// namespace/capability may not cross the D3 module boundary: reject any re-export FROM
-// node:http (`export * from 'node:http'`, `export { … } from 'node:http'`) and any export
-// of a LOCAL binding whose lexical identity is HTTP_NS (`export { http }`,
-// `export { http as h }`, `export default http`, `export = http`) — createServer included.
-// Ordinary local exports and type-only exports are untouched. Inspects only THIS module's
-// statements and local binding identity: no cross-module value-flow.
-const exportsHttpCapability = (sourceFile: ts.SourceFile): boolean => {
-  // OPTION B unification: consume the SAME lexical binding classification the
-  // network-egress analysis uses (`buildModuleFrame` over `collectHttpBindings`), so the
-  // export boundary can never disagree with `usesOutboundNetwork`. A binding classified
-  // HTTP_NS or HTTP_CLIENT — a namespace, a named client import, OR a locally-destructured
-  // non-createServer member — may not cross the module boundary; createServer/LOCAL and
-  // type-only forms may. No second name inventory.
-  const NODE_HTTP = 'node:http';
-  const frame = buildModuleFrame(sourceFile, collectHttpBindings(sourceFile));
-  const carriesAuthority = (name: string): boolean => {
-    const kind = frame.get(name);
-    return kind === 'HTTP_NS' || kind === 'HTTP_CLIENT';
-  };
-  for (const s of sourceFile.statements) {
-    // (a) a RUNTIME re-export from node:http (`export * from` / `export { … } from`).
+const binderUnwrap = (node: ts.Expression): ts.Expression => {
+  let cur: ts.Expression = node;
+  while (
+    ts.isParenthesizedExpression(cur) ||
+    ts.isAsExpression(cur) ||
+    ts.isSatisfiesExpression(cur) ||
+    ts.isNonNullExpression(cur) ||
+    ts.isTypeAssertionExpression(cur) ||
+    ts.isAwaitExpression(cur)
+  ) {
+    cur = cur.expression;
+  }
+  return cur;
+};
+
+const binderMemberName = (node: ts.PropertyAccessExpression | ts.ElementAccessExpression): string | null => {
+  if (ts.isPropertyAccessExpression(node)) return node.name.text;
+  const arg = node.argumentExpression;
+  return ts.isStringLiteralLike(arg) ? arg.text : null;
+};
+
+// The specifier text of the import a declaration belongs to (or null when not an import).
+const declarationImportSpecifier = (decl: ts.Declaration): string | null => {
+  let p: ts.Node | undefined = decl;
+  while (p !== undefined) {
+    if (ts.isImportDeclaration(p)) return ts.isStringLiteral(p.moduleSpecifier) ? p.moduleSpecifier.text : null;
+    if (ts.isImportEqualsDeclaration(p)) {
+      const ref = p.moduleReference;
+      return ts.isExternalModuleReference(ref) && ts.isStringLiteral(ref.expression) ? ref.expression.text : null;
+    }
+    p = p.parent as ts.Node | undefined;
+  }
+  return null;
+};
+
+// Whether a symbol is DIRECTLY a static node:http namespace binding (`import * as http`
+// / `import http` / `import http = require('node:http')`). One-hop, non-recursive — the
+// only acquisition relation `HTTP_CLIENT` destructuring is allowed to consult.
+const isDirectNodeHttpNamespace = (symbol: ts.Symbol | undefined): boolean => {
+  if (symbol === undefined || symbol.declarations === undefined) return false;
+  return symbol.declarations.some(
+    (d) =>
+      (ts.isNamespaceImport(d) || (ts.isImportClause(d) && d.name !== undefined) || ts.isImportEqualsDeclaration(d)) &&
+      declarationImportSpecifier(d) === 'node:http',
+  );
+};
+
+// Classify a single DECLARATION. Bounded: a node:http import, or a destructuring whose
+// initializer DIRECTLY resolves to the node:http namespace (one hop, no alias chains).
+const classifyHttpDeclaration = (decl: ts.Declaration, checker: ts.TypeChecker): HttpCapability => {
+  if (ts.isNamespaceImport(decl)) return declarationImportSpecifier(decl) === 'node:http' ? 'HTTP_NS' : 'NONE';
+  if (ts.isImportClause(decl) && decl.name !== undefined) {
+    return declarationImportSpecifier(decl) === 'node:http' ? 'HTTP_NS' : 'NONE';
+  }
+  if (ts.isImportEqualsDeclaration(decl)) return declarationImportSpecifier(decl) === 'node:http' ? 'HTTP_NS' : 'NONE';
+  if (ts.isImportSpecifier(decl)) {
+    if (declarationImportSpecifier(decl) !== 'node:http') return 'NONE';
+    const imported = (decl.propertyName ?? decl.name).text;
+    return HTTP_SERVER_VALUE_MEMBERS.has(imported) ? 'CREATE_SERVER' : 'HTTP_CLIENT';
+  }
+  if (ts.isBindingElement(decl) && ts.isObjectBindingPattern(decl.parent) && ts.isVariableDeclaration(decl.parent.parent)) {
+    const initializer = decl.parent.parent.initializer;
+    if (initializer !== undefined) {
+      const rhs = binderUnwrap(initializer);
+      if (ts.isIdentifier(rhs) && isDirectNodeHttpNamespace(checker.getSymbolAtLocation(rhs))) {
+        const key = decl.propertyName;
+        const member =
+          key === undefined
+            ? ts.isIdentifier(decl.name)
+              ? decl.name.text
+              : null
+            : ts.isIdentifier(key)
+              ? key.text
+              : ts.isStringLiteralLike(key)
+                ? key.text
+                : ts.isComputedPropertyName(key) && ts.isStringLiteralLike(key.expression)
+                  ? key.expression.text
+                  : null;
+        return member !== null && HTTP_SERVER_VALUE_MEMBERS.has(member) ? 'CREATE_SERVER' : 'HTTP_CLIENT';
+      }
+    }
+  }
+  return 'NONE';
+};
+
+// Classify a SYMBOL by its declaration(s) — the compiler binder resolved the symbol, so
+// this is nearest-visible-binding identity (shadowing/restoration/scope all included).
+const classifyHttpSymbol = (symbol: ts.Symbol | undefined, checker: ts.TypeChecker): HttpCapability => {
+  if (symbol === undefined || symbol.declarations === undefined) return 'NONE';
+  for (const decl of symbol.declarations) {
+    const cap = classifyHttpDeclaration(decl, checker);
+    if (cap !== 'NONE') return cap;
+  }
+  return 'NONE';
+};
+
+// Classify an EXPRESSION directly: an identifier (via its symbol) or a member access off
+// an HTTP_NS receiver (createServer vs other). Bounded by member-access nesting (finite);
+// no binding-element recursion, so no cycles.
+const classifyHttpExpression = (expr: ts.Expression, checker: ts.TypeChecker): HttpCapability => {
+  const e = binderUnwrap(expr);
+  if (ts.isIdentifier(e)) return classifyHttpSymbol(checker.getSymbolAtLocation(e), checker);
+  if (ts.isPropertyAccessExpression(e) || ts.isElementAccessExpression(e)) {
+    if (classifyHttpExpression(e.expression, checker) === 'HTTP_NS') {
+      const m = binderMemberName(e);
+      return m !== null && HTTP_SERVER_VALUE_MEMBERS.has(m) ? 'CREATE_SERVER' : 'HTTP_CLIENT';
+    }
+  }
+  return 'NONE';
+};
+
+// Whether an identifier is a value read (not a declaration/type/member/key position).
+const isBinderValueReference = (id: ts.Identifier): boolean => {
+  const p = id.parent as ts.Node | undefined;
+  if (p === undefined) return true;
+  if (ts.isQualifiedName(p) && p.right === id) return false;
+  if (ts.isTypeReferenceNode(p)) return false;
+  if (ts.isPropertyAccessExpression(p) && p.name === id) return false;
+  if (ts.isBindingElement(p) && (p.name === id || p.propertyName === id)) return false;
+  if (ts.isVariableDeclaration(p) && p.name === id) return false;
+  if (ts.isParameter(p) && p.name === id) return false;
+  if (ts.isPropertyAssignment(p) && p.name === id) return false;
+  if (
+    (ts.isFunctionDeclaration(p) || ts.isFunctionExpression(p) || ts.isClassDeclaration(p) || ts.isMethodDeclaration(p)) &&
+    p.name === id
+  ) {
+    return false;
+  }
+  if (ts.isImportSpecifier(p) || ts.isNamespaceImport(p) || ts.isImportClause(p) || ts.isExportSpecifier(p)) return false;
+  return true;
+};
+
+// The permitted positions for an HTTP_NS occurrence (else it is a forbidden escape): a
+// member-access receiver, an object-binding-pattern destructuring initializer, or a
+// type/non-runtime position (through paren/as/await wrappers).
+const isHttpNsSafePosition = (node: ts.Node): boolean => {
+  let cur: ts.Node = node;
+  for (;;) {
+    const parent = cur.parent as ts.Node | undefined;
     if (
-      ts.isExportDeclaration(s) &&
-      !s.isTypeOnly &&
-      s.moduleSpecifier !== undefined &&
-      ts.isStringLiteral(s.moduleSpecifier) &&
-      s.moduleSpecifier.text === NODE_HTTP
+      parent !== undefined &&
+      (ts.isParenthesizedExpression(parent) ||
+        ts.isAsExpression(parent) ||
+        ts.isSatisfiesExpression(parent) ||
+        ts.isNonNullExpression(parent) ||
+        ts.isAwaitExpression(parent))
     ) {
-      return true;
+      cur = parent;
+      continue;
     }
-    // (b) a local re-export of a binding carrying node:http authority. Type-only skipped.
-    if (ts.isExportDeclaration(s) && !s.isTypeOnly && s.moduleSpecifier === undefined && s.exportClause !== undefined && ts.isNamedExports(s.exportClause)) {
-      for (const el of s.exportClause.elements) {
-        if (!el.isTypeOnly && carriesAuthority((el.propertyName ?? el.name).text)) return true;
-      }
-    }
-    // (c) `export default <authority>` / `export = <authority>`.
-    if (ts.isExportAssignment(s) && ts.isIdentifier(s.expression) && carriesAuthority(s.expression.text)) return true;
-    // (d) an EXPORTED declaration whose bound name(s) carry node:http authority.
-    if (ts.isVariableStatement(s) && ts.getModifiers(s)?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword) === true) {
-      for (const decl of s.declarationList.declarations) {
-        const names: string[] = [];
-        eachBoundName(decl.name, (n) => names.push(n));
-        if (names.some((n) => carriesAuthority(n))) return true;
-      }
-    }
+    break;
+  }
+  const p = cur.parent as ts.Node | undefined;
+  if (p === undefined) return false;
+  if ((ts.isPropertyAccessExpression(p) || ts.isElementAccessExpression(p)) && p.expression === cur) return true;
+  if (ts.isVariableDeclaration(p) && ts.isObjectBindingPattern(p.name) && p.initializer === cur) return true;
+  if (
+    ts.isTypeQueryNode(p) ||
+    ts.isTypeReferenceNode(p) ||
+    ts.isQualifiedName(p) ||
+    ts.isTypeOfExpression(p) ||
+    ts.isImportTypeNode(p)
+  ) {
+    return true;
   }
   return false;
 };
 
-// A lexical binding kind for the identity-sensitive detection below. `HTTP_NS` and
-// `HTTP_CLIENT` mark the module-level node:http import bindings (namespace/default,
-// and any named node:http value that is not `createServer` respectively); `LOCAL`
-// marks any OTHER declaration
-// (parameter, const/let/var, function/class, catch, or unrelated import) that
-// SHADOWS an outer binding of the same name. Capability identity is therefore the
-// binding VISIBLE at an occurrence, never mere identifier text (NET-S1/NET-S2).
-type BindingKind = 'HTTP_NS' | 'HTTP_CLIENT' | 'LOCAL';
-
-// Collect every identifier a binding name introduces — a plain identifier or a
-// (possibly nested) destructuring pattern — into `sink`. Bounded by the finite
-// binding-pattern tree; performs no value resolution.
-const eachBoundName = (name: ts.BindingName, sink: (text: string) => void): void => {
-  if (ts.isIdentifier(name)) {
-    sink(name.text);
-    return;
-  }
-  for (const element of name.elements) {
-    if (ts.isBindingElement(element)) eachBoundName(element.name, sink);
-  }
-};
-
-// The names a single statement declares DIRECTLY in its own scope — const/let/var
-// declarations and function/class declaration names — with no descent into nested
-// blocks or functions (those get their own frames). The required matrices exercise
-// only const/let/params, so `var`'s function-hoisting is a stated bounded gap that
-// cannot make a covered case wrong.
-const declaredByStatement = (statement: ts.Statement, sink: (text: string) => void): void => {
-  if (ts.isVariableStatement(statement)) {
-    for (const decl of statement.declarationList.declarations) eachBoundName(decl.name, sink);
-  } else if (
-    (ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement)) &&
-    statement.name !== undefined
-  ) {
-    sink(statement.name.text);
-  }
-};
-
-// F1/F2 node:http capability PROPAGATION, reusing binding identity (never text):
-//   F1 `const http = (await) import('node:http')` -> `http` is HTTP_NS, exactly as a
-//       namespace import would be.
-//   F2 `const { request, get: g, createServer: cs } = <HTTP_NS>` -> each destructured
-//       member preserves the namespace capability: `createServer` (the one allowed
-//       server value) stays LOCAL, every other member is HTTP_CLIENT (outbound). The
-//       RHS must LEXICALLY resolve to HTTP_NS, so `const { request } = someLocalObject`
-//       is untouched. Bounded: one binding-pattern level, static keys only; deeper
-//       nesting and genuinely computed keys are unsupported (documented) gaps.
-const propagateHttpCapability = (
-  decl: ts.VariableDeclaration,
-  lookup: (name: string) => BindingKind | undefined,
-  sink: (name: string, kind: BindingKind) => void,
-): void => {
-  if (decl.initializer === undefined) return;
-  if (ts.isIdentifier(decl.name)) {
-    if (isNodeHttpDynamicImport(decl.initializer)) sink(decl.name.text, 'HTTP_NS');
-    return;
-  }
-  if (ts.isObjectBindingPattern(decl.name)) {
-    // The RHS is the node:http namespace when it is a lexically-HTTP_NS identifier
-    // OR the dynamic import itself (`const { request } = await import('node:http')`,
-    // the direct F1+F2 composition).
-    const rhs = unwrapExpr(decl.initializer);
-    const rhsIsHttpNs =
-      isNodeHttpDynamicImport(decl.initializer) || (ts.isIdentifier(rhs) && lookup(rhs.text) === 'HTTP_NS');
-    if (!rhsIsHttpNs) return;
-    for (const el of decl.name.elements) {
-      if (!ts.isIdentifier(el.name)) continue; // nested pattern: unsupported
-      const key = el.propertyName;
-      const member =
-        key === undefined
-          ? el.name.text
-          : ts.isIdentifier(key)
-            ? key.text
-            : ts.isStringLiteralLike(key)
-              ? key.text
-              : ts.isComputedPropertyName(key) && ts.isStringLiteralLike(key.expression)
-                ? key.expression.text
-                : null;
-      if (member === null) continue; // genuinely computed key: unsupported
-      sink(el.name.text, HTTP_SERVER_VALUE_MEMBERS.has(member) ? 'LOCAL' : 'HTTP_CLIENT');
-    }
-  }
-};
-
-// The module (top-level) lexical frame: node:http import bindings tagged with their
-// capability kind, every other top-level binding tagged LOCAL. This is the outermost
-// frame for the whole file, so a genuine module-level `const fetch` shadows the
-// global `fetch` module-wide (NET-S2), while `globalThis.fetch` stays a member call.
-const buildModuleFrame = (sourceFile: ts.SourceFile, http: HttpBindings): Map<string, BindingKind> => {
-  const frame = new Map<string, BindingKind>();
-  for (const statement of sourceFile.statements) {
-    declaredByStatement(statement, (text) => frame.set(text, 'LOCAL'));
-    if (ts.isImportDeclaration(statement) && statement.importClause !== undefined) {
-      const clause = statement.importClause;
-      if (clause.name !== undefined) frame.set(clause.name.text, 'LOCAL');
-      const bindings = clause.namedBindings;
-      if (bindings !== undefined) {
-        if (ts.isNamespaceImport(bindings)) {
-          frame.set(bindings.name.text, 'LOCAL');
-        } else {
-          for (const el of bindings.elements) frame.set(el.name.text, 'LOCAL');
-        }
-      }
-    } else if (ts.isImportEqualsDeclaration(statement)) {
-      frame.set(statement.name.text, 'LOCAL');
-    }
-  }
-  // Capability override: the node:http import bindings win their specific kind over
-  // the generic LOCAL tag applied above.
-  for (const name of http.namespaceOrDefault) frame.set(name, 'HTTP_NS');
-  for (const name of http.namedClient) frame.set(name, 'HTTP_CLIENT');
-  // F1/F2: dynamic-import acquisition and destructuring off HTTP_NS, in source order so
-  // a capability acquired earlier is visible to a later destructuring in the same scope.
-  for (const statement of sourceFile.statements) {
-    if (ts.isVariableStatement(statement)) {
-      for (const decl of statement.declarationList.declarations) {
-        propagateHttpCapability(decl, (n) => frame.get(n), (name, kind) => frame.set(name, kind));
-      }
-    }
-  }
-  return frame;
-};
-
-const usesOutboundNetwork = (source: string): boolean => {
-  const sourceFile = ts.createSourceFile(
-    'module.ts',
-    source,
-    ts.ScriptTarget.Latest,
-    /* setParentNodes */ true,
-    ts.ScriptKind.TS,
+// A receiver is the REAL global (globalThis/window/self/global) only when the binder
+// resolves it to NO local binding in this file (an intrinsic globalThis has a symbol but
+// no local declaration; a param/const shadow does). Identifier text is not identity.
+const isFreeGlobalReceiver = (expr: ts.Expression, checker: ts.TypeChecker, sourceFile: ts.SourceFile): boolean => {
+  const recv = binderUnwrap(expr);
+  if (!ts.isIdentifier(recv) || !GLOBAL_RECEIVER_NAMES.has(recv.text)) return false;
+  const symbol = checker.getSymbolAtLocation(recv);
+  if (symbol === undefined || symbol.declarations === undefined) return true;
+  const shadowedLocally = symbol.declarations.some(
+    (d) =>
+      d.getSourceFile() === sourceFile &&
+      (ts.isParameter(d) ||
+        ts.isVariableDeclaration(d) ||
+        ts.isBindingElement(d) ||
+        ts.isFunctionDeclaration(d) ||
+        ts.isClassDeclaration(d) ||
+        ts.isImportClause(d) ||
+        ts.isImportSpecifier(d) ||
+        ts.isNamespaceImport(d)),
   );
-  const constMap = collectStringConsts(sourceFile);
-  const http = collectHttpBindings(sourceFile);
+  return !shadowedLocally;
+};
 
-  // Lexical environment: a stack of frames, innermost last. `resolve` returns the
-  // kind of the NEAREST visible binding of a name, or undefined when the name is
-  // FREE at that occurrence (an unshadowed global such as `fetch`). Frames are
-  // pushed on scope entry and popped on scope exit, so sibling scopes are
-  // independent and an inner shadow vanishes once its scope closes.
-  const scopes: Map<string, BindingKind>[] = [buildModuleFrame(sourceFile, http)];
-  const resolve = (name: string): BindingKind | undefined => {
-    for (let i = scopes.length - 1; i >= 0; i--) {
-      const kind = scopes[i]?.get(name);
-      if (kind !== undefined) return kind;
-    }
-    return undefined;
-  };
+// Whether a call is a runtime dynamic `import('node:http')` (Option B: prohibited outright).
+const isDynamicNodeHttpImport = (node: ts.Node): boolean => {
+  if (!ts.isCallExpression(node) || node.expression.kind !== ts.SyntaxKind.ImportKeyword) return false;
+  const specifier = node.arguments[0];
+  return specifier !== undefined && ts.isStringLiteralLike(specifier) && specifier.text === 'node:http';
+};
 
-  // A receiver is the REAL global object only when its identifier is a global name
-  // (globalThis/window/self/global) AND no lexical binding shadows it at this
-  // occurrence — identifier text is not binding identity. So
-  // `function f(globalThis) { globalThis.fetch('local'); }` resolves the receiver to
-  // the LOCAL parameter and is NOT the global, while an unshadowed `globalThis.fetch`
-  // (FREE receiver) stays a real global member. Uses the same scope stack as `resolve`
-  // rather than the RC-shared text-only `isGlobalReceiver`, so this stays local to NET.
-  const isLexicalGlobalReceiver = (expr: ts.Expression): boolean => {
-    const recv = unwrapExpr(expr);
-    return ts.isIdentifier(recv) && GLOBAL_RECEIVER_NAMES.has(recv.text) && resolve(recv.text) === undefined;
-  };
-
-  // The frame a scope-introducing node contributes, or null when it is not one.
-  // Function-likes contribute their parameters; blocks their direct lexical
-  // declarations; for-headers their loop variables; catch clauses their variable.
-  const frameFor = (node: ts.Node): Map<string, BindingKind> | null => {
-    if (
-      ts.isFunctionDeclaration(node) ||
-      ts.isFunctionExpression(node) ||
-      ts.isArrowFunction(node) ||
-      ts.isMethodDeclaration(node) ||
-      ts.isConstructorDeclaration(node) ||
-      ts.isGetAccessorDeclaration(node) ||
-      ts.isSetAccessorDeclaration(node)
-    ) {
-      const frame = new Map<string, BindingKind>();
-      for (const param of node.parameters) eachBoundName(param.name, (t) => frame.set(t, 'LOCAL'));
-      // A NAMED function EXPRESSION binds its own name inside its body only (unlike a
-      // function DECLARATION, whose name lives in the enclosing scope and is already
-      // recorded there by `declaredByStatement`). Recording the self-binding in this
-      // frame lets `const helper = function request() { return request(); }` resolve
-      // the inner recursive call to the LOCAL self-binding, shadowing an imported
-      // `request`; the frame is popped on scope exit, so it never leaks to siblings or
-      // to the enclosing scope, where the import must still be rejected.
-      if (ts.isFunctionExpression(node) && node.name !== undefined) {
-        frame.set(node.name.text, 'LOCAL');
-      }
-      return frame;
-    }
-    if (ts.isBlock(node) || ts.isModuleBlock(node)) {
-      const frame = new Map<string, BindingKind>();
-      for (const statement of node.statements) declaredByStatement(statement, (t) => frame.set(t, 'LOCAL'));
-      // F1/F2 capability propagation within this block, resolving a destructuring RHS
-      // against this frame first, then the enclosing scopes (outer HTTP_NS imports).
-      for (const statement of node.statements) {
-        if (ts.isVariableStatement(statement)) {
-          for (const decl of statement.declarationList.declarations) {
-            propagateHttpCapability(decl, (n) => frame.get(n) ?? resolve(n), (name, kind) => frame.set(name, kind));
-          }
-        }
-      }
-      return frame;
-    }
-    if (ts.isForStatement(node) || ts.isForInStatement(node) || ts.isForOfStatement(node)) {
-      const frame = new Map<string, BindingKind>();
-      const init = node.initializer;
-      if (init !== undefined && ts.isVariableDeclarationList(init)) {
-        for (const decl of init.declarations) eachBoundName(decl.name, (t) => frame.set(t, 'LOCAL'));
-      }
-      return frame;
-    }
-    if (ts.isCatchClause(node)) {
-      const frame = new Map<string, BindingKind>();
-      if (node.variableDeclaration !== undefined) {
-        eachBoundName(node.variableDeclaration.name, (t) => frame.set(t, 'LOCAL'));
-      }
-      return frame;
-    }
-    return null;
-  };
-
+/**
+ * NET — reject outbound network egress, decided by TypeScript BINDER identity
+ * (D3-CX-POLICY-NET). Lexical binding identity — nearest visible binding, shadowing,
+ * restoration, for/switch/catch scope, parameter scope, named function-expression
+ * self-binding, and computed-name evaluation order — is delegated to the compiler binder
+ * via `checker.getSymbolAtLocation`, so this guard NEVER re-implements ECMAScript/
+ * TypeScript scoping. The Program is in-memory, single-file, `noLib`+`noResolve`: no
+ * filesystem, no module resolution, no network. Policy is the positive model: runtime
+ * `import('node:http')` is prohibited; the node:http namespace may be used only to obtain
+ * `createServer` (member access or `createServer`-only destructuring) or in type
+ * positions; any other node:http value (`HTTP_CLIENT`) may not be referenced; the free
+ * network globals `fetch`/`WebSocket` are rejected when truly unbound.
+ */
+const usesOutboundNetwork = (source: string): boolean => {
+  const { checker, sourceFile } = buildBinderProgram(source);
   let found = false;
   const visit = (node: ts.Node): void => {
-    const frame = frameFor(node);
-    if (frame !== null) scopes.push(frame);
-
-    // OPTION B — a runtime dynamic `import('node:http')` is prohibited OUTRIGHT: the D3
-    // host acquires node:http statically only. Rooted at the import expression itself, so
-    // it is rejected in EVERY context (receiver, argument, return, array/object/spread,
-    // conditional/logical, variable initializer, for-header, default export, wrappers) with
-    // no per-context rule. Non-node:http dynamic imports are untouched.
-    if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
-      const specifier = node.arguments[0];
-      if (specifier !== undefined && ts.isStringLiteralLike(specifier) && specifier.text === 'node:http') {
+    // (0) a runtime dynamic `import('node:http')` is prohibited outright, in every context.
+    if (isDynamicNodeHttpImport(node)) found = true;
+    // (1) member/element access: an HTTP_NS receiver is permitted ONLY for `createServer`;
+    //     a network global (`fetch`/`WebSocket`) off a FREE global receiver is rejected.
+    if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+      if (classifyHttpExpression(node.expression, checker) === 'HTTP_NS') {
+        const member = binderMemberName(node);
+        if (member === null || !HTTP_SERVER_VALUE_MEMBERS.has(member)) found = true;
+      }
+      const globalMember = binderMemberName(node);
+      if (globalMember !== null && NETWORK_GLOBAL_NAMES.has(globalMember) && isFreeGlobalReceiver(node.expression, checker, sourceFile)) {
         found = true;
       }
     }
-
-    if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
-      const member = memberNameOf(node, constMap);
-      const recv = unwrapExpr(node.expression);
-      const recvIsHttpNs =
-        (ts.isIdentifier(recv) && resolve(recv.text) === 'HTTP_NS') || isNodeHttpDynamicImport(recv);
-      // (d/3) an HTTP_NS receiver is permitted ONLY for a statically-PROVEN `createServer`
-      //     member; every other known member (`.request`/`.get`/`.ClientRequest`/`.Agent`/…)
-      //     AND any indeterminate/computed member (`http[dynamicKey]`, member === null) is
-      //     rejected fail-closed. `createServer` is the sole allowed value member; type-only
-      //     `http.ServerResponse` etc. are QualifiedName, not member accesses.
-      const provenCreateServer = member !== null && HTTP_SERVER_VALUE_MEMBERS.has(member);
-      if (recvIsHttpNs && !provenCreateServer) found = true;
-      if (member !== null) {
-        // (a) `<global>.fetch` / statically-keyed `<global>['fetch']` — only when the
-        //     receiver identifier is a global name that is FREE here (no local binding
-        //     shadows it). A shadowing local (param/const/…) makes it an ordinary
-        //     object, so `function f(globalThis) { globalThis.fetch(...) }` is allowed.
-        if (NETWORK_GLOBAL_NAMES.has(member) && isLexicalGlobalReceiver(node.expression)) found = true;
+    // (2) an identifier value read: HTTP_CLIENT is forbidden; HTTP_NS must sit in a safe
+    //     position (else escape); a FREE network global (`fetch`/`WebSocket`) is rejected.
+    if (ts.isIdentifier(node) && isBinderValueReference(node)) {
+      const symbol = checker.getSymbolAtLocation(node);
+      if (symbol !== undefined) {
+        const cap = classifyHttpSymbol(symbol, checker);
+        if (cap === 'HTTP_CLIENT') found = true;
+        if (cap === 'HTTP_NS' && !isHttpNsSafePosition(node)) found = true;
+      } else if (NETWORK_GLOBAL_NAMES.has(node.text)) {
+        found = true;
       }
     }
-    // (b) destructuring `fetch` off a global receiver, i.e. `const { fetch: f } =
-    //     globalThis` — but only when that receiver is the FREE global (a shadowing
-    //     local `globalThis`/… makes it an ordinary object, and `const { fetch } =
-    //     someLocalConfig` is untouched).
-    if (ts.isBindingElement(node)) {
-      const name = bindingPropertyName(node);
-      const decl = node.parent.parent;
-      const offGlobalReceiver =
-        ts.isVariableDeclaration(decl) &&
-        decl.initializer !== undefined &&
-        isLexicalGlobalReceiver(decl.initializer);
-      if (name !== null && NETWORK_GLOBAL_NAMES.has(name) && offGlobalReceiver) found = true;
-    }
-    if (ts.isIdentifier(node) && isValueReference(node)) {
-      // The `key` in a destructuring `const { key: local } = …` is a binding
-      // PROPERTY name, not an expression read (handled receiver-scoped by rule (b)),
-      // so it must not be mistaken for a bare reference to the global.
-      const isBindingPropertyKey = ts.isBindingElement(node.parent) && node.parent.propertyName === node;
-      if (!isBindingPropertyKey) {
-        const kind = resolve(node.text);
-        // (c) a bare network-global reference (`fetch`, `WebSocket`) that is FREE here
-        //     — no lexical binding of the name is visible — so it is the global. A
-        //     local shadow resolves to LOCAL and is allowed; `const f = fetch` is still
-        //     caught at `fetch`.
-        if (NETWORK_GLOBAL_NAMES.has(node.text) && kind === undefined) found = true;
-        // (e) a bare reference that lexically resolves to a NON-`createServer` node:http
-        //     named import (`request(...)`, `req(...)`, `new Agent()`); a shadowing
-        //     local resolves LOCAL.
-        if (kind === 'HTTP_CLIENT') found = true;
-        // (f) DESIGN A non-escape: an HTTP_NS value reference is permitted ONLY as an
-        //     access-object receiver (rule d/3), a destructuring initializer (F2), or a
-        //     NET-local type/non-runtime position; EVERY other runtime reference is a
-        //     forbidden ESCAPE (`const h = http`, `foo(http)`, `return http`, `[http]`,
-        //     `{ v: http }`, `{ ...http }`, `export default http`) — rejected AT the name,
-        //     so no alias/value-flow tracking is needed.
-        if (kind === 'HTTP_NS' && isHttpNamespaceEscape(node)) found = true;
+    // (3) destructuring a network global off a FREE global receiver: `const { fetch } = globalThis`.
+    if (ts.isBindingElement(node) && ts.isObjectBindingPattern(node.parent) && ts.isVariableDeclaration(node.parent.parent)) {
+      const key = node.propertyName ?? node.name;
+      const name = ts.isIdentifier(key) ? key.text : ts.isStringLiteralLike(key) ? key.text : null;
+      const initializer = node.parent.parent.initializer;
+      if (name !== null && NETWORK_GLOBAL_NAMES.has(name) && initializer !== undefined && isFreeGlobalReceiver(initializer, checker, sourceFile)) {
+        found = true;
       }
     }
-
     ts.forEachChild(node, visit);
-    if (frame !== null) scopes.pop();
   };
   ts.forEachChild(sourceFile, visit);
   return found;
+};
+
+// Design D / Option-B export confinement, consuming the SAME binder-backed classification
+// as `usesOutboundNetwork`: a binding classified HTTP_NS or HTTP_CLIENT (namespace, named
+// client import, or a locally-destructured non-createServer member) may not cross the
+// module boundary; createServer/LOCAL and type-only forms may. One source of truth.
+const exportsHttpCapability = (inputSourceFile: ts.SourceFile): boolean => {
+  const { checker, sourceFile } = buildBinderProgram(inputSourceFile.text);
+  const carriesAuthority = (symbol: ts.Symbol | undefined): boolean => {
+    const cap = classifyHttpSymbol(symbol, checker);
+    return cap === 'HTTP_NS' || cap === 'HTTP_CLIENT';
+  };
+  for (const statement of sourceFile.statements) {
+    // (a) a RUNTIME re-export from node:http (`export * from` / a non-type-only specifier).
+    if (
+      ts.isExportDeclaration(statement) &&
+      !statement.isTypeOnly &&
+      statement.moduleSpecifier !== undefined &&
+      ts.isStringLiteral(statement.moduleSpecifier) &&
+      statement.moduleSpecifier.text === 'node:http'
+    ) {
+      if (statement.exportClause === undefined) return true;
+      if (ts.isNamedExports(statement.exportClause)) {
+        for (const el of statement.exportClause.elements) {
+          if (!el.isTypeOnly) return true;
+        }
+      }
+    }
+    // (b) a local re-export of a binding carrying node:http authority. Type-only skipped.
+    if (
+      ts.isExportDeclaration(statement) &&
+      !statement.isTypeOnly &&
+      statement.moduleSpecifier === undefined &&
+      statement.exportClause !== undefined &&
+      ts.isNamedExports(statement.exportClause)
+    ) {
+      for (const el of statement.exportClause.elements) {
+        if (!el.isTypeOnly && carriesAuthority(checker.getExportSpecifierLocalTargetSymbol(el))) return true;
+      }
+    }
+    // (c) `export default <authority>` / `export = <authority>`.
+    if (ts.isExportAssignment(statement)) {
+      const cap = classifyHttpExpression(statement.expression, checker);
+      if (cap === 'HTTP_NS' || cap === 'HTTP_CLIENT') return true;
+    }
+    // (d) an EXPORTED declaration whose bound name(s) carry node:http authority.
+    if (ts.isVariableStatement(statement) && ts.getModifiers(statement)?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword) === true) {
+      const names: ts.Identifier[] = [];
+      const collect = (binding: ts.BindingName): void => {
+        if (ts.isIdentifier(binding)) {
+          names.push(binding);
+        } else {
+          for (const el of binding.elements) {
+            if (ts.isBindingElement(el)) collect(el.name);
+          }
+        }
+      };
+      for (const decl of statement.declarationList.declarations) collect(decl.name);
+      for (const nm of names) {
+        if (carriesAuthority(checker.getSymbolAtLocation(nm))) return true;
+      }
+    }
+  }
+  return false;
 };
 
 describe('D3 host has no mutation, subprocess, secret, or Git capability', () => {
@@ -4357,7 +4250,6 @@ describe('D3 host may not export node:http capability across the module boundary
     { form: 'exporting a namespace import binding', source: `import * as http from 'node:http';\nexport { http };` },
     { form: 'exporting an aliased namespace binding', source: `import * as http from 'node:http';\nexport { http as h };` },
     { form: 'default-exporting a namespace binding', source: `import * as http from 'node:http';\nexport default http;` },
-    { form: 'exporting a dynamic-import namespace binding', source: `const http = await import('node:http');\nexport { http };` },
     { form: 'export-equals of a namespace binding', source: `import http = require('node:http');\nexport = http;` },
   ];
   for (const { form, source } of exportReject) {
@@ -4420,8 +4312,6 @@ describe('D3 host closes direct dynamic-import receivers and runtime capability 
     { form: 'a named get import re-exported', source: `import { get } from 'node:http';\nexport { get };` },
     { form: 'a named ClientRequest import re-exported', source: `import { ClientRequest } from 'node:http';\nexport { ClientRequest };` },
     { form: 'a named Agent import re-exported', source: `import { Agent } from 'node:http';\nexport { Agent };` },
-    { form: 'an exported dynamic-import namespace declaration', source: `export const http = await import('node:http');` },
-    { form: 'an exported destructured dynamic-import client member', source: `export const { request } = await import('node:http');` },
     { form: 'an exported destructured namespace client member', source: `import * as http from 'node:http';\nexport const { request } = http;` },
   ];
   for (const { form, source } of exportReject) {
@@ -4456,6 +4346,9 @@ describe('D3 host closes direct dynamic-import receivers and runtime capability 
 // ---------------------------------------------------------------------------
 describe('D3 host prohibits runtime dynamic import of node:http (D3-CX-POLICY-NET-OPTB)', () => {
   const optbReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'an exported destructured dynamic-import client member', source: `export const { request } = await import('node:http');` },
+    { form: 'an exported dynamic-import namespace declaration', source: `export const http = await import('node:http');` },
+    { form: 'a namespace binding acquired from a dynamic import then exported', source: `const http = await import('node:http');\nexport { http };` },
     { form: 'a bare awaited dynamic import', source: `void (await import('node:http'));` },
     { form: 'a parenthesized awaited dynamic import', source: `void ((await import('node:http')));` },
     { form: 'a dynamic import passed as an argument', source: `declare function send(x: unknown): void;\nsend(await import('node:http'));` },
