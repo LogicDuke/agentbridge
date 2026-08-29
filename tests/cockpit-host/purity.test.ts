@@ -1059,23 +1059,24 @@ const isHttpNsSafePosition = (node: ts.Node): boolean => {
 // A receiver is the REAL global (globalThis/window/self/global) only when the binder
 // resolves it to NO local binding in this file (an intrinsic globalThis has a symbol but
 // no local declaration; a param/const shadow does). Identifier text is not identity.
+//
+// Local-value shadow rule (no declaration-kind whitelist): the receiver is free/global
+// only when its resolved symbol carries NO declaration belonging to the analyzed source
+// file. Any genuine local VALUE binding of the name — const/let/var, parameter, binding
+// element, function, class, enum, a namespace with a runtime value, import-equals, an
+// import binding, and any other runtime declaration — is a shadow, so the receiver is an
+// ordinary object, not the global. The value/type distinction is delegated to the binder,
+// not re-listed here: at a value-position receiver `checker.getSymbolAtLocation` resolves
+// with VALUE meaning, so a name whose only local declaration is type-only
+// (`interface global` / `type global`) does not resolve to that declaration — the symbol
+// is undefined (or carries no in-file declaration), and the receiver is correctly still
+// the free global. Restoration/nesting/sibling scope are the binder's job as before.
 const isFreeGlobalReceiver = (expr: ts.Expression, checker: ts.TypeChecker, sourceFile: ts.SourceFile): boolean => {
   const recv = binderUnwrap(expr);
   if (!ts.isIdentifier(recv) || !GLOBAL_RECEIVER_NAMES.has(recv.text)) return false;
   const symbol = checker.getSymbolAtLocation(recv);
   if (symbol === undefined || symbol.declarations === undefined) return true;
-  const shadowedLocally = symbol.declarations.some(
-    (d) =>
-      d.getSourceFile() === sourceFile &&
-      (ts.isParameter(d) ||
-        ts.isVariableDeclaration(d) ||
-        ts.isBindingElement(d) ||
-        ts.isFunctionDeclaration(d) ||
-        ts.isClassDeclaration(d) ||
-        ts.isImportClause(d) ||
-        ts.isImportSpecifier(d) ||
-        ts.isNamespaceImport(d)),
-  );
+  const shadowedLocally = symbol.declarations.some((d) => d.getSourceFile() === sourceFile);
   return !shadowedLocally;
 };
 
@@ -1084,6 +1085,131 @@ const isDynamicNodeHttpImport = (node: ts.Node): boolean => {
   if (!ts.isCallExpression(node) || node.expression.kind !== ts.SyntaxKind.ImportKeyword) return false;
   const specifier = node.arguments[0];
   return specifier !== undefined && ts.isStringLiteralLike(specifier) && specifier.text === 'node:http';
+};
+
+// SOCK — reject acquisition of the inbound SERVER SOCKET capability (D3-CX-POLICY-NET-SOCK).
+// The permitted `createServer` path yields a listening server whose request/response objects
+// and connection-family events expose the underlying duplex socket — a transitive OUTBOUND
+// capability (`req.socket.connect(...)`) the createServer allowance is not meant to grant.
+// This is the FINAL BOUNDED D3 source policy (commander decision, frozen): the strongest
+// finite policy that stays compatible with the actual host. It is NOT a taint/alias/type/
+// whole-program engine and does NOT claim literal no-egress — three purely syntactic rules:
+//
+//   RULE A — GLOBAL static socket/connection NAME ban, regardless of receiver identity. A
+//     property named `socket`/`connection` acquired by a statically identifiable name is
+//     rejected: dotted `x.socket` (optional chaining included), static-computed
+//     `x['socket']`/`` x[`connection`] ``, and object-destructuring `{ socket }` /
+//     `{ socket: s }` / `{ connection }` in any binding pattern (variable, parameter,
+//     nested, callback). Receiver identity is deliberately irrelevant — an unrelated
+//     `camera.socket` is an accepted, intentional policy false positive; real host/cockpit
+//     source uses neither name.
+//
+//   RULE A2 — for the request/response PARAMETERS of a function literal passed DIRECTLY to a
+//     permitted static `createServer` call (binder identity — these are the sole direct
+//     entry of IncomingMessage/ServerResponse into user code), an element access whose key
+//     is not a static string FAILS CLOSED (`req[key]`, `req['sock'+'et']`, `req[c?…:…]`).
+//     This closes computed recovery on the direct handler param without touching legitimate
+//     host indexing elsewhere (`array[index]`, `text[character]`, `object[key]` are NOT on a
+//     createServer handler param, so they are unaffected). No const-folding is used.
+//
+//   RULE B — BLANKET event-registration ban. Any call whose callee member is a registrar
+//     name (`on`/`once`/`addListener`/`prependListener`/`prependOnceListener`, read from a
+//     dotted or static-key access) is rejected regardless of receiver, event name, or handler
+//     shape. Real D3 host/cockpit source registers NO events, so this eliminates every
+//     socket-delivering event route — `request`, `connection`, `upgrade`, `connect`,
+//     `clientError`, `dropRequest`, and any future one — with no event-name list to maintain
+//     and no wrapper/receiver inference. The accepted, bounded false positive is that an
+//     unrelated synthetic `emitter.on('ready', …)` is also rejected.
+//
+// HONEST BOUNDARY (frozen, not a defect): an aliased/cross-function request combined with a
+// runtime-computed key — `const r = request; r[runtimeKey]` where `runtimeKey` becomes
+// `'socket'` at runtime — is NOT closed; closing it would require alias propagation / type
+// resolution / whole-program flow, deliberately excluded here. It belongs to a future
+// runtime-isolation enforcement boundary, not this source policy.
+const SOCKET_CAPABILITY_NAMES: ReadonlySet<string> = new Set(['socket', 'connection']);
+const SOCKET_EVENT_REGISTRARS: ReadonlySet<string> = new Set([
+  'on',
+  'once',
+  'addListener',
+  'prependListener',
+  'prependOnceListener',
+]);
+
+// The static key named by an element-access argument or a binding-element key, or null.
+const staticKeyText = (key: ts.Node | undefined): string | null => {
+  if (key === undefined) return null;
+  if (ts.isIdentifier(key)) return key.text;
+  if (ts.isStringLiteralLike(key)) return key.text;
+  if (ts.isComputedPropertyName(key) && ts.isStringLiteralLike(key.expression)) return key.expression.text;
+  return null;
+};
+
+const acquiresInboundServerSocket = (checker: ts.TypeChecker, sourceFile: ts.SourceFile): boolean => {
+  const isCreateServerCall = (node: ts.Node): boolean =>
+    ts.isCallExpression(node) && classifyHttpExpression(node.expression, checker) === 'CREATE_SERVER';
+
+  // Pass 1 (RULE A2 support) — collect the createServer request/response parameter symbols.
+  // Direct identifier params only; a destructured param `({ socket })` is a RULE A binding
+  // pattern, rejected in pass 2 like any other.
+  const reqResSymbols = new Set<ts.Symbol>();
+  const collect = (node: ts.Node): void => {
+    if (isCreateServerCall(node)) {
+      for (const arg of (node as ts.CallExpression).arguments) {
+        const handler = binderUnwrap(arg);
+        if (ts.isArrowFunction(handler) || ts.isFunctionExpression(handler)) {
+          for (const param of handler.parameters) {
+            if (ts.isIdentifier(param.name)) {
+              const symbol = checker.getSymbolAtLocation(param.name);
+              if (symbol !== undefined) reqResSymbols.add(symbol);
+            }
+          }
+        }
+      }
+    }
+    ts.forEachChild(node, collect);
+  };
+  ts.forEachChild(sourceFile, collect);
+
+  const receiverIsReqRes = (expr: ts.Expression): boolean => {
+    const e = binderUnwrap(expr);
+    if (!ts.isIdentifier(e)) return false;
+    const symbol = checker.getSymbolAtLocation(e);
+    return symbol !== undefined && reqResSymbols.has(symbol);
+  };
+
+  let found = false;
+  const visit = (node: ts.Node): void => {
+    // RULE A (a) — GLOBAL dotted `.socket`/`.connection` (optional chaining included).
+    if (ts.isPropertyAccessExpression(node) && SOCKET_CAPABILITY_NAMES.has(node.name.text)) found = true;
+    // RULE A (b) — GLOBAL static-computed `['socket']`/`['connection']`; else RULE A2 fails
+    //     closed on an indeterminate computed key when the receiver is a createServer param.
+    if (ts.isElementAccessExpression(node)) {
+      const arg = node.argumentExpression;
+      if (ts.isStringLiteralLike(arg)) {
+        if (SOCKET_CAPABILITY_NAMES.has(arg.text)) found = true;
+      } else if (receiverIsReqRes(node.expression)) {
+        found = true;
+      }
+    }
+    // RULE A (c) — GLOBAL `{ socket }` / `{ connection }` destructuring in any object binding
+    //     pattern (variable, parameter, nested, callback), including `{ socket: s }`.
+    if (ts.isBindingElement(node) && ts.isObjectBindingPattern(node.parent)) {
+      const name = staticKeyText(node.propertyName ?? node.name);
+      if (name !== null && SOCKET_CAPABILITY_NAMES.has(name)) found = true;
+    }
+    // RULE B — BLANKET event-registration ban: any registrar member call, any receiver, any
+    //     event name (dotted `.on` or static-key `['on']`).
+    if (
+      ts.isCallExpression(node) &&
+      (ts.isPropertyAccessExpression(node.expression) || ts.isElementAccessExpression(node.expression))
+    ) {
+      const registrar = binderMemberName(node.expression);
+      if (registrar !== null && SOCKET_EVENT_REGISTRARS.has(registrar)) found = true;
+    }
+    ts.forEachChild(node, visit);
+  };
+  ts.forEachChild(sourceFile, visit);
+  return found;
 };
 
 /**
@@ -1141,6 +1267,10 @@ const usesOutboundNetwork = (source: string): boolean => {
     ts.forEachChild(node, visit);
   };
   ts.forEachChild(sourceFile, visit);
+  // Inbound server-socket acquisition (SOCK) is decided over the SAME single-file binder
+  // program — one source of truth, no reparse — and is an additional rejection reason: the
+  // permitted createServer path may not be used to acquire the underlying socket capability.
+  if (acquiresInboundServerSocket(checker, sourceFile)) found = true;
   return found;
 };
 
@@ -4409,6 +4539,182 @@ describe('D3 host prohibits runtime dynamic import of node:http (D3-CX-POLICY-NE
     it(`ALLOWS export of ${form}`, () => {
       const sf = ts.createSourceFile('module.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
       expect(exportsHttpCapability(sf)).toBe(false);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// SOCK final bounded D3 socket policy (D3-CX-POLICY-NET-SOCK). Three finite, purely
+// syntactic rules, no taint/alias/type/whole-program: RULE A — a GLOBAL static ban on
+// acquiring a property named `socket`/`connection` (dotted, optional, static-computed, or
+// destructured) regardless of receiver; RULE A2 — on the request/response parameters of a
+// function literal passed directly to a permitted `createServer`, an indeterminate computed
+// element access fails closed; RULE B — a BLANKET ban on every event registrar call
+// (`on`/`once`/`addListener`/`prependListener`/`prependOnceListener`), any receiver, any
+// event name. Accepted, intentional false positives: an unrelated `camera.socket` and an
+// unrelated `emitter.on('ready', …)` are rejected because real host/cockpit source uses
+// neither. The alias + runtime-computed residual (`const r = request; r[runtimeKey]`) is the
+// frozen honest boundary, deliberately not closed here.
+// ---------------------------------------------------------------------------
+describe('D3 host enforces the final bounded socket-capability source policy (D3-CX-POLICY-NET-SOCK)', () => {
+  it('accepts every real host source (no host source acquires the inbound socket)', () => {
+    for (const { file, text } of hostSources()) {
+      expect(usesOutboundNetwork(text), `${file} acquires the inbound server socket`).toBe(false);
+    }
+  });
+
+  // The reported F1 transitive-egress reproduction: the permitted createServer path used to
+  // reach `req.socket` and call `.connect(...)` outbound. Rejected now at the acquisition.
+  it('rejects the reported req.socket transitive-outbound reproduction', () => {
+    expect(
+      usesOutboundNetwork(
+        `import http from 'node:http';\n` +
+          `http.createServer((req: http.IncomingMessage) => {\n` +
+          `  req.socket.destroy();\n` +
+          `  req.socket.connect(80, 'example.com');\n` +
+          `});`,
+      ),
+    ).toBe(true);
+  });
+
+  const H = `import http from 'node:http';\n`;
+  const handler = (body: string): string =>
+    H + `http.createServer((req: http.IncomingMessage, res: http.ServerResponse) => {\n${body}\n});`;
+
+  // --- RULE A: GLOBAL static socket/connection NAME ban (any receiver) — MUST REJECT ---
+  const ruleAReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'an unrelated camera.socket (accepted global false positive)', source: `const camera = { socket: 1 };\nvoid camera.socket;` },
+    { form: 'an unrelated thing.connection (accepted global false positive)', source: `const thing = { connection: 'local' };\nvoid thing.connection;` },
+    { form: 'a plain local named request with a .socket member', source: `const request = { socket: 1 };\nvoid request.socket;` },
+    { form: 'a direct req.socket member', source: handler(`req.socket.destroy();`) },
+    { form: 'a direct req.connection member', source: handler(`req.connection.destroy();`) },
+    { form: 'a res.socket member', source: handler(`void res.socket;`) },
+    { form: 'an optional req?.socket access', source: handler(`void req?.socket;`) },
+    { form: 'an optional obj?.connection access', source: `const obj: { connection?: unknown } = {};\nvoid obj?.connection;` },
+    { form: 'an alias const s = req.socket', source: handler(`const s = req.socket;\nvoid s;`) },
+    { form: "a static-computed req['socket'] access", source: handler(`void req['socket'];`) },
+    { form: 'a template-computed req[`socket`] access', source: handler('void req[`socket`];') },
+    { form: "a static-computed obj['connection'] on any receiver", source: `const obj: Record<string, unknown> = {};\nvoid obj['connection'];` },
+    { form: 'the aliased-then-.socket escape (closed by the global name ban)', source: handler(`const r = req;\nvoid r.socket;`) },
+    { form: 'a cross-function x.socket (closed by the global name ban)', source: H + `function h(x: { socket: unknown }): unknown { return x.socket; }\nhttp.createServer((req: http.IncomingMessage) => {\n  void h(req);\n});` },
+  ];
+
+  // --- RULE A: destructuring `{ socket }` / `{ connection }` (any binding pattern) — REJECT ---
+  const destructureReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a { socket } destructuring off req', source: handler(`const { socket } = req;\nvoid socket;`) },
+    { form: 'a { connection } destructuring off an unrelated object', source: `const obj = { connection: 1 };\nconst { connection } = obj;\nvoid connection;` },
+    { form: 'an aliased { socket: s } destructuring off res', source: handler(`const { socket: s } = res;\nvoid s;`) },
+    { form: 'a { connection: c } destructuring off req', source: handler(`const { connection: c } = req;\nvoid c;`) },
+    { form: 'an inline { socket } destructuring parameter', source: H + `http.createServer(({ socket }: http.IncomingMessage) => {\n  void socket;\n});` },
+    { form: 'a second-parameter { socket } destructuring', source: H + `http.createServer((_req: http.IncomingMessage, { socket }: http.ServerResponse) => {\n  void socket;\n});` },
+    { form: 'a function parameter { connection } destructuring', source: `function f({ connection }: { connection: unknown }): void {\n  void connection;\n}\nvoid f;` },
+  ];
+
+  // --- RULE A2: createServer handler param indeterminate computed access — FAIL-CLOSED ---
+  const ruleA2Reject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'an indeterminate req[key] on the handler param', source: handler(`const key = req.url ?? '';\nvoid req[key];`) },
+    { form: 'an indeterminate res[key] on the handler param', source: handler(`const key = req.url ?? '';\nvoid res[key];`) },
+    { form: "a concatenated req['sock' + 'et'] on the handler param", source: handler(`void req['sock' + 'et'];`) },
+    { form: 'a conditional req[c ? "socket" : "method"] on the handler param', source: handler(`const c = req.method === 'GET';\nvoid req[c ? 'socket' : 'method'];`) },
+  ];
+
+  // --- RULE B: BLANKET event-registration ban (any registrar, any receiver, any event) ---
+  const registrarNames = ['on', 'once', 'addListener', 'prependListener', 'prependOnceListener'];
+  const anyEventNames = ['request', 'connection', 'dropRequest', 'ready'];
+  const wrapperHead =
+    H + `function makeServer(): http.Server {\n  return http.createServer(() => {});\n}\nconst server = makeServer();\n`;
+  const eventReject: { readonly form: string; readonly source: string }[] = [];
+  for (const reg of registrarNames) {
+    for (const evt of anyEventNames) {
+      eventReject.push({
+        form: `a wrapper-return server.${reg}('${evt}', …)`,
+        source: wrapperHead + `server.${reg}('${evt}', () => {});`,
+      });
+    }
+  }
+  const eventRejectSpecial: readonly { readonly form: string; readonly source: string }[] = [
+    { form: "a 'request' event on a direct const server binding", source: H + `const server = http.createServer(() => {});\nserver.on('request', () => {});` },
+    { form: "a 'connection' event on the direct createServer return chain", source: H + `http.createServer(() => {}).on('connection', () => {});` },
+    { form: "a static-key registrar server['on']('request', …)", source: wrapperHead + `server['on']('request', () => {});` },
+    { form: "an unrelated declared emitter registering 'ready' (accepted false positive)", source: `declare const ee: { on(event: string, cb: () => void): void };\nee.on('ready', () => {});` },
+    { form: "a synthetic LocalEmitter registering 'anything' (accepted false positive)", source: `class LocalEmitter {\n  addListener(_event: string, _cb: () => void): void {}\n}\nconst emitter = new LocalEmitter();\nemitter.addListener('anything', () => {});` },
+  ];
+
+  for (const { form, source } of [
+    ...ruleAReject,
+    ...destructureReject,
+    ...ruleA2Reject,
+    ...eventReject,
+    ...eventRejectSpecial,
+  ]) {
+    it(`rejects ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // --- MUST ALLOW: the legitimate request/response surface and unrelated non-socket shapes ---
+  const sockAllow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'the ordinary request.method read', source: handler(`const m = req.method ?? '';\nvoid m;`) },
+    { form: 'the ordinary request.url read', source: handler(`const u = req.url ?? '';\nvoid u;`) },
+    { form: 'the ordinary response surface', source: handler(`res.statusCode = 200;\nres.setHeader('X', 'Y');\nres.end('ok');`) },
+    { form: "a static request['method'] access on the handler param", source: handler(`void req['method'];`) },
+    { form: 'a template request[`url`] access on the handler param', source: handler('void req[`url`];') },
+    { form: 'an empty createServer handler', source: H + `http.createServer(() => {});` },
+    { form: 'a listen call on a const server binding', source: H + `const server = http.createServer(() => {});\nserver.listen(4317, '127.0.0.1');` },
+    { form: 'unrelated array[index] indexing', source: `const array: readonly number[] = [];\nconst index = 0;\nvoid array[index];` },
+    { form: 'unrelated text[character] indexing', source: `const text = 'abc';\nconst character = 1;\nvoid text[character];` },
+    { form: 'unrelated object[key] indexing', source: `const object: Record<string, number> = {};\nconst key = 'a';\nvoid object[key];` },
+    { form: 'a non-socket ordinary member on an unrelated object', source: `const obj = { value: 1 };\nvoid obj.value;` },
+  ];
+  for (const { form, source } of sockAllow) {
+    it(`allows ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// NET free-global receiver is a LOCAL-VALUE-SHADOW question, not a declaration-kind list
+// (D3-CX-POLICY-NET-SHADOW-LOCAL). A global-receiver name (globalThis/window/self/global)
+// is the real free global only when the binder resolves it to NO declaration in this file.
+// ANY genuine local runtime VALUE binding of the name shadows the global — including enum,
+// a value namespace, and import-equals, which a prior declaration-kind whitelist missed and
+// wrongly flagged as egress. The value/type split is the binder's: at a value-position
+// receiver a type-only-only name (`interface`/`type`) does not resolve, so it stays the
+// free global and its network member is still rejected.
+// ---------------------------------------------------------------------------
+describe('D3 host free-global receiver is a local-value-shadow decision (D3-CX-POLICY-NET-SHADOW-LOCAL)', () => {
+  // A genuine local runtime VALUE binding of the receiver name is a shadow → ALLOWED.
+  const localShadowAllow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'an enum global shadow', source: `enum global { fetch }\nvoid global.fetch;` },
+    { form: 'a value-namespace global shadow', source: `namespace global {\n  export const fetch = (x: string) => x;\n}\nvoid global.fetch('a');` },
+    { form: 'an import-equals global shadow', source: `import global = require('x');\nvoid global.fetch;` },
+    { form: 'a const global shadow', source: `const global = { fetch: (x: string) => x };\nvoid global.fetch('a');` },
+    { form: 'a binding-element global shadow', source: `const { global } = { global: { fetch: (x: string) => x } };\nvoid global.fetch('a');` },
+    { form: 'a class global shadow', source: `class global {\n  static fetch = (x: string) => x;\n}\nvoid global.fetch('a');` },
+    { form: 'a function global shadow (WebSocket member)', source: `function global() {}\nvoid (global as unknown as { WebSocket: unknown }).WebSocket;` },
+    { form: 'an enum window shadow', source: `enum window { fetch }\nvoid window.fetch;` },
+    { form: 'a value-namespace self shadow', source: `namespace self {\n  export const WebSocket = class {};\n}\nvoid new self.WebSocket();` },
+    { form: 'a parameter global shadow', source: `function f(global: { fetch: (v: string) => string }) {\n  return global.fetch('local');\n}` },
+  ];
+  for (const { form, source } of localShadowAllow) {
+    it(`ALLOWS ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+
+  // A name whose ONLY local declaration is type-only is NOT a runtime shadow: the receiver
+  // stays the free global and the network member is REJECTED. Real free globals too.
+  const stillFreeReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'an interface-only global (still the free global)', source: `interface global { fetch: (v: string) => string }\nglobal.fetch('https://evil/');` },
+    { form: 'a type-alias-only global (still the free global)', source: `type global = { fetch: (v: string) => string };\nglobal.fetch('https://evil/');` },
+    { form: 'a real free globalThis.fetch', source: `globalThis.fetch('https://evil/');` },
+    { form: 'a real free window.fetch', source: `window.fetch('https://evil/');` },
+    { form: 'a real free self.WebSocket', source: `new self.WebSocket('wss://evil/');` },
+  ];
+  for (const { form, source } of stillFreeReject) {
+    it(`REJECTS ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
     });
   }
 });
