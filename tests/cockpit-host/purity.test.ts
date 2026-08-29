@@ -1306,73 +1306,124 @@ const acquiresInboundServerSocket = (checker: ts.TypeChecker, sourceFile: ts.Sou
   return found;
 };
 
-// F1/P2 — binder-identity gate for the NET free-global member check (D3-CX-POLICY-NET-BIND).
+// F1/P2 — recursive binder-identity resolution for the NET free-global member check
+// (D3-CX-POLICY-NET-BIND). `collectStringConsts` keys a resolved constant by identifier TEXT and,
+// while resolving a `const`'s initializer, folds EVERY identifier leaf by text too. For the NET
+// free-global member path that is unsound at two levels: (1) the element-access key identifier
+// itself may resolve to a DIFFERENT same-text binding, and (2) even a genuine same-symbol key
+// (`const key = Infinity`) can carry a value that was folded from an out-of-scope
+// `const Infinity = 'fetch'` INSIDE its initializer — binding identity is lost during initializer
+// resolution. Identifier text equality is never binding identity; the compiler binder is authority.
 //
-// `collectStringConsts` keys a resolved constant by identifier TEXT (under whole-file
-// uniqueness), and `staticStringOf` then substitutes that value for ANY same-text identifier.
-// For the NET free-global member path that is unsound: an element-access key such as
-// `globalThis[Infinity]`, whose `Infinity` reference does NOT lexically resolve to an in-scope
-// `const Infinity = 'fetch'` (a different-scope binding, a free global, a parameter/import
-// shadow), would still be handed the collected `'fetch'` — a PHANTOM member and an
-// outbound-network false positive, even though no fetch/WebSocket capability is acquired.
-// Identifier text equality is not binding identity; the compiler binder is the authority.
-//
-// This gate requires the key Identifier to RESOLVE, via `checker.getSymbolAtLocation`, to the
-// one unique `const <text> = <static string>` declaration that produced the collected value.
-// A key that resolves to a DIFFERENT same-text binding, or to no in-file binding at all, is
-// treated as unresolved for NET (null) — never as the collected const — and is left to the
-// independent fail-closed runtime-code guard. String literals and `+`-folds of literals carry
-// no identifier and are unaffected; a genuine same-binding `const key = 'fetch'; globalThis[key]`
-// still resolves and is still rejected. Bounded to NET: `collectStringConsts` / `staticStringOf`
-// / `memberNameOf` are unchanged, so the RC/HA text-only structural policy is not touched.
-const bindsToCollectedConst = (id: ts.Identifier, checker: ts.TypeChecker): boolean => {
+// The NET path therefore resolves strings itself, straight off the binder, WITHOUT consulting the
+// text-keyed const map: every Identifier hop — the key and every identifier reached while resolving
+// a collected initializer — must resolve (via `checker.getSymbolAtLocation`) to a single
+// `const <text> = <init>` declaration of matching text, and that declaration's initializer is then
+// resolved under the SAME discipline. A hop that resolves to a different same-text binding, to no
+// in-file binding (a free global under `noLib`), or to a non-const/duplicate binding, demotes the
+// whole chain to unresolved (`null`), left to the fail-closed runtime-code guard. String literals
+// and `+`-folds of literals carry no identifier and resolve as before, so a genuine same-symbol
+// const chain (`const a = 'fetch'; const key = a; globalThis[key]`) still folds and is still
+// rejected. `seen` bounds recursion: a const-initializer cycle terminates at `null`. Bounded to
+// NET: `collectStringConsts` / `staticStringOf` / `memberNameOf` are unchanged, so the RC/HA
+// text-only structural policy is not touched.
+
+// The single `const <text> = <init>` declaration a binder-resolved identifier denotes, else null:
+// the symbol has exactly one declaration, that declaration is a `const` VariableDeclaration whose
+// name text matches the reference. Text equality alone never qualifies — a different-scope or
+// free-global reference resolves to a different symbol (or none) and is rejected here.
+const netUniqueConstDecl = (id: ts.Identifier, checker: ts.TypeChecker): ts.VariableDeclaration | null => {
   const symbol = checker.getSymbolAtLocation(id);
   if (symbol === undefined || symbol.declarations === undefined || symbol.declarations.length !== 1) {
-    return false;
+    return null;
   }
   const decl = symbol.declarations[0];
   if (decl === undefined || !ts.isVariableDeclaration(decl) || !ts.isIdentifier(decl.name) || decl.name.text !== id.text) {
-    return false;
+    return null;
   }
   const list = decl.parent;
-  return ts.isVariableDeclarationList(list) && (list.flags & ts.NodeFlags.Const) !== 0;
+  return ts.isVariableDeclarationList(list) && (list.flags & ts.NodeFlags.Const) !== 0 ? decl : null;
 };
 
-// `staticStringOf` restricted, at every Identifier leaf, to the const the binder proves the
-// reference denotes (see `bindsToCollectedConst`). Used ONLY by the NET free-global member
-// path. Structurally identical to `staticStringOf` otherwise — literals and `+`-folds are
-// resolved exactly as before — so literal concatenation and genuine same-binding const keys
-// keep resolving; only a same-text/different-symbol identifier is demoted to unresolved.
-const netStaticStringOf = (
+// The statically-provable string an expression denotes for the NET path, resolved entirely by the
+// binder: a string literal or substitution-free template, a `+`-fold of such, or an Identifier the
+// binder proves is a unique `const` whose initializer resolves the same way — recursively, with
+// binder identity required at EVERY hop.
+//
+// Two DISTINCT bookkeeping structures, both keyed by DECLARATION identity (never identifier text),
+// so a shared initializer subtree is resolved once instead of exponentially (P2 memoization):
+//   - `seen`: the declarations on the CURRENT resolution path, so an initializer cycle yields
+//     `null` in finite time (a declaration re-entered before it completes is a cycle).
+//   - `memo`: the COMPLETED result of each declaration (a `string`, or `null` for unresolved),
+//     so a second reference to the same declaration — a diamond/doubling chain such as
+//     `aN = aN-1 + aN-1` — reads the cached result rather than recomputing its whole subtree.
+//     `memo.has` distinguishes a cached `null` from "not yet computed", so a genuine unresolved
+//     result never silently becomes a static value. The cache is per top-level key resolution and
+//     keyed by the binder-proven declaration node, so a result for one declaration is NEVER reused
+//     for a different same-text declaration in another scope.
+//
+// A per-resolution `budget` records the identifier hops spent (`netLastResolveVisits`, read by the
+// memoization regression test as deterministic structural evidence) and CAPS them: memoization
+// keeps the hop count linear in the number of const declarations, so a doubling chain costs O(N),
+// never O(2^N). Because resolution is synchronous, an un-memoized regression would block the event
+// loop rather than trip any test timeout — the cap converts that into a fast, deterministic failure.
+// The cap sits far above anything real host/Cockpit source or any genuine const chain produces, so
+// it never fires in normal classification.
+const NET_RESOLVE_VISIT_CAP = 200_000;
+let netLastResolveVisits = 0;
+
+const netResolveString = (
   node: ts.Expression,
-  constMap: ReadonlyMap<string, string>,
   checker: ts.TypeChecker,
+  seen: Set<ts.Declaration>,
+  memo: Map<ts.Declaration, string | null>,
+  budget: { spent: number },
 ): string | null => {
   const n = unwrapExpr(node);
   if (ts.isStringLiteralLike(n)) return n.text;
   if (ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.PlusToken) {
-    const left = netStaticStringOf(n.left, constMap, checker);
+    const left = netResolveString(n.left, checker, seen, memo, budget);
     if (left === null) return null;
-    const right = netStaticStringOf(n.right, constMap, checker);
+    const right = netResolveString(n.right, checker, seen, memo, budget);
     return right === null ? null : left + right;
   }
   if (ts.isIdentifier(n)) {
-    const value = constMap.get(n.text);
-    if (value === undefined) return null;
-    return bindsToCollectedConst(n, checker) ? value : null;
+    budget.spent += 1;
+    if (budget.spent > NET_RESOLVE_VISIT_CAP) {
+      throw new Error('NET constant resolution exceeded its visit budget (memoization regression)');
+    }
+    const decl = netUniqueConstDecl(n, checker);
+    if (decl === null || decl.initializer === undefined) return null;
+    if (memo.has(decl)) return memo.get(decl) ?? null; // completed result (string or cached null)
+    if (seen.has(decl)) return null; // re-entry before completion: cycle (do not cache)
+    seen.add(decl);
+    const value = netResolveString(decl.initializer, checker, seen, memo, budget);
+    seen.delete(decl);
+    memo.set(decl, value);
+    return value;
   }
   return null;
 };
 
 // `memberNameOf` for the NET path: a property name is read directly; an element-access key is
-// resolved with binder-identity gating (`netStaticStringOf`), never by identifier text alone.
+// resolved by `netResolveString` (binder identity at every hop), never by identifier text alone.
+// A fresh `seen`/`memo`/`budget` triple scopes cycle detection, memoization, and the hop budget to
+// this one key resolution; the hops spent are published to `netLastResolveVisits`.
 const netMemberNameOf = (
   node: ts.PropertyAccessExpression | ts.ElementAccessExpression,
-  constMap: ReadonlyMap<string, string>,
   checker: ts.TypeChecker,
 ): string | null => {
   if (ts.isPropertyAccessExpression(node)) return node.name.text;
-  return netStaticStringOf(node.argumentExpression, constMap, checker);
+  const budget = { spent: 0 };
+  const resolved = netResolveString(
+    node.argumentExpression,
+    checker,
+    new Set<ts.Declaration>(),
+    new Map<ts.Declaration, string | null>(),
+    budget,
+  );
+  netLastResolveVisits = budget.spent;
+  return resolved;
 };
 
 /**
@@ -1390,12 +1441,10 @@ const netMemberNameOf = (
  */
 const usesOutboundNetwork = (source: string): boolean => {
   const { checker, sourceFile } = buildBinderProgram(source);
-  // Statically-resolvable string constants for the free-global network-member check (F1):
-  // reuses the existing `collectStringConsts` / `memberNameOf` machinery so a computed member
-  // key that folds to a literal (`'fe' + 'tch'`, a `const key = 'fetch'`) is classified like a
-  // direct literal. A key that does not statically resolve stays `null` here and remains
-  // rejected fail-closed by the independent runtime-code guard — this never weakens that.
-  const constMap = collectStringConsts(sourceFile);
+  // Free-global network members (F1/P2) are resolved by `netMemberNameOf`, which reads string
+  // constants straight off the binder — identity required at the key AND at every initializer hop
+  // (see `netResolveString`) — rather than through the text-keyed const map. A key that does not
+  // statically resolve stays `null` and remains rejected fail-closed by the runtime-code guard.
   let found = false;
   const visit = (node: ts.Node): void => {
     // (0) a runtime dynamic `import('node:http')` is prohibited outright, in every context.
@@ -1407,15 +1456,15 @@ const usesOutboundNetwork = (source: string): boolean => {
         const member = binderMemberName(node);
         if (member === null || !HTTP_SERVER_VALUE_MEMBERS.has(member)) found = true;
       }
-      // F1 — a free-global network member (`fetch`/`WebSocket`) resolved through the static-string
-      //     machinery under a BINDER-IDENTITY gate (P2, `netMemberNameOf`): a direct literal, a
-      //     `+`-fold (`'fe' + 'tch'`), or a unique immutable `const key = 'fetch'` whose reference
-      //     the binder proves denotes that same const. A key whose identifier resolves to a
-      //     different same-text binding (or to no in-file binding) is NOT substituted — it stays
-      //     `null` here, so `globalThis[Infinity]` with an out-of-scope `const Infinity = 'fetch'`
-      //     is not a phantom member. A genuinely indeterminate key likewise resolves to `null` and
-      //     is not flagged here (the runtime-code guard rejects it fail-closed).
-      const globalMember = netMemberNameOf(node, constMap, checker);
+      // F1/P2 — a free-global network member (`fetch`/`WebSocket`) resolved by `netMemberNameOf`
+      //     under RECURSIVE binder identity: a direct literal, a `+`-fold (`'fe' + 'tch'`), or a
+      //     unique immutable `const` chain (`const a = 'fetch'; const key = a`) whose key AND every
+      //     initializer identifier the binder proves denote the collected const. A key — or any
+      //     initializer identifier in its chain — that resolves to a different same-text binding
+      //     (or to no in-file binding, e.g. `const key = Infinity` folding an out-of-scope
+      //     `const Infinity = 'fetch'`) is NOT substituted; it stays `null` here. A genuinely
+      //     indeterminate key likewise resolves to `null` (the runtime-code guard rejects it).
+      const globalMember = netMemberNameOf(node, checker);
       if (globalMember !== null && NETWORK_GLOBAL_NAMES.has(globalMember) && isFreeGlobalReceiver(node.expression, checker, sourceFile)) {
         found = true;
       }
@@ -5195,4 +5244,188 @@ describe('D3 host resolves computed network-member keys by binder identity (D3-C
       expect(usesRuntimeCodeGeneration(source)).toBe(true);
     });
   }
+});
+
+// ---------------------------------------------------------------------------
+// P2 (follow-up): binder identity must hold through the ENTIRE initializer-resolution chain, not
+// only at the final element-access key (D3-CX-POLICY-NET-BIND-INIT). Gating just the key left a
+// second hole: `const key = Infinity` is itself a genuine same-symbol const reference, but its
+// initializer `Infinity` was resolved by text-only const collection and folded to a phantom
+// `'fetch'` from an out-of-scope `const Infinity = 'fetch'`. The NET path now resolves strings
+// straight off the binder (`netResolveString`): every identifier hop — the key and every
+// identifier reached while resolving a collected initializer — must resolve to the unique `const`
+// declaration whose value is being substituted, recursively, bounded against initializer cycles.
+// A genuine multi-hop same-symbol chain still folds and is still rejected; a chain poisoned at any
+// hop demotes to unresolved and is left to the fail-closed runtime-code guard.
+// ---------------------------------------------------------------------------
+describe('D3 host binds identifiers inside collected constant initializers (D3-CX-POLICY-NET-BIND-INIT)', () => {
+  // The verified reproducer is a genuine FALSE POSITIVE: NET no longer flags it AND the
+  // runtime-code guard does not either — the source is truly accepted, not merely shifted.
+  it('accepts the verified reproducer (poisoned initializer const key = Infinity) by both guards', () => {
+    const reproducer = `function f() {\n  const Infinity = 'fetch';\n}\nconst key = Infinity;\nvoid globalThis[key];`;
+    expect(usesOutboundNetwork(reproducer)).toBe(false);
+    expect(usesRuntimeCodeGeneration(reproducer)).toBe(false);
+  });
+
+  // ALLOW — the key is a genuine unique const, but an identifier INSIDE its initializer chain does
+  // not lexically resolve to the collected declaration, so the fold is not binder-proven.
+  const allowPoisonedInit: readonly { readonly form: string; readonly source: string }[] = [
+    {
+      form: 'a function-scoped const Infinity folded into a module const initializer',
+      source: `function f() {\n  const Infinity = 'fetch';\n}\nconst key = Infinity;\nvoid globalThis[key];`,
+    },
+    {
+      form: 'a block-scoped const Infinity folded into a module const initializer',
+      source: `{\n  const Infinity = 'fetch';\n}\nconst key = Infinity;\nvoid globalThis[key];`,
+    },
+    {
+      form: 'a sibling-scope const marker folded into a module const initializer',
+      source: `function f() {\n  const marker = 'fetch';\n}\nconst key = marker;\nvoid globalThis[key];`,
+    },
+    {
+      form: 'a concatenation initializer where one segment resolves to a different binding',
+      source: `function f() {\n  const seg = 'tch';\n}\nconst a = 'fe';\nconst key = a + seg;\nvoid globalThis[key];`,
+    },
+    {
+      form: 'a parameter-shadow initializer',
+      source: `const label = 'fetch';\nfunction f(label: string) {\n  const key = label;\n  return globalThis[key];\n}\nvoid f;`,
+    },
+    {
+      form: 'an import-shadow initializer',
+      source: `import { thing } from './x.js';\nconst key = thing;\nvoid globalThis[key];`,
+    },
+    {
+      form: 'a free-global identifier initializer under noLib',
+      source: `const key = Infinity;\nvoid globalThis[key];`,
+    },
+    {
+      form: 'a same-text sibling-scope const referenced from another function initializer',
+      source: `function a() {\n  const Infinity = 'fetch';\n  void Infinity;\n}\nfunction b() {\n  const key = Infinity;\n  void globalThis[key];\n}\nvoid a;\nvoid b;`,
+    },
+  ];
+  for (const { form, source } of allowPoisonedInit) {
+    it(`ALLOWS ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+
+  // REJECT — genuine multi-hop same-symbol chains: every identifier resolves to the collected
+  // declaration, for both fetch and WebSocket, call and constructor, incl. an optional key.
+  const rejectGenuineChain: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a one-hop const key = a', source: `const a = 'fetch';\nconst key = a;\nglobalThis[key]('https://example.com/');` },
+    { form: "a concat const key = a + 'tch'", source: `const a = 'fe';\nconst key = a + 'tch';\nglobalThis[key]('https://example.com/');` },
+    { form: 'a two-hop const key = b = a chain', source: `const a = 'fe';\nconst b = a + 'tch';\nconst key = b;\nglobalThis[key]('https://example.com/');` },
+    { form: 'a WebSocket const ws = a', source: `const a = 'WebSocket';\nconst ws = a;\nvoid new globalThis[ws]('wss://example.com/');` },
+    { form: "a WebSocket concat const ws = a + 'Socket'", source: `const a = 'Web';\nconst ws = a + 'Socket';\nvoid new globalThis[ws]('wss://example.com/');` },
+    { form: 'an optional-computed same-symbol key', source: `const key = 'fetch';\nglobalThis?.[key]('https://example.com/');` },
+    { form: 'a direct literal element key', source: `globalThis['fetch']('https://example.com/');` },
+  ];
+  for (const { form, source } of rejectGenuineChain) {
+    it(`REJECTS ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // FAIL-CLOSED — a chain the NET path cannot binder-prove (ambient initializer, or a cycle) is
+  // not flagged by NET but REMAINS rejected fail-closed by the runtime-code guard, and cycle
+  // resolution TERMINATES. No outbound-network bypass is opened.
+  const failClosedChain: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'an ambient-declare initializer const key = k', source: `declare const k: string;\nconst key = k;\nglobalThis[key]('https://example.com/');` },
+    { form: 'a two-const initializer cycle a = b, b = a', source: `const a = b;\nconst b = a;\nvoid globalThis[a];` },
+    { form: 'a self-referential initializer const a = a', source: `const a = a;\nvoid globalThis[a];` },
+  ];
+  for (const { form, source } of failClosedChain) {
+    it(`keeps ${form} out of NET but rejected by the runtime-code guard (terminates)`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+      expect(usesRuntimeCodeGeneration(source)).toBe(true);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// P2 (second-order): NET recursive resolution must MEMOIZE by declaration identity, not merely
+// detect cycles path-locally (D3-CX-POLICY-NET-BIND-MEMO). Without a completed-result cache a
+// shared initializer subtree is recomputed on every reference, so a doubling chain
+// `aN = aN-1 + aN-1` costs 2^N resolutions (~22.5 s at N=22 on ~500 bytes). `netResolveString`
+// now caches each declaration's completed result (string or null) keyed by the binder-proven
+// declaration node — distinct from the cycle set — so every declaration's initializer is resolved
+// at most once. Binder identity stays authoritative at every hop, the cache never crosses scopes
+// (it is keyed by declaration, never text), a cached null never becomes a static value, and cycles
+// still terminate fail-closed.
+// ---------------------------------------------------------------------------
+describe('D3 host memoizes NET constant resolution by declaration identity (D3-CX-POLICY-NET-BIND-MEMO)', () => {
+  const doubling = (n: number, base: string): string => {
+    const lines = [`const a0 = '${base}';`];
+    for (let i = 1; i <= n; i++) lines.push(`const a${String(i)} = a${String(i - 1)} + a${String(i - 1)};`);
+    lines.push(`void globalThis[a${String(n)}];`);
+    return lines.join('\n');
+  };
+  const linear = (n: number, base: string): string => {
+    const lines = [`const a0 = '${base}';`];
+    for (let i = 1; i <= n; i++) lines.push(`const a${String(i)} = a${String(i - 1)};`);
+    lines.push(`globalThis[a${String(n)}]('https://example.com/');`);
+    return lines.join('\n');
+  };
+
+  // Shared-subtree (doubling) chain. With an empty base the resolved value is O(1) while the
+  // recomputation tree is 2^N without memo. `netLastResolveVisits` is the number of identifier hops
+  // the resolver actually spent: declaration-keyed memoization keeps it LINEAR in the declaration
+  // count (~2N), so a small bound here is deterministic structural evidence of memoization. An
+  // un-memoized resolver would spend 2^60 hops — impossible — and trip the visit cap at once
+  // (a fast throw, not a hang). The empty key is not a network global, so NET is not flagged.
+  it('resolves a shared-subtree doubling chain N=60 in a linear number of hops (memoized)', () => {
+    netLastResolveVisits = 0;
+    expect(usesOutboundNetwork(doubling(60, ''))).toBe(false);
+    expect(netLastResolveVisits).toBeGreaterThan(0);
+    expect(netLastResolveVisits).toBeLessThan(1000);
+  });
+
+  // The exact reported adversarial family (a0 = 'fe'), well beyond the prior N=22 failure point:
+  // the hop count is likewise linear, and the once-built value is not a network global.
+  it('resolves the reported doubling family N=24 (a0 = fe) in a linear number of hops', () => {
+    netLastResolveVisits = 0;
+    expect(usesOutboundNetwork(doubling(24, 'fe'))).toBe(false);
+    expect(netLastResolveVisits).toBeGreaterThan(0);
+    expect(netLastResolveVisits).toBeLessThan(1000);
+  });
+
+  // A long linear chain still resolves and rejects the genuine capability, fast.
+  it('rejects a long linear const chain resolving to fetch (N=40)', () => {
+    expect(usesOutboundNetwork(linear(40, 'fetch'))).toBe(true);
+  }, 4000);
+
+  // Cycles: memo + cycle interaction terminates and stays fail-closed (NET null, RC rejects).
+  const cycles: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a self cycle const a = a', source: `const a = a;\nglobalThis[a]('https://example.com/');` },
+    { form: 'a 2-node cycle a = b, b = a', source: `const a = b;\nconst b = a;\nglobalThis[a]('https://example.com/');` },
+    { form: 'a 3-node cycle a = b, b = c, c = a', source: `const a = b;\nconst b = c;\nconst c = a;\nglobalThis[a]('https://example.com/');` },
+  ];
+  for (const { form, source } of cycles) {
+    it(`keeps ${form} out of NET but rejected fail-closed (terminates)`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+      expect(usesRuntimeCodeGeneration(source)).toBe(true);
+    }, 4000);
+  }
+
+  // Declaration-identity cache must not leak between same-text declarations in different scopes.
+  it('rejects globalThis[s] where s resolves to a function-local const fetch', () => {
+    expect(
+      usesOutboundNetwork(`function f() {\n  const s = 'fetch';\n  return globalThis[s]('https://example.com/');\n}\nvoid f;`),
+    ).toBe(true);
+  });
+  it('allows globalThis[s] where a same-text s resolves to a benign function-local const', () => {
+    expect(usesOutboundNetwork(`function g() {\n  const s = 'safe';\n  return globalThis[s];\n}\nvoid g;`)).toBe(false);
+  });
+  it('does not reuse a module const fetch value for a shadowing function-local const', () => {
+    expect(
+      usesOutboundNetwork(`const a = 'fetch';\nfunction f() {\n  const a = 'safe';\n  return globalThis[a];\n}\nvoid f;\nvoid a;`),
+    ).toBe(false);
+  });
+
+  // Two distinct declarations sharing initializer text each resolve independently (no conflation).
+  it('rejects the genuine one of two distinct decls sharing initializer text', () => {
+    expect(
+      usesOutboundNetwork(`const m1 = 'fetch';\nconst m2 = 'fetch';\nvoid m1;\nglobalThis[m2]('https://example.com/');`),
+    ).toBe(true);
+  });
 });
