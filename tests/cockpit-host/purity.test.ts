@@ -1362,15 +1362,16 @@ const netUniqueConstDecl = (id: ts.Identifier, checker: ts.TypeChecker): ts.Vari
 //     keyed by the binder-proven declaration node, so a result for one declaration is NEVER reused
 //     for a different same-text declaration in another scope.
 //
-// A per-resolution `budget` records the identifier hops spent (`netLastResolveVisits`, read by the
-// memoization regression test as deterministic structural evidence) and CAPS them: memoization
-// keeps the hop count linear in the number of const declarations, so a doubling chain costs O(N),
-// never O(2^N). Because resolution is synchronous, an un-memoized regression would block the event
-// loop rather than trip any test timeout — the cap converts that into a fast, deterministic failure.
-// The cap sits far above anything real host/Cockpit source or any genuine const chain produces, so
-// it never fires in normal classification.
+// A per-member `budget` records the identifier hops ONE member resolution spends and CAPS them:
+// memoization keeps the hop count linear in the number of const declarations, so a doubling chain
+// costs O(N), never O(2^N). Because resolution is synchronous, an un-memoized regression would
+// block the event loop rather than trip a test timeout — the cap converts that into a fast,
+// deterministic failure. `netResolveVisits` accumulates hops across ALL member resolutions of ONE
+// `usesOutboundNetwork` traversal (reset at its start), so a test can prove the CROSS-member cost
+// is O(N + M) — a chain reused by M accesses is resolved once — not O(M × N). Both bounds sit far
+// above anything real host/Cockpit source or any genuine const chain produces.
 const NET_RESOLVE_VISIT_CAP = 200_000;
-let netLastResolveVisits = 0;
+let netResolveVisits = 0;
 
 const netResolveString = (
   node: ts.Expression,
@@ -1388,7 +1389,8 @@ const netResolveString = (
     return right === null ? null : left + right;
   }
   if (ts.isIdentifier(n)) {
-    budget.spent += 1;
+    netResolveVisits += 1; // cumulative across the whole usesOutboundNetwork traversal (test evidence)
+    budget.spent += 1; // per-member cap: prevents a single member's exponential from hanging
     if (budget.spent > NET_RESOLVE_VISIT_CAP) {
       throw new Error('NET constant resolution exceeded its visit budget (memoization regression)');
     }
@@ -1407,23 +1409,18 @@ const netResolveString = (
 
 // `memberNameOf` for the NET path: a property name is read directly; an element-access key is
 // resolved by `netResolveString` (binder identity at every hop), never by identifier text alone.
-// A fresh `seen`/`memo`/`budget` triple scopes cycle detection, memoization, and the hop budget to
-// this one key resolution; the hops spent are published to `netLastResolveVisits`.
+// The completed-result `memo` is SHARED across every member resolution of one `usesOutboundNetwork`
+// traversal, so a const chain reused by many accesses is resolved once (O(N + M), not O(M × N)). A
+// fresh `seen`/`budget` per call keeps active-path cycle detection and the per-member cap local: a
+// completed result is context-independent, so sharing it is sound, whereas sharing in-progress path
+// state would not be.
 const netMemberNameOf = (
   node: ts.PropertyAccessExpression | ts.ElementAccessExpression,
   checker: ts.TypeChecker,
+  memo: Map<ts.Declaration, string | null>,
 ): string | null => {
   if (ts.isPropertyAccessExpression(node)) return node.name.text;
-  const budget = { spent: 0 };
-  const resolved = netResolveString(
-    node.argumentExpression,
-    checker,
-    new Set<ts.Declaration>(),
-    new Map<ts.Declaration, string | null>(),
-    budget,
-  );
-  netLastResolveVisits = budget.spent;
-  return resolved;
+  return netResolveString(node.argumentExpression, checker, new Set<ts.Declaration>(), memo, { spent: 0 });
 };
 
 /**
@@ -1445,6 +1442,13 @@ const usesOutboundNetwork = (source: string): boolean => {
   // constants straight off the binder — identity required at the key AND at every initializer hop
   // (see `netResolveString`) — rather than through the text-keyed const map. A key that does not
   // statically resolve stays `null` and remains rejected fail-closed by the runtime-code guard.
+  //
+  // ONE completed-result memo is shared by every member resolution in THIS traversal, so a const
+  // chain reused across many accesses is resolved once (O(N + M), not O(M × N)). It is keyed by the
+  // binder's declaration nodes for this Program, so it cannot leak into another `usesOutboundNetwork`
+  // call. `netResolveVisits` is reset here to make the cumulative hop count observable to tests.
+  const netMemo = new Map<ts.Declaration, string | null>();
+  netResolveVisits = 0;
   let found = false;
   const visit = (node: ts.Node): void => {
     // (0) a runtime dynamic `import('node:http')` is prohibited outright, in every context.
@@ -1464,7 +1468,7 @@ const usesOutboundNetwork = (source: string): boolean => {
       //     (or to no in-file binding, e.g. `const key = Infinity` folding an out-of-scope
       //     `const Infinity = 'fetch'`) is NOT substituted; it stays `null` here. A genuinely
       //     indeterminate key likewise resolves to `null` (the runtime-code guard rejects it).
-      const globalMember = netMemberNameOf(node, checker);
+      const globalMember = netMemberNameOf(node, checker, netMemo);
       if (globalMember !== null && NETWORK_GLOBAL_NAMES.has(globalMember) && isFreeGlobalReceiver(node.expression, checker, sourceFile)) {
         found = true;
       }
@@ -5368,25 +5372,23 @@ describe('D3 host memoizes NET constant resolution by declaration identity (D3-C
   };
 
   // Shared-subtree (doubling) chain. With an empty base the resolved value is O(1) while the
-  // recomputation tree is 2^N without memo. `netLastResolveVisits` is the number of identifier hops
-  // the resolver actually spent: declaration-keyed memoization keeps it LINEAR in the declaration
-  // count (~2N), so a small bound here is deterministic structural evidence of memoization. An
-  // un-memoized resolver would spend 2^60 hops — impossible — and trip the visit cap at once
-  // (a fast throw, not a hang). The empty key is not a network global, so NET is not flagged.
+  // recomputation tree is 2^N without memo. `netResolveVisits` is the number of identifier hops the
+  // resolver actually spent across this single-access traversal: declaration-keyed memoization keeps
+  // it LINEAR in the declaration count (~2N), so a small bound here is deterministic structural
+  // evidence of memoization. An un-memoized resolver would spend 2^60 hops — impossible — and trip
+  // the visit cap at once (a fast throw, not a hang). The empty key is not a network global.
   it('resolves a shared-subtree doubling chain N=60 in a linear number of hops (memoized)', () => {
-    netLastResolveVisits = 0;
     expect(usesOutboundNetwork(doubling(60, ''))).toBe(false);
-    expect(netLastResolveVisits).toBeGreaterThan(0);
-    expect(netLastResolveVisits).toBeLessThan(1000);
+    expect(netResolveVisits).toBeGreaterThan(0);
+    expect(netResolveVisits).toBeLessThan(1000);
   });
 
   // The exact reported adversarial family (a0 = 'fe'), well beyond the prior N=22 failure point:
   // the hop count is likewise linear, and the once-built value is not a network global.
   it('resolves the reported doubling family N=24 (a0 = fe) in a linear number of hops', () => {
-    netLastResolveVisits = 0;
     expect(usesOutboundNetwork(doubling(24, 'fe'))).toBe(false);
-    expect(netLastResolveVisits).toBeGreaterThan(0);
-    expect(netLastResolveVisits).toBeLessThan(1000);
+    expect(netResolveVisits).toBeGreaterThan(0);
+    expect(netResolveVisits).toBeLessThan(1000);
   });
 
   // A long linear chain still resolves and rejects the genuine capability, fast.
@@ -5427,5 +5429,127 @@ describe('D3 host memoizes NET constant resolution by declaration identity (D3-C
     expect(
       usesOutboundNetwork(`const m1 = 'fetch';\nconst m2 = 'fetch';\nvoid m1;\nglobalThis[m2]('https://example.com/');`),
     ).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P2 (cross-member): the completed-result memo must be SHARED across every member resolution in one
+// `usesOutboundNetwork` traversal (D3-CX-POLICY-NET-BIND-XMEMO). Previously `netMemberNameOf` built
+// a fresh memo per access, so an N-declaration chain reused by M member accesses was resolved M
+// times — Θ(M × N) cumulative, unbounded by the per-member cap. One memo hoisted into the traversal
+// makes the cumulative cost O(N + M): each declaration is resolved once and reused. The memo stays
+// keyed by exact declaration identity and is created fresh per traversal, so it never leaks between
+// sources; per-member `seen`/budget stay local, preserving cycle detection and the cap.
+// ---------------------------------------------------------------------------
+describe('D3 host shares the NET declaration memo across member resolutions (D3-CX-POLICY-NET-BIND-XMEMO)', () => {
+  const chain = (n: number, base: string): string[] => {
+    const lines = [`const a0 = '${base}';`];
+    for (let i = 1; i <= n; i++) lines.push(`const a${String(i)} = a${String(i - 1)} + a${String(i - 1)};`);
+    return lines;
+  };
+
+  // 1. Same key repeated M times — cumulative work grows ADDITIVELY with M, not multiplicatively.
+  it('resolves a repeated key chain in additive (O(N+M)), not multiplicative (O(N*M)), work', () => {
+    const src = (n: number, m: number): string => {
+      const lines = chain(n, '');
+      for (let j = 0; j < m; j++) lines.push(`void globalThis[a${String(n)}];`);
+      return lines.join('\n');
+    };
+    expect(usesOutboundNetwork(src(50, 1))).toBe(false);
+    const c1 = netResolveVisits;
+    expect(usesOutboundNetwork(src(50, 100))).toBe(false);
+    const c100 = netResolveVisits;
+    // Shared memo: the 50-chain is resolved once; each extra access is a single memoized hop, so
+    // 100 accesses cost the 1-access cost plus ~M. Un-shared memo would give c100 ≈ 100 × c1.
+    expect(c1).toBeGreaterThan(0);
+    expect(c100).toBeLessThan(c1 + 400);
+  });
+
+  // 2. One chain referenced by many DISTINCT key declarations — resolved once, shared by all.
+  it('shares one chain across many distinct key declarations', () => {
+    const lines = chain(50, '');
+    const m = 100;
+    for (let j = 0; j < m; j++) lines.push(`const k${String(j)} = a50;`);
+    for (let j = 0; j < m; j++) lines.push(`void globalThis[k${String(j)}];`);
+    expect(usesOutboundNetwork(lines.join('\n'))).toBe(false);
+    // a0..a50 resolved ONCE and shared; each of 100 keys adds O(1). Un-shared → ~100× more hops.
+    expect(netResolveVisits).toBeLessThan(1000);
+  });
+
+  // 3. Same chain read through many UNRELATED (non-global) receivers — resolution still shared.
+  it('shares chain resolution across unrelated non-global receivers', () => {
+    const lines = chain(50, '');
+    lines.push('const obj: Record<string, unknown> = {};');
+    lines.push('const key = a50;');
+    const m = 100;
+    for (let j = 0; j < m; j++) lines.push('void obj[key];');
+    expect(usesOutboundNetwork(lines.join('\n'))).toBe(false); // obj is not a global receiver
+    expect(netResolveVisits).toBeLessThan(1000);
+  });
+
+  // 4. Independent chains are cached separately (no cross-chain contamination); WebSocket rejected.
+  it('caches independent chains separately', () => {
+    const src = [
+      `const a0 = 'fe';`,
+      `const a1 = a0 + a0;`,
+      `const b0 = 'WebSocket';`,
+      `const bk = b0;`,
+      `void globalThis[a1];`, // 'fefe' — not a network global → allowed
+      `new globalThis[bk]('wss://example.com/');`, // WebSocket → rejected
+    ].join('\n');
+    expect(usesOutboundNetwork(src)).toBe(true);
+  });
+
+  // Cache lifetime: the memo must NOT leak between separate usesOutboundNetwork calls (fresh memo,
+  // declaration-keyed for each Program), in either order.
+  it('does not leak the memo between separate usesOutboundNetwork calls', () => {
+    expect(usesOutboundNetwork(`const key = 'safe';\nvoid globalThis[key];`)).toBe(false);
+    expect(usesOutboundNetwork(`const key = 'fetch';\nglobalThis[key]('https://example.com/');`)).toBe(true);
+    expect(usesOutboundNetwork(`const key = 'fetch';\nglobalThis[key]('https://example.com/');`)).toBe(true);
+    expect(usesOutboundNetwork(`const key = 'safe';\nvoid globalThis[key];`)).toBe(false);
+  });
+
+  // A failed (poisoned → null) chain and a genuine chain coexist in the shared memo without
+  // contaminating one another (both orders exercised by the two accesses).
+  it('keeps a poisoned (null) and a genuine chain independent within one source', () => {
+    const src = [
+      `function f() { const p = 'fetch'; void p; }`,
+      `const bad = p;`, // out-of-scope p → null → that access allowed
+      `const good = 'fetch';`,
+      `void globalThis[bad];`,
+      `globalThis[good]('https://example.com/');`, // genuine → rejected overall
+    ].join('\n');
+    expect(usesOutboundNetwork(src)).toBe(true);
+  });
+
+  // Cached NULL is reused for a repeated poisoned key (no per-access recomputation, still allowed).
+  it('reuses a cached null result for a repeated poisoned key', () => {
+    const lines = [`function f() { const marker = 'fetch'; void marker; }`, `const key = marker;`];
+    for (let j = 0; j < 50; j++) lines.push('void globalThis[key];');
+    expect(usesOutboundNetwork(lines.join('\n'))).toBe(false);
+    expect(netResolveVisits).toBeLessThan(1000);
+  });
+
+  // Cycles still terminate and fail closed with the shared memo (in-progress state is never cached).
+  const cycles: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'self cycle', source: `const a = a;\nglobalThis[a]('https://example.com/');\nvoid globalThis[a];` },
+    { form: '2-node cycle', source: `const a = b;\nconst b = a;\nglobalThis[a]('https://example.com/');\nvoid globalThis[b];` },
+    { form: '3-node cycle', source: `const a = b;\nconst b = c;\nconst c = a;\nglobalThis[a]('https://example.com/');\nvoid globalThis[c];` },
+  ];
+  for (const { form, source } of cycles) {
+    it(`terminates a ${form} and fails closed with a shared memo`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+      expect(usesRuntimeCodeGeneration(source)).toBe(true);
+    });
+  }
+
+  // Prior binding fixes are preserved under the shared memo: poisoned keys allowed, genuine rejected.
+  it('preserves the poisoned-initializer ALLOW under the shared memo', () => {
+    expect(usesOutboundNetwork(`function f() {\n  const Infinity = 'fetch';\n}\nvoid globalThis[Infinity];`)).toBe(false);
+    expect(usesOutboundNetwork(`function f() {\n  const Infinity = 'fetch';\n}\nconst key = Infinity;\nvoid globalThis[key];`)).toBe(false);
+  });
+  it('preserves the genuine-chain REJECT under the shared memo', () => {
+    expect(usesOutboundNetwork(`const a = 'fetch';\nconst b = a;\nconst key = b;\nglobalThis[key]('https://example.com/');`)).toBe(true);
+    expect(usesOutboundNetwork(`const a = 'Web';\nconst ws = a + 'Socket';\nvoid new globalThis[ws]('wss://example.com/');`)).toBe(true);
   });
 });
