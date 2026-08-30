@@ -935,8 +935,61 @@ const isDirectNodeHttpNamespace = (symbol: ts.Symbol | undefined): boolean => {
   );
 };
 
+// The static property KEY an object-binding element reads from its receiver: an explicit
+// `propertyName` (identifier / string-literal / static computed string-literal), or, for the
+// shorthand `{ name }`, the bound identifier itself. Null when the key is not statically
+// identifiable — fail-closed as HTTP_CLIENT off an HTTP_NS receiver, exactly as the original
+// single-hop rule did.
+const bindingElementKey = (el: ts.BindingElement): string | null => {
+  const key = el.propertyName;
+  if (key === undefined) return ts.isIdentifier(el.name) ? el.name.text : null;
+  if (ts.isIdentifier(key) || ts.isStringLiteralLike(key)) return key.text;
+  if (ts.isComputedPropertyName(key) && ts.isStringLiteralLike(key.expression)) return key.expression.text;
+  return null;
+};
+
+// The node:http capability a member named `key` yields off a receiver of capability `recv`,
+// mirroring member-access semantics (`classifyHttpExpression`): off the namespace,
+// `createServer` is the one permitted server value and every other member (a non-static key
+// included) is an outbound HTTP_CLIENT; off an HTTP_CLIENT value every member stays
+// HTTP_CLIENT; nothing else propagates. No new capability kind, no member blacklist.
+const httpMemberCapability = (recv: HttpCapability, key: string | null): HttpCapability => {
+  if (recv === 'HTTP_NS') return key !== null && HTTP_SERVER_VALUE_MEMBERS.has(key) ? 'CREATE_SERVER' : 'HTTP_CLIENT';
+  if (recv === 'HTTP_CLIENT') return 'HTTP_CLIENT';
+  return 'NONE';
+};
+
+// The capability a single OBJECT-destructuring binding element acquires, propagated
+// RECURSIVELY through nested object binding patterns from the enclosing variable
+// declaration's initializer (still the sole acquisition root, resolved ONE hop to the
+// node:http namespace — no alias chains, no value-flow). A top-level element
+// `{ request } = http` reduces to the original single-hop rule; a nested
+// `{ globalAgent: { createConnection } } = http` propagates HTTP_NS → HTTP_CLIENT →
+// HTTP_CLIENT structurally down the pattern until this element's bound name is reached.
+// Only object patterns carry named members; an array binding pattern or a non-namespace
+// initializer does not propagate. Finite: one step per binding-pattern nesting level.
+const bindingElementHttpCapability = (el: ts.BindingElement, checker: ts.TypeChecker): HttpCapability => {
+  const pattern = el.parent;
+  if (!ts.isObjectBindingPattern(pattern)) return 'NONE';
+  const container = pattern.parent;
+  let receiver: HttpCapability;
+  if (ts.isVariableDeclaration(container)) {
+    const initializer = container.initializer;
+    if (initializer === undefined) return 'NONE';
+    const rhs = binderUnwrap(initializer);
+    receiver = ts.isIdentifier(rhs) && isDirectNodeHttpNamespace(checker.getSymbolAtLocation(rhs)) ? 'HTTP_NS' : 'NONE';
+  } else if (ts.isBindingElement(container)) {
+    receiver = bindingElementHttpCapability(container, checker);
+  } else {
+    return 'NONE';
+  }
+  if (receiver === 'NONE') return 'NONE';
+  return httpMemberCapability(receiver, bindingElementKey(el));
+};
+
 // Classify a single DECLARATION. Bounded: a node:http import, or a destructuring whose
-// initializer DIRECTLY resolves to the node:http namespace (one hop, no alias chains).
+// initializer DIRECTLY resolves to the node:http namespace (one hop, no alias chains),
+// propagated through nested object binding patterns to the bound name.
 const classifyHttpDeclaration = (decl: ts.Declaration, checker: ts.TypeChecker): HttpCapability => {
   if (ts.isNamespaceImport(decl)) return declarationImportSpecifier(decl) === 'node:http' ? 'HTTP_NS' : 'NONE';
   if (ts.isImportClause(decl) && decl.name !== undefined) {
@@ -948,27 +1001,8 @@ const classifyHttpDeclaration = (decl: ts.Declaration, checker: ts.TypeChecker):
     const imported = (decl.propertyName ?? decl.name).text;
     return HTTP_SERVER_VALUE_MEMBERS.has(imported) ? 'CREATE_SERVER' : 'HTTP_CLIENT';
   }
-  if (ts.isBindingElement(decl) && ts.isObjectBindingPattern(decl.parent) && ts.isVariableDeclaration(decl.parent.parent)) {
-    const initializer = decl.parent.parent.initializer;
-    if (initializer !== undefined) {
-      const rhs = binderUnwrap(initializer);
-      if (ts.isIdentifier(rhs) && isDirectNodeHttpNamespace(checker.getSymbolAtLocation(rhs))) {
-        const key = decl.propertyName;
-        const member =
-          key === undefined
-            ? ts.isIdentifier(decl.name)
-              ? decl.name.text
-              : null
-            : ts.isIdentifier(key)
-              ? key.text
-              : ts.isStringLiteralLike(key)
-                ? key.text
-                : ts.isComputedPropertyName(key) && ts.isStringLiteralLike(key.expression)
-                  ? key.expression.text
-                  : null;
-        return member !== null && HTTP_SERVER_VALUE_MEMBERS.has(member) ? 'CREATE_SERVER' : 'HTTP_CLIENT';
-      }
-    }
+  if (ts.isBindingElement(decl) && ts.isObjectBindingPattern(decl.parent)) {
+    return bindingElementHttpCapability(decl, checker);
   }
   return 'NONE';
 };
@@ -4680,6 +4714,39 @@ describe('D3 host tracks node:http capability through dynamic import and destruc
       ),
     ).toBe(true);
   });
+
+  // F2 (NESTED) — capability propagates RECURSIVELY through nested object destructuring off an
+  //     HTTP_NS binding (Codex P1 witness). The inner binding element sits under an OUTER binding
+  //     element rather than directly under the variable declaration, yet still acquires the
+  //     outbound client member. Each level reduces to the single-hop F2 member rule (HTTP_NS →
+  //     createServer is the one server value, every other member is HTTP_CLIENT; off an
+  //     HTTP_CLIENT value every member stays HTTP_CLIENT). No alias chains, no value-flow: the
+  //     acquisition root is still the one-hop node:http namespace initializer, walked structurally
+  //     down the binding pattern. Array patterns and non-namespace initializers do not propagate.
+  const nestedReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'the exact Codex witness: nested { globalAgent: { createConnection } } off a namespace import', source: `import * as http from 'node:http';\nconst {\n  globalAgent: { createConnection },\n} = http;\ncreateConnection({ host: 'example.com', port: 80 });` },
+    { form: 'a nested aliased { globalAgent: { createConnection: connect } }', source: `import * as http from 'node:http';\nconst {\n  globalAgent: { createConnection: connect },\n} = http;\nconnect({ host: 'example.com', port: 80 });` },
+    { form: 'a nested default { globalAgent: { createConnection: connect = fallback } }', source: `import * as http from 'node:http';\nconst fallback = (_o: { host: string; port: number }): void => {};\nconst {\n  globalAgent: { createConnection: connect = fallback },\n} = http;\nconnect({ host: 'example.com', port: 80 });` },
+    { form: 'a three-level nested { globalAgent: { pool: { createConnection } } }', source: `import * as http from 'node:http';\nconst {\n  globalAgent: { pool: { createConnection } },\n} = http;\ncreateConnection({ host: 'example.com', port: 80 });` },
+    { form: 'the same nesting off a default import resolving to the same HTTP_NS binding', source: `import http from 'node:http';\nconst {\n  globalAgent: { createConnection },\n} = http;\ncreateConnection({ host: 'example.com', port: 80 });` },
+  ];
+  for (const { form, source } of nestedReject) {
+    it(`REJECTS ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  const nestedAllow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a top-level { createServer } off a namespace import (unchanged)', source: `import * as http from 'node:http';\nconst { createServer } = http;\ncreateServer(() => {});` },
+    { form: 'a nested { createServer } that stays the one permitted server value', source: `import * as http from 'node:http';\nconst {\n  createServer,\n} = http;\ncreateServer(() => {});` },
+    { form: 'the same nested shape off an unrelated local object (not node:http)', source: `const cfg = {\n  globalAgent: { createConnection: (_o: { host: string }) => _o },\n};\nconst {\n  globalAgent: { createConnection },\n} = cfg;\nvoid createConnection({ host: 'x' });` },
+    { form: 'a type-only namespace import used only in a type position (unchanged)', source: `import type * as http from 'node:http';\ntype Conn = http.Server;\nvoid 0 as unknown as Conn;` },
+  ];
+  for (const { form, source } of nestedAllow) {
+    it(`ALLOWS ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
 });
 
 // ---------------------------------------------------------------------------
