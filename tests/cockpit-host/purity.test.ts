@@ -1306,6 +1306,216 @@ const acquiresInboundServerSocket = (checker: ts.TypeChecker, sourceFile: ts.Sou
   return found;
 };
 
+// F1/P2 — recursive binder-identity resolution for the NET free-global member check
+// (D3-CX-POLICY-NET-BIND). `collectStringConsts` keys a resolved constant by identifier TEXT and,
+// while resolving a `const`'s initializer, folds EVERY identifier leaf by text too. For the NET
+// free-global member path that is unsound at two levels: (1) the element-access key identifier
+// itself may resolve to a DIFFERENT same-text binding, and (2) even a genuine same-symbol key
+// (`const key = Infinity`) can carry a value that was folded from an out-of-scope
+// `const Infinity = 'fetch'` INSIDE its initializer — binding identity is lost during initializer
+// resolution. Identifier text equality is never binding identity; the compiler binder is authority.
+//
+// The NET path therefore resolves strings itself, straight off the binder, WITHOUT consulting the
+// text-keyed const map: every Identifier hop — the key and every identifier reached while resolving
+// a collected initializer — must resolve (via `checker.getSymbolAtLocation`) to a single
+// `const <text> = <init>` declaration of matching text, and that declaration's initializer is then
+// resolved under the SAME discipline. A hop that resolves to a different same-text binding, to no
+// in-file binding (a free global under `noLib`), or to a non-const/duplicate binding, demotes the
+// whole chain to unresolved (`null`), left to the fail-closed runtime-code guard. String literals
+// and `+`-folds of literals carry no identifier and resolve as before, so a genuine same-symbol
+// const chain (`const a = 'fetch'; const key = a; globalThis[key]`) still folds and is still
+// rejected. `seen` bounds recursion: a const-initializer cycle terminates at `null`. Bounded to
+// NET: `collectStringConsts` / `staticStringOf` / `memberNameOf` are unchanged, so the RC/HA
+// text-only structural policy is not touched.
+
+// The single `const <text> = <init>` declaration a binder-resolved identifier denotes, else null:
+// the symbol has exactly one declaration, that declaration is a `const` VariableDeclaration whose
+// name text matches the reference. Text equality alone never qualifies — a different-scope or
+// free-global reference resolves to a different symbol (or none) and is rejected here.
+const netUniqueConstDecl = (id: ts.Identifier, checker: ts.TypeChecker): ts.VariableDeclaration | null => {
+  const symbol = checker.getSymbolAtLocation(id);
+  if (symbol === undefined || symbol.declarations === undefined || symbol.declarations.length !== 1) {
+    return null;
+  }
+  const decl = symbol.declarations[0];
+  if (decl === undefined || !ts.isVariableDeclaration(decl) || !ts.isIdentifier(decl.name) || decl.name.text !== id.text) {
+    return null;
+  }
+  const list = decl.parent;
+  return ts.isVariableDeclarationList(list) && (list.flags & ts.NodeFlags.Const) !== 0 ? decl : null;
+};
+
+// The statically-provable string an expression denotes for the NET path, resolved entirely by the
+// binder: a string literal or substitution-free template, a `+`-fold of such, or an Identifier the
+// binder proves is a unique `const` whose initializer resolves the same way — recursively, with
+// binder identity required at EVERY hop.
+//
+// Two DISTINCT bookkeeping structures, both keyed by DECLARATION identity (never identifier text),
+// so a shared initializer subtree is resolved once instead of exponentially (P2 memoization):
+//   - `seen`: the declarations on the CURRENT resolution path, so an initializer cycle yields
+//     `null` in finite time (a declaration re-entered before it completes is a cycle).
+//   - `memo`: the COMPLETED result of each declaration (a `string`, or `null` for unresolved),
+//     so a second reference to the same declaration — a diamond/doubling chain such as
+//     `aN = aN-1 + aN-1` — reads the cached result rather than recomputing its whole subtree.
+//     `memo.has` distinguishes a cached `null` from "not yet computed", so a genuine unresolved
+//     result never silently becomes a static value. The cache is per top-level key resolution and
+//     keyed by the binder-proven declaration node, so a result for one declaration is NEVER reused
+//     for a different same-text declaration in another scope.
+//
+// A per-member `budget` records the identifier hops ONE member resolution spends and CAPS them:
+// memoization keeps the hop count linear in the number of const declarations, so a doubling chain
+// costs O(N), never O(2^N). Because resolution is synchronous, an un-memoized regression would
+// block the event loop rather than trip a test timeout — the cap converts that into a fast,
+// deterministic failure. `netResolveVisits` accumulates hops across ALL member resolutions of ONE
+// `usesOutboundNetwork` traversal (reset at its start), so a test can prove the CROSS-member cost
+// is O(N + M) — a chain reused by M accesses is resolved once — not O(M × N). Both bounds sit far
+// above anything real host/Cockpit source or any genuine const chain produces.
+const NET_RESOLVE_VISIT_CAP = 200_000;
+
+// NET member-key CLASSIFICATION (D3-CX-POLICY-NET-KEY, frozen DDR). At a binder-verified FREE
+// global receiver the computed member key is resolved to one of three states, and ONLY these three
+// — a member name is never demoted to a bare `null` that silently means "allow":
+//
+//   Resolved(string)  — the key statically denotes exactly this string (a literal, a
+//                       substitution-free template, a bounded `+`-fold, or a binder-proven unique
+//                       `const` chain). DENY iff the string is a NETWORK_GLOBAL_NAMES member.
+//   NotCapability     — the key is PROVABLY not a capability name: a `+`-fold whose result exceeds
+//                       the longest capability name. Because `+` only ADDS characters, no further
+//                       concatenation can shrink it to `fetch`/`WebSocket`, so this is a sound
+//                       ALLOW — and it lets the fold stop BEFORE materializing the oversized string.
+//   Indeterminate     — the key cannot be statically pinned down: a runtime/ambient/mutated/
+//                       duplicate/undeclared/shadowed-differently identifier, an initializer cycle,
+//                       a non-string expression form, OR a RESOURCE-BOUND ABORT (depth/visit
+//                       ceiling). At a free-global receiver this is DENIED fail-closed — a computed
+//                       key that MIGHT be `fetch`/`WebSocket` at runtime must not slip past NET by
+//                       being unresolvable. (Converting an abort to "allow" was the P1 egress hole:
+//                       a deep `const shared='fetch'; nK='' + nK-1; globalThis[nN](...)` aborted and
+//                       was allowed.) NET no longer relies on the runtime-code guard to catch these.
+//
+// The identifier-ALIAS spine (`const a = b; const b = c; …`) resolves ITERATIVELY, so a genuine
+// long chain to `fetch`/`WebSocket` still classifies as Resolved (DENY), and a long benign chain as
+// Resolved-non-capability (ALLOW), rather than aborting into a false positive. Only a non-identifier
+// initializer (literal / `+`-fold) recurses, bounded by `NET_RESOLVE_DEPTH_CAP` (deterministic, far
+// below the native stack limit and far above any real host/Cockpit source or genuine capability
+// fold); the visit ceiling bounds total work. Both bounds raise `NetResolveAbort`, which maps to
+// Indeterminate. Resolved and NotCapability are context-INDEPENDENT (intrinsic to a declaration's
+// own initializer) and are memoized; the abort is context-DEPENDENT (it depends on the depth a
+// declaration is reached from) and is thrown, so it is NEVER memoized — a declaration aborted on a
+// deep path still resolves when later reached from a shallow one. (A deeply nested LITERAL `+`
+// expression overflows the shared `ts.forEachChild` AST walk every detector uses, before this
+// resolver is reached — a pre-existing whole-file traversal limit, out of scope here.)
+const NET_RESOLVE_DEPTH_CAP = 2_000;
+// The longest network-capability name (`WebSocket` = 9). Derived from the policy set so it stays
+// correct if the set changes; a `+`-fold whose result exceeds it is provably NotCapability.
+const MAX_NETWORK_MEMBER_LENGTH = Math.max(...[...NETWORK_GLOBAL_NAMES].map((name) => name.length));
+let netResolveVisits = 0;
+
+// The three-state key classification. `Resolved` carries the exact string; the other two are
+// nullary. A member key is exactly one of these — never an ambiguous `null`.
+type NetKey =
+  | { readonly kind: 'resolved'; readonly value: string }
+  | { readonly kind: 'notCapability' }
+  | { readonly kind: 'indeterminate' };
+const NET_NOT_CAPABILITY: NetKey = { kind: 'notCapability' };
+const NET_INDETERMINATE: NetKey = { kind: 'indeterminate' };
+
+// A resource-bound abort (recursion depth or visit budget). Thrown (not returned) so no partially
+// resolved declaration on the aborted path is memoized, and caught at the member boundary where it
+// becomes an Indeterminate key (fail-closed DENY at a free-global receiver), never a crash.
+class NetResolveAbort extends Error {}
+
+const netResolveKey = (
+  node: ts.Expression,
+  checker: ts.TypeChecker,
+  seen: Set<ts.Declaration>,
+  memo: Map<ts.Declaration, NetKey>,
+  budget: { spent: number },
+  depth: number,
+): NetKey => {
+  if (depth > NET_RESOLVE_DEPTH_CAP) throw new NetResolveAbort(); // resource bound: not memoized
+  const n = unwrapExpr(node);
+  if (ts.isStringLiteralLike(n)) return { kind: 'resolved', value: n.text };
+  if (ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+    const left = netResolveKey(n.left, checker, seen, memo, budget, depth + 1);
+    if (left.kind === 'indeterminate') return NET_INDETERMINATE;
+    if (left.kind === 'notCapability') return NET_NOT_CAPABILITY; // already too long; `+` only grows it
+    const right = netResolveKey(n.right, checker, seen, memo, budget, depth + 1);
+    if (right.kind === 'indeterminate') return NET_INDETERMINATE;
+    if (right.kind === 'notCapability') return NET_NOT_CAPABILITY;
+    // Bound OUTPUT before allocating `left + right`: an oversized result is provably NotCapability,
+    // so no exponential intermediate is ever materialized.
+    if (left.value.length + right.value.length > MAX_NETWORK_MEMBER_LENGTH) return NET_NOT_CAPABILITY;
+    return { kind: 'resolved', value: left.value + right.value };
+  }
+  if (ts.isIdentifier(n)) {
+    // Resolve an identifier-ALIAS spine (`const a = b; const b = c; …`) ITERATIVELY, so a chain of
+    // any length consumes O(1) native stack. Every declaration on the spine denotes the SAME key, so
+    // the completed classification is recorded for all of them at once. A hop that is not a
+    // binder-proven unique `const` (runtime/ambient/mutated/duplicate/undeclared/shadowed) or a
+    // cycle is Indeterminate. Only a non-identifier initializer (literal / `+`-fold) recurses.
+    const spine: ts.Declaration[] = [];
+    let cur: ts.Identifier = n;
+    let key: NetKey = NET_INDETERMINATE;
+    for (;;) {
+      netResolveVisits += 1; // cumulative across the whole usesOutboundNetwork traversal (test evidence)
+      budget.spent += 1; // per-member ceiling
+      if (budget.spent > NET_RESOLVE_VISIT_CAP) throw new NetResolveAbort(); // resource bound: not memoized
+      const decl = netUniqueConstDecl(cur, checker);
+      if (decl === null || decl.initializer === undefined) {
+        key = NET_INDETERMINATE; // not a binder-proven unique const → unknown key
+        break;
+      }
+      if (memo.has(decl)) {
+        key = memo.get(decl) ?? NET_INDETERMINATE; // completed classification
+        break;
+      }
+      if (seen.has(decl)) {
+        key = NET_INDETERMINATE; // re-entry before completion: cycle (do not cache)
+        break;
+      }
+      seen.add(decl);
+      spine.push(decl);
+      const init = unwrapExpr(decl.initializer);
+      if (ts.isIdentifier(init)) {
+        cur = init; // alias hop: iterate, no recursion
+        continue;
+      }
+      key = netResolveKey(init, checker, seen, memo, budget, depth + 1); // literal / `+`-fold
+      break;
+    }
+    // Reached only on a NON-abort return (a thrown NetResolveAbort unwinds past this, leaving the
+    // aborted-path declarations UNcached). The completed classification is context-independent, so
+    // caching it for every alias on the spine is sound.
+    for (const d of spine) {
+      seen.delete(d);
+      memo.set(d, key);
+    }
+    return key;
+  }
+  return NET_INDETERMINATE; // any other expression form (call, number, conditional, …): unknown key
+};
+
+// Classify the member key of a property/element access for the NET path. A property name is read
+// directly (always Resolved); an element-access key is resolved by `netResolveKey` (binder identity
+// at every hop), never by identifier text alone. The completed-classification `memo` is SHARED
+// across every member resolution of one `usesOutboundNetwork` traversal, so a const chain reused by
+// many accesses is resolved once (O(N + M), not O(M × N)); a fresh `seen`/`budget` per call keeps
+// active-path cycle detection and the per-member ceiling local. A resource-bound abort becomes
+// Indeterminate (fail-closed at a free-global receiver).
+const netMemberKey = (
+  node: ts.PropertyAccessExpression | ts.ElementAccessExpression,
+  checker: ts.TypeChecker,
+  memo: Map<ts.Declaration, NetKey>,
+): NetKey => {
+  if (ts.isPropertyAccessExpression(node)) return { kind: 'resolved', value: node.name.text };
+  try {
+    return netResolveKey(node.argumentExpression, checker, new Set<ts.Declaration>(), memo, { spent: 0 }, 0);
+  } catch (error) {
+    if (error instanceof NetResolveAbort) return NET_INDETERMINATE;
+    throw error;
+  }
+};
+
 /**
  * NET — reject outbound network egress, decided by TypeScript BINDER identity
  * (D3-CX-POLICY-NET). Lexical binding identity — nearest visible binding, shadowing,
@@ -1321,6 +1531,19 @@ const acquiresInboundServerSocket = (checker: ts.TypeChecker, sourceFile: ts.Sou
  */
 const usesOutboundNetwork = (source: string): boolean => {
   const { checker, sourceFile } = buildBinderProgram(source);
+  // Free-global network members (F1/P2/P1) are classified by `netMemberKey` straight off the binder
+  // — identity required at the key AND at every initializer hop (see `netResolveKey`) — into
+  // Resolved / NotCapability / Indeterminate. At a binder-verified free-global receiver:
+  // Resolved(`fetch`/`WebSocket`) and Indeterminate DENY; Resolved(other) and NotCapability ALLOW.
+  // NET is self-contained fail-closed here — it does NOT lean on the runtime-code guard to reject an
+  // indeterminate computed key.
+  //
+  // ONE completed-classification memo is shared by every member resolution in THIS traversal, so a
+  // const chain reused across many accesses is resolved once (O(N + M), not O(M × N)). It is keyed by
+  // the binder's declaration nodes for this Program, so it cannot leak into another
+  // `usesOutboundNetwork` call. `netResolveVisits` is reset here to make the hop count observable.
+  const netMemo = new Map<ts.Declaration, NetKey>();
+  netResolveVisits = 0;
   let found = false;
   const visit = (node: ts.Node): void => {
     // (0) a runtime dynamic `import('node:http')` is prohibited outright, in every context.
@@ -1332,9 +1555,18 @@ const usesOutboundNetwork = (source: string): boolean => {
         const member = binderMemberName(node);
         if (member === null || !HTTP_SERVER_VALUE_MEMBERS.has(member)) found = true;
       }
-      const globalMember = binderMemberName(node);
-      if (globalMember !== null && NETWORK_GLOBAL_NAMES.has(globalMember) && isFreeGlobalReceiver(node.expression, checker, sourceFile)) {
-        found = true;
+      // F1/P2/P1 — classify the member key (Resolved / NotCapability / Indeterminate) off the binder
+      //     and decide it ONLY at a binder-verified free-global receiver. Resolved(capability) DENY;
+      //     Resolved(other) ALLOW; NotCapability (provably too long) ALLOW; Indeterminate (runtime/
+      //     ambient/mutated/undeclared/cycle key, or a depth/visit resource abort) DENY fail-closed —
+      //     a key that MIGHT be `fetch`/`WebSocket` at runtime must not pass by being unresolvable.
+      const memberKey = netMemberKey(node, checker, netMemo);
+      if (isFreeGlobalReceiver(node.expression, checker, sourceFile)) {
+        if (memberKey.kind === 'resolved') {
+          if (NETWORK_GLOBAL_NAMES.has(memberKey.value)) found = true;
+        } else if (memberKey.kind === 'indeterminate') {
+          found = true;
+        }
       }
     }
     // (2) an identifier value read: HTTP_CLIENT is forbidden; HTTP_NS must sit in a safe
@@ -4961,4 +5193,696 @@ describe('D3 host inspects destructuring assignments for socket acquisition (D3-
       expect(usesOutboundNetwork(source)).toBe(false);
     });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Codex P1: statically-COMPUTED free-global network members (D3-CX-CODEX-F1-COMPUTED). The
+// free-global network-member check resolved the member with the literal-only `binderMemberName`,
+// so a key that folds to a literal (`globalThis['fe' + 'tch']`, `const key = 'fetch'; globalThis[key]`)
+// escaped `usesOutboundNetwork` while never being a runtime-code-generation capability either.
+// The check now resolves the member through the existing `collectStringConsts` / `memberNameOf`
+// static-string machinery (no new evaluator), so the whole NETWORK_GLOBAL_NAMES family is caught
+// for direct, `+`-folded, and unique-immutable-const keys. A genuinely indeterminate key is not
+// resolved here and is DENIED fail-closed by NET at a free-global receiver.
+// ---------------------------------------------------------------------------
+describe('D3 host rejects statically-computed free-global network members (D3-CX-CODEX-F1-COMPUTED)', () => {
+  const rejectComputed: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a dotted globalThis.fetch', source: `globalThis.fetch('https://example.com/');` },
+    { form: 'an optional globalThis?.fetch', source: `globalThis?.fetch('https://example.com/');` },
+    { form: "a literal globalThis['fetch']", source: `globalThis['fetch']('https://example.com/');` },
+    { form: 'a template globalThis[`fetch`]', source: 'globalThis[`fetch`]("https://example.com/");' },
+    { form: "a concatenated globalThis['fe' + 'tch']", source: `globalThis['fe' + 'tch']('https://example.com/');` },
+    { form: 'a const-key globalThis[key]', source: `const key = 'fetch';\nglobalThis[key]('https://example.com/');` },
+    { form: "a const-prefix globalThis[prefix + 'tch']", source: `const prefix = 'fe';\nglobalThis[prefix + 'tch']('https://example.com/');` },
+    { form: 'a bare new WebSocket', source: `void new WebSocket('wss://example.com/');` },
+    { form: 'a dotted new globalThis.WebSocket', source: `void new globalThis.WebSocket('wss://example.com/');` },
+    { form: "a literal new globalThis['WebSocket']", source: `void new globalThis['WebSocket']('wss://example.com/');` },
+    { form: "a concatenated new globalThis['Web' + 'Socket']", source: `void new globalThis['Web' + 'Socket']('wss://example.com/');` },
+    { form: 'a const-key new globalThis[w]', source: `const w = 'WebSocket';\nvoid new globalThis[w]('wss://example.com/');` },
+    { form: "a window['fe' + 'tch'] receiver", source: `window['fe' + 'tch']('https://example.com/');` },
+    { form: "a self['We' + 'bSocket'] receiver", source: `void new self['We' + 'bSocket']('wss://example.com/');` },
+  ];
+  for (const { form, source } of rejectComputed) {
+    it(`rejects ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // A genuinely indeterminate free-global member key (a runtime `declare const` key) cannot be
+  // statically pinned down, so at a free-global receiver NET DENIES it fail-closed (frozen key
+  // policy) — a key that might be `fetch`/`WebSocket` at runtime must not pass by being unresolvable.
+  const indeterminate: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a runtime-key globalThis[k] call', source: `declare const k: string;\nglobalThis[k]('https://example.com/');` },
+    { form: 'a runtime-key new globalThis[k]', source: `declare const k: string;\nvoid new globalThis[k]('wss://example.com/');` },
+  ];
+  for (const { form, source } of indeterminate) {
+    it(`rejects ${form} fail-closed`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // ALLOW / PRESERVE — a computed member that does not fold to a protected network global, and a
+  // local runtime shadow of the receiver, stay allowed.
+  const allowComputed: readonly { readonly form: string; readonly source: string }[] = [
+    { form: "a non-network globalThis['ordinaryLocalMember']", source: `void globalThis['ordinaryLocalMember'];` },
+    { form: "a non-network concatenated globalThis['con' + 'sole']", source: `void globalThis['con' + 'sole'];` },
+    { form: 'a receiver-shadowed globalThis with a computed member', source: `function f(globalThis: { fetch: (v: string) => string }): string {\n  return globalThis['fe' + 'tch']('local');\n}\nvoid f;` },
+    { form: 'a computed member off an unrelated local object', source: `const rt = { fetch: (v: string) => v };\nvoid rt['fe' + 'tch']('local');` },
+  ];
+  for (const { form, source } of allowComputed) {
+    it(`allows ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// P2: the free-global network-member check resolves a computed key through a collected string
+// constant by identifier TEXT (D3-CX-POLICY-NET-BIND). `collectStringConsts` keys a value by
+// text under whole-file uniqueness, so a single out-of-scope `const Infinity = 'fetch'` made
+// `globalThis[Infinity]` — whose `Infinity` reference does NOT resolve to that const — fold to
+// a PHANTOM `'fetch'` member and reject as egress, a false positive that acquires no runtime
+// fetch/WebSocket capability. The member is now resolved with `netMemberNameOf`, which
+// substitutes a collected constant for an Identifier key ONLY when the compiler binder proves
+// the reference denotes that same unique `const` declaration; identifier text equality is not
+// binding identity. Literals and `+`-folds are unchanged, a genuine same-binding const key is
+// still rejected, and a key that cannot be bound is Indeterminate and is DENIED fail-closed by NET
+// itself at a free-global receiver. RC/HA text-only policy is untouched.
+// ---------------------------------------------------------------------------
+describe('D3 host resolves computed network-member keys by binder identity (D3-CX-POLICY-NET-BIND)', () => {
+  // Under the frozen fail-closed key policy the outer `globalThis[Infinity]` key is Indeterminate
+  // (it does not resolve to a unique in-file `const`), so NET DENIES it — a computed free-global key
+  // that cannot be statically pinned down is not allowed. Binder identity is still authoritative for
+  // genuine same-symbol chains (which stay REJECT below) and for Resolved non-capability keys.
+  it('rejects the indeterminate reproducer (out-of-scope const Infinity) fail-closed', () => {
+    const reproducer = `function f() {\n  const Infinity = 'fetch';\n  void Infinity;\n}\nvoid (globalThis as any)[Infinity];`;
+    expect(usesOutboundNetwork(reproducer)).toBe(true);
+  });
+
+  // DENY fail-closed — the element-access key does NOT lexically resolve to a unique in-file `const`
+  // (a different/inner/sibling scope, a parameter or import shadow, or a free global), so it is
+  // Indeterminate and, at a free-global receiver, denied. None is a proven capability chain, but
+  // none is provably NOT one either, so fail-closed is the sound verdict.
+  const indeterminateKeys: readonly { readonly form: string; readonly source: string }[] = [
+    {
+      form: 'a function-scoped const Infinity with an outer key reference',
+      source: `function f() {\n  const Infinity = 'fetch';\n  void Infinity;\n}\nvoid (globalThis as any)[Infinity];`,
+    },
+    {
+      form: 'a block-scoped const Infinity with an outer key reference',
+      source: `{\n  const Infinity = 'fetch';\n}\nvoid globalThis[Infinity];`,
+    },
+    {
+      form: 'a sibling-scope const key that the second scope does not see',
+      source: `function a() {\n  const key = 'fetch';\n  void key;\n}\nfunction b() {\n  void globalThis[key];\n}\nvoid a;\nvoid b;`,
+    },
+    {
+      form: 'an inner-declared const with an outer WebSocket key reference (constructor)',
+      source: `function outer() {\n  function inner() {\n    const wsName = 'WebSocket';\n    void wsName;\n  }\n  void inner;\n  return new globalThis[wsName]('wss://example.com/');\n}\nvoid outer;`,
+    },
+    {
+      form: 'a parameter shadow of the collected const name',
+      source: `const routeName = 'fetch';\nfunction f(routeName: string) {\n  return globalThis[routeName];\n}\nvoid f;`,
+    },
+    {
+      form: 'an imported-name / inner-const same-text key resolving to the import',
+      source: `import { helper } from './x.js';\nfunction f() {\n  const helper = 'fetch';\n  void helper;\n}\nvoid helper;\nvoid globalThis[helper];`,
+    },
+  ];
+  for (const { form, source } of indeterminateKeys) {
+    it(`rejects ${form} fail-closed`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // REJECT — genuine egress: literals, `+`-folds, and const keys whose reference the binder DOES
+  // prove denotes the collected const (same-symbol), for both fetch and WebSocket.
+  const rejectGenuine: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a same-binding const key globalThis[key]', source: `const key = 'fetch';\nglobalThis[key]('https://example.com/');` },
+    { form: 'a same-binding const key new globalThis[ws]', source: `const ws = 'WebSocket';\nvoid new globalThis[ws]('wss://example.com/');` },
+    { form: "a same-binding const-prefix globalThis[prefix + 'tch']", source: `const prefix = 'fe';\nglobalThis[prefix + 'tch']('https://example.com/');` },
+    { form: "a literal concatenation globalThis['fe' + 'tch']", source: `globalThis['fe' + 'tch']('https://example.com/');` },
+    { form: 'a dotted globalThis.fetch', source: `globalThis.fetch('https://example.com/');` },
+    { form: 'a dotted new globalThis.WebSocket', source: `void new globalThis.WebSocket('wss://example.com/');` },
+    { form: 'a same-scope const key inside a function (same symbol)', source: `function f() {\n  const key = 'fetch';\n  return globalThis[key]('https://example.com/');\n}\nvoid f;` },
+  ];
+  for (const { form, source } of rejectGenuine) {
+    it(`REJECTS ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // FAIL-CLOSED — a key the NET branch cannot bind (ambient, mutated, or undeclared) is
+  // Indeterminate and is DENIED by NET itself at a free-global receiver (no longer deferred to the
+  // runtime-code guard), so binder-identity gating narrows NET WITHOUT opening an egress bypass.
+  const failClosed: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'an ambient declare const key globalThis[k]', source: `declare const k: string;\nglobalThis[k]('https://example.com/');` },
+    { form: 'a mutated let key globalThis[k]', source: `let k = 'fetch';\nk = 'other';\nglobalThis[k]('https://example.com/');` },
+    { form: 'an undeclared free-global key globalThis[neverDeclared]', source: `void globalThis[neverDeclared];` },
+  ];
+  for (const { form, source } of failClosed) {
+    it(`rejects ${form} fail-closed by NET`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// P2 (follow-up): binder identity must hold through the ENTIRE initializer-resolution chain, not
+// only at the final element-access key (D3-CX-POLICY-NET-BIND-INIT). Gating just the key left a
+// second hole: `const key = Infinity` is itself a genuine same-symbol const reference, but its
+// initializer `Infinity` was resolved by text-only const collection and folded to a phantom
+// `'fetch'` from an out-of-scope `const Infinity = 'fetch'`. The NET path now resolves strings
+// straight off the binder (`netResolveString`): every identifier hop — the key and every
+// identifier reached while resolving a collected initializer — must resolve to the unique `const`
+// declaration whose value is being substituted, recursively, bounded against initializer cycles.
+// A genuine multi-hop same-symbol chain still folds and is still rejected; a chain poisoned at any
+// hop is Indeterminate and is DENIED fail-closed by NET itself at a free-global receiver.
+// ---------------------------------------------------------------------------
+describe('D3 host binds identifiers inside collected constant initializers (D3-CX-POLICY-NET-BIND-INIT)', () => {
+  // Under the frozen fail-closed key policy: `const key = Infinity` where `Infinity` does not
+  // resolve to a unique in-file `const` leaves the key Indeterminate, so NET DENIES it. (Binder
+  // identity still folds a genuine same-symbol multi-hop chain to Resolved(capability) — REJECT.)
+  it('rejects the poisoned-initializer reproducer (const key = Infinity) fail-closed', () => {
+    const reproducer = `function f() {\n  const Infinity = 'fetch';\n}\nconst key = Infinity;\nvoid globalThis[key];`;
+    expect(usesOutboundNetwork(reproducer)).toBe(true);
+  });
+
+  // DENY fail-closed — the key is a unique const, but an identifier INSIDE its initializer chain
+  // does not resolve to a unique in-file const, so the chain is Indeterminate (not binder-proven).
+  const indeterminateInit: readonly { readonly form: string; readonly source: string }[] = [
+    {
+      form: 'a function-scoped const Infinity folded into a module const initializer',
+      source: `function f() {\n  const Infinity = 'fetch';\n}\nconst key = Infinity;\nvoid globalThis[key];`,
+    },
+    {
+      form: 'a block-scoped const Infinity folded into a module const initializer',
+      source: `{\n  const Infinity = 'fetch';\n}\nconst key = Infinity;\nvoid globalThis[key];`,
+    },
+    {
+      form: 'a sibling-scope const marker folded into a module const initializer',
+      source: `function f() {\n  const marker = 'fetch';\n}\nconst key = marker;\nvoid globalThis[key];`,
+    },
+    {
+      form: 'a concatenation initializer where one segment resolves to a different binding',
+      source: `function f() {\n  const seg = 'tch';\n}\nconst a = 'fe';\nconst key = a + seg;\nvoid globalThis[key];`,
+    },
+    {
+      form: 'a parameter-shadow initializer',
+      source: `const label = 'fetch';\nfunction f(label: string) {\n  const key = label;\n  return globalThis[key];\n}\nvoid f;`,
+    },
+    {
+      form: 'an import-shadow initializer',
+      source: `import { thing } from './x.js';\nconst key = thing;\nvoid globalThis[key];`,
+    },
+    {
+      form: 'a free-global identifier initializer under noLib',
+      source: `const key = Infinity;\nvoid globalThis[key];`,
+    },
+    {
+      form: 'a same-text sibling-scope const referenced from another function initializer',
+      source: `function a() {\n  const Infinity = 'fetch';\n  void Infinity;\n}\nfunction b() {\n  const key = Infinity;\n  void globalThis[key];\n}\nvoid a;\nvoid b;`,
+    },
+  ];
+  for (const { form, source } of indeterminateInit) {
+    it(`rejects ${form} fail-closed`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // REJECT — genuine multi-hop same-symbol chains: every identifier resolves to the collected
+  // declaration, for both fetch and WebSocket, call and constructor, incl. an optional key.
+  const rejectGenuineChain: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a one-hop const key = a', source: `const a = 'fetch';\nconst key = a;\nglobalThis[key]('https://example.com/');` },
+    { form: "a concat const key = a + 'tch'", source: `const a = 'fe';\nconst key = a + 'tch';\nglobalThis[key]('https://example.com/');` },
+    { form: 'a two-hop const key = b = a chain', source: `const a = 'fe';\nconst b = a + 'tch';\nconst key = b;\nglobalThis[key]('https://example.com/');` },
+    { form: 'a WebSocket const ws = a', source: `const a = 'WebSocket';\nconst ws = a;\nvoid new globalThis[ws]('wss://example.com/');` },
+    { form: "a WebSocket concat const ws = a + 'Socket'", source: `const a = 'Web';\nconst ws = a + 'Socket';\nvoid new globalThis[ws]('wss://example.com/');` },
+    { form: 'an optional-computed same-symbol key', source: `const key = 'fetch';\nglobalThis?.[key]('https://example.com/');` },
+    { form: 'a direct literal element key', source: `globalThis['fetch']('https://example.com/');` },
+  ];
+  for (const { form, source } of rejectGenuineChain) {
+    it(`REJECTS ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // FAIL-CLOSED — a chain the NET path cannot binder-prove (ambient initializer, or a cycle) is
+  // Indeterminate and is DENIED by NET itself, and cycle resolution still TERMINATES. No bypass.
+  const failClosedChain: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'an ambient-declare initializer const key = k', source: `declare const k: string;\nconst key = k;\nglobalThis[key]('https://example.com/');` },
+    { form: 'a two-const initializer cycle a = b, b = a', source: `const a = b;\nconst b = a;\nvoid globalThis[a];` },
+    { form: 'a self-referential initializer const a = a', source: `const a = a;\nvoid globalThis[a];` },
+  ];
+  for (const { form, source } of failClosedChain) {
+    it(`rejects ${form} fail-closed by NET (terminates)`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// P2 (second-order): NET recursive resolution must MEMOIZE by declaration identity, not merely
+// detect cycles path-locally (D3-CX-POLICY-NET-BIND-MEMO). Without a completed-result cache a
+// shared initializer subtree is recomputed on every reference, so a doubling chain
+// `aN = aN-1 + aN-1` costs 2^N resolutions (~22.5 s at N=22 on ~500 bytes). `netResolveString`
+// now caches each declaration's completed result (string or null) keyed by the binder-proven
+// declaration node — distinct from the cycle set — so every declaration's initializer is resolved
+// at most once. Binder identity stays authoritative at every hop, the cache never crosses scopes
+// (it is keyed by declaration, never text), a cached null never becomes a static value, and cycles
+// still terminate fail-closed.
+// ---------------------------------------------------------------------------
+describe('D3 host memoizes NET constant resolution by declaration identity (D3-CX-POLICY-NET-BIND-MEMO)', () => {
+  const doubling = (n: number, base: string): string => {
+    const lines = [`const a0 = '${base}';`];
+    for (let i = 1; i <= n; i++) lines.push(`const a${String(i)} = a${String(i - 1)} + a${String(i - 1)};`);
+    lines.push(`void globalThis[a${String(n)}];`);
+    return lines.join('\n');
+  };
+  const linear = (n: number, base: string): string => {
+    const lines = [`const a0 = '${base}';`];
+    for (let i = 1; i <= n; i++) lines.push(`const a${String(i)} = a${String(i - 1)};`);
+    lines.push(`globalThis[a${String(n)}]('https://example.com/');`);
+    return lines.join('\n');
+  };
+
+  // Shared-subtree (doubling) chain. With an empty base the resolved value is O(1) while the
+  // recomputation tree is 2^N without memo. `netResolveVisits` is the number of identifier hops the
+  // resolver actually spent across this single-access traversal: declaration-keyed memoization keeps
+  // it LINEAR in the declaration count (~2N), so a small bound here is deterministic structural
+  // evidence of memoization. An un-memoized resolver would spend 2^60 hops — impossible — and trip
+  // the visit cap at once (a fast throw, not a hang). The empty key is not a network global.
+  it('resolves a shared-subtree doubling chain N=60 in a linear number of hops (memoized)', () => {
+    expect(usesOutboundNetwork(doubling(60, ''))).toBe(false);
+    expect(netResolveVisits).toBeGreaterThan(0);
+    expect(netResolveVisits).toBeLessThan(1000);
+  });
+
+  // The exact reported adversarial family (a0 = 'fe'), well beyond the prior N=22 failure point:
+  // the hop count is likewise linear, and the once-built value is not a network global.
+  it('resolves the reported doubling family N=24 (a0 = fe) in a linear number of hops', () => {
+    expect(usesOutboundNetwork(doubling(24, 'fe'))).toBe(false);
+    expect(netResolveVisits).toBeGreaterThan(0);
+    expect(netResolveVisits).toBeLessThan(1000);
+  });
+
+  // A long linear chain still resolves and rejects the genuine capability, fast.
+  it('rejects a long linear const chain resolving to fetch (N=40)', () => {
+    expect(usesOutboundNetwork(linear(40, 'fetch'))).toBe(true);
+  }, 4000);
+
+  // Cycles: memo + cycle interaction terminates and is DENIED fail-closed by NET (Indeterminate).
+  const cycles: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a self cycle const a = a', source: `const a = a;\nglobalThis[a]('https://example.com/');` },
+    { form: 'a 2-node cycle a = b, b = a', source: `const a = b;\nconst b = a;\nglobalThis[a]('https://example.com/');` },
+    { form: 'a 3-node cycle a = b, b = c, c = a', source: `const a = b;\nconst b = c;\nconst c = a;\nglobalThis[a]('https://example.com/');` },
+  ];
+  for (const { form, source } of cycles) {
+    it(`rejects ${form} fail-closed by NET (terminates)`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    }, 4000);
+  }
+
+  // Declaration-identity cache must not leak between same-text declarations in different scopes.
+  it('rejects globalThis[s] where s resolves to a function-local const fetch', () => {
+    expect(
+      usesOutboundNetwork(`function f() {\n  const s = 'fetch';\n  return globalThis[s]('https://example.com/');\n}\nvoid f;`),
+    ).toBe(true);
+  });
+  it('allows globalThis[s] where a same-text s resolves to a benign function-local const', () => {
+    expect(usesOutboundNetwork(`function g() {\n  const s = 'safe';\n  return globalThis[s];\n}\nvoid g;`)).toBe(false);
+  });
+  it('does not reuse a module const fetch value for a shadowing function-local const', () => {
+    expect(
+      usesOutboundNetwork(`const a = 'fetch';\nfunction f() {\n  const a = 'safe';\n  return globalThis[a];\n}\nvoid f;\nvoid a;`),
+    ).toBe(false);
+  });
+
+  // Two distinct declarations sharing initializer text each resolve independently (no conflation).
+  it('rejects the genuine one of two distinct decls sharing initializer text', () => {
+    expect(
+      usesOutboundNetwork(`const m1 = 'fetch';\nconst m2 = 'fetch';\nvoid m1;\nglobalThis[m2]('https://example.com/');`),
+    ).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P2 (cross-member): the completed-result memo must be SHARED across every member resolution in one
+// `usesOutboundNetwork` traversal (D3-CX-POLICY-NET-BIND-XMEMO). Previously `netMemberNameOf` built
+// a fresh memo per access, so an N-declaration chain reused by M member accesses was resolved M
+// times — Θ(M × N) cumulative, unbounded by the per-member cap. One memo hoisted into the traversal
+// makes the cumulative cost O(N + M): each declaration is resolved once and reused. The memo stays
+// keyed by exact declaration identity and is created fresh per traversal, so it never leaks between
+// sources; per-member `seen`/budget stay local, preserving cycle detection and the cap.
+// ---------------------------------------------------------------------------
+describe('D3 host shares the NET declaration memo across member resolutions (D3-CX-POLICY-NET-BIND-XMEMO)', () => {
+  const chain = (n: number, base: string): string[] => {
+    const lines = [`const a0 = '${base}';`];
+    for (let i = 1; i <= n; i++) lines.push(`const a${String(i)} = a${String(i - 1)} + a${String(i - 1)};`);
+    return lines;
+  };
+
+  // 1. Same key repeated M times — cumulative work grows ADDITIVELY with M, not multiplicatively.
+  it('resolves a repeated key chain in additive (O(N+M)), not multiplicative (O(N*M)), work', () => {
+    const src = (n: number, m: number): string => {
+      const lines = chain(n, '');
+      for (let j = 0; j < m; j++) lines.push(`void globalThis[a${String(n)}];`);
+      return lines.join('\n');
+    };
+    expect(usesOutboundNetwork(src(50, 1))).toBe(false);
+    const c1 = netResolveVisits;
+    expect(usesOutboundNetwork(src(50, 100))).toBe(false);
+    const c100 = netResolveVisits;
+    // Shared memo: the 50-chain is resolved once; each extra access is a single memoized hop, so
+    // 100 accesses cost the 1-access cost plus ~M. Un-shared memo would give c100 ≈ 100 × c1.
+    expect(c1).toBeGreaterThan(0);
+    expect(c100).toBeLessThan(c1 + 400);
+  });
+
+  // 2. One chain referenced by many DISTINCT key declarations — resolved once, shared by all.
+  it('shares one chain across many distinct key declarations', () => {
+    const lines = chain(50, '');
+    const m = 100;
+    for (let j = 0; j < m; j++) lines.push(`const k${String(j)} = a50;`);
+    for (let j = 0; j < m; j++) lines.push(`void globalThis[k${String(j)}];`);
+    expect(usesOutboundNetwork(lines.join('\n'))).toBe(false);
+    // a0..a50 resolved ONCE and shared; each of 100 keys adds O(1). Un-shared → ~100× more hops.
+    expect(netResolveVisits).toBeLessThan(1000);
+  });
+
+  // 3. Same chain read through many UNRELATED (non-global) receivers — resolution still shared.
+  it('shares chain resolution across unrelated non-global receivers', () => {
+    const lines = chain(50, '');
+    lines.push('const obj: Record<string, unknown> = {};');
+    lines.push('const key = a50;');
+    const m = 100;
+    for (let j = 0; j < m; j++) lines.push('void obj[key];');
+    expect(usesOutboundNetwork(lines.join('\n'))).toBe(false); // obj is not a global receiver
+    expect(netResolveVisits).toBeLessThan(1000);
+  });
+
+  // 4. Independent chains are cached separately (no cross-chain contamination); WebSocket rejected.
+  it('caches independent chains separately', () => {
+    const src = [
+      `const a0 = 'fe';`,
+      `const a1 = a0 + a0;`,
+      `const b0 = 'WebSocket';`,
+      `const bk = b0;`,
+      `void globalThis[a1];`, // 'fefe' — not a network global → allowed
+      `new globalThis[bk]('wss://example.com/');`, // WebSocket → rejected
+    ].join('\n');
+    expect(usesOutboundNetwork(src)).toBe(true);
+  });
+
+  // Cache lifetime: the memo must NOT leak between separate usesOutboundNetwork calls (fresh memo,
+  // declaration-keyed for each Program), in either order.
+  it('does not leak the memo between separate usesOutboundNetwork calls', () => {
+    expect(usesOutboundNetwork(`const key = 'safe';\nvoid globalThis[key];`)).toBe(false);
+    expect(usesOutboundNetwork(`const key = 'fetch';\nglobalThis[key]('https://example.com/');`)).toBe(true);
+    expect(usesOutboundNetwork(`const key = 'fetch';\nglobalThis[key]('https://example.com/');`)).toBe(true);
+    expect(usesOutboundNetwork(`const key = 'safe';\nvoid globalThis[key];`)).toBe(false);
+  });
+
+  // An Indeterminate (poisoned) chain and a genuine chain coexist in the shared memo without
+  // contaminating one another: both are denied at a free-global receiver, so the overall verdict is
+  // deny (both orders exercised by the two accesses).
+  it('keeps a poisoned (Indeterminate) and a genuine chain independent within one source', () => {
+    const src = [
+      `function f() { const p = 'fetch'; void p; }`,
+      `const bad = p;`, // out-of-scope p → Indeterminate → denied fail-closed
+      `const good = 'fetch';`,
+      `void globalThis[bad];`,
+      `globalThis[good]('https://example.com/');`, // genuine → rejected
+    ].join('\n');
+    expect(usesOutboundNetwork(src)).toBe(true);
+  });
+
+  // A cached Indeterminate classification is reused for a repeated poisoned key (no per-access
+  // recomputation); it is DENIED fail-closed at the free-global receiver.
+  it('reuses a cached Indeterminate result for a repeated poisoned key (denied)', () => {
+    const lines = [`function f() { const marker = 'fetch'; void marker; }`, `const key = marker;`];
+    for (let j = 0; j < 50; j++) lines.push('void globalThis[key];');
+    expect(usesOutboundNetwork(lines.join('\n'))).toBe(true);
+    expect(netResolveVisits).toBeLessThan(1000);
+  });
+
+  // Cycles still terminate and are DENIED fail-closed by NET with the shared memo (in-progress
+  // state is never cached).
+  const cycles: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'self cycle', source: `const a = a;\nglobalThis[a]('https://example.com/');\nvoid globalThis[a];` },
+    { form: '2-node cycle', source: `const a = b;\nconst b = a;\nglobalThis[a]('https://example.com/');\nvoid globalThis[b];` },
+    { form: '3-node cycle', source: `const a = b;\nconst b = c;\nconst c = a;\nglobalThis[a]('https://example.com/');\nvoid globalThis[c];` },
+  ];
+  for (const { form, source } of cycles) {
+    it(`terminates a ${form} and is denied fail-closed with a shared memo`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // Under the shared memo an Indeterminate poisoned key is DENIED fail-closed, and a genuine chain
+  // is still rejected.
+  it('denies a poisoned-initializer key under the shared memo', () => {
+    expect(usesOutboundNetwork(`function f() {\n  const Infinity = 'fetch';\n}\nvoid globalThis[Infinity];`)).toBe(true);
+    expect(usesOutboundNetwork(`function f() {\n  const Infinity = 'fetch';\n}\nconst key = Infinity;\nvoid globalThis[key];`)).toBe(true);
+  });
+  it('preserves the genuine-chain REJECT under the shared memo', () => {
+    expect(usesOutboundNetwork(`const a = 'fetch';\nconst b = a;\nconst key = b;\nglobalThis[key]('https://example.com/');`)).toBe(true);
+    expect(usesOutboundNetwork(`const a = 'Web';\nconst ws = a + 'Socket';\nvoid new globalThis[ws]('wss://example.com/');`)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P2/P1 (resolver totality + fail-closed abort) — the NET member-key classifier must return a
+// BOUNDED verdict, never crash or allocate an unbounded intermediate, and an abort must fail CLOSED
+// (D3-CX-POLICY-NET-BIND-TOTALITY / D3-CX-POLICY-NET-KEY). Three verified Codex findings, same
+// resolver boundary:
+//   A (P2). `left + right` materialized a folded string of exponential size (`aN = aN-1 + aN-1`)
+//      while only ~2N visits were charged, so the visit cap never fired. A fold whose result
+//      exceeds the longest capability name is now classified NotCapability BEFORE allocating the
+//      oversized string, and NotCapability ALLOWS (it can never equal `fetch`/`WebSocket`).
+//   B (P2). A long chain recursed once per hop, so Node's call stack threw an uncaught RangeError
+//      (~7.8k frames) far below the visit cap. The identifier-alias spine now resolves ITERATIVELY
+//      (O(1) native stack; genuine long chains still classify Resolved and reject, benign ones
+//      Resolved-non-capability and allow), and a deterministic recursion-depth cap bounds the
+//      remaining `+`-fold recursion.
+//   C (P1). Converting a resource abort to "allow" let a genuine deep fetch chain slip past NET
+//      (`const shared='fetch'; nK='' + nK-1; globalThis[nN](...)`). A resource abort now maps to
+//      Indeterminate, and Indeterminate at a free-global receiver is DENIED fail-closed — NET no
+//      longer relies on the runtime-code guard to catch an unresolvable computed key.
+// Neither bound weakens genuine `fetch`/`WebSocket` detection.
+// ---------------------------------------------------------------------------
+describe('D3 host bounds NET resolver output growth and recursion depth (D3-CX-POLICY-NET-BIND-TOTALITY)', () => {
+  const doublingKey = (n: number, base: string): string => {
+    const lines = [`const a0 = '${base}';`];
+    for (let i = 1; i <= n; i++) lines.push(`const a${String(i)} = a${String(i - 1)} + a${String(i - 1)};`);
+    return lines.join('\n');
+  };
+  const linearKey = (n: number, base: string): string => {
+    const lines = [`const a0 = '${base}';`];
+    for (let i = 1; i <= n; i++) lines.push(`const a${String(i)} = a${String(i - 1)};`);
+    return lines.join('\n');
+  };
+
+  // --- FINDING A — output-length bound ---------------------------------------------------------
+  // A shallow doubling chain whose resolved length is exponential in N: the repaired resolver does
+  // BOUNDED work (no OOM, no hang) and never materializes the 2^N string. Under the OLD resolver
+  // this N=30 source built a >1 GB string on ~60 visits. `netResolveVisits` staying tiny is the
+  // structural proof that resolution stopped early rather than folding the whole tree.
+  it('does bounded work on an exponentially-growing doubling chain (no huge allocation)', () => {
+    const src = `${doublingKey(30, 'x')}\nvoid globalThis[a30];`;
+    expect(usesOutboundNetwork(src)).toBe(false); // the resolved value is not a network member
+    expect(netResolveVisits).toBeGreaterThan(0);
+    expect(netResolveVisits).toBeLessThan(1000); // linear in N, not 2^N
+  }, 4000);
+
+  it('does bounded work on the reported doubling family N=40 (a0 = fe)', () => {
+    const src = `${doublingKey(40, 'fe')}\nvoid globalThis[a40];`;
+    expect(usesOutboundNetwork(src)).toBe(false);
+    expect(netResolveVisits).toBeLessThan(1000);
+  }, 4000);
+
+  // The length bound stops tracking a value that can no longer equal a capability name, but never
+  // rejects a genuine short fold: every `fetch` / `WebSocket` fold (and every prefix of one) is
+  // within MAX_NETWORK_MEMBER_LENGTH, for direct, multi-part, and const-chain forms.
+  const genuineFolds: readonly { readonly form: string; readonly source: string }[] = [
+    { form: "a two-part 'fe' + 'tch'", source: `globalThis['fe' + 'tch']('https://example.com/');` },
+    { form: "a five-part 'f'+'e'+'t'+'c'+'h'", source: `globalThis['f' + 'e' + 't' + 'c' + 'h']('https://example.com/');` },
+    { form: "a two-part 'Web' + 'Socket'", source: `void new globalThis['Web' + 'Socket']('wss://example.com/');` },
+    { form: "a nine-part W+e+b+S+o+c+k+e+t", source: `void new globalThis['W' + 'e' + 'b' + 'S' + 'o' + 'c' + 'k' + 'e' + 't']('wss://example.com/');` },
+    { form: 'a genuine three-hop const chain', source: `const a = 'fetch';\nconst b = a;\nconst key = b;\nglobalThis[key]('https://example.com/');` },
+  ];
+  for (const { form, source } of genuineFolds) {
+    it(`still REJECTS ${form} under the length bound`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // A benign computed member that exceeds the capability-name length is still allowed (a static
+  // literal key is read directly, not folded, so it is unaffected by the fold-length bound).
+  it('still ALLOWS a benign over-length computed member', () => {
+    expect(usesOutboundNetwork(`void globalThis['ordinaryLocalMember'];`)).toBe(false);
+    expect(usesOutboundNetwork(`void globalThis['con' + 'sole'];`)).toBe(false); // 'console' ≤ 9
+  });
+
+  // --- FINDING B — recursion-depth / stack totality -------------------------------------------
+  // A long linear identifier chain to a genuine capability resolves ITERATIVELY: it is still
+  // REJECTED (not demoted to null, not a RangeError) at depths that crashed the old resolver.
+  for (const N of [500, 2000, 10000]) {
+    it(`still REJECTS a genuine linear fetch chain N=${String(N)} (iterative, no stack overflow)`, () => {
+      expect(usesOutboundNetwork(`${linearKey(N, 'fetch')}\nglobalThis[a${String(N)}]('https://example.com/');`)).toBe(true);
+    }, 8000);
+    it(`still REJECTS a genuine linear WebSocket chain N=${String(N)}`, () => {
+      expect(usesOutboundNetwork(`${linearKey(N, 'WebSocket')}\nvoid new globalThis[a${String(N)}]('wss://example.com/');`)).toBe(true);
+    }, 8000);
+  }
+
+  // A long linear chain to a benign value is allowed without crashing.
+  it('ALLOWS a long linear chain to a benign value without a stack overflow', () => {
+    expect(usesOutboundNetwork(`${linearKey(10000, 'safe')}\nvoid globalThis[a10000];`)).toBe(false);
+  }, 8000);
+
+  // A chain deep enough to exceed the recursion-depth cap yields a BOUNDED verdict (no RangeError,
+  // no hang) — Indeterminate, which at a free-global receiver is DENIED fail-closed (the key could
+  // be a capability at runtime). The identifier-indirected empty-base doubling reaches the `+`-fold
+  // recursion cap and aborts.
+  for (const N of [1200, 2000, 4000]) {
+    it(`denies fail-closed past the depth cap (empty-base doubling N=${String(N)})`, () => {
+      expect(usesOutboundNetwork(`${doublingKey(N, '')}\nvoid globalThis[a${String(N)}];`)).toBe(true);
+    }, 8000);
+  }
+
+  // --- VISIT-BUDGET throw audit ---------------------------------------------------------------
+  // The visit-budget ceiling now ABORTS to Indeterminate (caught at the member boundary; denied
+  // fail-closed) instead of throwing an uncaught Error; a resolution within budget is unaffected.
+  it('resolves within the visit budget without throwing', () => {
+    expect(() => usesOutboundNetwork(`${linearKey(4000, 'fetch')}\nglobalThis[a4000]('https://example.com/');`)).not.toThrow();
+  }, 8000);
+
+  // --- INTERACTION MATRIX (both bounds compose) -----------------------------------------------
+  it('1. shallow but exponentially-growing string → bounded, allowed', () => {
+    expect(usesOutboundNetwork(`${doublingKey(30, 'x')}\nvoid globalThis[a30];`)).toBe(false);
+  }, 4000);
+  it('2. deep but constant-size string → bounded, allowed', () => {
+    expect(usesOutboundNetwork(`${linearKey(8000, 'safe')}\nvoid globalThis[a8000];`)).toBe(false);
+  }, 8000);
+  it('3. deep AND growing string → bounded, denied fail-closed (depth abort)', () => {
+    // Resolving a4000 recurses down to a0 (~2N depth) BEFORE the length bound can fire, so it hits
+    // the depth cap and aborts → Indeterminate → DENY. Bounded (no RangeError), fail-closed.
+    expect(usesOutboundNetwork(`${doublingKey(4000, 'x')}\nvoid globalThis[a4000];`)).toBe(true);
+  }, 8000);
+  it('4. depth-limit path after a cached valid result (genuine still rejected)', () => {
+    // genuine short chain first (caches a valid result), then a deep chain in the same source.
+    const src = `const good = 'fetch';\n${doublingKey(2000, '')}\nglobalThis[good]('https://example.com/');\nvoid globalThis[a2000];`;
+    expect(usesOutboundNetwork(src)).toBe(true); // genuine 'good' detected; deep chain aborts → denied
+  }, 8000);
+  it('5. length-limit path after a cached valid result (genuine still rejected)', () => {
+    const src = `const good = 'fetch';\n${doublingKey(30, 'x')}\nvoid globalThis[a30];\nglobalThis[good]('https://example.com/');`;
+    expect(usesOutboundNetwork(src)).toBe(true);
+  }, 4000);
+  it('6. valid fetch after an earlier null (separate calls, shared nothing)', () => {
+    expect(usesOutboundNetwork(`${doublingKey(30, 'x')}\nvoid globalThis[a30];`)).toBe(false);
+    expect(usesOutboundNetwork(`globalThis['fetch']('https://example.com/');`)).toBe(true);
+  }, 4000);
+  it('7. valid WebSocket after an earlier null', () => {
+    expect(usesOutboundNetwork(`${linearKey(5000, 'safe')}\nvoid globalThis[a5000];`)).toBe(false);
+    expect(usesOutboundNetwork(`void new globalThis['Web' + 'Socket']('wss://example.com/');`)).toBe(true);
+  }, 8000);
+  it('8. null after a valid chain (both in one source, genuine rejected)', () => {
+    const src = `const key = 'fetch';\n${doublingKey(30, 'x')}\nglobalThis[key]('https://example.com/');\nvoid globalThis[a30];`;
+    expect(usesOutboundNetwork(src)).toBe(true);
+  }, 4000);
+  it('9. repeated NotCapability key reuse stays bounded and allowed', () => {
+    const lines = [doublingKey(30, 'x')];
+    for (let j = 0; j < 50; j++) lines.push(`void globalThis[a30];`);
+    expect(usesOutboundNetwork(lines.join('\n'))).toBe(false);
+    expect(netResolveVisits).toBeLessThan(1000); // shared memo: the NotCapability chain resolved once
+  }, 4000);
+  it('10. shared traversal memo after a NotCapability result does not poison a genuine key', () => {
+    const src = `${doublingKey(30, 'x')}\nconst good = 'fetch';\nvoid globalThis[a30];\nglobalThis[good]('https://example.com/');`;
+    expect(usesOutboundNetwork(src)).toBe(true);
+  }, 4000);
+
+  // --- P1 — a resource abort DENIES fail-closed (D3-CX-POLICY-NET-KEY) -------------------------
+  // The exact reported reproducer: a genuine `fetch` chain that the resolver ABORTS on (its `+`-fold
+  // recursion exceeds the depth cap) must be DENIED, not allowed. Under the old "abort → null →
+  // allow" mapping this was a genuine egress false negative.
+  it('denies the reported depth-abort fetch chain fail-closed (P1)', () => {
+    const lines = [`const shared = 'fetch';`, `const n0 = shared;`];
+    for (let i = 1; i <= 2500; i++) lines.push(`const n${String(i)} = '' + n${String(i - 1)};`);
+    lines.push(`globalThis[n2500]('https://example.com/');`);
+    expect(usesOutboundNetwork(lines.join('\n'))).toBe(true);
+  }, 8000);
+  it('denies a depth-abort WebSocket chain fail-closed (P1)', () => {
+    const lines = [`const shared = 'WebSocket';`, `const n0 = shared;`];
+    for (let i = 1; i <= 2500; i++) lines.push(`const n${String(i)} = '' + n${String(i - 1)};`);
+    lines.push(`void new globalThis[n2500]('wss://example.com/');`);
+    expect(usesOutboundNetwork(lines.join('\n'))).toBe(true);
+  }, 8000);
+
+  // --- MEMO SAFETY — a resource-bound abort is NOT cached (context-dependent) ------------------
+  // Mandatory adversarial shape: a declaration reached once past the depth cap (aborted, not
+  // cached) must still classify correctly when reached directly from a shallow path in the SAME
+  // traversal. A genuine `good = 'fetch'` sits alongside a depth-exceeding chain; both DENY, and
+  // `good` is detected directly (the abort did not poison the shared memo).
+  it('does not cache a depth-bound abort for a shared declaration', () => {
+    const src = [
+      doublingKey(2500, ''), // exceeds the depth cap → NetResolveAbort → not memoized → denied
+      `const good = 'fetch';`,
+      `void globalThis[a2500];`, // aborts → Indeterminate → denied fail-closed
+      `globalThis[good]('https://example.com/');`, // genuine, resolved directly → rejected
+    ].join('\n');
+    expect(usesOutboundNetwork(src)).toBe(true);
+  }, 8000);
+
+  // The exact prescribed adversarial shape: a genuine `shared = 'fetch'` reached PAST the depth
+  // cap on a deep `+`-nested path (`nK = '' + nK-1`, which aborts and is NOT memoized) must still
+  // be detected when reached DIRECTLY from a shallow path in the SAME traversal (shared memo).
+  it('resolves a shared genuine decl directly after a deep-path abort left it uncached', () => {
+    const lines = [`const shared = 'fetch';`, `const n0 = shared;`];
+    for (let i = 1; i <= 1500; i++) lines.push(`const n${String(i)} = '' + n${String(i - 1)};`);
+    lines.push(`void globalThis[n1500];`); // deep path → NetResolveAbort → bounded null, not cached
+    lines.push(`globalThis[shared]('https://example.com/');`); // shallow direct → 'fetch' → rejected
+    expect(usesOutboundNetwork(lines.join('\n'))).toBe(true);
+  }, 8000);
+
+  // Two distinct declarations sharing a NotCapability shape each resolve independently; a genuine
+  // one alongside a NotCapability one is still rejected (no cross-contamination via the shared memo).
+  it('keeps a NotCapability chain and a genuine chain independent within one source', () => {
+    const src = `${doublingKey(30, 'x')}\nconst g = 'Web';\nconst ws = g + 'Socket';\nvoid globalThis[a30];\nvoid new globalThis[ws]('wss://example.com/');`;
+    expect(usesOutboundNetwork(src)).toBe(true);
+  }, 4000);
+
+  // --- FAIL-CLOSED (NET self-contained) -------------------------------------------------------
+  // A computed free-global key the NET path cannot pin down is Indeterminate and is DENIED by NET
+  // itself: ambient, mutated, and undeclared keys.
+  const failClosed: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'an ambient declare const key', source: `declare const k: string;\nglobalThis[k]('https://example.com/');` },
+    { form: 'a mutated let key', source: `let k = 'fetch';\nk = 'other';\nglobalThis[k]('https://example.com/');` },
+    { form: 'an undeclared free-global key', source: `void globalThis[neverDeclared];` },
+  ];
+  for (const { form, source } of failClosed) {
+    it(`rejects ${form} fail-closed by NET`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // --- CYCLE termination under the new spine/bounds (denied fail-closed) ----------------------
+  const cycles: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a self cycle const a = a', source: `const a = a;\nglobalThis[a]('https://example.com/');` },
+    { form: 'a 2-node cycle a = b, b = a', source: `const a = b;\nconst b = a;\nglobalThis[a]('https://example.com/');` },
+    { form: 'a 3-node cycle a = b, b = c, c = a', source: `const a = b;\nconst b = c;\nconst c = a;\nglobalThis[a]('https://example.com/');` },
+  ];
+  for (const { form, source } of cycles) {
+    it(`terminates ${form} and is denied fail-closed by NET`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // --- POISONED-BINDING now DENIED fail-closed (frozen key policy supersedes the earlier allow) -
+  // An out-of-scope `const Infinity = 'fetch'` leaves `globalThis[Infinity]` Indeterminate, so it is
+  // denied — the analyzer cannot prove the runtime key is not a capability, and fail-closed wins.
+  it('denies the poisoned-binding cases fail-closed', () => {
+    expect(usesOutboundNetwork(`function f() {\n  const Infinity = 'fetch';\n}\nvoid globalThis[Infinity];`)).toBe(true);
+    expect(usesOutboundNetwork(`function f() {\n  const Infinity = 'fetch';\n}\nconst key = Infinity;\nvoid globalThis[key];`)).toBe(true);
+  });
 });
