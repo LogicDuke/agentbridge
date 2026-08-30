@@ -1371,7 +1371,48 @@ const netUniqueConstDecl = (id: ts.Identifier, checker: ts.TypeChecker): ts.Vari
 // is O(N + M) — a chain reused by M accesses is resolved once — not O(M × N). Both bounds sit far
 // above anything real host/Cockpit source or any genuine const chain produces.
 const NET_RESOLVE_VISIT_CAP = 200_000;
+
+// RESOLVER-TOTALITY BOUNDS (D3-CX-POLICY-NET-BIND-TOTALITY). Memoization bounds the NUMBER of
+// declaration visits, but two independent quantities were unbounded, each turning a small valid
+// source into a crash/OOM rather than a bounded policy verdict (verified Codex P2 pair):
+//
+//   1. OUTPUT LENGTH. `left + right` materialized the folded string with no size bound, so a
+//      doubling chain (`a0 = 'x'; aN = aN-1 + aN-1`) built a 2^N-char string on ~2N visits —
+//      the visit cap never fired. Because `+` only ADDS characters, a (sub)result longer than
+//      the longest capability name can never become a NETWORK_GLOBAL_NAMES member through
+//      further concatenation, so the fold stops tracking it and returns `null` BEFORE allocating
+//      the oversized string. This is a SEMANTIC result (a declaration's resolved length is
+//      intrinsic to its own initializer, independent of the caller), hence safely memoizable.
+//
+//   2. RECURSION DEPTH. A long chain recursed once per hop, so Node's native call stack threw
+//      an uncaught `RangeError` (~7.8k frames) far below the visit cap. The identifier-ALIAS
+//      spine (`const a = b; const b = c; …`) is now resolved ITERATIVELY — a chain of any length
+//      consumes O(1) native stack, so a genuine long chain to `fetch`/`WebSocket` still resolves
+//      and is still rejected (rather than crashing, or worse, being demoted to `null` and slipping
+//      past NET). Only a non-identifier initializer (a literal or `+`-fold) recurses, and a hard
+//      `NET_RESOLVE_DEPTH_CAP` — deterministic, far below the native stack limit and far above any
+//      real host/Cockpit source or genuine capability fold — bounds that remaining recursion.
+//      Exceeding it is a RESOURCE-BOUND ABORT: unlike the length bound it is context-DEPENDENT
+//      (it depends on the depth from which a declaration was reached), so it is signalled by
+//      `NetResolveAbort` and NEVER written to `memo` — a declaration aborted on a deep path still
+//      resolves normally when later reached from a shallow one. The visit-budget ceiling now
+//      aborts the same way instead of throwing an uncaught `Error`.
+//
+// `netMemberNameOf` catches `NetResolveAbort` and folds it to `null`; the independent runtime-code
+// guard then rejects a computed free-global key fail-closed, so a resource bound narrows NET
+// WITHOUT opening an outbound-network bypass. (A deeply nested LITERAL `+` expression overflows
+// the shared `ts.forEachChild` AST walk that every detector in this file uses, before this
+// resolver is reached — a pre-existing whole-file traversal limit, out of scope here.)
+const NET_RESOLVE_DEPTH_CAP = 2_000;
+// The longest network-capability name (`WebSocket` = 9). Derived from the policy set so it stays
+// correct if the set changes; a fold whose result would exceed it cannot equal any member name.
+const MAX_NETWORK_MEMBER_LENGTH = Math.max(...[...NETWORK_GLOBAL_NAMES].map((name) => name.length));
 let netResolveVisits = 0;
+
+// A resource-bound abort (recursion depth or visit budget) — DISTINCT from a semantic `null`.
+// Thrown (not returned) so no partially-resolved declaration on the aborted path is memoized, and
+// caught at the member boundary where it becomes a bounded `null` verdict rather than a crash.
+class NetResolveAbort extends Error {}
 
 const netResolveString = (
   node: ts.Expression,
@@ -1379,29 +1420,63 @@ const netResolveString = (
   seen: Set<ts.Declaration>,
   memo: Map<ts.Declaration, string | null>,
   budget: { spent: number },
+  depth: number,
 ): string | null => {
+  if (depth > NET_RESOLVE_DEPTH_CAP) throw new NetResolveAbort(); // resource bound: not memoized
   const n = unwrapExpr(node);
   if (ts.isStringLiteralLike(n)) return n.text;
   if (ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.PlusToken) {
-    const left = netResolveString(n.left, checker, seen, memo, budget);
+    const left = netResolveString(n.left, checker, seen, memo, budget, depth + 1);
     if (left === null) return null;
-    const right = netResolveString(n.right, checker, seen, memo, budget);
-    return right === null ? null : left + right;
+    const right = netResolveString(n.right, checker, seen, memo, budget, depth + 1);
+    if (right === null) return null;
+    // Bound OUTPUT before allocating `left + right`: an oversized result can never equal a
+    // capability name, so stop tracking it — no exponential intermediate is ever materialized.
+    if (left.length + right.length > MAX_NETWORK_MEMBER_LENGTH) return null;
+    return left + right;
   }
   if (ts.isIdentifier(n)) {
-    netResolveVisits += 1; // cumulative across the whole usesOutboundNetwork traversal (test evidence)
-    budget.spent += 1; // per-member cap: prevents a single member's exponential from hanging
-    if (budget.spent > NET_RESOLVE_VISIT_CAP) {
-      throw new Error('NET constant resolution exceeded its visit budget (memoization regression)');
+    // Resolve an identifier-ALIAS spine (`const a = b; const b = c; …`) ITERATIVELY, so a chain
+    // of any length consumes O(1) native stack. Every declaration on the spine denotes the SAME
+    // value, so the completed result is recorded for all of them at once. Only a non-identifier
+    // initializer (a literal or a `+`-fold) recurses, under the depth cap above.
+    const spine: ts.Declaration[] = [];
+    let cur: ts.Identifier = n;
+    let value: string | null = null;
+    for (;;) {
+      netResolveVisits += 1; // cumulative across the whole usesOutboundNetwork traversal (test evidence)
+      budget.spent += 1; // per-member ceiling
+      if (budget.spent > NET_RESOLVE_VISIT_CAP) throw new NetResolveAbort(); // resource bound: not memoized
+      const decl = netUniqueConstDecl(cur, checker);
+      if (decl === null || decl.initializer === undefined) {
+        value = null;
+        break;
+      }
+      if (memo.has(decl)) {
+        value = memo.get(decl) ?? null; // completed result (string or cached null)
+        break;
+      }
+      if (seen.has(decl)) {
+        value = null; // re-entry before completion: cycle (do not cache)
+        break;
+      }
+      seen.add(decl);
+      spine.push(decl);
+      const init = unwrapExpr(decl.initializer);
+      if (ts.isIdentifier(init)) {
+        cur = init; // alias hop: iterate, no recursion
+        continue;
+      }
+      value = netResolveString(init, checker, seen, memo, budget, depth + 1); // literal / `+`-fold
+      break;
     }
-    const decl = netUniqueConstDecl(n, checker);
-    if (decl === null || decl.initializer === undefined) return null;
-    if (memo.has(decl)) return memo.get(decl) ?? null; // completed result (string or cached null)
-    if (seen.has(decl)) return null; // re-entry before completion: cycle (do not cache)
-    seen.add(decl);
-    const value = netResolveString(decl.initializer, checker, seen, memo, budget);
-    seen.delete(decl);
-    memo.set(decl, value);
+    // Reached only on a NON-abort return (a thrown NetResolveAbort unwinds past this, leaving the
+    // aborted-path declarations UNcached). The completed value is context-independent, so caching
+    // it for every alias on the spine is sound.
+    for (const d of spine) {
+      seen.delete(d);
+      memo.set(d, value);
+    }
     return value;
   }
   return null;
@@ -1420,7 +1495,14 @@ const netMemberNameOf = (
   memo: Map<ts.Declaration, string | null>,
 ): string | null => {
   if (ts.isPropertyAccessExpression(node)) return node.name.text;
-  return netResolveString(node.argumentExpression, checker, new Set<ts.Declaration>(), memo, { spent: 0 });
+  try {
+    return netResolveString(node.argumentExpression, checker, new Set<ts.Declaration>(), memo, { spent: 0 }, 0);
+  } catch (error) {
+    // A resource-bound abort (depth/visit ceiling) is an UNRESOLVED key, not a crash: the
+    // independent runtime-code guard rejects a computed free-global key fail-closed.
+    if (error instanceof NetResolveAbort) return null;
+    throw error;
+  }
 };
 
 /**
@@ -5551,5 +5633,215 @@ describe('D3 host shares the NET declaration memo across member resolutions (D3-
   it('preserves the genuine-chain REJECT under the shared memo', () => {
     expect(usesOutboundNetwork(`const a = 'fetch';\nconst b = a;\nconst key = b;\nglobalThis[key]('https://example.com/');`)).toBe(true);
     expect(usesOutboundNetwork(`const a = 'Web';\nconst ws = a + 'Socket';\nvoid new globalThis[ws]('wss://example.com/');`)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P2 (resolver totality) — the NET static-string resolver must return a BOUNDED verdict, never
+// crash or allocate an unbounded intermediate (D3-CX-POLICY-NET-BIND-TOTALITY). Two verified
+// Codex P2 findings, same resolver boundary:
+//   A. `left + right` materialized a folded string of exponential size (`aN = aN-1 + aN-1`) while
+//      only ~2N declaration visits were charged — the visit cap never fired, so a tiny source
+//      could exhaust memory / stall CI. The fold now stops tracking (returns null) once a result
+//      exceeds the longest capability name, BEFORE allocating the oversized string.
+//   B. A long chain recursed once per hop, so Node's call stack threw an uncaught RangeError
+//      (~7.8k frames) far below the 200,000-visit cap. The identifier-alias spine now resolves
+//      ITERATIVELY (O(1) native stack; genuine long chains still resolve and reject), and a
+//      deterministic recursion-depth cap bounds the remaining `+`-fold recursion, returning a
+//      bounded unresolved (null) verdict — the runtime-code guard then rejects a computed
+//      free-global key fail-closed. Neither bound weakens genuine `fetch` / `WebSocket` detection.
+// ---------------------------------------------------------------------------
+describe('D3 host bounds NET resolver output growth and recursion depth (D3-CX-POLICY-NET-BIND-TOTALITY)', () => {
+  const doublingKey = (n: number, base: string): string => {
+    const lines = [`const a0 = '${base}';`];
+    for (let i = 1; i <= n; i++) lines.push(`const a${String(i)} = a${String(i - 1)} + a${String(i - 1)};`);
+    return lines.join('\n');
+  };
+  const linearKey = (n: number, base: string): string => {
+    const lines = [`const a0 = '${base}';`];
+    for (let i = 1; i <= n; i++) lines.push(`const a${String(i)} = a${String(i - 1)};`);
+    return lines.join('\n');
+  };
+
+  // --- FINDING A — output-length bound ---------------------------------------------------------
+  // A shallow doubling chain whose resolved length is exponential in N: the repaired resolver does
+  // BOUNDED work (no OOM, no hang) and never materializes the 2^N string. Under the OLD resolver
+  // this N=30 source built a >1 GB string on ~60 visits. `netResolveVisits` staying tiny is the
+  // structural proof that resolution stopped early rather than folding the whole tree.
+  it('does bounded work on an exponentially-growing doubling chain (no huge allocation)', () => {
+    const src = `${doublingKey(30, 'x')}\nvoid globalThis[a30];`;
+    expect(usesOutboundNetwork(src)).toBe(false); // the resolved value is not a network member
+    expect(netResolveVisits).toBeGreaterThan(0);
+    expect(netResolveVisits).toBeLessThan(1000); // linear in N, not 2^N
+  }, 4000);
+
+  it('does bounded work on the reported doubling family N=40 (a0 = fe)', () => {
+    const src = `${doublingKey(40, 'fe')}\nvoid globalThis[a40];`;
+    expect(usesOutboundNetwork(src)).toBe(false);
+    expect(netResolveVisits).toBeLessThan(1000);
+  }, 4000);
+
+  // The length bound stops tracking a value that can no longer equal a capability name, but never
+  // rejects a genuine short fold: every `fetch` / `WebSocket` fold (and every prefix of one) is
+  // within MAX_NETWORK_MEMBER_LENGTH, for direct, multi-part, and const-chain forms.
+  const genuineFolds: readonly { readonly form: string; readonly source: string }[] = [
+    { form: "a two-part 'fe' + 'tch'", source: `globalThis['fe' + 'tch']('https://example.com/');` },
+    { form: "a five-part 'f'+'e'+'t'+'c'+'h'", source: `globalThis['f' + 'e' + 't' + 'c' + 'h']('https://example.com/');` },
+    { form: "a two-part 'Web' + 'Socket'", source: `void new globalThis['Web' + 'Socket']('wss://example.com/');` },
+    { form: "a nine-part W+e+b+S+o+c+k+e+t", source: `void new globalThis['W' + 'e' + 'b' + 'S' + 'o' + 'c' + 'k' + 'e' + 't']('wss://example.com/');` },
+    { form: 'a genuine three-hop const chain', source: `const a = 'fetch';\nconst b = a;\nconst key = b;\nglobalThis[key]('https://example.com/');` },
+  ];
+  for (const { form, source } of genuineFolds) {
+    it(`still REJECTS ${form} under the length bound`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // A benign computed member that exceeds the capability-name length is still allowed (a static
+  // literal key is read directly, not folded, so it is unaffected by the fold-length bound).
+  it('still ALLOWS a benign over-length computed member', () => {
+    expect(usesOutboundNetwork(`void globalThis['ordinaryLocalMember'];`)).toBe(false);
+    expect(usesOutboundNetwork(`void globalThis['con' + 'sole'];`)).toBe(false); // 'console' ≤ 9
+  });
+
+  // --- FINDING B — recursion-depth / stack totality -------------------------------------------
+  // A long linear identifier chain to a genuine capability resolves ITERATIVELY: it is still
+  // REJECTED (not demoted to null, not a RangeError) at depths that crashed the old resolver.
+  for (const N of [500, 2000, 10000]) {
+    it(`still REJECTS a genuine linear fetch chain N=${String(N)} (iterative, no stack overflow)`, () => {
+      expect(usesOutboundNetwork(`${linearKey(N, 'fetch')}\nglobalThis[a${String(N)}]('https://example.com/');`)).toBe(true);
+    }, 8000);
+    it(`still REJECTS a genuine linear WebSocket chain N=${String(N)}`, () => {
+      expect(usesOutboundNetwork(`${linearKey(N, 'WebSocket')}\nvoid new globalThis[a${String(N)}]('wss://example.com/');`)).toBe(true);
+    }, 8000);
+  }
+
+  // A long linear chain to a benign value is allowed without crashing.
+  it('ALLOWS a long linear chain to a benign value without a stack overflow', () => {
+    expect(usesOutboundNetwork(`${linearKey(10000, 'safe')}\nvoid globalThis[a10000];`)).toBe(false);
+  }, 8000);
+
+  // A chain deep enough to exceed the recursion-depth cap yields a BOUNDED unresolved verdict
+  // (no RangeError, no hang). The identifier-indirected empty-base doubling reaches the `+`-fold
+  // recursion cap; the resolved value is not a capability, so the source is simply allowed.
+  for (const N of [1200, 2000, 4000]) {
+    it(`returns a bounded verdict past the depth cap (empty-base doubling N=${String(N)})`, () => {
+      expect(usesOutboundNetwork(`${doublingKey(N, '')}\nvoid globalThis[a${String(N)}];`)).toBe(false);
+    }, 8000);
+  }
+
+  // --- VISIT-BUDGET throw audit ---------------------------------------------------------------
+  // The visit-budget ceiling now ABORTS to a bounded null (caught at the member boundary) instead
+  // of throwing an uncaught Error; a resolution well within budget is unaffected.
+  it('resolves within the visit budget without throwing', () => {
+    expect(() => usesOutboundNetwork(`${linearKey(4000, 'fetch')}\nglobalThis[a4000]('https://example.com/');`)).not.toThrow();
+  }, 8000);
+
+  // --- INTERACTION MATRIX (both bounds compose) -----------------------------------------------
+  it('1. shallow but exponentially-growing string → bounded, allowed', () => {
+    expect(usesOutboundNetwork(`${doublingKey(30, 'x')}\nvoid globalThis[a30];`)).toBe(false);
+  }, 4000);
+  it('2. deep but constant-size string → bounded, allowed', () => {
+    expect(usesOutboundNetwork(`${linearKey(8000, 'safe')}\nvoid globalThis[a8000];`)).toBe(false);
+  }, 8000);
+  it('3. deep AND growing string → bounded, allowed', () => {
+    expect(usesOutboundNetwork(`${doublingKey(4000, 'x')}\nvoid globalThis[a4000];`)).toBe(false);
+  }, 8000);
+  it('4. depth-limit path after a cached valid result (genuine still rejected)', () => {
+    // genuine short chain first (caches a valid result), then a deep chain in the same source.
+    const src = `const good = 'fetch';\n${doublingKey(2000, '')}\nglobalThis[good]('https://example.com/');\nvoid globalThis[a2000];`;
+    expect(usesOutboundNetwork(src)).toBe(true); // genuine 'good' detected; deep chain is bounded null
+  }, 8000);
+  it('5. length-limit path after a cached valid result (genuine still rejected)', () => {
+    const src = `const good = 'fetch';\n${doublingKey(30, 'x')}\nvoid globalThis[a30];\nglobalThis[good]('https://example.com/');`;
+    expect(usesOutboundNetwork(src)).toBe(true);
+  }, 4000);
+  it('6. valid fetch after an earlier null (separate calls, shared nothing)', () => {
+    expect(usesOutboundNetwork(`${doublingKey(30, 'x')}\nvoid globalThis[a30];`)).toBe(false);
+    expect(usesOutboundNetwork(`globalThis['fetch']('https://example.com/');`)).toBe(true);
+  }, 4000);
+  it('7. valid WebSocket after an earlier null', () => {
+    expect(usesOutboundNetwork(`${linearKey(5000, 'safe')}\nvoid globalThis[a5000];`)).toBe(false);
+    expect(usesOutboundNetwork(`void new globalThis['Web' + 'Socket']('wss://example.com/');`)).toBe(true);
+  }, 8000);
+  it('8. null after a valid chain (both in one source, genuine rejected)', () => {
+    const src = `const key = 'fetch';\n${doublingKey(30, 'x')}\nglobalThis[key]('https://example.com/');\nvoid globalThis[a30];`;
+    expect(usesOutboundNetwork(src)).toBe(true);
+  }, 4000);
+  it('9. repeated bounded-null key reuse stays bounded and allowed', () => {
+    const lines = [doublingKey(30, 'x')];
+    for (let j = 0; j < 50; j++) lines.push(`void globalThis[a30];`);
+    expect(usesOutboundNetwork(lines.join('\n'))).toBe(false);
+    expect(netResolveVisits).toBeLessThan(1000); // shared memo: the bounded-null chain resolved once
+  }, 4000);
+  it('10. shared traversal memo after a bounded-null result does not poison a genuine key', () => {
+    const src = `${doublingKey(30, 'x')}\nconst good = 'fetch';\nvoid globalThis[a30];\nglobalThis[good]('https://example.com/');`;
+    expect(usesOutboundNetwork(src)).toBe(true);
+  }, 4000);
+
+  // --- MEMO SAFETY — a resource-bound abort is NOT cached (context-dependent) ------------------
+  // Mandatory adversarial shape: a genuine declaration reached once past the depth cap (aborted,
+  // not cached) must still resolve when reached directly from a shallow path in the SAME traversal.
+  // A genuine `good = 'fetch'` sits alongside a depth-exceeding chain; `good` is detected directly.
+  it('does not cache a depth-bound abort as a completed null for a shared declaration', () => {
+    const src = [
+      doublingKey(2500, ''), // exceeds the depth cap → NetResolveAbort → not memoized
+      `const good = 'fetch';`,
+      `void globalThis[a2500];`, // aborts to a bounded null (allowed)
+      `globalThis[good]('https://example.com/');`, // genuine, resolved directly → rejected
+    ].join('\n');
+    expect(usesOutboundNetwork(src)).toBe(true);
+  }, 8000);
+
+  // The exact prescribed adversarial shape: a genuine `shared = 'fetch'` reached PAST the depth
+  // cap on a deep `+`-nested path (`nK = '' + nK-1`, which aborts and is NOT memoized) must still
+  // be detected when reached DIRECTLY from a shallow path in the SAME traversal (shared memo).
+  it('resolves a shared genuine decl directly after a deep-path abort left it uncached', () => {
+    const lines = [`const shared = 'fetch';`, `const n0 = shared;`];
+    for (let i = 1; i <= 1500; i++) lines.push(`const n${String(i)} = '' + n${String(i - 1)};`);
+    lines.push(`void globalThis[n1500];`); // deep path → NetResolveAbort → bounded null, not cached
+    lines.push(`globalThis[shared]('https://example.com/');`); // shallow direct → 'fetch' → rejected
+    expect(usesOutboundNetwork(lines.join('\n'))).toBe(true);
+  }, 8000);
+
+  // Two distinct declarations sharing a bounded-null shape each resolve independently; a genuine
+  // one alongside a bounded-null one is still rejected (no cross-contamination via the shared memo).
+  it('keeps a bounded-null chain and a genuine chain independent within one source', () => {
+    const src = `${doublingKey(30, 'x')}\nconst g = 'Web';\nconst ws = g + 'Socket';\nvoid globalThis[a30];\nvoid new globalThis[ws]('wss://example.com/');`;
+    expect(usesOutboundNetwork(src)).toBe(true);
+  }, 4000);
+
+  // --- FAIL-CLOSED composition ----------------------------------------------------------------
+  // A computed free-global key the NET path cannot bound remains rejected fail-closed by the
+  // independent runtime-code guard (unchanged): ambient, mutated, and undeclared keys.
+  const failClosed: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'an ambient declare const key', source: `declare const k: string;\nglobalThis[k]('https://example.com/');` },
+    { form: 'a mutated let key', source: `let k = 'fetch';\nk = 'other';\nglobalThis[k]('https://example.com/');` },
+    { form: 'an undeclared free-global key', source: `void globalThis[neverDeclared];` },
+  ];
+  for (const { form, source } of failClosed) {
+    it(`keeps ${form} out of NET but rejected by the runtime-code guard`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+      expect(usesRuntimeCodeGeneration(source)).toBe(true);
+    });
+  }
+
+  // --- CYCLE preservation under the new spine/bounds ------------------------------------------
+  const cycles: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a self cycle const a = a', source: `const a = a;\nglobalThis[a]('https://example.com/');` },
+    { form: 'a 2-node cycle a = b, b = a', source: `const a = b;\nconst b = a;\nglobalThis[a]('https://example.com/');` },
+    { form: 'a 3-node cycle a = b, b = c, c = a', source: `const a = b;\nconst b = c;\nconst c = a;\nglobalThis[a]('https://example.com/');` },
+  ];
+  for (const { form, source } of cycles) {
+    it(`terminates ${form} and fails closed`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+      expect(usesRuntimeCodeGeneration(source)).toBe(true);
+    });
+  }
+
+  // --- POISONED-BINDING allow preserved (prior fixes intact) ----------------------------------
+  it('preserves the poisoned-binding ALLOW cases', () => {
+    expect(usesOutboundNetwork(`function f() {\n  const Infinity = 'fetch';\n}\nvoid globalThis[Infinity];`)).toBe(false);
+    expect(usesOutboundNetwork(`function f() {\n  const Infinity = 'fetch';\n}\nconst key = Infinity;\nvoid globalThis[key];`)).toBe(false);
   });
 });
