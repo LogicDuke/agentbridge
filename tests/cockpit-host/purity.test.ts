@@ -1136,16 +1136,31 @@ const isDynamicNodeHttpImport = (node: ts.Node): boolean => {
 // capability (`req.socket.connect(...)`) the createServer allowance is not meant to grant.
 // This is the FINAL BOUNDED D3 source policy (commander decision, frozen): the strongest
 // finite policy that stays compatible with the actual host. It is NOT a taint/alias/type/
-// whole-program engine and does NOT claim literal no-egress — three purely syntactic rules:
+// whole-program engine and does NOT claim literal no-egress. It is ONE global static-name
+// rule (RULE A over a socket-acquisition name FAMILY) plus its req/res computed refinement
+// (RULE A2), both receiver- and position-independent:
 //
-//   RULE A — GLOBAL static socket/connection NAME ban, regardless of receiver identity. A
-//     property named `socket`/`connection` acquired by a statically identifiable name is
-//     rejected: dotted `x.socket` (optional chaining included), static-computed
-//     `x['socket']`/`` x[`connection`] ``, and object-destructuring `{ socket }` /
-//     `{ socket: s }` / `{ connection }` in any binding pattern (variable, parameter,
-//     nested, callback). Receiver identity is deliberately irrelevant — an unrelated
-//     `camera.socket` is an accepted, intentional policy false positive; real host/cockpit
-//     source uses neither name.
+//   RULE A — GLOBAL static socket-ACQUISITION NAME ban, regardless of receiver identity and
+//     regardless of call/read position. Two name families are rejected wherever a statically
+//     identifiable property/binding KEY names them:
+//       (i)  the SOCKET-VALUE names `socket`/`connection` — the duplex socket itself; and
+//       (ii) the SOCKET-DELIVERY member names `on`/`once`/`addListener`/`prependListener`/
+//            `prependOnceListener`/`setTimeout` — the permitted http.Server callbacks that
+//            hand a socket to a handler (`connection`/`request`/`upgrade`/`connect`/
+//            `clientError`/`dropRequest`/`timeout`, plus `setTimeout`'s one-shot timeout
+//            socket), covered with NO event-name list.
+//     The ban fires on every statically identifiable form: dotted `x.on` (optional chaining
+//     included), static-computed `x['on']`/`` x[`socket`] ``, and object-destructuring
+//     `{ socket }` / `{ on: h }` in any binding pattern (variable, parameter, nested,
+//     callback). Because it anchors on the member NAME at ANY position — not on a call
+//     callee — it closes the indirect-registrar family uniformly: `server.on(...)`,
+//     `server.on.call/apply/bind(...)`, `Reflect.apply(server.on, …)`, `const m = server.on`
+//     (F2), and `server.setTimeout(t, socket => …)` (F1) all contain the banned name as a
+//     property access and are rejected at acquisition, with no witness-specific
+//     `.call`/`.apply`/`.bind` blacklist. Receiver identity is deliberately irrelevant — an
+//     unrelated `camera.socket`, `emitter.on('ready', …)`, or `obj.setTimeout(…)` is an
+//     accepted, intentional policy false positive; real host/cockpit source uses none of
+//     these names (it calls only `http.createServer` and `server.listen`).
 //
 //   RULE A2 — for the request/response PARAMETERS of a function literal passed DIRECTLY to a
 //     permitted static `createServer` call (binder identity — these are the sole direct
@@ -1153,29 +1168,38 @@ const isDynamicNodeHttpImport = (node: ts.Node): boolean => {
 //     is not a static string FAILS CLOSED (`req[key]`, `req['sock'+'et']`, `req[c?…:…]`).
 //     This closes computed recovery on the direct handler param without touching legitimate
 //     host indexing elsewhere (`array[index]`, `text[character]`, `object[key]` are NOT on a
-//     createServer handler param, so they are unaffected). No const-folding is used.
+//     createServer handler param, so they are unaffected). No const-folding is used. A2's
+//     socket/connection semantics are preserved byte-for-byte by the RULE A name-family
+//     promotion above (A2 keeps consulting `SOCKET_CAPABILITY_NAMES`, not the wider family).
 //
-//   RULE B — BLANKET event-registration ban. Any call whose callee member is a registrar
-//     name (`on`/`once`/`addListener`/`prependListener`/`prependOnceListener`, read from a
-//     dotted or static-key access) is rejected regardless of receiver, event name, or handler
-//     shape. Real D3 host/cockpit source registers NO events, so this eliminates every
-//     socket-delivering event route — `request`, `connection`, `upgrade`, `connect`,
-//     `clientError`, `dropRequest`, and any future one — with no event-name list to maintain
-//     and no wrapper/receiver inference. The accepted, bounded false positive is that an
-//     unrelated synthetic `emitter.on('ready', …)` is also rejected.
-//
-// HONEST BOUNDARY (frozen, not a defect): an aliased/cross-function request combined with a
-// runtime-computed key — `const r = request; r[runtimeKey]` where `runtimeKey` becomes
-// `'socket'` at runtime — is NOT closed; closing it would require alias propagation / type
-// resolution / whole-program flow, deliberately excluded here. It belongs to a future
-// runtime-isolation enforcement boundary, not this source policy.
+// HONEST BOUNDARY (frozen, not a defect): a socket-delivering member acquired WITHOUT its
+// name ever appearing statically — a cross-function alias combined with a runtime-computed
+// key, `const r = request; r[runtimeKey]` where `runtimeKey` becomes `'socket'` at runtime
+// (or a registrar/`setTimeout` reached as `server[k]` with runtime `k`) — is NOT closed;
+// closing it would require alias propagation / type resolution / whole-program flow,
+// deliberately excluded here. It belongs to a future runtime-isolation enforcement boundary,
+// not this source policy.
+// The SOCKET-VALUE names (RULE A family i) — the duplex socket itself. Still used verbatim by
+// the RULE A2 req/res-bound branches below, whose socket/connection semantics are preserved.
 const SOCKET_CAPABILITY_NAMES: ReadonlySet<string> = new Set(['socket', 'connection']);
-const SOCKET_EVENT_REGISTRARS: ReadonlySet<string> = new Set([
+// The SOCKET-DELIVERY member names (RULE A family ii) — the permitted http.Server callbacks
+// that hand a socket to a handler. `setTimeout` (the one-shot 'timeout' socket — F1) sits
+// beside the five event registrars; the whole family is banned by NAME at any position (F2),
+// never by call shape, so `.call`/`.apply`/`.bind`/`Reflect.apply`/`const m = server.on`
+// cannot launder it, and there is NO event-name list to maintain.
+const SOCKET_DELIVERY_MEMBERS: ReadonlySet<string> = new Set([
   'on',
   'once',
   'addListener',
   'prependListener',
   'prependOnceListener',
+  'setTimeout',
+]);
+// The full RULE A static name family (i ∪ ii), tested at every statically identifiable
+// property/binding-key position (dotted, static-computed, destructured), receiver-independent.
+const STATIC_SOCKET_ACQUISITION_NAMES: ReadonlySet<string> = new Set([
+  ...SOCKET_CAPABILITY_NAMES,
+  ...SOCKET_DELIVERY_MEMBERS,
 ]);
 
 // The static key named by an element-access argument or a binding-element key, or null.
@@ -1222,23 +1246,34 @@ const acquiresInboundServerSocket = (checker: ts.TypeChecker, sourceFile: ts.Sou
 
   let found = false;
   const visit = (node: ts.Node): void => {
-    // RULE A (a) — GLOBAL dotted `.socket`/`.connection` (optional chaining included).
-    if (ts.isPropertyAccessExpression(node) && SOCKET_CAPABILITY_NAMES.has(node.name.text)) found = true;
-    // RULE A (b) — GLOBAL static-computed `['socket']`/`['connection']`; else RULE A2 fails
-    //     closed on an indeterminate computed key when the receiver is a createServer param.
+    // RULE A (a) — GLOBAL dotted socket-acquisition NAME: `.socket`/`.connection` or a delivery
+    //     member `.on`/`.once`/`.addListener`/`.prependListener`/`.prependOnceListener`/
+    //     `.setTimeout` (optional chaining included), any receiver, any position. This is the node
+    //     that closes the indirect-registrar family (F2): the inner `server.on` inside
+    //     `server.on.call(...)` / `server.on.apply(...)` / `server.on.bind(...)` /
+    //     `Reflect.apply(server.on, …)` / `const m = server.on`, and the `server.setTimeout`
+    //     receiver of `server.setTimeout(t, socket => …)` (F1), are each a property access
+    //     visited here regardless of how (or whether) they are later invoked.
+    if (ts.isPropertyAccessExpression(node) && STATIC_SOCKET_ACQUISITION_NAMES.has(node.name.text)) found = true;
+    // RULE A (b) — GLOBAL static-computed socket-acquisition NAME `['socket']`/`['connection']`/
+    //     `['on']`/…/`['setTimeout']` (any receiver, e.g. `server['on']('connection', …)`); else
+    //     RULE A2 fails closed on an indeterminate computed key when the receiver is a
+    //     createServer param. The A2 (receiverIsReqRes) branch is unchanged.
     if (ts.isElementAccessExpression(node)) {
       const arg = node.argumentExpression;
       if (ts.isStringLiteralLike(arg)) {
-        if (SOCKET_CAPABILITY_NAMES.has(arg.text)) found = true;
+        if (STATIC_SOCKET_ACQUISITION_NAMES.has(arg.text)) found = true;
       } else if (receiverIsReqRes(node.expression)) {
         found = true;
       }
     }
-    // RULE A (c) — GLOBAL `{ socket }` / `{ connection }` destructuring in any object binding
-    //     pattern (variable, parameter, nested, callback), including `{ socket: s }`.
+    // RULE A (c) — GLOBAL socket-acquisition NAME destructuring in any object binding pattern
+    //     (variable, parameter, nested, callback): `{ socket }` / `{ connection }` /
+    //     `{ on }` / `{ setTimeout }`, including the renamed `{ on: h }` / `{ socket: s }` form
+    //     (the static source KEY is what is banned, never the local binding name).
     if (ts.isBindingElement(node) && ts.isObjectBindingPattern(node.parent)) {
       const name = staticKeyText(node.propertyName ?? node.name);
-      if (name !== null && SOCKET_CAPABILITY_NAMES.has(name)) found = true;
+      if (name !== null && STATIC_SOCKET_ACQUISITION_NAMES.has(name)) found = true;
     }
     // RULE A2 (destructuring) — an INDETERMINATE computed binding key destructured DIRECTLY
     //     from a createServer request/response handler parameter fails closed (bound to the
@@ -1291,15 +1326,14 @@ const acquiresInboundServerSocket = (checker: ts.TypeChecker, sourceFile: ts.Sou
         }
       }
     }
-    // RULE B — BLANKET event-registration ban: any registrar member call, any receiver, any
-    //     event name (dotted `.on` or static-key `['on']`).
-    if (
-      ts.isCallExpression(node) &&
-      (ts.isPropertyAccessExpression(node.expression) || ts.isElementAccessExpression(node.expression))
-    ) {
-      const registrar = binderMemberName(node.expression);
-      if (registrar !== null && SOCKET_EVENT_REGISTRARS.has(registrar)) found = true;
-    }
+    // RULE B (PROMOTED into RULE A's name family) — the event registrars and `setTimeout` are
+    //     now banned by NAME at RULE A (a)/(b)/(c) above, receiver- and position-independent, so
+    //     the former call-callee-only registrar ban is fully subsumed (a called `server.on(...)`
+    //     is caught by its `.on` property access, exactly like an uncalled `const m = server.on`).
+    //     Anchoring on the member NAME rather than the call callee is precisely what closes the
+    //     `.call`/`.apply`/`.bind`/`Reflect.apply`/method-extraction indirection (F2) and the
+    //     `setTimeout` delivery surface (F1) — with NO witness-specific `.call`/`.apply`/`.bind`
+    //     blacklist and NO event-name enumeration. No separate call-shaped rule remains.
     ts.forEachChild(node, visit);
   };
   ts.forEachChild(sourceFile, visit);
@@ -4879,17 +4913,21 @@ describe('D3 host prohibits runtime dynamic import of node:http (D3-CX-POLICY-NE
 });
 
 // ---------------------------------------------------------------------------
-// SOCK final bounded D3 socket policy (D3-CX-POLICY-NET-SOCK). Three finite, purely
-// syntactic rules, no taint/alias/type/whole-program: RULE A — a GLOBAL static ban on
-// acquiring a property named `socket`/`connection` (dotted, optional, static-computed, or
-// destructured) regardless of receiver; RULE A2 — on the request/response parameters of a
-// function literal passed directly to a permitted `createServer`, an indeterminate computed
-// element access fails closed; RULE B — a BLANKET ban on every event registrar call
-// (`on`/`once`/`addListener`/`prependListener`/`prependOnceListener`), any receiver, any
-// event name. Accepted, intentional false positives: an unrelated `camera.socket` and an
-// unrelated `emitter.on('ready', …)` are rejected because real host/cockpit source uses
-// neither. The alias + runtime-computed residual (`const r = request; r[runtimeKey]`) is the
-// frozen honest boundary, deliberately not closed here.
+// SOCK final bounded D3 socket policy (D3-CX-POLICY-NET-SOCK). Finite, purely syntactic, no
+// taint/alias/type/whole-program: RULE A — a GLOBAL static ban on acquiring a socket-ACQUISITION
+// NAME by any statically identifiable property/binding key, receiver- AND position-independent.
+// The name family is (i) the socket-value names `socket`/`connection` and (ii) the socket-delivery
+// member names `on`/`once`/`addListener`/`prependListener`/`prependOnceListener`/`setTimeout` —
+// the permitted http.Server callbacks that hand over a socket, with no event-name list. Anchoring
+// on the NAME (not the call callee) folds in the former registrar ban and closes the indirect
+// family: `server.on(...)`, `server.on.call/apply/bind(...)`, `Reflect.apply(server.on, …)`,
+// `const m = server.on` (F2), and `server.setTimeout(…, socket => …)` (F1). RULE A2 — on the
+// request/response parameters of a function literal passed directly to a permitted `createServer`,
+// an indeterminate computed element access fails closed (socket/connection semantics unchanged).
+// Accepted, intentional false positives: an unrelated `camera.socket`, `emitter.on('ready', …)`,
+// or `obj.setTimeout(…)` is rejected because real host/cockpit source uses none of these names.
+// The alias + runtime-computed residual (`const r = request; r[runtimeKey]`, or `server[k]` with
+// runtime `k`) is the frozen honest boundary, deliberately not closed here.
 // ---------------------------------------------------------------------------
 describe('D3 host enforces the final bounded socket-capability source policy (D3-CX-POLICY-NET-SOCK)', () => {
   it('accepts every real host source (no host source acquires the inbound socket)', () => {
@@ -4953,7 +4991,7 @@ describe('D3 host enforces the final bounded socket-capability source policy (D3
     { form: 'a conditional req[c ? "socket" : "method"] on the handler param', source: handler(`const c = req.method === 'GET';\nvoid req[c ? 'socket' : 'method'];`) },
   ];
 
-  // --- RULE B: BLANKET event-registration ban (any registrar, any receiver, any event) ---
+  // --- RULE A (promoted): registrar-name ban, now by NAME at any position (direct call form) ---
   const registrarNames = ['on', 'once', 'addListener', 'prependListener', 'prependOnceListener'];
   const anyEventNames = ['request', 'connection', 'dropRequest', 'ready'];
   const wrapperHead =
@@ -4975,12 +5013,34 @@ describe('D3 host enforces the final bounded socket-capability source policy (D3
     { form: "a synthetic LocalEmitter registering 'anything' (accepted false positive)", source: `class LocalEmitter {\n  addListener(_event: string, _cb: () => void): void {}\n}\nconst emitter = new LocalEmitter();\nemitter.addListener('anything', () => {});` },
   ];
 
+  // --- ADVERSARIAL MATRIX (frozen DDR): F1 setTimeout surface + F2 indirect-registrar family.
+  //     Each is closed by the RULE A member-NAME ban (the banned name is a property/element
+  //     access somewhere in the source), with NO witness-specific `.call`/`.apply`/`.bind` list. ---
+  const familyReject: readonly { readonly form: string; readonly source: string }[] = [
+    // F1 — server.setTimeout delivers the connection socket to its callback.
+    { form: 'F1: server.setTimeout(t, socket => socket.connect(...))', source: wrapperHead + `server.setTimeout(2000, (socket: { connect(p: number, h: string): void }) => {\n  socket.connect(80, 'example.com');\n});` },
+    { form: 'F1: server.setTimeout acquired via .bind', source: wrapperHead + `const t = server.setTimeout.bind(server);\nvoid t;` },
+    // F2 — the same registrar reached indirectly; the inner `server.on` name is what is banned.
+    { form: 'F2: server.on.call(server, "connection", …)', source: wrapperHead + `server.on.call(server, 'connection', (socket: unknown) => {\n  void socket;\n});` },
+    { form: 'F2: server.on.apply(server, [...])', source: wrapperHead + `server.on.apply(server, ['connection', (socket: unknown) => {\n  void socket;\n}]);` },
+    { form: 'F2: server.on.bind(server)(...)', source: wrapperHead + `const reg = server.on.bind(server);\nreg('connection', (socket: unknown) => {\n  void socket;\n});` },
+    { form: 'F2: Reflect.apply(server.on, server, [...])', source: wrapperHead + `Reflect.apply(server.on, server, ['connection', (socket: unknown) => {\n  void socket;\n}]);` },
+    { form: 'F2: method-extraction const m = server.on; m.call(...)', source: wrapperHead + `const m = server.on;\nm.call(server, 'connection', (socket: unknown) => {\n  void socket;\n});` },
+    { form: 'F2: static-key extraction server["on"].call(...)', source: wrapperHead + `server['on'].call(server, 'connection', () => {});` },
+    { form: 'F2: const m = server.on rejected at acquisition (no call)', source: wrapperHead + `const m = server.on;\nvoid m;` },
+    { form: 'F2: server.once.call(server, "upgrade", …)', source: wrapperHead + `server.once.call(server, 'upgrade', () => {});` },
+    // Intentionally broad static policy — unrelated .on / .setTimeout are rejected too.
+    { form: 'benign unrelated object.on (accepted broad-policy false positive)', source: `const obj = { on(_e: string, _c: () => void): void {} };\nobj.on('x', () => {});` },
+    { form: 'benign unrelated object.setTimeout (accepted broad-policy false positive)', source: `const timer = { setTimeout(_m: number, _c: () => void): void {} };\ntimer.setTimeout(0, () => {});` },
+  ];
+
   for (const { form, source } of [
     ...ruleAReject,
     ...destructureReject,
     ...ruleA2Reject,
     ...eventReject,
     ...eventRejectSpecial,
+    ...familyReject,
   ]) {
     it(`rejects ${form}`, () => {
       expect(usesOutboundNetwork(source)).toBe(true);
@@ -5000,6 +5060,10 @@ describe('D3 host enforces the final bounded socket-capability source policy (D3
     { form: 'unrelated text[character] indexing', source: `const text = 'abc';\nconst character = 1;\nvoid text[character];` },
     { form: 'unrelated object[key] indexing', source: `const object: Record<string, number> = {};\nconst key = 'a';\nvoid object[key];` },
     { form: 'a non-socket ordinary member on an unrelated object', source: `const obj = { value: 1 };\nvoid obj.value;` },
+    // Matrix item 17 — the frozen honest boundary stays OUTSIDE the proof; the mechanism must
+    // NOT be broadened to close it (doing so would need alias/type/whole-program analysis).
+    { form: 'the frozen alias + runtime-key residual on req (remains allowed)', source: handler(`const r = req;\nconst k = req.url ?? '';\nvoid r[k];`) },
+    { form: 'the frozen runtime-computed server[k] residual (remains allowed)', source: wrapperHead + `const k = String(4317);\nvoid server[k];` },
   ];
   for (const { form, source } of sockAllow) {
     it(`allows ${form}`, () => {
