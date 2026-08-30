@@ -337,9 +337,32 @@ const unwrapExpr = (node: ts.Expression): ts.Expression => {
   return cur;
 };
 
+// A global-object SELF-REFERENCE hop: the member NAME read off a receiver when that
+// receiver is a member access whose key is a statically present string
+// (`globalThis.globalThis`, `window['window']`). The real global exposes itself under
+// every GLOBAL_RECEIVER_NAMES key (`globalThis.globalThis === globalThis`,
+// `globalThis.window === globalThis`, …), so a chain of such hops off a global base still
+// denotes the real global. Returns the hop name or null; it NEVER folds a runtime-built
+// key (no alias/value-flow), so a truly computed key stays outside the frozen boundary.
+const selfReferenceHopName = (
+  node: ts.PropertyAccessExpression | ts.ElementAccessExpression,
+): string | null => {
+  if (ts.isPropertyAccessExpression(node)) return node.name.text;
+  return ts.isStringLiteralLike(node.argumentExpression) ? node.argumentExpression.text : null;
+};
+
+// A structural global receiver: a bare global-object identifier, OR a self-reference member
+// (name in GLOBAL_RECEIVER_NAMES) read off another structural global receiver — so
+// `globalThis.globalThis`, `globalThis.window`, `window.window` are all recognized. Finite:
+// each recursion strips one member-access layer off `node.expression`.
 const isGlobalReceiver = (node: ts.Expression): boolean => {
   const n = unwrapExpr(node);
-  return ts.isIdentifier(n) && GLOBAL_RECEIVER_NAMES.has(n.text);
+  if (ts.isIdentifier(n)) return GLOBAL_RECEIVER_NAMES.has(n.text);
+  if (ts.isPropertyAccessExpression(n) || ts.isElementAccessExpression(n)) {
+    const hop = selfReferenceHopName(n);
+    return hop !== null && GLOBAL_RECEIVER_NAMES.has(hop) && isGlobalReceiver(n.expression);
+  }
+  return false;
 };
 
 // The statically-provable string value of an expression: a string literal or
@@ -362,6 +385,16 @@ const staticStringOf = (node: ts.Expression, constMap: ReadonlyMap<string, strin
   }
   return null;
 };
+
+// Totality ceiling for `+`-fold resolution (TOTALITY). The longest name any consumer of
+// this resolver compares against is `prependOnceListener` (19) / `getBuiltinModule` (16),
+// so a fold longer than this can never be a matched capability/socket/reserved name. Capping
+// the fold length keeps the resolver total: an adversarial exponentially-growing `+`-chain
+// (`a1 = a0 + a0; a2 = a1 + a1; …`) resolves to UNKNOWN instead of exhausting string memory,
+// exactly as the NET binder resolver already aborts such chains. No genuine name (all ≤ 19)
+// is suppressed. Ascending source order + memoization keep recursion depth O(1) per name, so
+// depth is already bounded; this bounds output SIZE, the only remaining growth axis.
+const MAX_STATIC_FOLD_LEN = 64;
 
 // Collect the identifier texts that provably denote a single immutable string
 // constant, resolved conservatively and in FINITE time over the already-parsed
@@ -473,6 +506,8 @@ const collectStringConsts = (sourceFile: ts.SourceFile): Map<string, string> => 
       if (left === null) return null;
       const right = resolveExpr(n.right);
       if (right === null) return null;
+      // TOTALITY: never build a fold longer than any name this resolver is compared against.
+      if (left.length + right.length > MAX_STATIC_FOLD_LEN) return null;
       return left + right;
     }
     if (ts.isIdentifier(n)) return resolveName(n.text);
@@ -1151,10 +1186,22 @@ const hasLocalRuntimeShadow = (symbol: ts.Symbol, sourceFile: ts.SourceFile): bo
 // free. Restoration/nesting/sibling scope are the binder's job as before.
 const isFreeGlobalReceiver = (expr: ts.Expression, checker: ts.TypeChecker, sourceFile: ts.SourceFile): boolean => {
   const recv = binderUnwrap(expr);
-  if (!ts.isIdentifier(recv) || !GLOBAL_RECEIVER_NAMES.has(recv.text)) return false;
-  const symbol = checker.getSymbolAtLocation(recv);
-  if (symbol === undefined) return true;
-  return !hasLocalRuntimeShadow(symbol, sourceFile);
+  if (ts.isIdentifier(recv)) {
+    if (!GLOBAL_RECEIVER_NAMES.has(recv.text)) return false;
+    const symbol = checker.getSymbolAtLocation(recv);
+    if (symbol === undefined) return true;
+    return !hasLocalRuntimeShadow(symbol, sourceFile);
+  }
+  // Global-object self-reference hop (`globalThis.globalThis`, `window.window`, …): the member
+  // name is a global-receiver name and its own receiver is (recursively) a free global. Binder/
+  // shadowing authority stays at the BASE identifier above — a shadowed base
+  // (`function f(globalThis){ globalThis.globalThis.fetch() }`) demotes the whole chain to an
+  // ordinary object. Finite: recursion descends `recv.expression`.
+  if (ts.isPropertyAccessExpression(recv) || ts.isElementAccessExpression(recv)) {
+    const hop = selfReferenceHopName(recv);
+    return hop !== null && GLOBAL_RECEIVER_NAMES.has(hop) && isFreeGlobalReceiver(recv.expression, checker, sourceFile);
+  }
+  return false;
 };
 
 // Whether a call is a runtime dynamic `import('node:http')` (Option B: prohibited outright).
@@ -1249,6 +1296,13 @@ const acquiresInboundServerSocket = (checker: ts.TypeChecker, sourceFile: ts.Sou
   const isCreateServerCall = (node: ts.Node): boolean =>
     ts.isCallExpression(node) && classifyHttpExpression(node.expression, checker) === 'CREATE_SERVER';
 
+  // DDR-B: the SAME bounded static-string resolver the RC/HA member-name check uses, so a
+  // statically constructed socket-acquisition key (`server['o' + 'n']`,
+  // `const k = 'on'; server[k]`) resolves to its name. Receiver-independent, fail-closed: a
+  // genuinely runtime key resolves to null and stays outside the proof (frozen boundary). NET's
+  // own binder-based key resolver is untouched; this map is local to SOCK.
+  const constMap = collectStringConsts(sourceFile);
+
   // Pass 1 (RULE A2 support) — collect the createServer request/response parameter symbols.
   // Direct identifier params only; a destructured param `({ socket })` is a RULE A binding
   // pattern, rejected in pass 2 like any other.
@@ -1295,18 +1349,28 @@ const acquiresInboundServerSocket = (checker: ts.TypeChecker, sourceFile: ts.Sou
     //     createServer param. The A2 (receiverIsReqRes) branch is unchanged.
     if (ts.isElementAccessExpression(node)) {
       const arg = node.argumentExpression;
-      if (ts.isStringLiteralLike(arg)) {
-        if (STATIC_SOCKET_ACQUISITION_NAMES.has(arg.text)) found = true;
-      } else if (receiverIsReqRes(node.expression)) {
-        found = true;
-      }
+      const resolved = staticStringOf(arg, constMap);
+      // RULE A extension (DDR-B): a statically-resolvable socket-acquisition NAME, ANY receiver
+      //     (`server['o' + 'n']`, `const k='on'; server[k]`, `` server[`socket`] ``).
+      if (resolved !== null && STATIC_SOCKET_ACQUISITION_NAMES.has(resolved)) found = true;
+      // RULE A2 (unchanged): a non-string-literal computed key on a createServer req/res param
+      //     fails closed. The trigger stays keyed on `!isStringLiteralLike`, so A2's fail-closed
+      //     surface is byte-for-byte what it was — the resolver only ADDS global name rejections.
+      else if (!ts.isStringLiteralLike(arg) && receiverIsReqRes(node.expression)) found = true;
     }
     // RULE A (c) — GLOBAL socket-acquisition NAME destructuring in any object binding pattern
     //     (variable, parameter, nested, callback): `{ socket }` / `{ connection }` /
     //     `{ on }` / `{ setTimeout }`, including the renamed `{ on: h }` / `{ socket: s }` form
     //     (the static source KEY is what is banned, never the local binding name).
     if (ts.isBindingElement(node) && ts.isObjectBindingPattern(node.parent)) {
-      const name = staticKeyText(node.propertyName ?? node.name);
+      const keyNode = node.propertyName ?? node.name;
+      // RULE A extension (DDR-B): a statically-resolvable COMPUTED destructuring key
+      //     (`{ ['o'+'n']: h }`, `{ [k]: h }` with `const k='on'`) resolves via the SAME
+      //     resolver; a plain key keeps its existing staticKeyText path. The separate A2
+      //     destructuring branch below is untouched, so its fail-closed surface is preserved.
+      const name = ts.isComputedPropertyName(keyNode)
+        ? staticStringOf(keyNode.expression, constMap)
+        : staticKeyText(keyNode);
       if (name !== null && STATIC_SOCKET_ACQUISITION_NAMES.has(name)) found = true;
     }
     // RULE A2 (destructuring) — an INDETERMINATE computed binding key destructured DIRECTLY
@@ -5135,6 +5199,93 @@ describe('D3 host enforces the final bounded socket-capability source policy (D3
   for (const { form, source } of sockAllow) {
     it(`allows ${form}`, () => {
       expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+
+  // --- DDR-B: statically CONSTRUCTED socket-acquisition KEYS resolve via the shared
+  //     static-string resolver, any receiver — MUST REJECT. `server['o' + 'n']` is the
+  //     reported reproduction. A genuinely runtime key resolves to null and stays outside. ---
+  const ddrBReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: "the reported server['o' + 'n']('connection', …) reproduction", source: wrapperHead + `server['o' + 'n']('connection', (s: { destroy(): void; connect(p: number, h: string): void }) => {\n  s.destroy();\n  setTimeout(() => s.connect(80, 'example.com'), 50);\n});` },
+    { form: "a literal server['on']", source: wrapperHead + `server['on']('connection', () => {});` },
+    { form: "a const-bound key const k = 'on'; server[k]", source: wrapperHead + `const k = 'on';\nserver[k]('connection', () => {});` },
+    { form: 'a template server[`on`]', source: wrapperHead + 'server[`on`](\'connection\', () => {});' },
+    { form: "a concatenated socket value server['sock' + 'et']", source: wrapperHead + `void server['sock' + 'et'];` },
+    { form: "a concatenated server['connec' + 'tion']", source: wrapperHead + `void server['connec' + 'tion'];` },
+    { form: "a concatenated setTimeout server['set' + 'Timeout']", source: wrapperHead + `void server['set' + 'Timeout'];` },
+    { form: "the destructuring twin const { ['o'+'n']: h } = server", source: wrapperHead + `const { ['o' + 'n']: h } = server;\nvoid h;` },
+    { form: "a const-bound destructuring key const k='socket'; { [k]: s } = server", source: wrapperHead + `const k = 'socket';\nconst { [k]: s } = server;\nvoid s;` },
+  ];
+  for (const { form, source } of ddrBReject) {
+    it(`rejects ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // --- DDR-B: the frozen runtime-computed boundary stays OUTSIDE the proof — MUST ALLOW.
+  //     A key that is not statically resolvable (a call result, an ambient runtime name) is
+  //     unchanged; closing it would need alias/type/whole-program flow, deliberately excluded. ---
+  const ddrBAllow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a genuinely runtime server[runtimeKey] (declared, unresolvable)', source: wrapperHead + `declare const runtimeKey: string;\nvoid server[runtimeKey];` },
+    { form: 'a call-result key server[String(4317)] (unresolvable)', source: wrapperHead + `void server[String(4317)];` },
+    { form: 'a harmless resolvable non-socket key server["lis" + "ten"]', source: wrapperHead + `void server['lis' + 'ten'];` },
+  ];
+  for (const { form, source } of ddrBAllow) {
+    it(`allows ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// DDR-A — a global-object SELF-REFERENCE chain (`globalThis.globalThis`, `window.window`,
+// `globalThis.global`, …) denotes the real global, so a network member read off it is egress.
+// Recognition is structural and finite (each hop is a member name in GLOBAL_RECEIVER_NAMES off
+// a recursively-global receiver); binder/shadowing authority stays at the BASE identifier, so a
+// shadowed base is an ordinary object and the `const g = globalThis.globalThis; g.fetch()` alias
+// residual stays OUTSIDE the frozen boundary (no alias/value-flow).
+// ---------------------------------------------------------------------------
+describe('D3 host recognizes global-object self-reference chains as global receivers (DDR-A)', () => {
+  const selfRefReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'globalThis.fetch (base case)', source: `globalThis.fetch('https://evil.example/');` },
+    { form: 'globalThis.globalThis.fetch', source: `globalThis.globalThis.fetch('https://evil.example/');` },
+    { form: 'globalThis.global.fetch', source: `globalThis.global.fetch('https://evil.example/');` },
+    { form: 'globalThis.window.fetch (fail-closed)', source: `globalThis.window.fetch('https://evil.example/');` },
+    { form: 'window.window.fetch', source: `window.window.fetch('https://evil.example/');` },
+    { form: 'self.self.fetch', source: `self.self.fetch('https://evil.example/');` },
+    { form: 'multi-hop globalThis.globalThis.globalThis.fetch', source: `globalThis.globalThis.globalThis.fetch('https://evil.example/');` },
+    { form: "string-literal hop globalThis['globalThis'].fetch", source: `globalThis['globalThis'].fetch('https://evil.example/');` },
+    { form: 'a self-reference chain to the second global new globalThis.globalThis.WebSocket(...)', source: `void new globalThis.globalThis.WebSocket('wss://evil.example/');` },
+    { form: 'destructuring fetch off a self-reference chain', source: `const { fetch } = globalThis.globalThis;\nvoid fetch('https://evil.example/');` },
+  ];
+  for (const { form, source } of selfRefReject) {
+    it(`rejects ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  const selfRefAllow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a shadowed base parameter globalThis (ordinary local object)', source: `function f(globalThis: { globalThis: { fetch(x: string): void } }): void {\n  globalThis.globalThis.fetch('https://evil.example/');\n}\nvoid f;` },
+    { form: 'an unrelated obj.globalThis.fetch (base not a global receiver)', source: `const obj = { globalThis: { fetch: (x: string) => x } };\nvoid obj.globalThis.fetch('x');` },
+    { form: 'the frozen alias residual const g = globalThis.globalThis; g.fetch() (remains allowed)', source: `const g = globalThis.globalThis;\nvoid g.fetch('https://evil.example/');` },
+    { form: 'a non-network member off a self-reference chain globalThis.globalThis.crypto', source: `void globalThis.globalThis.crypto;` },
+  ];
+  for (const { form, source } of selfRefAllow) {
+    it(`allows ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+
+  // RC twin — the SAME self-reference recursion in the structural `isGlobalReceiver` closes
+  //     `globalThis.globalThis.eval(...)` in the runtime-code-generation policy.
+  const rcTwinReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'globalThis.globalThis.eval(...)', source: `globalThis.globalThis.eval("import('../domain/actions.js')");` },
+    { form: 'window.window.Function(...)', source: `window.window.Function('return import("../domain/actions.js")')();` },
+    { form: "string-literal hop globalThis['globalThis'].eval(...)", source: `globalThis['globalThis']['eval']("import('../domain/actions.js')");` },
+  ];
+  for (const { form, source } of rcTwinReject) {
+    it(`rejects (RC twin) ${form}`, () => {
+      expect(usesRuntimeCodeGeneration(source)).toBe(true);
     });
   }
 });
