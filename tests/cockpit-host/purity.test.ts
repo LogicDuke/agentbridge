@@ -1125,6 +1125,49 @@ const isHttpNsSafePosition = (node: ts.Node): boolean => {
   return false;
 };
 
+// DDR-CREATE-SERVER-ALIAS-POLICY (Option A — positive-model restriction). The one permitted
+// node:http value capability, `createServer`, may itself REMAIN only in the smallest approved
+// direct-call forms: as the callee of a call (`http.createServer(...)`, `createServer(...)`,
+// `mk(...)`), or in a type / non-runtime position. Every other position — a variable/const
+// initializer, an assignment right-hand side, a call ARGUMENT, a return, an array/object
+// element or spread value — FORWARDS or STORES the constructor capability itself and is a
+// forbidden escape, decided at THIS occurrence (the same shape as `isHttpNsSafePosition`; no
+// alias/value-flow tracking — a receiving binding such as `start`/`cs` is never classified).
+// The returned Server object is a SEPARATE value (capability NONE), so the CALL RESULT
+// (`const server = http.createServer(...)`) sits in none of these positions and is untouched.
+// Unwraps only the same finite transparent wrappers (paren / as / satisfies / non-null / await).
+const isCreateServerSafePosition = (node: ts.Node): boolean => {
+  let cur: ts.Node = node;
+  for (;;) {
+    const parent = cur.parent as ts.Node | undefined;
+    if (
+      parent !== undefined &&
+      (ts.isParenthesizedExpression(parent) ||
+        ts.isAsExpression(parent) ||
+        ts.isSatisfiesExpression(parent) ||
+        ts.isNonNullExpression(parent) ||
+        ts.isAwaitExpression(parent))
+    ) {
+      cur = parent;
+      continue;
+    }
+    break;
+  }
+  const p = cur.parent as ts.Node | undefined;
+  if (p === undefined) return false;
+  if ((ts.isCallExpression(p) || ts.isNewExpression(p)) && p.expression === cur) return true;
+  if (
+    ts.isTypeQueryNode(p) ||
+    ts.isTypeReferenceNode(p) ||
+    ts.isQualifiedName(p) ||
+    ts.isTypeOfExpression(p) ||
+    ts.isImportTypeNode(p)
+  ) {
+    return true;
+  }
+  return false;
+};
+
 // A declaration EMITS a runtime value binding — and so can shadow a runtime global — only
 // when it is neither ambient (`declare …`, which emits nothing) nor a type-only form
 // (interface / type alias / type-only import). This is the minimal runtime-emission
@@ -1735,12 +1778,18 @@ const usesOutboundNetwork = (source: string): boolean => {
   const visit = (node: ts.Node): void => {
     // (0) a runtime dynamic `import('node:http')` is prohibited outright, in every context.
     if (isDynamicNodeHttpImport(node)) found = true;
-    // (1) member/element access: an HTTP_NS receiver is permitted ONLY for `createServer`;
+    // (1) member/element access: an HTTP_NS receiver is permitted ONLY for `createServer`,
+    //     and that `createServer` access must itself sit in a direct-call position
+    //     (DDR-CREATE-SERVER-ALIAS-POLICY) — a stored/forwarded `http.createServer` escapes;
     //     a network global (`fetch`/`WebSocket`) off a FREE global receiver is rejected.
     if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
       if (classifyHttpExpression(node.expression, checker) === 'HTTP_NS') {
         const member = binderMemberName(node);
-        if (member === null || !HTTP_SERVER_VALUE_MEMBERS.has(member)) found = true;
+        if (member === null || !HTTP_SERVER_VALUE_MEMBERS.has(member)) {
+          found = true; // a non-createServer (outbound client) member off the namespace
+        } else if (!isCreateServerSafePosition(node)) {
+          found = true; // the createServer constructor forwarded/stored out of a direct call
+        }
       }
       // F1/P2/P1 — classify the member key (Resolved / NotCapability / Indeterminate) off the binder
       //     and decide it ONLY at a binder-verified free-global receiver. Resolved(capability) DENY;
@@ -1764,6 +1813,11 @@ const usesOutboundNetwork = (source: string): boolean => {
         const cap = classifyHttpSymbol(symbol, checker);
         if (cap === 'HTTP_CLIENT') found = true;
         if (cap === 'HTTP_NS' && !isHttpNsSafePosition(node)) found = true;
+        // A createServer-classified identifier (named/renamed import or directly-destructured
+        // binding) is the constructor capability itself: it may be READ only in a direct-call
+        // position (DDR-CREATE-SERVER-ALIAS-POLICY). A read that stores/forwards it
+        // (`const start = createServer`) escapes — decided here, without tracking `start`.
+        if (cap === 'CREATE_SERVER' && !isCreateServerSafePosition(node)) found = true;
         // A bare network global (`fetch`/`WebSocket`) whose only in-file declarations emit no
         // runtime value (an ambient `declare const fetch`, a type-only import) still reaches
         // the runtime global — reject it. A real local shadow (const/function/class/…) does not.
@@ -1771,6 +1825,21 @@ const usesOutboundNetwork = (source: string): boolean => {
       } else if (NETWORK_GLOBAL_NAMES.has(node.text)) {
         found = true;
       }
+    }
+    // (2b) an EXPORT specifier forwarding the createServer constructor out of the module
+    //      (`export { createServer }`) is a non-call escape position for the capability
+    //      (DDR-CREATE-SERVER-ALIAS-POLICY). One binder hop to the local target's own
+    //      classification — no module-graph or value-flow analysis. A type-only specifier, a
+    //      re-export from node:http (no local target → NONE, left to export confinement), and
+    //      the exported CALL RESULT (`export const server = http.createServer(...)`, whose
+    //      binding is NONE) are all untouched, so `exportsHttpCapability` stays unchanged.
+    if (
+      ts.isExportSpecifier(node) &&
+      !node.isTypeOnly &&
+      !node.parent.parent.isTypeOnly &&
+      classifyHttpSymbol(checker.getExportSpecifierLocalTargetSymbol(node), checker) === 'CREATE_SERVER'
+    ) {
+      found = true;
     }
     // (3) DECLARATION destructuring a network global off a FREE global receiver:
     //     `const { fetch } = globalThis`, `const { fetch: f } = globalThis.globalThis`. The source
@@ -4930,13 +4999,107 @@ describe('D3 host forbids escape of the node:http namespace capability (D3-CX-PO
   const escapeAllow: readonly { readonly form: string; readonly source: string }[] = [
     { form: 'a createServer access on the namespace', source: `import * as http from 'node:http';\nhttp.createServer(() => {});` },
     { form: 'a statically-keyed createServer access', source: `import * as http from 'node:http';\nhttp['createServer'](() => {});` },
-    { form: 'extracting createServer to a const via access', source: `import * as http from 'node:http';\nconst cs = http.createServer;\ncs(() => {});` },
+    // NOTE: 'extracting createServer to a const via access'
+    // (`const cs = http.createServer; cs(() => {});`) was RECLASSIFIED out of this permissive
+    // family — CREATE_SERVER constructor forwarding is outside the positive authority model
+    // (DDR-CREATE-SERVER-ALIAS-POLICY). It now asserts REJECT in the createServer describe below.
     { form: 'a createServer destructuring', source: `import * as http from 'node:http';\nconst { createServer } = http;\ncreateServer(() => {});` },
     { form: 'a type reference to the namespace member', source: `import * as http from 'node:http';\nexport type S = http.Server;\nhttp.createServer(() => {});` },
     { form: 'a typeof type query of the namespace', source: `import * as http from 'node:http';\nexport type T = typeof http;\nhttp.createServer(() => {});` },
     { form: 'a runtime typeof of the namespace', source: `import * as http from 'node:http';\nconst t = typeof http;\nvoid t;\nhttp.createServer(() => {});` },
   ];
   for (const { form, source } of escapeAllow) {
+    it(`ALLOWS ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// NET createServer constructor positive-model restriction (DDR-CREATE-SERVER-ALIAS-POLICY,
+// Codex finding PRRT_kwDOTzqfcs6dkiEI / P1 "Track createServer aliases before inspecting
+// handlers", Option A). The one permitted node:http value capability — the inbound-server
+// constructor `createServer` — may itself REMAIN only in the smallest approved direct-call
+// forms (a call callee, or a type position); any position that forwards or stores the
+// constructor value (an alias, an assignment target, a call argument, a return, an array/
+// object element or spread, an export of the binding) is a rejected escape, decided at THAT
+// occurrence. This REDUCES accepted authority: it introduces no alias/value-flow tracking — a
+// receiving binding such as `start`/`cs` is never classified, so the closure of the Codex
+// witness (`const start = http.createServer; start(req => …req.socket…)`) comes from
+// `http.createServer` being stored, not from following `start`. The returned Server object is
+// a separate NONE value, so the CALL RESULT (`const server = http.createServer(...)`, its
+// `.listen(...)`, and its export) is untouched. Binder identity remains authoritative, so an
+// unrelated or shadowed local `createServer` stays an ordinary local.
+// ---------------------------------------------------------------------------
+describe('D3 host restricts the createServer constructor to direct-call positions (DDR-CREATE-SERVER-ALIAS-POLICY)', () => {
+  const createServerReject: readonly { readonly form: string; readonly source: string }[] = [
+    // 1 — const alias from http.createServer (also the reclassified NET-ESCAPE permissive case:
+    //     `const cs = http.createServer; cs(() => {})` previously asserted ALLOW).
+    { form: 'a const alias of http.createServer', source: `import * as http from 'node:http';\nconst start = http.createServer;\nstart(() => {});` },
+    { form: 'the reclassified permissive alias-then-call case', source: `import * as http from 'node:http';\nconst cs = http.createServer;\ncs(() => {});` },
+    // 2 — alias of a directly-extracted (destructured) createServer.
+    { form: 'a const alias of a destructured createServer', source: `import * as http from 'node:http';\nconst { createServer } = http;\nconst start = createServer;\nstart(() => {});` },
+    // 3 — post-declaration assignment of the constructor.
+    { form: 'a post-declaration assignment of http.createServer', source: `import * as http from 'node:http';\nlet start;\nstart = http.createServer;\nstart(() => {});` },
+    // 4 — call-argument forwarding of the constructor.
+    { form: 'forwarding http.createServer as a call argument', source: `import * as http from 'node:http';\ndeclare function run(x: unknown): void;\nrun(http.createServer);` },
+    // 5 — returning the constructor.
+    { form: 'returning http.createServer', source: `import * as http from 'node:http';\nexport function g(): unknown {\n  return http.createServer;\n}` },
+    // 6 — array storage of the constructor.
+    { form: 'storing http.createServer in an array', source: `import * as http from 'node:http';\nconst x = [http.createServer];\nvoid x;` },
+    // 7 — object storage of the constructor (property value and spread+property).
+    { form: 'storing http.createServer in an object property', source: `import * as http from 'node:http';\nconst x = { start: http.createServer };\nvoid x;` },
+    { form: 'storing http.createServer in a spread object property', source: `import * as http from 'node:http';\nconst base = {};\nconst x = { ...base, start: http.createServer };\nvoid x;` },
+    // 8 — export of the constructor capability (named import re-exported; destructured re-exported).
+    { form: 'exporting a named createServer import binding', source: `import { createServer } from 'node:http';\nexport { createServer };` },
+    { form: 'exporting a destructured createServer binding', source: `import * as http from 'node:http';\nconst { createServer } = http;\nexport { createServer };` },
+  ];
+  for (const { form, source } of createServerReject) {
+    it(`REJECTS ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // 9 — the exact Codex witness: the constructor is forwarded to `start`, then the handler
+  //     reaches the underlying socket through a runtime-computed key. Rejection is because
+  //     `http.createServer` is stored, NOT because `start` is tracked.
+  it('REJECTS the exact Codex runtime-key handler witness', () => {
+    const source = [
+      `import http from 'node:http';`,
+      ``,
+      `const start = http.createServer;`,
+      ``,
+      `start(req => {`,
+      `  const key = (req.url ?? '').slice(1);`,
+      `  const s = (req as any)[key];`,
+      ``,
+      `  s.destroy();`,
+      `  setTimeout(() => s.connect(80, 'example.com'), 50);`,
+      `});`,
+    ].join('\n');
+    expect(usesOutboundNetwork(source)).toBe(true);
+  });
+
+  const createServerAllow: readonly { readonly form: string; readonly source: string }[] = [
+    // 10–11 — the direct namespace call and the static-element call.
+    { form: 'a direct http.createServer(...) call', source: `import http from 'node:http';\nhttp.createServer(() => {});` },
+    { form: `a direct http['createServer'](...) call`, source: `import * as http from 'node:http';\nhttp['createServer'](() => {});` },
+    // 12–13 — a direct named import call and a renamed named import call.
+    { form: 'a direct named createServer import call', source: `import { createServer } from 'node:http';\ncreateServer(() => {});` },
+    { form: 'a direct renamed named createServer import call', source: `import { createServer as mk } from 'node:http';\nmk(() => {});` },
+    // 14–15 — a direct destructuring call and a renamed destructuring call.
+    { form: 'a direct destructured createServer call', source: `import * as http from 'node:http';\nconst { createServer } = http;\ncreateServer(() => {});` },
+    { form: 'a direct renamed destructured createServer call', source: `import * as http from 'node:http';\nconst { createServer: mk } = http;\nmk(() => {});` },
+    // 16–17 — storing and exporting the CALL RESULT (the Server object, capability NONE).
+    { form: 'storing the createServer call RESULT', source: `import http from 'node:http';\nconst server = http.createServer(() => {});\nvoid server;` },
+    { form: 'exporting the createServer call RESULT', source: `import http from 'node:http';\nexport const server = http.createServer(() => {});` },
+    // 18–19 — an unrelated local createServer, and a shadowed parameter createServer.
+    { form: 'an unrelated local object method createServer', source: `const local = {\n  createServer() {},\n};\nlocal.createServer();` },
+    { form: 'a shadowed parameter named createServer', source: `function f(createServer: () => void) {\n  createServer();\n}\nvoid f;` },
+    // 20 — the returned Server object's own methods (e.g. listen) are unchanged.
+    { form: 'the returned server.listen(...) behavior', source: `import http from 'node:http';\nconst server = http.createServer(() => {});\nserver.listen(4317);` },
+  ];
+  for (const { form, source } of createServerAllow) {
     it(`ALLOWS ${form}`, () => {
       expect(usesOutboundNetwork(source)).toBe(false);
     });
