@@ -1795,6 +1795,107 @@ const sockResolveKey = (
   }
 };
 
+// DDR-NET-STATIC-KEY-PARITY (nested authority) — the self-reference HOP NAME a DESTRUCTURING key
+// denotes, resolved by the SAME bounded binder resolver used for a member-access hop (`netHopName`)
+// but reading a binding/object-literal KEY node instead of an element-access argument: a plain
+// identifier / string-literal key is its own text, a computed key (`{ ['global' + 'This']: … }`,
+// `{ [k]: … }` with `const k = 'globalThis'`) folds off the binder, capped at
+// `MAX_GLOBAL_RECEIVER_LENGTH` (10 — a hop can fold to `globalThis`, one above the 9-char network
+// member ceiling). Only a Resolved key yields a hop name; NotCapability, Indeterminate, and a
+// resource-bound abort all become null (NOT a hop), so a genuinely runtime intermediate key never
+// starts/continues authority and stays outside the frozen boundary. This is the destructuring twin
+// of `netHopName`; it introduces NO new resolver — it reuses `netResolveKey` exactly like
+// `netDestructuringKey`, only at the wider self-hop ceiling that `MAX_NETWORK_MEMBER_LENGTH` (9)
+// would prune a 10-char self-reference name out of.
+const netDestructuringHopName = (keyNode: ts.Node, checker: ts.TypeChecker): string | null => {
+  if (ts.isComputedPropertyName(keyNode)) {
+    try {
+      const key = netResolveKey(keyNode.expression, checker, new Set<ts.Declaration>(), new Map<ts.Declaration, NetKey>(), { spent: 0 }, 0, MAX_GLOBAL_RECEIVER_LENGTH);
+      return key.kind === 'resolved' ? key.value : null;
+    } catch (error) {
+      if (error instanceof NetResolveAbort) return null;
+      throw error;
+    }
+  }
+  if (ts.isIdentifier(keyNode) || ts.isStringLiteralLike(keyNode)) return keyNode.text;
+  return null;
+};
+
+// DDR-NET-STATIC-KEY-PARITY (nested authority) — whether free-global-receiver authority REACHES an
+// object binding PATTERN, resolved STRUCTURALLY over the finite binding AST (never value flow):
+//   - a TOP-LEVEL pattern (its container is the variable declaration) has authority iff the
+//     declaration's initializer is a binder-proven free global receiver (`isFreeGlobalReceiver`);
+//   - a NESTED pattern (its container is an OUTER binding element) has authority iff (a) the outer
+//     element's own pattern already has authority AND (b) the outer element's KEY resolves — through
+//     the SAME binder-aware key machinery (`netDestructuringHopName`) — to a global self-reference
+//     name in `GLOBAL_RECEIVER_NAMES`, exactly as `globalThis.globalThis` re-denotes the real global.
+// Authority therefore CONTINUES only through a proven self-hop key; an intermediate key that is a
+// non-self-hop name (`foo`), indeterminate, or a non-namespace receiver stops it (allow), mirroring
+// how a shadowed/runtime hop demotes a member-access receiver. Finite: the recursion strips one
+// binding-pattern nesting level per step and terminates at the variable declaration; it walks only
+// binding-pattern parent links, never a value graph.
+const objectPatternHasFreeGlobalAuthority = (
+  pattern: ts.ObjectBindingPattern,
+  checker: ts.TypeChecker,
+  sourceFile: ts.SourceFile,
+): boolean => {
+  const container = pattern.parent;
+  if (ts.isVariableDeclaration(container)) {
+    return container.initializer !== undefined && isFreeGlobalReceiver(container.initializer, checker, sourceFile);
+  }
+  if (ts.isBindingElement(container) && ts.isObjectBindingPattern(container.parent)) {
+    if (!objectPatternHasFreeGlobalAuthority(container.parent, checker, sourceFile)) return false;
+    const hop = netDestructuringHopName(container.propertyName ?? container.name, checker);
+    return hop !== null && GLOBAL_RECEIVER_NAMES.has(hop);
+  }
+  return false;
+};
+
+// DDR-NET-REFLECT-GET (F1) — whether `Reflect` is the binder-proven UNSHADOWED built-in intrinsic.
+// Reflect is a DISTINCT intrinsic, deliberately NOT a member of `GLOBAL_RECEIVER_NAMES`: it is
+// recognized only here, and only when the binder resolves the identifier to NO local runtime value
+// binding, exactly the `isFreeGlobalReceiver` identifier rule reused verbatim. A local
+// `const Reflect = { get() { … } }` (or any runtime binding of the name) is therefore an ordinary
+// object and its `.get` is NOT the built-in — identifier text alone never qualifies.
+const isFreeReflect = (expr: ts.Expression, checker: ts.TypeChecker, sourceFile: ts.SourceFile): boolean => {
+  const e = binderUnwrap(expr);
+  if (!ts.isIdentifier(e) || e.text !== 'Reflect') return false;
+  const symbol = checker.getSymbolAtLocation(e);
+  if (symbol === undefined) return true;
+  return !hasLocalRuntimeShadow(symbol, sourceFile);
+};
+
+// DDR-NET-REFLECT-GET (F1) — whether a call callee is a DIRECT built-in `Reflect.get` member: a
+// dotted `Reflect.get` or a static-string element access `Reflect['get']` / `Reflect['g' + 'et']`,
+// with the `get` name resolved by the SAME `netMemberKey` machinery (never identifier text), off a
+// binder-proven unshadowed `Reflect`. A runtime/aliased member key (`Reflect[k]`), an alias of
+// Reflect (`const R = Reflect; R.get(…)`), or a shadowed Reflect all fail this — no alias, no
+// call/apply/bind, no wrapper: one statically identifiable built-in member.
+const isBuiltinReflectGetCallee = (callee: ts.Expression, checker: ts.TypeChecker, sourceFile: ts.SourceFile): boolean => {
+  const c = binderUnwrap(callee);
+  if (!ts.isPropertyAccessExpression(c) && !ts.isElementAccessExpression(c)) return false;
+  const memberKey = netMemberKey(c, checker, new Map<ts.Declaration, NetKey>());
+  if (!(memberKey.kind === 'resolved' && memberKey.value === 'get')) return false;
+  return isFreeReflect(c.expression, checker, sourceFile);
+};
+
+// DDR-NET-REFLECT-GET (F1) — classify the KEY ARGUMENT of a `Reflect.get(receiver, key)` call with
+// the SAME three-state discipline as a computed member key: a string literal / substitution-free
+// template / `+`-fold resolves to its value; an identifier resolves through the binder-proven unique
+// `const` chain (`const k = 'fetch'; Reflect.get(globalThis, k)`); a runtime/ambient/undeclared key
+// (`declare const runtimeKey; Reflect.get(globalThis, runtimeKey)`) or a resource-bound abort is
+// Indeterminate. The key is a VALUE expression (not a binding key), so — unlike `netDestructuringKey`
+// — a bare identifier is resolved, never taken as its own text; this reuses `netResolveKey` exactly
+// like `netMemberKey`'s element-access branch, at the network-member ceiling.
+const netReflectGetKey = (keyArg: ts.Expression, checker: ts.TypeChecker): NetKey => {
+  try {
+    return netResolveKey(keyArg, checker, new Set<ts.Declaration>(), new Map<ts.Declaration, NetKey>(), { spent: 0 }, 0, MAX_NETWORK_MEMBER_LENGTH);
+  } catch (error) {
+    if (error instanceof NetResolveAbort) return NET_INDETERMINATE;
+    throw error;
+  }
+};
+
 /**
  * NET — reject outbound network egress, decided by TypeScript BINDER identity
  * (D3-CX-POLICY-NET). Lexical binding identity — nearest visible binding, shadowing,
@@ -1824,6 +1925,43 @@ const usesOutboundNetwork = (source: string): boolean => {
   const netMemo = new Map<ts.Declaration, NetKey>();
   netResolveVisits = 0;
   let found = false;
+  // Branch (4) helper — walk an object-literal ASSIGNMENT target with free-global authority already
+  // established for THIS object literal (the top-level call is guarded by the `= <free global>`
+  // receiver; a nested call is reached only through a proven self-hop key below). This is the
+  // assignment twin of branch (3)'s `objectPatternHasFreeGlobalAuthority` recursion: each property's
+  // source KEY is classified for a network capability at the network ceiling, and authority CONTINUES
+  // into a nested object-literal value only through a self-reference hop key (resolved at the wider
+  // self-hop ceiling by `netDestructuringHopName`). Finite: it descends only nested object-literal
+  // targets, one per pattern level, and terminates when no nested object literal remains.
+  const scanFreeGlobalAssignmentTarget = (target: ts.ObjectLiteralExpression): void => {
+    for (const prop of target.properties) {
+      let keyNode: ts.Node | undefined;
+      let valueNode: ts.Expression | undefined;
+      if (ts.isShorthandPropertyAssignment(prop)) {
+        keyNode = prop.name;
+      } else if (ts.isPropertyAssignment(prop)) {
+        keyNode = prop.name;
+        valueNode = prop.initializer;
+      } else {
+        continue; // spread / accessor / method — not a destructuring target property
+      }
+      const key = netDestructuringKey(keyNode, checker);
+      if (key.kind === 'resolved') {
+        if (NETWORK_GLOBAL_NAMES.has(key.value)) found = true;
+      } else if (key.kind === 'indeterminate') {
+        found = true; // fail-closed at a proven free-global receiver
+      }
+      // Authority continues into a nested object-literal target ONLY through a self-reference hop key
+      // (a GLOBAL_RECEIVER_NAMES name resolved at the self-hop ceiling), mirroring branch (3).
+      if (valueNode !== undefined) {
+        const nested = binderUnwrap(valueNode);
+        if (ts.isObjectLiteralExpression(nested)) {
+          const hop = netDestructuringHopName(keyNode, checker);
+          if (hop !== null && GLOBAL_RECEIVER_NAMES.has(hop)) scanFreeGlobalAssignmentTarget(nested);
+        }
+      }
+    }
+  };
   const visit = (node: ts.Node): void => {
     // (0) a runtime dynamic `import('node:http')` is prohibited outright, in every context.
     if (isDynamicNodeHttpImport(node)) found = true;
@@ -1890,17 +2028,22 @@ const usesOutboundNetwork = (source: string): boolean => {
     ) {
       found = true;
     }
-    // (3) DECLARATION destructuring a network global off a FREE global receiver:
-    //     `const { fetch } = globalThis`, `const { fetch: f } = globalThis.globalThis`. The source
-    //     KEY (`propertyName ?? name`) is classified with the SAME resolver as a member key
-    //     (DDR-NET-STATIC-KEY-PARITY F2): a plain/quoted key is its own text, a computed static key
-    //     (`{ ['fe' + 'tch']: f }`, `{ [k]: f }`) folds off the binder. At the proven free-global
-    //     receiver Resolved(capability) and Indeterminate DENY (an indeterminate key fails closed,
-    //     just like a member key), Resolved(other)/NotCapability ALLOW. Capability is extracted here,
-    //     at the destructuring; `f` is not followed onward through value flow.
-    if (ts.isBindingElement(node) && ts.isObjectBindingPattern(node.parent) && ts.isVariableDeclaration(node.parent.parent)) {
-      const initializer = node.parent.parent.initializer;
-      if (initializer !== undefined && isFreeGlobalReceiver(initializer, checker, sourceFile)) {
+    // (3) DECLARATION destructuring a network global off a FREE global receiver, including
+    //     RECURSIVE NESTED object binding patterns (DDR-NET-STATIC-KEY-PARITY, nested authority):
+    //     `const { fetch } = globalThis`, `const { fetch: f } = globalThis.globalThis`,
+    //     `const { globalThis: { fetch: f } } = globalThis.globalThis`. Free-global authority begins
+    //     at the declaration initializer and CONTINUES into a nested pattern ONLY through a
+    //     self-reference hop key (`objectPatternHasFreeGlobalAuthority`) — `{ globalThis: … }` off a
+    //     global re-denotes the real global, exactly like `globalThis.globalThis`, while `{ foo: … }`
+    //     does not. At an authoritative pattern this element's source KEY (`propertyName ?? name`) is
+    //     classified with the SAME resolver as a member key: a plain/quoted key is its own text, a
+    //     computed static key (`{ ['fe' + 'tch']: f }`, `{ [k]: f }`) folds off the binder.
+    //     Resolved(capability) and Indeterminate DENY (an indeterminate key fails closed, just like a
+    //     member key), Resolved(other)/NotCapability ALLOW. Capability is extracted here, at the
+    //     destructuring; the bound name is not followed onward through value flow. Structural and
+    //     finite — authority is proven by walking finite binding-pattern parents, never a value graph.
+    if (ts.isBindingElement(node) && ts.isObjectBindingPattern(node.parent)) {
+      if (objectPatternHasFreeGlobalAuthority(node.parent, checker, sourceFile)) {
         const key = netDestructuringKey(node.propertyName ?? node.name, checker);
         if (key.kind === 'resolved') {
           if (NETWORK_GLOBAL_NAMES.has(key.value)) found = true;
@@ -1909,24 +2052,40 @@ const usesOutboundNetwork = (source: string): boolean => {
         }
       }
     }
-    // (4) ASSIGNMENT destructuring a network global off a FREE global receiver:
-    //     `({ fetch: f } = globalThis)`, `({ fetch } = globalThis.globalThis)`. The target is an
-    //     ObjectLiteralExpression (Shorthand/PropertyAssignment), not a binding pattern, so branch
-    //     (3) does not see it (DDR-NET-STATIC-KEY-PARITY F2). Same classification and same
-    //     free-global fail-closed policy; bound to the `= globalThis` right-hand receiver, so an
+    // (4) ASSIGNMENT destructuring a network global off a FREE global receiver, including RECURSIVE
+    //     NESTED object patterns (DDR-NET-STATIC-KEY-PARITY, assignment parity):
+    //     `({ fetch: f } = globalThis)`, `({ fetch } = globalThis.globalThis)`,
+    //     `({ globalThis: { fetch: f } } = globalThis.globalThis)`. The target is an
+    //     ObjectLiteralExpression (Shorthand/PropertyAssignment), not a binding pattern, so branch (3)
+    //     does not see it. `scanFreeGlobalAssignmentTarget` mirrors branch (3)'s structural recursion
+    //     for the object-literal AST: the same leaf key classification and free-global fail-closed
+    //     policy, with authority continuing into a nested object-literal value ONLY through a
+    //     self-reference hop key — declaration and assignment forms have equivalent finite authority
+    //     semantics where their AST forms correspond. Bound to the `=` right-hand receiver, so an
     //     unrelated `({ fetch: f } = obj)` and a shadowed-global receiver stay allowed.
     if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken && isFreeGlobalReceiver(node.right, checker, sourceFile)) {
       const target = binderUnwrap(node.left);
-      if (ts.isObjectLiteralExpression(target)) {
-        for (const prop of target.properties) {
-          const keyNode = ts.isShorthandPropertyAssignment(prop) ? prop.name : ts.isPropertyAssignment(prop) ? prop.name : undefined;
-          if (keyNode === undefined) continue;
-          const key = netDestructuringKey(keyNode, checker);
-          if (key.kind === 'resolved') {
-            if (NETWORK_GLOBAL_NAMES.has(key.value)) found = true;
-          } else if (key.kind === 'indeterminate') {
-            found = true; // fail-closed at a proven free-global receiver
-          }
+      if (ts.isObjectLiteralExpression(target)) scanFreeGlobalAssignmentTarget(target);
+    }
+    // (5) a direct built-in `Reflect.get(<free global receiver>, <key>)` acquisition of a network
+    //     global (DDR-NET-REFLECT-GET, F1): `Reflect.get(globalThis.globalThis, 'fetch')(...)`.
+    //     Reflect must be binder-proven UNSHADOWED (a local `const Reflect = { get() {} }` is an
+    //     ordinary object — `isBuiltinReflectGetCallee`); the RECEIVER argument must be a binder-proven
+    //     free global (`isFreeGlobalReceiver`); the KEY argument is classified by the SAME
+    //     `netResolveKey` as a computed member key (`netReflectGetKey`) — a bare identifier is
+    //     resolved through its const chain, never taken as text. Resolved(capability)/Indeterminate
+    //     DENY (fail-closed), Resolved(other)/NotCapability ALLOW. One statically
+    //     identifiable built-in call: NO alias of Reflect or of get, NO call/apply/bind chain, NO
+    //     wrapper, NO value-flow after acquisition.
+    if (ts.isCallExpression(node) && isBuiltinReflectGetCallee(node.expression, checker, sourceFile)) {
+      const recvArg = node.arguments[0];
+      const keyArg = node.arguments[1];
+      if (recvArg !== undefined && keyArg !== undefined && isFreeGlobalReceiver(recvArg, checker, sourceFile)) {
+        const key = netReflectGetKey(keyArg, checker);
+        if (key.kind === 'resolved') {
+          if (NETWORK_GLOBAL_NAMES.has(key.value)) found = true;
+        } else if (key.kind === 'indeterminate') {
+          found = true; // fail-closed at a proven free-global receiver
         }
       }
     }
@@ -5712,6 +5871,117 @@ describe('D3 host folds static keys in self-reference hops and destructuring ass
       usesOutboundNetwork(`declare const runtimeKey: string;\nlet f: unknown;\n({ [runtimeKey]: f } = globalThis);\nvoid f;`),
     ).toBe(true);
   });
+});
+
+// ---------------------------------------------------------------------------
+// NET bounded P1 mechanism repair (PR #64): reflective built-in acquisition and NESTED
+// destructuring authority (DDR-NET-REFLECT-GET / DDR-NET-STATIC-KEY-PARITY nested authority).
+// The frozen invariant — a statically identifiable network-global capability may not be acquired
+// from a binder-proven free-global receiver through a SUPPORTED FINITE ACQUISITION FORM, decided AT
+// THE ACQUISITION SITE — is extended by exactly three finite forms, without any taint / alias /
+// value-flow expansion:
+//   F1 — a direct built-in `Reflect.get(<free global>, <key>)` (Reflect a distinct intrinsic,
+//        binder-proven unshadowed; the key a binder-resolved static string; fail-closed on an
+//        indeterminate key). No alias of Reflect/get, no call/apply/bind, no wrapper.
+//   F2 — recursive NESTED DECLARATION binding patterns, authority continuing into a nested pattern
+//        ONLY through a self-reference hop key (`{ globalThis: { fetch } }` off a global), never
+//        through a non-self-hop key (`{ foo: { fetch } }`).
+//   assignment parity — the same recursive authority for object-DESTRUCTURING ASSIGNMENT targets,
+//        where their AST forms correspond to the declaration form.
+// Authority propagation is STRUCTURAL within the finite binding/destructuring AST only: once the
+// binding pattern (or the object-literal target) ends, propagation ends. The scanner still makes NO
+// literal-runtime-no-egress claim (aliased Reflect.get, alias chains, wrappers, Proxy/getter
+// semantics, cross-module flow all remain honest, unsupported gaps).
+// ---------------------------------------------------------------------------
+describe('D3 host closes reflective and nested-destructuring free-global acquisition (PR #64 bounded P1)', () => {
+  // ---- F1: direct built-in Reflect.get — DENY -----------------------------------------------
+  const reflectReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: '1. the exact witness Reflect.get(globalThis.globalThis, "fetch")(...)', source: `Reflect.get(globalThis.globalThis, 'fetch')('https://example.com/');` },
+    { form: '2. a const-key Reflect.get(globalThis, k) folding to fetch', source: `const k = 'fetch';\nReflect.get(globalThis, k)('https://example.com/');` },
+    { form: '3. a concatenated key Reflect.get(globalThis, "fe" + "tch")', source: `Reflect.get(globalThis, 'fe' + 'tch')('https://example.com/');` },
+    { form: '4. Reflect.get(globalThis, "WebSocket") acquiring the second global', source: `void new (Reflect.get(globalThis, 'WebSocket'))('wss://example.com/');` },
+    { form: '5. a static-element callee Reflect["get"](globalThis, "fetch")', source: `Reflect['get'](globalThis, 'fetch')('https://example.com/');` },
+    { form: '6. a plain globalThis receiver Reflect.get(globalThis, "fetch")', source: `Reflect.get(globalThis, 'fetch')('https://example.com/');` },
+  ];
+  for (const { form, source } of reflectReject) {
+    it(`rejects ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // Indeterminate Reflect.get key on a proven free global fails CLOSED.
+  it('rejects Reflect.get(globalThis, runtimeKey) fail-closed on an indeterminate key', () => {
+    expect(
+      usesOutboundNetwork(`declare const runtimeKey: string;\nReflect.get(globalThis, runtimeKey);`),
+    ).toBe(true);
+  });
+
+  // ---- F1: direct built-in Reflect.get — ALLOW (preserve) -----------------------------------
+  const reflectAllow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: '7. Reflect.get on an ordinary local object (non-global receiver)', source: `const local = { fetch() {} };\nReflect.get(local, 'fetch')();` },
+    { form: '8. a user-shadowed Reflect (non-built-in reflection)', source: `const Reflect = {\n  get() {\n    return () => undefined;\n  },\n};\nReflect.get(globalThis, 'fetch')();` },
+    { form: '9. Reflect.get acquiring a NON-network member off a free global', source: `void Reflect.get(globalThis, 'crypto');` },
+    { form: '10. a Reflect.get ALIAS is an unsupported honest gap (not this mechanism)', source: `const rget = Reflect.get;\nrget(globalThis, 'fetch')('https://example.com/');` },
+    { form: '11. an aliased receiver Reflect.get(g, "fetch") where g = globalThis (unsupported gap)', source: `const g = globalThis;\nReflect.get(g, 'fetch')('https://example.com/');` },
+  ];
+  for (const { form, source } of reflectAllow) {
+    it(`allows ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+
+  // ---- F2: recursive NESTED DECLARATION destructuring — DENY --------------------------------
+  const nestedDeclReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: '12. the exact witness const { globalThis: { fetch: f } } = globalThis.globalThis', source: `const {\n  globalThis: { fetch: f },\n} = globalThis.globalThis;\nf('https://example.com/');` },
+    { form: '13. a nested pattern off a bare global const { globalThis: { fetch } } = globalThis', source: `const {\n  globalThis: { fetch },\n} = globalThis;\nvoid fetch('https://example.com/');` },
+    { form: '14. a three-level self-hop nest const { globalThis: { window: { fetch } } } = globalThis', source: `const {\n  globalThis: { window: { fetch } },\n} = globalThis;\nvoid fetch('https://example.com/');` },
+    { form: '15. the second global nested const { globalThis: { WebSocket: W } } = globalThis', source: `const {\n  globalThis: { WebSocket: W },\n} = globalThis;\nvoid new W('wss://example.com/');` },
+    { form: '16. a computed self-hop intermediate const { ["global" + "This"]: { fetch: f } } = globalThis', source: `const {\n  ['global' + 'This']: { fetch: f },\n} = globalThis;\nf('https://example.com/');` },
+    { form: '17. a nested indeterminate leaf key fails closed', source: `declare const runtimeKey: string;\nconst {\n  globalThis: { [runtimeKey]: f },\n} = globalThis;\nvoid f;` },
+    { form: '18. an indeterminate INTERMEDIATE key fails closed at the free global', source: `declare const runtimeKey: string;\nconst {\n  [runtimeKey]: { fetch: f },\n} = globalThis;\nvoid f;` },
+  ];
+  for (const { form, source } of nestedDeclReject) {
+    it(`rejects ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // ---- F2: recursive NESTED DECLARATION destructuring — ALLOW (preserve) --------------------
+  const nestedDeclAllow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: '19. a NON-self-hop intermediate const { foo: { fetch: f } } = globalThis', source: `const {\n  foo: { fetch: f },\n} = globalThis as unknown as { foo: { fetch: (u: string) => unknown } };\nvoid f;` },
+    { form: '20. a nested pattern off a non-global receiver const { globalThis: { harmless } } = localObject', source: `const localObject = { globalThis: { harmless: 1 } };\nconst {\n  globalThis: { harmless },\n} = localObject;\nvoid harmless;` },
+    { form: '21. a nested self-hop to a NON-network leaf const { globalThis: { crypto } } = globalThis', source: `const {\n  globalThis: { crypto },\n} = globalThis;\nvoid crypto;` },
+    { form: '22. a self-hop nest under a SHADOWED global base (binder says local)', source: `function f(globalThis: { globalThis: { fetch: (u: string) => unknown } }): void {\n  const {\n    globalThis: { fetch: g },\n  } = globalThis;\n  void g('local');\n}\nvoid f;` },
+  ];
+  for (const { form, source } of nestedDeclAllow) {
+    it(`allows ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+
+  // ---- assignment parity: recursive NESTED ASSIGNMENT destructuring — DENY -------------------
+  const nestedAssignReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: '23. the exact witness ({ globalThis: { fetch: f } } = globalThis.globalThis)', source: `let f: (u: string) => unknown;\n({\n  globalThis: { fetch: f },\n} = globalThis.globalThis);\nvoid f;` },
+    { form: '24. a nested assignment off a bare global ({ globalThis: { fetch } } = globalThis)', source: `let fetch: (u: string) => unknown;\n({\n  globalThis: { fetch },\n} = globalThis);\nvoid fetch;` },
+    { form: '25. a computed self-hop intermediate ({ ["global" + "This"]: { fetch: f } } = globalThis)', source: `let f: (u: string) => unknown;\n({\n  ['global' + 'This']: { fetch: f },\n} = globalThis);\nvoid f;` },
+    { form: '26. a nested indeterminate leaf key assignment fails closed', source: `declare const runtimeKey: string;\nlet f: unknown;\n({\n  globalThis: { [runtimeKey]: f },\n} = globalThis);\nvoid f;` },
+  ];
+  for (const { form, source } of nestedAssignReject) {
+    it(`rejects ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // ---- assignment parity: recursive NESTED ASSIGNMENT destructuring — ALLOW (preserve) -------
+  const nestedAssignAllow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: '27. a NON-self-hop intermediate ({ foo: { fetch: f } } = globalThis)', source: `let f: (u: string) => unknown;\n({\n  foo: { fetch: f },\n} = globalThis as unknown as { foo: { fetch: (u: string) => unknown } });\nvoid f;` },
+    { form: '28. a nested assignment off an unrelated receiver ({ globalThis: { fetch: f } } = obj)', source: `const obj = { globalThis: { fetch: (u: string) => u } };\nlet f: (u: string) => unknown;\n({\n  globalThis: { fetch: f },\n} = obj);\nvoid f;` },
+  ];
+  for (const { form, source } of nestedAssignAllow) {
+    it(`allows ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
 });
 
 // ---------------------------------------------------------------------------
