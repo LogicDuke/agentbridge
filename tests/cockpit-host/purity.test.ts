@@ -1343,12 +1343,18 @@ const acquiresInboundServerSocket = (checker: ts.TypeChecker, sourceFile: ts.Sou
   const isCreateServerCall = (node: ts.Node): boolean =>
     ts.isCallExpression(node) && classifyHttpExpression(node.expression, checker) === 'CREATE_SERVER';
 
-  // DDR-B: the SAME bounded static-string resolver the RC/HA member-name check uses, so a
-  // statically constructed socket-acquisition key (`server['o' + 'n']`,
-  // `const k = 'on'; server[k]`) resolves to its name. Receiver-independent, fail-closed: a
-  // genuinely runtime key resolves to null and stays outside the proof (frozen boundary). NET's
-  // own binder-based key resolver is untouched; this map is local to SOCK.
-  const constMap = collectStringConsts(sourceFile);
+  // DDR-NET-STATIC-KEY-PARITY (SOCK): socket acquisition keys are resolved by TypeScript BINDER
+  // identity via the shared bounded `netResolveKey` (see `sockResolveKey`) — the SAME resolver NET's
+  // member/hop/destructuring keys use — never by the whole-file text-keyed `collectStringConsts`/
+  // `staticStringOf`. A Resolved socket-acquisition NAME is rejected on any receiver
+  // (`server['o' + 'n']`, `const k = 'on'; server[k]`), and a shadowing same-text `const` in an
+  // unrelated scope can no longer make a binder-pinned key unresolved (the scope-insensitive
+  // fail-open). An Indeterminate (genuinely runtime / resource-abort) key stays outside the proof,
+  // except on a createServer req/res param where RULE A2 fails closed. One declaration-keyed memo,
+  // fresh per traversal and scoped to the socket ceiling, is shared by every SOCK key resolution so a
+  // const chain reused across many accesses is resolved once (bounded work); per-key `seen`/`budget`
+  // stay local (cycle detection + the per-key hop ceiling).
+  const sockMemo = new Map<ts.Declaration, NetKey>();
 
   // Pass 1 (RULE A2 support) — collect the createServer request/response parameter symbols.
   // Direct identifier params only; a destructured param `({ socket })` is a RULE A binding
@@ -1391,19 +1397,26 @@ const acquiresInboundServerSocket = (checker: ts.TypeChecker, sourceFile: ts.Sou
     //     visited here regardless of how (or whether) they are later invoked.
     if (ts.isPropertyAccessExpression(node) && STATIC_SOCKET_ACQUISITION_NAMES.has(node.name.text)) found = true;
     // RULE A (b) — GLOBAL static-computed socket-acquisition NAME `['socket']`/`['connection']`/
-    //     `['on']`/…/`['setTimeout']` (any receiver, e.g. `server['on']('connection', …)`); else
-    //     RULE A2 fails closed on an indeterminate computed key when the receiver is a
-    //     createServer param. The A2 (receiverIsReqRes) branch is unchanged.
+    //     `['on']`/…/`['setTimeout']` (any receiver, e.g. `server['on']('connection', …)`),
+    //     resolved by BINDER identity (`sockResolveKey` → `netResolveKey`), never by identifier
+    //     text. Resolved(socket name) REJECTS on any receiver; Resolved(other) and NotCapability are
+    //     non-matches; Indeterminate falls to the unchanged RULE A2 fail-closed branch.
     if (ts.isElementAccessExpression(node)) {
       const arg = node.argumentExpression;
-      const resolved = staticStringOf(arg, constMap);
-      // RULE A extension (DDR-B): a statically-resolvable socket-acquisition NAME, ANY receiver
-      //     (`server['o' + 'n']`, `const k='on'; server[k]`, `` server[`socket`] ``).
-      if (resolved !== null && STATIC_SOCKET_ACQUISITION_NAMES.has(resolved)) found = true;
-      // RULE A2 (unchanged): a non-string-literal computed key on a createServer req/res param
-      //     fails closed. The trigger stays keyed on `!isStringLiteralLike`, so A2's fail-closed
-      //     surface is byte-for-byte what it was — the resolver only ADDS global name rejections.
-      else if (!ts.isStringLiteralLike(arg) && receiverIsReqRes(node.expression)) found = true;
+      const key = sockResolveKey(arg, checker, sockMemo);
+      // RULE A extension: a binder-resolvable socket-acquisition NAME, ANY receiver
+      //     (`server['o' + 'n']`, `const k='on'; server[k]`, `` server[`socket`] ``), even with an
+      //     unrelated shadowing `const k` in another scope — binder identity pins the exact key.
+      if (key.kind === 'resolved') {
+        if (STATIC_SOCKET_ACQUISITION_NAMES.has(key.value)) found = true;
+      }
+      // RULE A2 (unchanged): an INDETERMINATE (runtime / resource-abort) computed key on a
+      //     createServer req/res param fails closed. The trigger stays keyed on `!isStringLiteralLike`,
+      //     so A2's fail-closed surface is byte-for-byte what it was — the resolver only ADDS global
+      //     name rejections; a NotCapability key never reaches here.
+      else if (key.kind === 'indeterminate' && !ts.isStringLiteralLike(arg) && receiverIsReqRes(node.expression)) {
+        found = true;
+      }
     }
     // RULE A (c) — GLOBAL socket-acquisition NAME destructuring in any object binding pattern
     //     (variable, parameter, nested, callback): `{ socket }` / `{ connection }` /
@@ -1411,13 +1424,19 @@ const acquiresInboundServerSocket = (checker: ts.TypeChecker, sourceFile: ts.Sou
     //     (the static source KEY is what is banned, never the local binding name).
     if (ts.isBindingElement(node) && ts.isObjectBindingPattern(node.parent)) {
       const keyNode = node.propertyName ?? node.name;
-      // RULE A extension (DDR-B): a statically-resolvable COMPUTED destructuring key
-      //     (`{ ['o'+'n']: h }`, `{ [k]: h }` with `const k='on'`) resolves via the SAME
-      //     resolver; a plain key keeps its existing staticKeyText path. The separate A2
-      //     destructuring branch below is untouched, so its fail-closed surface is preserved.
-      const name = ts.isComputedPropertyName(keyNode)
-        ? staticStringOf(keyNode.expression, constMap)
-        : staticKeyText(keyNode);
+      // RULE A extension: a COMPUTED destructuring key (`{ ['o'+'n']: h }`, `{ [k]: h }` with
+      //     `const k='on'`) is resolved by the SAME binder-aware `sockResolveKey` used for member
+      //     access — binder identity, never identifier text — so a shadowing same-text `const`
+      //     elsewhere cannot flip it. A plain identifier/string key is its own literal text
+      //     (`staticKeyText`, purely syntactic). The separate A2 destructuring branch below is
+      //     untouched, so its fail-closed surface is preserved.
+      let name: string | null = null;
+      if (ts.isComputedPropertyName(keyNode)) {
+        const key = sockResolveKey(keyNode.expression, checker, sockMemo);
+        if (key.kind === 'resolved') name = key.value;
+      } else {
+        name = staticKeyText(keyNode);
+      }
       if (name !== null && STATIC_SOCKET_ACQUISITION_NAMES.has(name)) found = true;
     }
     // RULE A2 (destructuring) — an INDETERMINATE computed binding key destructured DIRECTLY
@@ -1744,6 +1763,36 @@ const netDestructuringKey = (keyNode: ts.Node, checker: ts.TypeChecker): NetKey 
   }
   if (ts.isIdentifier(keyNode) || ts.isStringLiteralLike(keyNode)) return { kind: 'resolved', value: keyNode.text };
   return NET_INDETERMINATE;
+};
+
+// DDR-NET-STATIC-KEY-PARITY (SOCK, F1) — SOCK's static socket acquisition-key resolution is
+// CONSOLIDATED onto the SAME bounded binder-aware `netResolveKey` the NET member/hop/destructuring
+// keys use, replacing the scope-insensitive whole-file text-keyed `collectStringConsts`/
+// `staticStringOf` path. Binder identity is required at the key AND at every const-initializer hop,
+// so the exact occurrence is resolved by the TypeScript binder: an unrelated sibling/nested same-text
+// declaration in another scope can no longer make a statically-known key unresolved — the fail-open
+// that let `const k='on'; server[k](...)` escape when an unrelated `const k='noop'` existed elsewhere
+// (the whole-file collector saw two `k` bindings and demoted the key to UNKNOWN even though the
+// binder pins the exact `k='on'`). The socket ceiling is the longest name in
+// STATIC_SOCKET_ACQUISITION_NAMES (`prependOnceListener` = 19), DERIVED from the set so a `+`-fold to
+// any socket name (`'set' + 'Timeout'`) resolves rather than being pruned as NotCapability. A fresh
+// `seen`/`budget` per call keeps active-path cycle detection and the per-key hop ceiling local; the
+// caller's shared per-traversal `memo` (declaration-keyed, socket-ceiling-scoped) keeps a reused
+// chain O(N + M); a resource-bound abort is caught and becomes Indeterminate. Mechanism
+// CONSOLIDATION only — no new resolver, alias/capability/taint propagation, assignment following, or
+// new policy family; NET's own resolver and the shared RC/HA text helpers are untouched.
+const MAX_SOCKET_MEMBER_LENGTH = Math.max(...[...STATIC_SOCKET_ACQUISITION_NAMES].map((name) => name.length));
+const sockResolveKey = (
+  node: ts.Expression,
+  checker: ts.TypeChecker,
+  memo: Map<ts.Declaration, NetKey>,
+): NetKey => {
+  try {
+    return netResolveKey(node, checker, new Set<ts.Declaration>(), memo, { spent: 0 }, 0, MAX_SOCKET_MEMBER_LENGTH);
+  } catch (error) {
+    if (error instanceof NetResolveAbort) return NET_INDETERMINATE;
+    throw error;
+  }
 };
 
 /**
@@ -5451,9 +5500,9 @@ describe('D3 host enforces the final bounded socket-capability source policy (D3
     });
   }
 
-  // --- DDR-B: statically CONSTRUCTED socket-acquisition KEYS resolve via the shared
-  //     static-string resolver, any receiver — MUST REJECT. `server['o' + 'n']` is the
-  //     reported reproduction. A genuinely runtime key resolves to null and stays outside. ---
+  // --- DDR-B: statically CONSTRUCTED socket-acquisition KEYS resolve via the binder-aware
+  //     `sockResolveKey` (`netResolveKey`), any receiver — MUST REJECT. `server['o' + 'n']` is the
+  //     reported reproduction. A genuinely runtime key is Indeterminate and stays outside. ---
   const ddrBReject: readonly { readonly form: string; readonly source: string }[] = [
     { form: "the reported server['o' + 'n']('connection', …) reproduction", source: wrapperHead + `server['o' + 'n']('connection', (s: { destroy(): void; connect(p: number, h: string): void }) => {\n  s.destroy();\n  setTimeout(() => s.connect(80, 'example.com'), 50);\n});` },
     { form: "a literal server['on']", source: wrapperHead + `server['on']('connection', () => {});` },
@@ -5472,14 +5521,58 @@ describe('D3 host enforces the final bounded socket-capability source policy (D3
   }
 
   // --- DDR-B: the frozen runtime-computed boundary stays OUTSIDE the proof — MUST ALLOW.
-  //     A key that is not statically resolvable (a call result, an ambient runtime name) is
-  //     unchanged; closing it would need alias/type/whole-program flow, deliberately excluded. ---
+  //     A key the binder cannot pin to a static string (a call result, an ambient runtime name) is
+  //     Indeterminate; closing it would need alias/type/whole-program flow, deliberately excluded. ---
   const ddrBAllow: readonly { readonly form: string; readonly source: string }[] = [
     { form: 'a genuinely runtime server[runtimeKey] (declared, unresolvable)', source: wrapperHead + `declare const runtimeKey: string;\nvoid server[runtimeKey];` },
     { form: 'a call-result key server[String(4317)] (unresolvable)', source: wrapperHead + `void server[String(4317)];` },
     { form: 'a harmless resolvable non-socket key server["lis" + "ten"]', source: wrapperHead + `void server['lis' + 'ten'];` },
   ];
   for (const { form, source } of ddrBAllow) {
+    it(`allows ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+
+  // --- CODEX F1 BINDER-KEY MATRIX (SOCK consolidation): the socket acquisition key is now resolved
+  //     by TypeScript BINDER identity (`sockResolveKey` → `netResolveKey`), so an unrelated shadowing
+  //     same-text `const` in another scope NEVER makes a binder-pinned key unresolved the way the
+  //     whole-file text collector did. M2/M4/M6 are the regression witnesses: under the old
+  //     text-keyed `collectStringConsts`/`staticStringOf` the sibling `const` demoted the key to
+  //     UNKNOWN (fail-open); the binder pins the exact declaration and REJECTS. MUST REJECT. ---
+  const binderKeyReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: "M1: const k='on'; server[k]('connection', …)", source: wrapperHead + `const k = 'on';\nserver[k]('connection', () => {});` },
+    { form: "M2: M1 with an unrelated shadowing const k='noop' (regression witness)", source: wrapperHead + `const k = 'on';\nserver[k]('connection', () => {});\nfunction unrelated(): void {\n  const k = 'noop';\n  void k;\n}\nvoid unrelated;` },
+    { form: "M3: const key='socket'; req[key]", source: handler(`const key = 'socket';\nvoid req[key];`) },
+    { form: "M4: M3 with an unrelated shadowing const key='x' (regression witness)", source: handler(`const key = 'socket';\nfunction unrelated(): void {\n  const key = 'x';\n  void key;\n}\nvoid req[key];\nvoid unrelated;`) },
+    { form: "M5: const k='on'; const { [k]: h } = server", source: wrapperHead + `const k = 'on';\nconst { [k]: h } = server;\nvoid h;` },
+    { form: "M6: M5 with an unrelated shadowing const k='noop' (regression witness)", source: wrapperHead + `const k = 'on';\nfunction unrelated(): void {\n  const k = 'noop';\n  void k;\n}\nconst { [k]: h } = server;\nvoid h;\nvoid unrelated;` },
+    { form: "M7: server['o' + 'n']('connection', …)", source: wrapperHead + `server['o' + 'n']('connection', () => {});` },
+    { form: "M8: const k='connection'; server[k]", source: wrapperHead + `const k = 'connection';\nvoid server[k];` },
+    { form: "M9: const k='setTimeout'; server[k](…)", source: wrapperHead + `const k = 'setTimeout';\nserver[k](0, () => {});` },
+    { form: "M10: direct literal server['on']('connection', …)", source: wrapperHead + `server['on']('connection', () => {});` },
+    // M13 — the RULE A2 fail-closed floor is preserved: a genuinely runtime key on a createServer
+    //     req/res param is DENIED (Indeterminate + receiverIsReqRes).
+    { form: "M13: req[runtimeKey] stays RULE A2 fail-closed on the handler param", source: handler(`declare const runtimeKey: string;\nvoid req[runtimeKey];`) },
+  ];
+  for (const { form, source } of binderKeyReject) {
+    it(`rejects ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // --- CODEX F1 BINDER-KEY MATRIX (preserve): a runtime key on an unrelated receiver stays OUTSIDE
+  //     the frozen proof, a provably-harmless key is allowed, and — resolved by the SAME binder
+  //     identity — a harmless key is NEVER flipped by a shadowing socket-named sibling const
+  //     (M16 exercises binder identity in the ALLOW direction). MUST ALLOW. ---
+  const binderKeyAllow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: "M11: server[runtimeKey] on an unrelated receiver stays outside the proof", source: wrapperHead + `declare const runtimeKey: string;\nvoid server[runtimeKey];` },
+    { form: "M12: server[String(4317)] stays outside the static proof", source: wrapperHead + `void server[String(4317)];` },
+    { form: "M14: req['method'] stays allowed", source: handler(`void req['method'];`) },
+    { form: "M15: harmless static server['listen'] stays allowed", source: wrapperHead + `void server['listen'];` },
+    { form: "M16: a harmless key is not flipped by a shadowing socket-named sibling const", source: wrapperHead + `const k = 'listen';\nfunction unrelated(): void {\n  const k = 'on';\n  void k;\n}\nvoid server[k];\nvoid unrelated;` },
+  ];
+  for (const { form, source } of binderKeyAllow) {
     it(`allows ${form}`, () => {
       expect(usesOutboundNetwork(source)).toBe(false);
     });
