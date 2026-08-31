@@ -353,14 +353,25 @@ const selfReferenceHopName = (
 
 // A structural global receiver: a bare global-object identifier, OR a self-reference member
 // (name in GLOBAL_RECEIVER_NAMES) read off another structural global receiver — so
-// `globalThis.globalThis`, `globalThis.window`, `window.window` are all recognized. Finite:
+// `globalThis.globalThis`, `globalThis.window`, `window.window` are all recognized. An
+// ELEMENT-access hop key is folded by the SAME bounded static-key resolver the rest of this
+// checker-free detector uses (`staticStringOf`: literal / `+`-concat / `const`-key chains), so
+// `globalThis['global' + 'This']` and `const k = 'globalThis'; globalThis[k]` are recognized hops
+// on parity with the dotted / string-literal form — the forwarding closure (rule (e′)) then rejects
+// a static-key self-hop forwarded as a value, not only a literal one. A runtime-built key folds to
+// null and stays outside the boundary; binder/shadowing authority stays with the base identifier
+// (this reserves the receiver names structurally — see the RC v3/v4 forwarding suites). Finite:
 // each recursion strips one member-access layer off `node.expression`.
-const isGlobalReceiver = (node: ts.Expression): boolean => {
+const isGlobalReceiver = (node: ts.Expression, constMap: ReadonlyMap<string, string>): boolean => {
   const n = unwrapExpr(node);
   if (ts.isIdentifier(n)) return GLOBAL_RECEIVER_NAMES.has(n.text);
-  if (ts.isPropertyAccessExpression(n) || ts.isElementAccessExpression(n)) {
+  if (ts.isPropertyAccessExpression(n)) {
     const hop = selfReferenceHopName(n);
-    return hop !== null && GLOBAL_RECEIVER_NAMES.has(hop) && isGlobalReceiver(n.expression);
+    return hop !== null && GLOBAL_RECEIVER_NAMES.has(hop) && isGlobalReceiver(n.expression, constMap);
+  }
+  if (ts.isElementAccessExpression(n)) {
+    const hop = staticStringOf(n.argumentExpression, constMap);
+    return hop !== null && GLOBAL_RECEIVER_NAMES.has(hop) && isGlobalReceiver(n.expression, constMap);
   }
   return false;
 };
@@ -667,7 +678,7 @@ const usesRuntimeCodeGeneration = (source: string): boolean => {
       // (a) `.constructor` on any receiver — the function-constructor chain.
       if (member === 'constructor') found = true;
       // (b) `.eval` / `.Function` off a global receiver.
-      else if (member !== null && RC_PRIMITIVE_NAMES.has(member) && isGlobalReceiver(node.expression)) {
+      else if (member !== null && RC_PRIMITIVE_NAMES.has(member) && isGlobalReceiver(node.expression, constMap)) {
         found = true;
       }
     }
@@ -714,7 +725,7 @@ const usesRuntimeCodeGeneration = (source: string): boolean => {
     //      rejects a shadowed `const g = globalThis`, and the escaped alias is never traced.
     if (
       (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) &&
-      isGlobalReceiver(node) &&
+      isGlobalReceiver(node, constMap) &&
       !servesAsAccessObject(node)
     ) {
       found = true;
@@ -727,7 +738,7 @@ const usesRuntimeCodeGeneration = (source: string): boolean => {
     //     `globalThis['ev' + 'al']`) is not caught here (the latter is caught by (b)).
     if (
       ts.isElementAccessExpression(node) &&
-      isGlobalReceiver(node.expression) &&
+      isGlobalReceiver(node.expression, constMap) &&
       staticStringOf(node.argumentExpression, constMap) === null
     ) {
       found = true;
@@ -781,10 +792,10 @@ const HIDDEN_BUILTIN_METHODS: ReadonlySet<string> = new Set(['getBuiltinModule',
 const isProcessValue = (node: ts.Node, constMap: ReadonlyMap<string, string>): boolean => {
   if (ts.isIdentifier(node)) return node.text === 'process' && isValueReference(node);
   if (ts.isPropertyAccessExpression(node)) {
-    return node.name.text === 'process' && isGlobalReceiver(node.expression);
+    return node.name.text === 'process' && isGlobalReceiver(node.expression, constMap);
   }
   if (ts.isElementAccessExpression(node)) {
-    return staticStringOf(node.argumentExpression, constMap) === 'process' && isGlobalReceiver(node.expression);
+    return staticStringOf(node.argumentExpression, constMap) === 'process' && isGlobalReceiver(node.expression, constMap);
   }
   return false;
 };
@@ -4635,6 +4646,88 @@ describe('D3 host RC global-object self-reference forwarding closure (D3-CX-POLI
         `function h(globalThis: { globalThis: { eval: (s: string) => void } }) {\n  const g = globalThis.globalThis;\n  g.eval('x');\n}`,
       ),
     ).toBe(true);
+  });
+});
+
+// RC v5 — STATIC-KEY parity for the global self-reference forwarding closure. The v4 closure
+// recognized a forwarded self-hop only through the checker-free `isGlobalReceiver`, which folded
+// LITERAL keys only, so a bounded static-key self-hop forwarded as a value —
+// `const g = globalThis['global' + 'This']; g.fetch(…)` or `const k = 'globalThis'; globalThis[k]`
+// — folded to the benign receiver name `globalThis` and slipped past every guard (RC (f) saw the
+// key as Resolved(other), not Indeterminate, and the literal-only self-hop resolver never
+// recognized the hop). `isGlobalReceiver` now folds an element-access hop key through the SAME
+// bounded static-key resolver the rest of this checker-free detector already uses (`staticStringOf`:
+// literal / `+`-concat / `const`-key), so the forwarding closure (rule (e′)) recognizes the identical
+// finite key grammar the NET self-hop mechanism does — reusing existing machinery, introducing no
+// new resolver, and tracing no alias. A truly runtime key folds to null and stays outside the
+// boundary; a template-substitution key stays Indeterminate and is already denied fail-closed by
+// rule (f). Shadow/binder authority is unchanged: `isGlobalReceiver` reserves the receiver NAMES
+// structurally (as v3/v4 already do), so a forwarded self-hop off a shadowed base is rejected on
+// exact parity with the forwarded literal self-hop — while the DIRECT member path stays shadow-aware
+// (see DDR-A). Every witness typechecks under strict NodeNext.
+// ---------------------------------------------------------------------------
+describe('D3 host RC static-key global forwarding parity (D3-CX-POLICY-RC v5)', () => {
+  const rejected: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a concat self-hop key forwarded then fetch (Codex witness)', source: `const g = globalThis['global' + 'This'];\ng.fetch('https://example.com/');` },
+    { form: 'a const-string self-hop key forwarded then fetch', source: `const key = 'globalThis';\nconst g = globalThis[key];\ng.fetch('https://example.com/');` },
+    { form: 'a bracket-literal self-hop key forwarded then fetch', source: `const g = globalThis['globalThis'];\ng.fetch('https://example.com/');` },
+    { form: 'an inline template self-hop key forwarded then fetch (fail-closed via rule (f))', source: "const g = globalThis[`global${'This'}`];\ng.fetch('https://example.com/');" },
+    { form: 'a const template self-hop key forwarded then fetch (fail-closed via rule (f))', source: "const key = `global${'This'}`;\nconst g = globalThis[key];\ng.fetch('https://example.com/');" },
+    { form: 'a window concat self-hop forwarded then fetch (type-valid synthetic)', source: `declare const window: typeof globalThis;\nconst g = window['win' + 'dow'];\ng.fetch('https://example.com/');` },
+    { form: 'a concat self-hop key forwarded then eval (codegen route parity)', source: `const g = globalThis['global' + 'This'];\ng.eval("import('../domain/actions.js')");` },
+    // A runtime-computed key is NOT folded to a static self-hop; it stays denied only by the
+    // pre-existing Indeterminate (fail-closed) rule (f), never by the new static fold.
+    { form: 'a runtime-key access stays denied fail-closed (indeterminate, not folded)', source: `declare function rk(): string;\nconst g = globalThis[rk()];\ng.fetch('https://example.com/');` },
+  ];
+  for (const { form, source } of rejected) {
+    it(`rejects ${form}`, () => {
+      expect(usesRuntimeCodeGeneration(source)).toBe(true);
+    });
+  }
+
+  // The shadowed static-key forward is rejected on EXACT PARITY with the shadowed LITERAL forward
+  // (both are the RC structural name reservation, shadow-blind by adopted v3/v4 design) — the fix
+  // recognizes more key spellings, it does not change shadow handling.
+  it('rejects a shadowed static-key forward on parity with the shadowed literal forward', () => {
+    const shadowConcat = `function f(globalThis: { [k: string]: { fetch: (u: string) => void } }) {\n  const g = globalThis['global' + 'This'];\n  g.fetch('x');\n}`;
+    const shadowLiteral = `function f(globalThis: { globalThis: { fetch: (u: string) => void } }) {\n  const g = globalThis.globalThis;\n  g.fetch('x');\n}`;
+    expect(usesRuntimeCodeGeneration(shadowConcat)).toBe(usesRuntimeCodeGeneration(shadowLiteral));
+    expect(usesRuntimeCodeGeneration(shadowConcat)).toBe(true);
+  });
+
+  // PRESERVE — the DIRECT shadowed self-hop MEMBER stays allowed: NET is checker-based and
+  // shadow-aware for direct member access, and RC does not fire on a direct member receiver.
+  it('preserves a direct shadowed self-hop member access', () => {
+    const src = `function f(globalThis: { globalThis: { fetch: (u: string) => void } }) {\n  globalThis.globalThis.fetch('x');\n}`;
+    expect(usesOutboundNetwork(src)).toBe(false);
+    expect(usesRuntimeCodeGeneration(src)).toBe(false);
+  });
+
+  // PRESERVE — the frozen NET alias residual is untouched (NET still does not trace the alias;
+  // the source is denied by the RC forwarding closure, not by NET).
+  it('preserves the frozen NET alias residual (NET stays false)', () => {
+    expect(usesOutboundNetwork(`const g = globalThis.globalThis;\ng.fetch('https://example.com/');`)).toBe(false);
+    expect(usesOutboundNetwork(`const g = globalThis['global' + 'This'];\ng.fetch('https://example.com/');`)).toBe(false);
+  });
+
+  // PRESERVE — an unrelated local object whose base is NOT a global-receiver name is never folded
+  // into the global, whether accessed directly or forwarded.
+  it('preserves unrelated local objects with a globalThis property', () => {
+    expect(usesRuntimeCodeGeneration(`const o = { globalThis: { fetch(u: string) { return u; } } };\nconst g = o.globalThis;\ng.fetch('x');`)).toBe(false);
+    expect(usesOutboundNetwork(`const o = { globalThis: { fetch(u: string) { return u; } } };\no.globalThis.fetch('x');`)).toBe(false);
+  });
+
+  // PRESERVE — forwarding a benign statically-resolved global member (folded key is not a
+  // global-receiver name) is not a self-hop and stays allowed.
+  it('preserves forwarding of a benign resolved global member', () => {
+    expect(usesRuntimeCodeGeneration(`const c = globalThis['cons' + 'ole'];\nvoid c;`)).toBe(false);
+    expect(usesRuntimeCodeGeneration(`const c = globalThis['console'];\nvoid c;`)).toBe(false);
+  });
+
+  // PRESERVE — the DIRECT static-key self-hop member is still denied by NET's binder-aware path.
+  it('keeps the direct static-key self-hop member denied by NET', () => {
+    expect(usesOutboundNetwork(`globalThis['global' + 'This'].fetch('https://example.com/');`)).toBe(true);
+    expect(usesOutboundNetwork(`globalThis.globalThis.fetch('https://example.com/');`)).toBe(true);
   });
 });
 
