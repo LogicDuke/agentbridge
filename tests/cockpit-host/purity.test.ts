@@ -696,6 +696,29 @@ const usesRuntimeCodeGeneration = (source: string): boolean => {
     ) {
       found = true;
     }
+    // (e') forwarding a global-object SELF-REFERENCE value (`globalThis.globalThis`,
+    //      `window['window']`, and chains of such hops) as a value — the SAME
+    //      acquisition-site closure as (e), lifted from the bare identifier to the
+    //      structural global receiver that (b)/(f) already recognize via `isGlobalReceiver`.
+    //      `globalThis.globalThis` re-denotes the real global, so `const g =
+    //      globalThis.globalThis; g.eval(...)` (or `g.fetch(...)`) is the same forwarded
+    //      alias as `const g = globalThis`, only spelled through the self-hop that NET's
+    //      `isFreeGlobalReceiver` already proves free — without this, rule (e) caught the
+    //      bare identifier but the self-hop laundered the acquisition into an array
+    //      element / object value / initializer / argument / return. A self-hop that
+    //      DIRECTLY serves as the access object (`globalThis.globalThis.fetch(...)`, itself
+    //      caught by NET; `globalThis.globalThis.console.log(...)`) is a direct member
+    //      operation and preserved — only a self-hop escaping as a VALUE is rejected. No
+    //      checker and no flow tracing: the receiver's identity is RC's existing structural
+    //      name reservation (b)/(f), so a shadowed base is rejected exactly as (e) already
+    //      rejects a shadowed `const g = globalThis`, and the escaped alias is never traced.
+    if (
+      (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) &&
+      isGlobalReceiver(node) &&
+      !servesAsAccessObject(node)
+    ) {
+      found = true;
+    }
     // (f) a computed element access on a recognized global receiver whose key is not
     //     statically resolvable — a runtime-built key (`['e','v','a','l'].join('')`,
     //     `String.fromCharCode(...)`) could acquire `eval`/`Function`/`process` off
@@ -4537,6 +4560,81 @@ describe('D3 host RC global-object forwarding closure (D3-CX-POLICY-RC v3)', () 
     // Preservation: the real host's direct `process.argv[1]` (numeric key on
     // `process.argv`, not on `process`) is unaffected.
     expect(acquiresHiddenBuiltin(`const e = process.argv[1];\nvoid e;`)).toBe(false);
+  });
+});
+
+// RC v4 — global-object SELF-REFERENCE forwarding closure. v3 rejected forwarding a
+// BARE global receiver (`const g = globalThis; g.eval(...)`), but the self-reference
+// hop `globalThis.globalThis` — which `isGlobalReceiver` already recognizes as the
+// real global for rules (b)/(f), and which NET's `isFreeGlobalReceiver` proves free —
+// evaded rule (e), so laundering the acquisition through the self-hop
+// (`const g = globalThis.globalThis; g.eval(...)` / `[globalThis.globalThis][0].fetch(...)`)
+// slipped past every detector. v4 closes the parity gap at the exact forwarding site
+// with NO alias tracing: the self-hop is rejected where it ESCAPES as a value, never by
+// following the resulting alias. This is the same acquisition-site closure as v3, lifted
+// from the bare identifier to the structural global receiver. Every witness typechecks
+// under strict NodeNext. (This is where the network self-hop forwarding witness — a
+// `.fetch` acquired off a forwarded `globalThis.globalThis` — is closed too: NET relies on
+// this forwarding closure exactly as the NET detector's doc comment states, so the witness
+// is denied here, before any free receiver can reach the `.fetch` member.)
+// ---------------------------------------------------------------------------
+describe('D3 host RC global-object self-reference forwarding closure (D3-CX-POLICY-RC v4)', () => {
+  const rejected: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'direct self-hop alias then eval', source: `const g = globalThis.globalThis;\ng.eval("import('../domain/actions.js')");` },
+    { form: 'self-hop forwarded through an array then eval', source: `const g = [globalThis.globalThis][0]!;\ng.eval("import('../domain/actions.js')");` },
+    { form: 'self-hop forwarded through an object then Function', source: `const box = { g: globalThis.globalThis };\nbox.g.Function('return 1')();` },
+    { form: 'self-hop returned from a function then eval', source: `function obtain() { return globalThis.globalThis; }\nobtain().eval("import('../domain/actions.js')");` },
+    { form: 'self-hop passed as a function argument', source: `function consume(x: unknown): void { void x; }\nconsume(globalThis.globalThis);` },
+    { form: 'self-hop acquired via IIFE then eval', source: `const g = (() => globalThis.globalThis)();\ng.eval("import('../domain/actions.js')");` },
+    { form: 'element-access self-hop alias then eval', source: `const g = globalThis['globalThis'];\ng.eval("import('../domain/actions.js')");` },
+    { form: 'window.window self-hop alias then eval (type-valid synthetic)', source: `declare const window: typeof globalThis;\nconst g = window.window;\ng.eval("import('../domain/actions.js')");` },
+    { form: 'two-hop self-reference chain forwarded then eval', source: `const g = globalThis.globalThis.globalThis;\ng.eval("import('../domain/actions.js')");` },
+    // The exact Codex F2 network witness: a forwarded self-hop whose alias is used to
+    // reach the `fetch` global. Denied at the self-hop forwarding site (RC), which is
+    // the closure NET depends on — no free receiver ever reaches `.fetch`.
+    { form: 'network fetch off a self-hop forwarded through an array (Codex F2)', source: `const g = [globalThis.globalThis][0]!;\ng.fetch('https://example.com/');` },
+    { form: 'network fetch off a direct self-hop alias', source: `const g = globalThis.globalThis;\ng.fetch('https://example.com/');` },
+  ];
+  for (const { form, source } of rejected) {
+    it(`rejects ${form}`, () => {
+      expect(usesRuntimeCodeGeneration(source)).toBe(true);
+    });
+  }
+
+  // Preservation: a self-hop that DIRECTLY serves as a member-access receiver is a
+  // normal operation and stays accepted by RC — the network `.fetch` case is caught
+  // by NET (the direct-member detector), not by this forwarding closure, and a benign
+  // direct member (`.console`) is harmless.
+  it('preserves a direct self-hop member access', () => {
+    expect(usesRuntimeCodeGeneration(`globalThis.globalThis.console.log('x');`)).toBe(false);
+    expect(usesRuntimeCodeGeneration(`globalThis.globalThis.setTimeout(() => {}, 0);`)).toBe(false);
+    // A direct network member off the self-hop is not RC's concern; NET rejects it.
+    expect(usesRuntimeCodeGeneration(`globalThis.globalThis.fetch('https://example.com/');`)).toBe(false);
+    expect(usesOutboundNetwork(`globalThis.globalThis.fetch('https://example.com/');`)).toBe(true);
+  });
+
+  // Preservation: forwarding an ORDINARY local object that merely happens to expose an
+  // `eval`/`fetch` member is not a global acquisition and must remain accepted.
+  it('preserves forwarding of an unrelated local object', () => {
+    expect(
+      usesRuntimeCodeGeneration(`const box = { g: { eval(s: string) { return s; } } };\nbox.g.eval('x');`),
+    ).toBe(false);
+    expect(
+      usesOutboundNetwork(`const box = { g: { fetch(u: string) { return u; } } };\nbox.g.fetch('x');`),
+    ).toBe(false);
+  });
+
+  // The self-hop forwarding is rejected receiver-name-structurally (RC carries no
+  // TypeChecker), exactly as v3 rejects a shadowed bare `const g = globalThis`: a
+  // lexically-shadowed `globalThis` base is still denied when forwarded through the
+  // self-hop. NET (which IS checker-based) remains the shadow-aware detector for direct
+  // member access; this closure preserves v3's deliberate fail-closed name reservation.
+  it('rejects a shadowed self-hop forwarding, matching v3 bare-identifier parity', () => {
+    expect(
+      usesRuntimeCodeGeneration(
+        `function h(globalThis: { globalThis: { eval: (s: string) => void } }) {\n  const g = globalThis.globalThis;\n  g.eval('x');\n}`,
+      ),
+    ).toBe(true);
   });
 });
 
