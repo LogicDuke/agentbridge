@@ -1706,6 +1706,29 @@ const netResolveKey = (
     if (left.value.length + right.value.length > maxLen) return NET_NOT_CAPABILITY;
     return { kind: 'resolved', value: left.value + right.value };
   }
+  // A SUBSTITUTED template `` `o${'n'}` `` denotes the same static string as the `+`-fold and folds the
+  // SAME way: the head text, then for every span the resolved substitution EXPRESSION followed by that
+  // span's literal text — each substitution resolved through THIS resolver (string literal / `+`-fold /
+  // unique-const identity), reusing the same depth/visit/length bounds. A substitution-free template is
+  // a `NoSubstitutionTemplateLiteral` already handled by the `isStringLiteralLike` branch above; a
+  // `TemplateExpression` always carries ≥1 span. Length is bounded BEFORE each concat (an oversized
+  // result is provably NotCapability, so no oversized intermediate is materialized). If ANY substitution
+  // is indeterminate (runtime / mutable / ambient / unresolvable), the whole template is Indeterminate —
+  // no runtime coercion, no `toString`, no value flow.
+  if (ts.isTemplateExpression(n)) {
+    let value = n.head.text;
+    if (value.length > maxLen) return NET_NOT_CAPABILITY;
+    for (const span of n.templateSpans) {
+      const part = netResolveKey(span.expression, checker, seen, memo, budget, depth + 1, maxLen);
+      if (part.kind === 'indeterminate') return NET_INDETERMINATE;
+      if (part.kind === 'notCapability') return NET_NOT_CAPABILITY; // already too long; concat only grows it
+      if (value.length + part.value.length > maxLen) return NET_NOT_CAPABILITY;
+      value += part.value;
+      if (value.length + span.literal.text.length > maxLen) return NET_NOT_CAPABILITY;
+      value += span.literal.text;
+    }
+    return { kind: 'resolved', value };
+  }
   if (ts.isIdentifier(n)) {
     // Resolve an identifier-ALIAS spine (`const a = b; const b = c; …`) ITERATIVELY, so a chain of
     // any length consumes O(1) native stack. Every declaration on the spine denotes the SAME key, so
@@ -5743,6 +5766,49 @@ describe('D3 host enforces the final bounded socket-capability source policy (D3
     { form: 'a harmless resolvable non-socket key server["lis" + "ten"]', source: wrapperHead + `void server['lis' + 'ten'];` },
   ];
   for (const { form, source } of ddrBAllow) {
+    it(`allows ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+
+  // --- DDR-B (STATIC-TEMPLATE PARITY): a socket-acquisition KEY spelled as a SUBSTITUTED template
+  //     `` server[`o${'n'}`] `` denotes the same static string as `server['on']` / `server['o'+'n']`,
+  //     but its key node is a `TemplateExpression` (not `StringLiteralLike`, not a `+` BinaryExpression,
+  //     not an Identifier), so the bounded static-key resolver (`netResolveKey`, via `sockResolveKey`)
+  //     previously fell through to Indeterminate — and an Indeterminate key rejects only on a tracked
+  //     req/res receiver, so with an http.Server receiver the registrar escaped. A `TemplateExpression`
+  //     is folded EXACTLY like the `+`-fold: `head.text` + resolved(span.expression) + span.literal.text
+  //     for every span, each substitution resolved through the SAME binder-aware machinery (string
+  //     literal / `+`-fold / unique-const identity), reusing the SAME depth/visit/length bounds. Every
+  //     substitution must be independently bounded-static; if ANY is mutable/ambient/runtime the whole
+  //     template stays Indeterminate (see the allow block). The no-substitution `` server[`on`] `` is
+  //     already `StringLiteralLike` and handled above. MUST REJECT. ---
+  const ddrBTemplateReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'the reported server[`o${\'n\'}`](\'connection\', …) registrar extraction + reconnect', source: wrapperHead + 'server[`o${\'n\'}`](\'connection\', (s: { destroy(): void; connect(p: number, h: string): void }) => {\n  s.destroy();\n  setTimeout(() => s.connect(80, \'example.com\'), 50);\n});' },
+    { form: 'a whole-key substitution server[`${\'on\'}`]', source: wrapperHead + 'server[`${\'on\'}`](\'connection\', () => {});' },
+    { form: 'a const-substitution server[`${a}n`] with const a = \'o\'', source: wrapperHead + 'const a = \'o\';\nserver[`${a}n`](\'connection\', () => {});' },
+    { form: 'a two-const-substitution server[`${a}${b}`] with a=\'o\', b=\'n\'', source: wrapperHead + 'const a = \'o\';\nconst b = \'n\';\nserver[`${a}${b}`](\'connection\', () => {});' },
+    { form: 'a delivery member server[`set${\'Timeout\'}`]', source: wrapperHead + 'void server[`set${\'Timeout\'}`];' },
+    { form: 'a capability name server[`sock${\'et\'}`]', source: wrapperHead + 'void server[`sock${\'et\'}`];' },
+    { form: 'a binder-pinned const under a same-text shadow in another scope server[`${a}n`]', source: wrapperHead + 'const a = \'o\';\nfunction other(): string {\n  const a = \'zz\';\n  return a;\n}\nvoid other;\nserver[`${a}n`](\'connection\', () => {});' },
+  ];
+  for (const { form, source } of ddrBTemplateReject) {
+    it(`rejects ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // --- DDR-B (STATIC-TEMPLATE PARITY): the frozen indeterminate boundary is UNCHANGED — a template
+  //     with ANY non-bounded-static substitution (runtime/ambient identifier, mutable `let` binding,
+  //     unresolvable call) stays Indeterminate, so on a non-req/res receiver it is NOT flagged. Only a
+  //     fully binder-static template folds. MUST ALLOW. ---
+  const ddrBTemplateAllow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a runtime-substituted server[`o${runtime}n`] (declared, unresolvable)', source: wrapperHead + 'declare const runtime: string;\nvoid server[`o${runtime}n`];' },
+    { form: 'a mutable-binding server[`${a}n`] with let a = \'o\'', source: wrapperHead + 'let a = \'o\';\na = \'o\';\nvoid server[`${a}n`];' },
+    { form: 'a call-result substitution server[`o${String(1)}`] (unresolvable)', source: wrapperHead + 'void server[`o${String(1)}`];' },
+    { form: 'a harmless resolvable non-socket template server[`lis${\'ten\'}`]', source: wrapperHead + 'void server[`lis${\'ten\'}`];' },
+  ];
+  for (const { form, source } of ddrBTemplateAllow) {
     it(`allows ${form}`, () => {
       expect(usesOutboundNetwork(source)).toBe(false);
     });
