@@ -1386,6 +1386,44 @@ const acquiresInboundServerSocket = (checker: ts.TypeChecker, sourceFile: ts.Sou
   };
 
   let found = false;
+  // RULE A (c, assignment parity — DELIVERY/REGISTRAR members ONLY) — the assignment-AST twin of the
+  //     RULE A (c) per-binding-element key check, walked over the finite ObjectLiteralExpression
+  //     destructuring TARGET of an `=`, but DELIBERATELY SCOPED to the receiver-independent
+  //     delivery/registrar-member family (`SOCKET_DELIVERY_MEMBERS`: on/once/addListener/
+  //     prependListener/prependOnceListener/setTimeout), NOT the full `STATIC_SOCKET_ACQUISITION_NAMES`
+  //     set. `({ on: register } = server)` extracts the registrar exactly like `const { on: register }
+  //     = server`, but its target is an ObjectLiteralExpression (Shorthand/PropertyAssignment), not a
+  //     BindingElement, so RULE A (c) never saw it. Each target KEY is resolved by the SAME
+  //     binder-aware machinery A (c) uses — a plain/quoted key is its own text (`staticKeyText`), a
+  //     computed key (`{ ['o'+'n']: … }`, `{ [k]: … }`) folds off the binder (`sockResolveKey`) — and a
+  //     RESOLVED delivery/registrar name REJECTS receiver-independently (the `.on` / `const { on }`
+  //     registrar bans are already receiver-independent, so no server identity is tracked). The
+  //     socket/connection CAPABILITY names are intentionally EXCLUDED here: their assignment-extraction
+  //     policy stays the receiver-sensitive req/res-bound RULE A2 assignment branch below (the accepted
+  //     D3-CX-CODEX-ASSIGN "no global broadening" invariant — `({ socket } = unrelatedObject)` and
+  //     `({ socket } = server)` remain allowed). Recurses ONLY into a nested ObjectLiteralExpression
+  //     VALUE — the assignment twin of a nested binding pattern (`({ a: { on } } = x)`) — terminating at
+  //     the finite AST depth with NO value flow, alias following, or receiver tracking. An INDETERMINATE
+  //     computed key is NOT globally failed closed here (only a Resolved delivery name rejects); the
+  //     req/res A2 branch below retains its own fail-closed behavior.
+  const scanSocketAssignmentTarget = (target: ts.ObjectLiteralExpression): void => {
+    for (const prop of target.properties) {
+      if (ts.isShorthandPropertyAssignment(prop)) {
+        if (SOCKET_DELIVERY_MEMBERS.has(prop.name.text)) found = true;
+      } else if (ts.isPropertyAssignment(prop)) {
+        let name: string | null = null;
+        if (ts.isComputedPropertyName(prop.name)) {
+          const key = sockResolveKey(prop.name.expression, checker, sockMemo);
+          if (key.kind === 'resolved') name = key.value;
+        } else {
+          name = staticKeyText(prop.name);
+        }
+        if (name !== null && SOCKET_DELIVERY_MEMBERS.has(name)) found = true;
+        const value = binderUnwrap(prop.initializer);
+        if (ts.isObjectLiteralExpression(value)) scanSocketAssignmentTarget(value);
+      }
+    }
+  };
   const visit = (node: ts.Node): void => {
     // RULE A (a) — GLOBAL dotted socket-acquisition NAME: `.socket`/`.connection` or a delivery
     //     member `.on`/`.once`/`.addListener`/`.prependListener`/`.prependOnceListener`/
@@ -1489,6 +1527,23 @@ const acquiresInboundServerSocket = (checker: ts.TypeChecker, sourceFile: ts.Sou
           }
         }
       }
+    }
+    // RULE A (c, assignment parity — DELIVERY/REGISTRAR members ONLY) — receiver-INDEPENDENT
+    //     delivery/registrar-member NAME in an object DESTRUCTURING ASSIGNMENT target:
+    //     `({ on: register } = server)` / `({ on } = server)` / `({ ['o'+'n']: h } = server)` / nested
+    //     `({ a: { on } } = server)`. The target is an ObjectLiteralExpression (Shorthand/
+    //     PropertyAssignment), NOT a BindingElement, so RULE A (c) above does not see it, and the RULE
+    //     A2 assignment branch just above is bound to req/res receivers + SOCKET_CAPABILITY_NAMES only.
+    //     `scanSocketAssignmentTarget` closes the verified registrar-extraction gap by applying the
+    //     receiver-independent SOCKET_DELIVERY_MEMBERS ban to the assignment AST — server identity is
+    //     never tracked, exactly as `.on` / `const { on }` are already receiver-independent. The
+    //     socket/connection CAPABILITY names are DELIBERATELY not broadened here: their assignment
+    //     extraction stays the req/res-bound RULE A2 branch above (accepted D3-CX-CODEX-ASSIGN
+    //     invariant). Only a RESOLVED delivery name rejects; an indeterminate computed key is left to
+    //     the req/res-bound RULE A2 branch above (NOT globally failed closed).
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+      const target = binderUnwrap(node.left);
+      if (ts.isObjectLiteralExpression(target)) scanSocketAssignmentTarget(target);
     }
     // RULE B (PROMOTED into RULE A's name family) — the event registrars and `setTimeout` are
     //     now banned by NAME at RULE A (a)/(b)/(c) above, receiver- and position-independent, so
@@ -5688,6 +5743,54 @@ describe('D3 host enforces the final bounded socket-capability source policy (D3
     { form: 'a harmless resolvable non-socket key server["lis" + "ten"]', source: wrapperHead + `void server['lis' + 'ten'];` },
   ];
   for (const { form, source } of ddrBAllow) {
+    it(`allows ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+
+  // --- ASSIGNMENT-DESTRUCTURING PARITY (SOCK, DELIVERY/REGISTRAR members ONLY): `({ on: register } =
+  //     server)` extracts the registrar off `server` exactly like the declaration twin
+  //     `const { on: register } = server`, but the target is an ObjectLiteralExpression (Shorthand/
+  //     PropertyAssignment), not a BindingElement, so RULE A (c) did not see it and the req/res-bound
+  //     RULE A2 assignment branch (SOCKET_CAPABILITY names, req/res receivers) skipped a `server`
+  //     receiver. The new receiver-independent branch closes ONLY the delivery/registrar-member family
+  //     (`SOCKET_DELIVERY_MEMBERS`: on/once/addListener/prependListener/prependOnceListener/setTimeout),
+  //     resolved by the SAME `sockResolveKey`/`staticKeyText` as RULE A (c). The socket/connection
+  //     CAPABILITY names are DELIBERATELY NOT broadened (accepted D3-CX-CODEX-ASSIGN invariant); see the
+  //     allow block below. MUST REJECT. ---
+  const assignDestructureReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'the reported ({ on: register } = server) registrar extraction + reconnect', source: wrapperHead + `let register: (this: unknown, e: string, cb: (s: { destroy(): void; connect(p: number, h: string): void }) => void) => void;\n({ on: register } = server as unknown as { on: typeof register });\nregister.call(server, 'connection', (socket) => {\n  socket.destroy();\n  setTimeout(() => socket.connect(80, 'example.com'), 50);\n});` },
+    { form: 'a shorthand ({ on } = server)', source: wrapperHead + `let on: unknown;\n({ on } = server as unknown as { on: unknown });\nvoid on;` },
+    { form: "a static-computed ({ ['on']: register } = server)", source: wrapperHead + `let register: unknown;\n({ ['on']: register } = server as unknown as { on: unknown });\nvoid register;` },
+    { form: "a concatenated ({ ['o' + 'n']: register } = server)", source: wrapperHead + `let register: unknown;\n({ ['o' + 'n']: register } = server as unknown as Record<string, unknown>);\nvoid register;` },
+    { form: "a const-bound ({ [k]: register } = server) with const k = 'on'", source: wrapperHead + `const k = 'on';\nlet register: unknown;\n({ [k]: register } = server as unknown as Record<string, unknown>);\nvoid register;` },
+    { form: 'a setTimeout member ({ setTimeout: t } = server)', source: wrapperHead + `let t: unknown;\n({ setTimeout: t } = server as unknown as { setTimeout: unknown });\nvoid t;` },
+    { form: 'a once member ({ once: h } = server)', source: wrapperHead + `let h: unknown;\n({ once: h } = server as unknown as { once: unknown });\nvoid h;` },
+    { form: 'a nested ({ inner: { on: register } } = wrap) parity with RULE A (c)', source: wrapperHead + `let register: unknown;\nconst wrap = { inner: server } as unknown as { inner: { on: unknown } };\n({ inner: { on: register } } = wrap);\nvoid register;` },
+  ];
+  for (const { form, source } of assignDestructureReject) {
+    it(`rejects ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // --- ASSIGNMENT-DESTRUCTURING PARITY (SOCK) — the DELIBERATE asymmetry: the new receiver-independent
+  //     branch is scoped to DELIVERY/REGISTRAR members only, so socket/connection CAPABILITY assignment
+  //     extraction keeps its accepted req/res-sensitive semantics (the D3-CX-CODEX-ASSIGN "no global
+  //     broadening" invariant) — `({ socket } = unrelatedObject)` / `({ socket } = server)` /
+  //     `({ connection } = unrelatedObject)` remain ALLOWED. The delivery branch also adds NO global
+  //     fail-closed on indeterminate keys and NO receiver/alias/taint tracking, so a harmless key and an
+  //     indeterminate key on an unrelated object stay allowed. MUST ALLOW. ---
+  const assignDestructureAllow: readonly { readonly form: string; readonly source: string }[] = [
+    // The accepted D3-CX-CODEX-ASSIGN invariant, asserted adjacently here as a preservation guard.
+    { form: 'the preserved ({ socket: localSocket } = unrelatedObject) capability invariant', source: `const unrelatedObject = { socket: 123 };\nlet localSocket: unknown;\n({ socket: localSocket } = unrelatedObject);\nvoid localSocket;` },
+    { form: 'a capability ({ socket: s } = server) stays req/res-bound (NOT delivery-broadened)', source: wrapperHead + `let s: unknown;\n({ socket: s } = server as unknown as { socket: unknown });\nvoid s;` },
+    { form: 'a capability ({ connection: c } = unrelatedObject) is NOT globally banned', source: `const unrelatedObject = { connection: 1 };\nlet c: unknown;\n({ connection: c } = unrelatedObject);\nvoid c;` },
+    { form: 'a harmless ({ harmless: x } = arbitraryObject)', source: `const arbitraryObject: Record<string, unknown> = {};\nlet x: unknown;\n({ harmless: x } = arbitraryObject);\nvoid x;` },
+    { form: 'a harmless shorthand ({ method } = arbitraryObject)', source: `const arbitraryObject: Record<string, unknown> = {};\nlet method: unknown;\n({ method } = arbitraryObject);\nvoid method;` },
+    { form: 'an INDETERMINATE key on an unrelated object stays outside the proof', source: `declare const runtimeKey: string;\nconst arbitraryObject: Record<string, unknown> = {};\nlet x: unknown;\n({ [runtimeKey]: x } = arbitraryObject);\nvoid x;` },
+  ];
+  for (const { form, source } of assignDestructureAllow) {
     it(`allows ${form}`, () => {
       expect(usesOutboundNetwork(source)).toBe(false);
     });
