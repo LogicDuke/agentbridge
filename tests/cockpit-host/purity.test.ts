@@ -1400,15 +1400,58 @@ const acquiresInboundServerSocket = (checker: ts.TypeChecker, sourceFile: ts.Sou
   // stay local (cycle detection + the per-key hop ceiling).
   const sockMemo = new Map<ts.Declaration, NetKey>();
 
+  // ROOT-FAMILY-CS-ARGUMENT-RESOLUTION — normalize ONE argument of an already-proven node:http
+  //     createServer call to the finite provable source expression the positive policy must inspect,
+  //     BEFORE Pass 1's handler-parameter collection and RULE A3's option scan look at it. Only unique,
+  //     immutable, binder-proven LOCAL bindings are followed: a transparent wrapper (`binderUnwrap`:
+  //     paren / `as` / satisfies / `!` / type-assertion / await), a unique `const` identifier folded to
+  //     its initializer (the SAME `netUniqueConstDecl` primitive the NET/SOCK key resolvers use —
+  //     binder identity, exactly one declaration, `const` list flag — iterated so a `const b = a; const
+  //     a = {…}` alias spine resolves), and a unique `FunctionDeclaration` identifier folded to its
+  //     declaration node. Resolution STOPS (returns the last node reached, i.e. Indeterminate for the
+  //     caller's type guards) on every mutable / runtime / unsupported form — a `let`/`var` binding
+  //     (identity can change), a parameter, a property, a call result, a spread-built object, a
+  //     duplicate/absent declaration, an alias cycle — so those stay outside the proof exactly as the
+  //     frozen positive model already leaves `createServer(getOptions())` outside it. An explicit hop
+  //     cap plus a visited-declaration set guarantee termination. This is bounded local declaration
+  //     NORMALIZATION scoped to createServer arguments — NOT value flow, alias/taint propagation, a call
+  //     graph, or class-body inspection: the resolved node's VALUE, body, and constructor are never
+  //     read here; the caller's existing guards (`isArrowFunction`/`isFunctionExpression`/
+  //     `isFunctionDeclaration` for the handler, `isObjectLiteralExpression` for the options) decide
+  //     whether the finite policy applies, and the option KEYS are still resolved by the same bounded
+  //     `staticKeyText`/`sockResolveKey` machinery. A DIRECT inline function / object-literal argument
+  //     is returned unchanged (the loop never runs), so existing direct-form behavior is identical.
+  const CS_ARG_RESOLVE_HOP_CAP = 64;
+  const resolveCreateServerArgument = (arg: ts.Expression): ts.Node => {
+    let cur: ts.Expression = binderUnwrap(arg);
+    const seen = new Set<ts.Declaration>();
+    for (let hops = 0; ts.isIdentifier(cur) && hops < CS_ARG_RESOLVE_HOP_CAP; hops++) {
+      const symbol = checker.getSymbolAtLocation(cur);
+      const decls = symbol?.declarations;
+      if (decls === undefined || decls.length !== 1) return cur; // ambient / duplicate / undeclared: stop
+      const decl = decls[0];
+      if (decl === undefined || seen.has(decl)) return cur; // alias cycle / re-entry: stop in finite time
+      seen.add(decl);
+      if (ts.isFunctionDeclaration(decl)) return decl; // unique named-function handler: the function IS the source
+      const constDecl = netUniqueConstDecl(cur, checker);
+      if (constDecl === null || constDecl.initializer === undefined) return cur; // let/var/param/property/no-init: stop
+      cur = binderUnwrap(constDecl.initializer); // unique `const` hop (const→const spine included)
+    }
+    return cur;
+  };
+
   // Pass 1 (RULE A2 support) — collect the createServer request/response parameter symbols.
   // Direct identifier params only; a destructured param `({ socket })` is a RULE A binding
-  // pattern, rejected in pass 2 like any other.
+  // pattern, rejected in pass 2 like any other. The listener argument is first normalized through
+  // the bounded createServer argument resolver, so a unique-`const`/`FunctionDeclaration`-bound
+  // named handler (`function handler(req){…}; createServer(handler)`) contributes its parameters
+  // exactly as a direct inline arrow/function expression does (ROOT-FAMILY-CS-ARGUMENT-RESOLUTION F1).
   const reqResSymbols = new Set<ts.Symbol>();
   const collect = (node: ts.Node): void => {
     if (isCreateServerCall(node)) {
       for (const arg of (node as ts.CallExpression).arguments) {
-        const handler = binderUnwrap(arg);
-        if (ts.isArrowFunction(handler) || ts.isFunctionExpression(handler)) {
+        const handler = resolveCreateServerArgument(arg);
+        if (ts.isArrowFunction(handler) || ts.isFunctionExpression(handler) || ts.isFunctionDeclaration(handler)) {
           for (const param of handler.parameters) {
             if (ts.isIdentifier(param.name)) {
               const symbol = checker.getSymbolAtLocation(param.name);
@@ -1485,7 +1528,13 @@ const acquiresInboundServerSocket = (checker: ts.TypeChecker, sourceFile: ts.Sou
     //     superstring key (`IncomingMessageLimit`).
     if (isCreateServerCall(node)) {
       for (const arg of (node as ts.CallExpression).arguments) {
-        const optionsObject = binderUnwrap(arg);
+        // ROOT-FAMILY-CS-ARGUMENT-RESOLUTION (F2): normalize the argument through the bounded
+        //     createServer argument resolver first, so a unique-`const`-bound alias of the options
+        //     object (`const options = { IncomingMessage: Capture }; createServer(options as any, …)`,
+        //     including a computed-static option key and a const→const spine) is reserved exactly like
+        //     a direct object literal. A `let`/parameter/call-result/spread options argument does not
+        //     resolve to an ObjectLiteralExpression and stays outside the proof (frozen positive model).
+        const optionsObject = resolveCreateServerArgument(arg);
         if (!ts.isObjectLiteralExpression(optionsObject)) continue;
         for (const prop of optionsObject.properties) {
           if (!ts.isPropertyAssignment(prop) && !ts.isShorthandPropertyAssignment(prop)) continue;
@@ -6213,6 +6262,89 @@ describe('D3 host enforces the final bounded socket-capability source policy (D3
       `http.createServer({ IncomingMessage: Capture } as any, () => {});`;
     expect(usesOutboundNetwork(source)).toBe(true);
   });
+
+  // --- ROOT-FAMILY-CS-ARGUMENT-RESOLUTION (F1 — named/const-bound request listeners): a createServer
+  //     request listener supplied by a unique immutable local binding (a `FunctionDeclaration`, a
+  //     `const` arrow, or a `const` function expression) now contributes its request/response
+  //     parameters to the RULE A2 fail-closed set exactly as a DIRECT inline arrow/function does. The
+  //     discriminating witness is an INDETERMINATE computed member access on the request parameter
+  //     (`const s = req[runtimeKey]; s.connect(80, …)`): `.connect`/`.destroy` are NOT globally banned
+  //     socket-acquisition names (only `.socket`/`.connection`/the delivery members are), so this
+  //     socket recovery is caught ONLY by RULE A2's req/res-bound indeterminate-key fail-close — which
+  //     needs the handler parameter symbol. Before the argument-resolution repair a named/const handler
+  //     never registered its parameter and the access escaped; now it is reserved. MUST REJECT. ---
+  const RK = `declare const rk: string;\n`;
+  const namedHandlerReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'A: a FunctionDeclaration handler (req[runtimeKey] socket recovery)', source: H + RK + `function handler(req: any, res: any) {\n  const s = req[rk];\n  s.connect(80, 'example.com');\n}\nhttp.createServer(handler);` },
+    { form: 'B: a const-arrow handler (req[runtimeKey] socket recovery)', source: H + RK + `const handler = (req: any, res: any) => {\n  const s = req[rk];\n  s.connect(80, 'example.com');\n};\nhttp.createServer(handler);` },
+    { form: 'C: a const-function-expression handler (req[runtimeKey] socket recovery)', source: H + RK + `const handler = function (req: any, res: any) {\n  const s = req[rk];\n  s.connect(80, 'example.com');\n};\nhttp.createServer(handler);` },
+    { form: 'D: an as-wrapped const-arrow handler', source: H + RK + `const handler = (req: any, res: any) => {\n  const s = req[rk];\n  s.connect(80, 'example.com');\n};\nhttp.createServer(handler as any);` },
+    { form: 'E: a const-chain alias to a FunctionDeclaration handler', source: H + RK + `function base(req: any, res: any) {\n  const s = req[rk];\n  s.connect(80, 'example.com');\n}\nconst handler = base;\nhttp.createServer(handler);` },
+    { form: 'F: a const-arrow handler with an indeterminate DESTRUCTURING key off req', source: H + RK + `const handler = (req: any, res: any) => {\n  const { [rk]: s } = req;\n  s.connect(80, 'example.com');\n};\nhttp.createServer(handler);` },
+  ];
+  for (const { form, source } of namedHandlerReject) {
+    it(`rejects ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // --- ROOT-FAMILY-CS-ARGUMENT-RESOLUTION (F1 — preserve): the resolver follows ONLY unique immutable
+  //     bindings, so a benign named/const handler stays allowed, the inline baseline is unchanged, and
+  //     a MUTABLE/runtime listener whose identity the analyzer cannot pin (`let` handler, a
+  //     parameter-supplied handler) stays OUTSIDE the proof — the frozen positive model denies only
+  //     what it can prove, exactly as it already allows `createServer(getListener())`. MUST ALLOW. ---
+  const namedHandlerAllow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a benign FunctionDeclaration handler (no socket capability)', source: H + `function handler(req: any, res: any) {\n  res.end('ok');\n}\nhttp.createServer(handler);` },
+    { form: 'a benign const-arrow handler (static harmless key)', source: H + `const handler = (req: any, res: any) => {\n  const m = req['method'];\n  void m;\n};\nhttp.createServer(handler);` },
+    { form: 'the inline-arrow baseline with a benign body (unchanged)', source: H + `http.createServer((req: any, res: any) => {\n  res.end('ok');\n});` },
+    { form: 'a MUTABLE let handler with req[runtimeKey] stays outside the proof', source: H + RK + `let handler = (req: any, res: any) => {\n  const s = req[rk];\n  s.connect(80, 'example.com');\n};\nhttp.createServer(handler);` },
+    { form: 'a parameter-supplied handler stays outside the proof', source: H + RK + `function mount(handler: any) {\n  http.createServer(handler);\n}\nvoid mount;` },
+  ];
+  for (const { form, source } of namedHandlerAllow) {
+    it(`allows ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+
+  // --- ROOT-FAMILY-CS-ARGUMENT-RESOLUTION (F2 — aliased constructor-injection options): a createServer
+  //     options object supplied by a unique immutable local binding is normalized to its object literal
+  //     and its KEYS reserved exactly like a direct `{ IncomingMessage: … }` literal — a plain const
+  //     alias, a const alias with a computed-static / const-key option key, a `ServerResponse` alias,
+  //     an as-wrapped alias, and a const→const spine. The supplied class value/body/constructor are
+  //     still never inspected; only the option KEY is read. MUST REJECT. ---
+  const aliasedOptionsReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a: a plain const options alias { IncomingMessage: Capture }', source: H + `class Capture {}\nconst options = { IncomingMessage: Capture };\nhttp.createServer(options as any, () => {});` },
+    { form: "b: a const options alias with a computed key { ['Incoming'+'Message']: Capture }", source: H + `class Capture {}\nconst options = { ['Incoming' + 'Message']: Capture };\nhttp.createServer(options as any, () => {});` },
+    { form: "c: a const options alias with a const-bound computed key", source: H + `class Capture {}\nconst key = 'IncomingMessage';\nconst options = { [key]: Capture };\nhttp.createServer(options as any, () => {});` },
+    { form: 'd: a const ServerResponse options alias (parity)', source: H + `class Cap {}\nconst options = { ServerResponse: Cap };\nhttp.createServer(options as any, () => {});` },
+    { form: 'e: an as-wrapped const options alias', source: H + `class Capture {}\nconst options = { IncomingMessage: Capture };\nhttp.createServer((options as any), () => {});` },
+    { form: 'f: a const->const options spine', source: H + `class Capture {}\nconst a = { IncomingMessage: Capture };\nconst options = a;\nhttp.createServer(options as any, () => {});` },
+  ];
+  for (const { form, source } of aliasedOptionsReject) {
+    it(`rejects ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // --- ROOT-FAMILY-CS-ARGUMENT-RESOLUTION (F2 — preserve): a benign const options alias stays allowed,
+  //     a superstring key is still an exact-set miss, and a MUTABLE/runtime options argument
+  //     (`let` options, a parameter, a call result, a spread-built object) stays OUTSIDE the proof —
+  //     the same frozen positive-model disposition that already allows `createServer(getOptions())`.
+  //     An object literal carrying the key OUTSIDE any createServer call is still untouched. MUST ALLOW.
+  const aliasedOptionsAllow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a benign const options alias { maxHeaderSize: 8192 }', source: H + `const options = { maxHeaderSize: 8192 };\nhttp.createServer(options, () => {});` },
+    { form: 'a benign const alias superstring key { IncomingMessageLimit: 10 }', source: H + `const options = { IncomingMessageLimit: 10 };\nhttp.createServer(options as any, () => {});` },
+    { form: 'a MUTABLE let options alias stays outside the proof', source: H + `class Capture {}\nlet options = { IncomingMessage: Capture };\nhttp.createServer(options as any, () => {});` },
+    { form: 'a parameter-supplied options object stays outside the proof', source: H + `function mount(options: any) {\n  http.createServer(options as any, () => {});\n}\nvoid mount;` },
+    { form: 'a call-result options object stays outside the proof', source: H + `declare function getOptions(): any;\nhttp.createServer(getOptions(), () => {});` },
+    { form: 'a spread-copied const options object stays outside the proof (spread not value-followed)', source: H + `class Capture {}\nconst base = { IncomingMessage: Capture };\nconst options = { ...base };\nhttp.createServer(options as any, () => {});` },
+    { form: 'a const options object with the key OUTSIDE any createServer call', source: H + `class X {}\nconst options = { IncomingMessage: X };\nvoid options;\nhttp.createServer(() => {});` },
+  ];
+  for (const { form, source } of aliasedOptionsAllow) {
+    it(`allows ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
 });
 
 // ---------------------------------------------------------------------------
