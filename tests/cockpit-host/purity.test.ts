@@ -1363,6 +1363,16 @@ const STATIC_SOCKET_ACQUISITION_NAMES: ReadonlySet<string> = new Set([
   ...SOCKET_CAPABILITY_NAMES,
   ...SOCKET_DELIVERY_MEMBERS,
 ]);
+// RULE A3 — the finite Node http.Server CONSTRUCTOR-INJECTION option family. `createServer`'s options
+// object may name a custom request/response constructor class; Node then constructs the supplied
+// `IncomingMessage` subclass with the LIVE connection socket (`constructor(socket)`) and the supplied
+// `ServerResponse` subclass with the request object. A plain class passed under either key therefore
+// receives that capability in its constructor without ever naming a banned socket property or a
+// node:http value — a socket/request-delivery entry point the createServer allowance is not meant to
+// grant. This is a closed two-name family on the installed Node 24 API (`ServerOptions.IncomingMessage`
+// / `ServerOptions.ServerResponse`); reserving the option KEYS at the createServer acquisition site
+// closes it with no class-body, constructor, or alias inspection.
+const CONSTRUCTOR_INJECTION_OPTIONS: ReadonlySet<string> = new Set(['IncomingMessage', 'ServerResponse']);
 
 // The static key named by an element-access argument or a binding-element key, or null.
 const staticKeyText = (key: ts.Node | undefined): string | null => {
@@ -1459,6 +1469,37 @@ const acquiresInboundServerSocket = (checker: ts.TypeChecker, sourceFile: ts.Sou
     }
   };
   const visit = (node: ts.Node): void => {
+    // RULE A3 — CONSTRUCTOR-INJECTION options on a permitted createServer call. Node constructs a
+    //     supplied `IncomingMessage` subclass with the LIVE connection socket and a supplied
+    //     `ServerResponse` subclass with the request, so an option naming either is a socket/request
+    //     capability delivery. Only an OBJECT-LITERAL argument is inspected — the requestListener
+    //     FUNCTION argument is skipped, and the check runs ONLY when `isCreateServerCall` already
+    //     proved this is the node:http createServer capability, so an unrelated `foo.createServer({
+    //     IncomingMessage })` and any object literal OUTSIDE a createServer call are untouched. A
+    //     property KEY is resolved by the SAME `staticKeyText`/`sockResolveKey` machinery as every
+    //     other SOCK key (plain/quoted key is its own text; a computed key folds off the binder); a
+    //     RESOLVED `IncomingMessage`/`ServerResponse` name REJECTS at this acquisition site — the
+    //     supplied class value, its body, and its constructor are NEVER inspected (no taint/type/
+    //     whole-program, no alias following). A runtime/indeterminate key is no match here (unchanged
+    //     SOCK disposition, not globally failed closed), and the exact-set test never matches a
+    //     superstring key (`IncomingMessageLimit`).
+    if (isCreateServerCall(node)) {
+      for (const arg of (node as ts.CallExpression).arguments) {
+        const optionsObject = binderUnwrap(arg);
+        if (!ts.isObjectLiteralExpression(optionsObject)) continue;
+        for (const prop of optionsObject.properties) {
+          if (!ts.isPropertyAssignment(prop) && !ts.isShorthandPropertyAssignment(prop)) continue;
+          let name: string | null;
+          if (ts.isPropertyAssignment(prop) && ts.isComputedPropertyName(prop.name)) {
+            const key = sockResolveKey(prop.name.expression, checker, sockMemo);
+            name = key.kind === 'resolved' ? key.value : null;
+          } else {
+            name = staticKeyText(prop.name);
+          }
+          if (name !== null && CONSTRUCTOR_INJECTION_OPTIONS.has(name)) found = true;
+        }
+      }
+    }
     // RULE A (a) — GLOBAL dotted socket-acquisition NAME: `.socket`/`.connection` or a delivery
     //     member `.on`/`.once`/`.addListener`/`.prependListener`/`.prependOnceListener`/
     //     `.setTimeout` (optional chaining included), any receiver, any position. This is the node
@@ -6096,6 +6137,82 @@ describe('D3 host enforces the final bounded socket-capability source policy (D3
       expect(usesOutboundNetwork(source)).toBe(false);
     });
   }
+
+  // --- RULE A3 (createServer CONSTRUCTOR-INJECTION options): Node v24.12.0 constructs a supplied
+  //     `IncomingMessage` subclass with the LIVE connection socket (`constructor(socket)`) and a
+  //     supplied `ServerResponse` subclass with the request object. A PLAIN class passed as either
+  //     option (`{ IncomingMessage: Capture } as any`) therefore receives the live socket in its
+  //     constructor and can `destroy()`/`connect()` outbound WITHOUT naming any banned socket
+  //     property or node:http value — the createServer options object is a socket/request-capability
+  //     delivery the createServer allowance is not meant to grant. This surface is reachable ONLY
+  //     through the allowed `http.createServer(options, …)` path (a `new http.Server({…})` form is
+  //     already rejected as a non-createServer namespace member; a class that `extends
+  //     http.IncomingMessage` is already rejected because that heritage reference is a non-createServer
+  //     node:http VALUE). The option KEYS `IncomingMessage`/`ServerResponse` are reserved at the
+  //     createServer acquisition SITE: the supplied class body, its constructor, and any alias are
+  //     never inspected (no taint / type / whole-program / value-flow). Only an OBJECT-LITERAL
+  //     argument is scanned (the requestListener function argument is skipped), and only when the call
+  //     is already the permitted node:http createServer capability. The key is resolved by the SAME
+  //     bounded `sockResolveKey`/`staticKeyText` machinery as every other SOCK key. MUST REJECT. ---
+  const injectionReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'A: the plain-class { IncomingMessage: Capture } custom-constructor socket delivery', source: H + `class Capture {\n  constructor(socket: any) {\n    socket.destroy();\n    socket.connect(80, 'example.com');\n  }\n}\nhttp.createServer({ IncomingMessage: Capture } as any, () => {});` },
+    { form: "B: a static quoted { 'IncomingMessage': Capture } key", source: H + `class Capture {\n  constructor(socket: any) {\n    socket.connect(80, 'example.com');\n  }\n}\nhttp.createServer({ 'IncomingMessage': Capture } as any, () => {});` },
+    { form: "C: a computed { ['Incoming' + 'Message']: Capture } key", source: H + `class Capture {\n  constructor(socket: any) {\n    socket.connect(80, 'example.com');\n  }\n}\nhttp.createServer({ ['Incoming' + 'Message']: Capture } as any, () => {});` },
+    { form: "D: a const-bound { [k]: Capture } key with const k = 'IncomingMessage'", source: H + `class Capture {\n  constructor(socket: any) {\n    socket.connect(80, 'example.com');\n  }\n}\nconst k = 'IncomingMessage';\nhttp.createServer({ [k]: Capture } as any, () => {});` },
+    { form: 'E: a shorthand { IncomingMessage } option (plain class named IncomingMessage)', source: H + `class IncomingMessage {\n  constructor(socket: any) {\n    socket.connect(80, 'example.com');\n  }\n}\nhttp.createServer({ IncomingMessage } as any, () => {});` },
+    { form: 'F: a { ServerResponse: Cap } custom-constructor option (parity)', source: H + `class Cap {\n  constructor(req: any) {\n    req.socket.connect(80, 'example.com');\n  }\n}\nhttp.createServer({ ServerResponse: Cap } as any, () => {});` },
+    { form: "G: a computed { ['Server' + 'Response']: Cap } key (parity)", source: H + `class Cap {\n  constructor(req: any) {\n    void req;\n  }\n}\nhttp.createServer({ ['Server' + 'Response']: Cap } as any, () => {});` },
+    { form: 'H: the options-first single-argument createServer({ IncomingMessage: Capture }) overload', source: H + `class Capture {\n  constructor(socket: any) {\n    socket.connect(80, 'example.com');\n  }\n}\nhttp.createServer({ IncomingMessage: Capture } as any);` },
+    { form: 'I: a substituted-template { [`Incoming${\'Message\'}`]: Capture } key', source: H + `class Capture {\n  constructor(socket: any) {\n    socket.connect(80, 'example.com');\n  }\n}\nhttp.createServer({ [\`Incoming\${'Message'}\`]: Capture } as any, () => {});` },
+    { form: 'J: both options together { IncomingMessage: A, ServerResponse: B }', source: H + `class A {\n  constructor(socket: any) {\n    socket.connect(80, 'example.com');\n  }\n}\nclass B {}\nhttp.createServer({ IncomingMessage: A, ServerResponse: B } as any, () => {});` },
+  ];
+  for (const { form, source } of injectionReject) {
+    it(`rejects ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // --- RULE A3 (preserve): the reservation fires ONLY for the finite injection option family
+  //     (`IncomingMessage`/`ServerResponse`) on a PROVEN node:http createServer call. Benign
+  //     createServer options, an empty/handler-only call, an unrelated `.createServer` that is not the
+  //     node:http capability, and any object literal carrying an `IncomingMessage`/`ServerResponse` key
+  //     OUTSIDE a createServer call are all untouched — no object literal is globally banned, and a key
+  //     that merely CONTAINS the reserved name (an exact-set membership test, never a substring) is not
+  //     matched. Runtime/indeterminate option keys follow the existing SOCK disposition (no match here,
+  //     not globally failed closed). MUST ALLOW. ---
+  const injectionAllow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a benign { maxHeaderSize: 8192 } options object', source: H + `http.createServer({ maxHeaderSize: 8192 }, () => {});` },
+    { form: 'a benign { keepAlive: true, keepAliveTimeout: 5000 } options object', source: H + `http.createServer({ keepAlive: true, keepAliveTimeout: 5000 }, () => {});` },
+    { form: 'the handler-only createServer(handler) form', source: H + `http.createServer(() => {});` },
+    { form: 'an unrelated foo.createServer({ IncomingMessage: X }) that is not the node:http capability', source: `const foo = { createServer(_o: unknown, _h: () => void): void {} };\nclass X {}\nfoo.createServer({ IncomingMessage: X }, () => {});` },
+    { form: 'an object literal with an IncomingMessage key OUTSIDE any createServer call', source: H + `class X {}\nconst options = { IncomingMessage: X };\nvoid options;\nhttp.createServer(() => {});` },
+    { form: 'a benign superstring key { IncomingMessageLimit: 10 } (exact-set, not substring)', source: H + `http.createServer({ IncomingMessageLimit: 10 } as any, () => {});` },
+    { form: 'a genuinely runtime option key { [runtimeKey]: X } stays outside the proof', source: H + `declare const runtimeKey: string;\nclass X {}\nhttp.createServer({ [runtimeKey]: X } as any, () => {});` },
+  ];
+  for (const { form, source } of injectionAllow) {
+    it(`allows ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+
+  // --- RULE A3 (prompt-supplied exact witness, defense-in-depth): the extends-form witness the
+  //     cumulative audit reproduced (`class Capture extends http.IncomingMessage { super(socket) }`)
+  //     is ALSO rejected — here already by NET's positive node:http model (the `http.IncomingMessage`
+  //     heritage reference is a non-createServer node:http value), independently of RULE A3. Asserted
+  //     so the exact reported spelling is pinned closed. MUST REJECT. ---
+  it('rejects the prompt-supplied extends-form IncomingMessage witness (already closed by NET)', () => {
+    const source =
+      H +
+      `class Capture extends http.IncomingMessage {\n` +
+      `  constructor(socket: any) {\n` +
+      `    super(socket);\n` +
+      `    socket.destroy();\n` +
+      `    setTimeout(() => socket.connect(80, 'example.com'), 50);\n` +
+      `  }\n` +
+      `}\n` +
+      `http.createServer({ IncomingMessage: Capture } as any, () => {});`;
+    expect(usesOutboundNetwork(source)).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------
