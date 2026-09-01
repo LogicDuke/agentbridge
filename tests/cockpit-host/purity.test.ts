@@ -1537,9 +1537,22 @@ const acquiresInboundServerSocket = (checker: ts.TypeChecker, sourceFile: ts.Sou
         const optionsObject = resolveCreateServerArgument(arg);
         if (!ts.isObjectLiteralExpression(optionsObject)) continue;
         for (const prop of optionsObject.properties) {
-          if (!ts.isPropertyAssignment(prop) && !ts.isShorthandPropertyAssignment(prop)) continue;
+          // PROPERTY-KIND PARITY (Codex P1): reserve the constructor-option KEY for every element whose
+          //     property READ delivers the caller's value to Node — a data property (PropertyAssignment /
+          //     ShorthandPropertyAssignment) OR a GETTER (GetAccessorDeclaration: Node reads the option
+          //     with an ordinary property GET, which RUNS the getter, then constructs its return with the
+          //     live connection socket). A SET-only accessor (property read is `undefined`, so Node falls
+          //     back to its own default), an object-literal concise MethodDeclaration (a concise method is
+          //     NOT constructable — `new` throws), and a SpreadAssignment (outside the frozen value-flow
+          //     boundary) deliver no usable constructor and are skipped. The element VALUE/body is never
+          //     inspected; only the KEY is resolved, by the same staticKeyText/sockResolveKey machinery.
+          if (
+            !ts.isPropertyAssignment(prop) &&
+            !ts.isShorthandPropertyAssignment(prop) &&
+            !ts.isGetAccessorDeclaration(prop)
+          ) continue;
           let name: string | null;
-          if (ts.isPropertyAssignment(prop) && ts.isComputedPropertyName(prop.name)) {
+          if (!ts.isShorthandPropertyAssignment(prop) && ts.isComputedPropertyName(prop.name)) {
             const key = sockResolveKey(prop.name.expression, checker, sockMemo);
             name = key.kind === 'resolved' ? key.value : null;
           } else {
@@ -6262,6 +6275,56 @@ describe('D3 host enforces the final bounded socket-capability source policy (D3
       `http.createServer({ IncomingMessage: Capture } as any, () => {});`;
     expect(usesOutboundNetwork(source)).toBe(true);
   });
+
+  // --- RULE A3 PROPERTY-KIND PARITY (Codex P1 — constructor-option ACCESSORS): the RULE A3
+  //     constructor-option reservation classifies an options-object element by its PROPERTY KIND, never
+  //     by its value. Node v24.12.0 reads `options.IncomingMessage` / `.ServerResponse` with an ordinary
+  //     property GET, so any element whose READ yields the caller's value delivers the socket/request
+  //     constructor: a data property (PropertyAssignment / shorthand) AND a GETTER — reading the option
+  //     RUNS the getter, and Node then constructs its return with the live connection socket (verified
+  //     constructable under the actual runtime). A getter therefore has exact parity with the already
+  //     reserved data-property form and MUST REJECT: plain, quoted, computed-static, and const-key
+  //     getters, for both `IncomingMessage` and `ServerResponse`, and through the bounded createServer
+  //     argument resolver (const-alias / options-first overload). The getter BODY and return value are
+  //     never inspected — only the KEY is resolved, by the same `staticKeyText`/`sockResolveKey`
+  //     machinery as every other constructor-option key. MUST REJECT. ---
+  const accessorInjectionReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a: a getter { get IncomingMessage() { return Capture; } } (socket-capability constructor)', source: H + `class Capture {\n  constructor(socket: any) {\n    socket.connect(80, 'example.com');\n  }\n}\nhttp.createServer({ get IncomingMessage() { return Capture; } } as any, () => {});` },
+    { form: "b: a quoted getter { get 'IncomingMessage'() { … } }", source: H + `class Capture {\n  constructor(socket: any) {\n    socket.connect(80, 'example.com');\n  }\n}\nhttp.createServer({ get 'IncomingMessage'() { return Capture; } } as any, () => {});` },
+    { form: "c: a computed-static getter { get ['Incoming' + 'Message']() { … } }", source: H + `class Capture {\n  constructor(socket: any) {\n    socket.connect(80, 'example.com');\n  }\n}\nhttp.createServer({ get ['Incoming' + 'Message']() { return Capture; } } as any, () => {});` },
+    { form: "d: a const-key getter { get [k]() { … } } with const k = 'IncomingMessage'", source: H + `class Capture {\n  constructor(socket: any) {\n    socket.connect(80, 'example.com');\n  }\n}\nconst k = 'IncomingMessage';\nhttp.createServer({ get [k]() { return Capture; } } as any, () => {});` },
+    { form: 'e: a getter { get ServerResponse() { … } } (request-capability parity, A3-key isolated)', source: H + `class Cap {\n  constructor(req: any) {\n    void req;\n  }\n}\nhttp.createServer({ get ServerResponse() { return Cap; } } as any, () => {});` },
+    { form: "f: a computed-static getter { get ['Server' + 'Response']() { … } }", source: H + `class Cap {\n  constructor(req: any) {\n    void req;\n  }\n}\nhttp.createServer({ get ['Server' + 'Response']() { return Cap; } } as any, () => {});` },
+    { form: 'g: a getter reached through a const options alias (bounded arg resolver + A3)', source: H + `class Capture {\n  constructor(socket: any) {\n    socket.connect(80, 'example.com');\n  }\n}\nconst options = { get IncomingMessage() { return Capture; } };\nhttp.createServer(options as any, () => {});` },
+    { form: 'h: a getter on the options-first single-argument overload', source: H + `class Capture {\n  constructor(socket: any) {\n    socket.connect(80, 'example.com');\n  }\n}\nhttp.createServer({ get IncomingMessage() { return Capture; } } as any);` },
+  ];
+  for (const { form, source } of accessorInjectionReject) {
+    it(`rejects ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // --- RULE A3 PROPERTY-KIND PARITY (preserve — non-delivering element kinds stay OUTSIDE the
+  //     reservation, justified by Node read semantics rather than guessed): a SET-only accessor reads as
+  //     `undefined` (Node then falls back to its OWN default IncomingMessage/ServerResponse — no caller
+  //     value is delivered); an object-literal CONCISE METHOD reads as a function that is NOT a
+  //     constructor (`new` throws under the actual runtime), so it cannot receive the socket either; and
+  //     a SPREAD element remains outside the frozen value-flow boundary (unchanged). A benign
+  //     non-reserved accessor, a superstring-key getter (exact-set miss, never a substring), and a
+  //     reserved-key getter OUTSIDE any createServer call are likewise untouched. MUST ALLOW. ---
+  const accessorInjectionAllow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a SET-only accessor { set IncomingMessage(v) {} } (property read is undefined → default)', source: H + `http.createServer({ set IncomingMessage(_v: any) {} } as any, () => {});` },
+    { form: 'a concise METHOD { IncomingMessage() {} } (a concise method is not constructable)', source: H + `http.createServer({ IncomingMessage() {} } as any, () => {});` },
+    { form: 'a SPREAD element { ...base } carrying a getter stays outside the value-flow boundary', source: H + `class Capture {}\nconst base = { get IncomingMessage() { return Capture; } };\nhttp.createServer({ ...base } as any, () => {});` },
+    { form: 'a benign non-reserved getter { get maxHeaderSize() { return 8192; } }', source: H + `http.createServer({ get maxHeaderSize() { return 8192; } } as any, () => {});` },
+    { form: 'a superstring-key getter { get IncomingMessageLimit() { … } } (exact-set miss)', source: H + `http.createServer({ get IncomingMessageLimit() { return 10; } } as any, () => {});` },
+    { form: 'a reserved-key getter OUTSIDE any createServer call', source: H + `class X {}\nconst options = { get IncomingMessage() { return X; } };\nvoid options;\nhttp.createServer(() => {});` },
+  ];
+  for (const { form, source } of accessorInjectionAllow) {
+    it(`allows ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
 
   // --- ROOT-FAMILY-CS-ARGUMENT-RESOLUTION (F1 — named/const-bound request listeners): a createServer
   //     request listener supplied by a unique immutable local binding (a `FunctionDeclaration`, a
