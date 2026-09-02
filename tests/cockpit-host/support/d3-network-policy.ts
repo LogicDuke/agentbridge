@@ -374,8 +374,8 @@ export function valueSymbolOf(checker: ts.TypeChecker, node: ts.Node): ts.Symbol
   return checker.getSymbolAtLocation(node);
 }
 
-/** Whether a declaration is ambient: it or an enclosing declaration carries `declare`. */
-function isAmbient(node: ts.Declaration): boolean {
+/** Whether a node is ambient: it or an enclosing declaration carries `declare`. */
+function isAmbient(node: ts.Node): boolean {
   let current: ts.Node = node;
   while (!ts.isSourceFile(current)) {
     if (ts.canHaveModifiers(current) && (ts.getCombinedModifierFlags(current as ts.Declaration) & ts.ModifierFlags.Ambient) !== 0) {
@@ -440,7 +440,7 @@ function isInstantiatedNamespace(declaration: ts.ModuleDeclaration): boolean {
   if (ts.isModuleDeclaration(declaration.body)) return isInstantiatedNamespace(declaration.body);
   if (!ts.isModuleBlock(declaration.body)) return false;
   return declaration.body.statements.some((statement) => {
-    if (isAmbient(statement as ts.Declaration)) return false;
+    if (isAmbient(statement)) return false;
     if (ts.isVariableStatement(statement) || ts.isClassDeclaration(statement)) return true;
     if (ts.isFunctionDeclaration(statement)) return statement.body !== undefined;
     if (ts.isEnumDeclaration(statement)) return (ts.getCombinedModifierFlags(statement) & ts.ModifierFlags.Const) === 0;
