@@ -1352,6 +1352,14 @@ const SOCKET_CAPABILITY_NAMES: ReadonlySet<string> = new Set(['socket', 'connect
 // beside the five event registrars; the whole family is banned by NAME at any position (F2),
 // never by call shape, so `.call`/`.apply`/`.bind`/`Reflect.apply`/`const m = server.on`
 // cannot launder it, and there is NO event-name list to maintain.
+// EXACT-HEAD CODEX P1: `emit` joins the SAME family — http.Server inherits
+// `EventEmitter.prototype.emit`, and Node's internal connection delivery invokes the server's OWN
+// overridable `emit` (`server.emit('connection', socket)`, verified on Node v24.12.0), so REPLACING
+// or reading `server.emit` receives the live socket exactly as the registrars do. Being a receiver-
+// independent member NAME, it is closed at every acquisition position — reads AND the replacement
+// writes `server.emit = …` / `server['emit'] = …` (the LHS `server.emit` is a member access the RULE
+// A (a)/(b) visit sees regardless of the `=`) — with no emit-specific rule and no EventEmitter/event-
+// name analysis. Real host source names none of these members.
 const SOCKET_DELIVERY_MEMBERS: ReadonlySet<string> = new Set([
   'on',
   'once',
@@ -1359,6 +1367,7 @@ const SOCKET_DELIVERY_MEMBERS: ReadonlySet<string> = new Set([
   'prependListener',
   'prependOnceListener',
   'setTimeout',
+  'emit',
 ]);
 // RULE A family (iii) — CONSTRUCTOR RE-DERIVATION (Day-7 F2). The permitted createServer CALL RESULT
 // is an http.Server whose ordinary `constructor` property (inherited from `http.Server.prototype`) IS
@@ -6551,6 +6560,69 @@ describe('D3 host enforces the final bounded socket-capability source policy (D3
     { form: 'an INDETERMINATE key on an unrelated object stays outside the proof', source: `declare const runtimeKey: string;\nconst arbitraryObject: Record<string, unknown> = {};\nlet x: unknown;\n({ [runtimeKey]: x } = arbitraryObject);\nvoid x;` },
   ];
   for (const { form, source } of assignDestructureAllow) {
+    it(`allows ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+
+  // --- EXACT-HEAD CODEX P1 (SOCKET-DELIVERY member `emit`): a permitted http.Server inherits
+  //     `EventEmitter.prototype.emit`, and Node's internal connection delivery invokes the server's
+  //     OWN overridable `emit` (`server.emit('connection', socket)` — verified on Node v24.12.0:
+  //     `server instanceof EventEmitter`, `server.emit === EventEmitter.prototype.emit`, and a
+  //     replacement receives the live `net.Socket`, which exposes `.destroy()`/`.connect()` for an
+  //     outbound reconnect). `emit` is therefore ONE MORE member of the SAME receiver-independent
+  //     SOCKET_DELIVERY_MEMBERS family as `on`/`once`/`addListener`/`prependListener`/
+  //     `prependOnceListener`/`setTimeout`: a http.Server method that hands a socket to user code.
+  //     It is closed by the EXISTING RULE A static-name machinery at every acquisition position — no
+  //     emit-specific rule, no value/event-name/EventEmitter analysis. Because the ban anchors on the
+  //     member NAME at ANY position (read OR write), the REPLACEMENT forms (`server.emit = …`,
+  //     `server['emit'] = …`) are closed by the very same property/element-access visit that closes
+  //     the reads — the `server.emit` / `server['emit']` sub-node is a member access regardless of
+  //     which side of the `=` it sits on. MUST REJECT. ---
+  const emitReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a dotted read server.emit', source: wrapperHead + `void server.emit;` },
+    { form: "a static-computed server['emit']", source: wrapperHead + `void server['emit'];` },
+    { form: 'a template-computed server[`emit`]', source: wrapperHead + 'void server[`emit`];' },
+    { form: "a concatenated server['em' + 'it']", source: wrapperHead + `void server['em' + 'it'];` },
+    { form: "a const-bound server[k] with const k = 'emit'", source: wrapperHead + `const k = 'emit';\nvoid server[k];` },
+    { form: 'a declaration destructuring const { emit } = server', source: wrapperHead + `const { emit } = server;\nvoid emit;` },
+    { form: 'a renamed declaration destructuring const { emit: e } = server', source: wrapperHead + `const { emit: e } = server;\nvoid e;` },
+    { form: 'an assignment destructuring ({ emit: e } = server)', source: wrapperHead + `let e: unknown;\n({ emit: e } = server as unknown as { emit: unknown });\nvoid e;` },
+    { form: "a structural reflective Reflect.get(server, 'emit')", source: wrapperHead + `void Reflect.get(server, 'emit');` },
+    { form: "a computed-static reflective Reflect.get(server, k) with const k = 'emit'", source: wrapperHead + `const k = 'emit';\nvoid Reflect.get(server, k);` },
+    { form: 'an indirect invocation server.emit.call(server, …)', source: wrapperHead + `server.emit.call(server, 'connection', {});` },
+    { form: 'an indirect invocation server.emit.apply(server, …)', source: wrapperHead + `server.emit.apply(server, ['connection', {}]);` },
+    { form: 'an indirect invocation server.emit.bind(server)', source: wrapperHead + `const b = server.emit.bind(server);\nvoid b;` },
+    { form: 'a replacement assignment server.emit = fn', source: wrapperHead + `server.emit = function (): boolean {\n  return true;\n};` },
+    { form: "a replacement assignment server['emit'] = fn", source: wrapperHead + `server['emit'] = function (): boolean {\n  return true;\n};` },
+    { form: 'the reported emit-replacement socket capture + outbound reconnect', source: wrapperHead + `const originalEmit = server.emit;\nserver.emit = function (event: any, ...values: any[]) {\n  if (event === 'connection') {\n    const socket = values[0];\n    socket.destroy();\n    setTimeout(() => socket.connect(80, 'example.com'), 50);\n  }\n  return originalEmit.call(this, event, ...values);\n};` },
+    // Negative-control PARITY (documented, not silently changed): the delivery family is
+    //     receiver-INDEPENDENT, so an unrelated `localEmitter.emit` is an accepted policy false
+    //     positive exactly like the existing `ee.on('ready', …)` / `emitter.addListener(…)` entries.
+    //     Real cockpit host source names `.emit` nowhere (only the English word "emit"/"emits" inside
+    //     JSDoc comments, which are not AST nodes), so this false positive stays hypothetical.
+    { form: 'an unrelated localEmitter.emit read (accepted receiver-independent false positive)', source: `declare const localEmitter: { emit(e: string): void };\nconst emit = localEmitter.emit;\nvoid emit;` },
+  ];
+  for (const { form, source } of emitReject) {
+    it(`rejects ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // --- EXACT-HEAD CODEX P1 (SOCKET-DELIVERY member `emit`) — PRECISION: the RULE A name ban fires
+  //     ONLY where `emit` names a value member access, a binding SOURCE key, an assignment
+  //     destructuring key, or a reflective key argument. An object-literal DATA key, a bare string,
+  //     a superstring member (`emitter`/`emitted`), and a type-position method signature are NOT that
+  //     name at an acquisition position and stay allowed. MUST ALLOW. ---
+  const emitAllow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'an object-literal DATA key { emit: 1 }', source: `const config = { emit: 1 };\nvoid config;` },
+    { form: "a bare string binding const label = 'emit'", source: `const label = 'emit';\nvoid label;` },
+    { form: 'a superstring member server.emitter', source: wrapperHead + `void server.emitter;` },
+    { form: 'a superstring member server.emitted', source: wrapperHead + `void server.emitted;` },
+    { form: 'a type-position emit method signature', source: `interface Sink {\n  emit(x: number): void;\n}\ndeclare const s: Sink;\nvoid s;` },
+    { form: "an unrelated call arg log('emit')", source: `declare function log(m: string): void;\nlog('emit');` },
+  ];
+  for (const { form, source } of emitAllow) {
     it(`allows ${form}`, () => {
       expect(usesOutboundNetwork(source)).toBe(false);
     });
