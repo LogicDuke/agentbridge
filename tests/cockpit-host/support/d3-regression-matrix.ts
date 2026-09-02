@@ -300,6 +300,35 @@ globalThis.fetch;`,
     ['GLOBAL_RECEIVER_NETWORK_MEMBER'],
   ),
   allow('free-global identity', 'global-root name as a property key', `const g = { globalThis: 1, window: 2 };\ng.globalThis + g.window;`),
+  // PR #67 F3: the result of a direct non-optional call of a permitted static member retains global-root authority.
+  deny('free-global identity', 'permitted member call result reaches fetch (PR #67 F3)', `globalThis.valueOf().fetch('https://exfil.example/');`, ['GLOBAL_RECEIVER_NETWORK_MEMBER']),
+  deny('free-global identity', 'self-hop then permitted member call result reaches fetch', `globalThis.global.valueOf().fetch('https://exfil.example/');`, ['GLOBAL_RECEIVER_NETWORK_MEMBER']),
+  deny('free-global identity', 'permitted member call result forwarded through const', `const g = globalThis.valueOf();`, ['GLOBAL_RECEIVER_ESCAPE']),
+  deny('free-global identity', 'permitted member call result forwarded through call argument', `use(window.valueOf());`, ['GLOBAL_RECEIVER_ESCAPE']),
+  deny('free-global identity', 'permitted member call result forwarded through return', `function g() { return self.valueOf(); }`, ['GLOBAL_RECEIVER_ESCAPE']),
+  deny('free-global identity', 'permitted member call result through static element key', `self['valueOf']().fetch('x');`, ['GLOBAL_RECEIVER_NETWORK_MEMBER']),
+  deny('free-global identity', 'permitted member call result wrapped', `(globalThis.valueOf() as any).fetch('x');`, ['GLOBAL_RECEIVER_NETWORK_MEMBER']),
+  deny('free-global identity', 'permitted member call result destructured to fetch', `const { fetch: f } = globalThis.valueOf();`, ['GLOBAL_RECEIVER_NETWORK_MEMBER']),
+  deny('free-global identity', 'permitted member call result read through a runtime key', `declare const k: string;\nglobalThis.valueOf()[k];`, ['GLOBAL_RECEIVER_RUNTIME_KEY']),
+  deny('free-global identity', 'permitted member call result self-hop then fetch', `globalThis.valueOf().window.fetch('x');`, ['GLOBAL_RECEIVER_NETWORK_MEMBER']),
+  deny('free-global identity', 'chained permitted member call results', `globalThis.valueOf().valueOf().fetch('x');`, ['GLOBAL_RECEIVER_NETWORK_MEMBER']),
+  deny('free-global identity', 'any permitted member call result retains root authority (not name-specific)', `const t = globalThis.toString();`, ['GLOBAL_RECEIVER_ESCAPE']),
+  allow('free-global identity', 'permitted member call as statement, void, typeof', `globalThis.valueOf();\nvoid globalThis.valueOf();\ntypeof globalThis.valueOf();`),
+  allow('free-global identity', 'non-network member of a permitted member call result', `globalThis.valueOf().console.log('x');`),
+  // PR #67 F3 (optional-call continuation): an optional call of a permitted member yields the same root value.
+  deny('free-global identity', 'optional call of a permitted member reaches fetch (PR #67 F3)', `globalThis.valueOf?.().fetch('x');`, ['GLOBAL_RECEIVER_NETWORK_MEMBER']),
+  deny('free-global identity', 'optional member and optional call reach fetch', `globalThis?.valueOf?.().fetch('x');`, ['GLOBAL_RECEIVER_NETWORK_MEMBER']),
+  deny('free-global identity', 'optional member and normal call reach fetch', `globalThis?.valueOf().fetch('x');`, ['GLOBAL_RECEIVER_NETWORK_MEMBER']),
+  deny('free-global identity', 'optional call through a static element key reaches fetch', `globalThis['valueOf']?.().fetch('x');`, ['GLOBAL_RECEIVER_NETWORK_MEMBER']),
+  deny('free-global identity', 'optional call through a static element key reaches WebSocket', `globalThis['valueOf']?.().WebSocket;`, ['GLOBAL_RECEIVER_NETWORK_MEMBER']),
+  deny('free-global identity', 'optional call result forwarded through const', `const g = globalThis.valueOf?.();`, ['GLOBAL_RECEIVER_ESCAPE']),
+  deny('free-global identity', 'optional call result forwarded through call argument', `use(globalThis.valueOf?.());`, ['GLOBAL_RECEIVER_ESCAPE']),
+  deny('free-global identity', 'optional call result forwarded through return', `function g() { return window.valueOf?.(); }`, ['GLOBAL_RECEIVER_ESCAPE']),
+  deny('free-global identity', 'optional call result wrapped', `(globalThis.valueOf?.() as any).fetch('x');`, ['GLOBAL_RECEIVER_NETWORK_MEMBER']),
+  deny('free-global identity', 'optional call result self-hop then fetch', `globalThis.valueOf?.().self.fetch('x');`, ['GLOBAL_RECEIVER_NETWORK_MEMBER']),
+  deny('free-global identity', 'optional call result read through a runtime key', `declare const k: string;\nglobalThis.valueOf?.()[k];`, ['GLOBAL_RECEIVER_RUNTIME_KEY']),
+  allow('free-global identity', 'optional permitted member call as statement, void, typeof', `globalThis.valueOf?.();\nvoid globalThis.valueOf?.();\ntypeof globalThis.valueOf?.();`),
+  allow('free-global identity', 'non-network member of an optional permitted member call result', `globalThis.valueOf?.().console.log('x');`),
 ];
 
 // ---------------------------------------------------------------------------
@@ -438,6 +467,20 @@ const SOCKET: readonly RegressionRow[] = [
   allow('socket acquisition through proven target policy', 'close', withServer(`server.close();`)),
   allow('socket acquisition through proven target policy', 'request.method and request.url', inListener(`const m = request.method ?? '';\nconst u = request.url;\nm + u;`)),
   allow('socket acquisition through proven target policy', 'response setHeader/end/statusCode', inListener(`response.statusCode = 404;\nresponse.setHeader('a', 'b');\nresponse.end('x');`)),
+  // PR #67 F2: the result of a direct non-optional allowed member call retains the receiver's authority.
+  deny('socket acquisition through proven target policy', 'listen result subscribes to connection (PR #67 F2)', withServer(`server.listen(1).on('connection', (socket) => { socket.write('x'); });`), ['SERVER_MEMBER']),
+  deny('socket acquisition through proven target policy', 'close result subscribes', withServer(`server.close().on('close', () => {});`), ['SERVER_MEMBER']),
+  deny('socket acquisition through proven target policy', 'listen result address', withServer(`server.listen(1).address();`), ['SERVER_MEMBER']),
+  deny('socket acquisition through proven target policy', 'setHeader result socket', inListener(`response.setHeader('a', 'b').socket;`), ['RESPONSE_MEMBER']),
+  deny('socket acquisition through proven target policy', 'end result socket', inListener(`response.end('x').socket;`), ['RESPONSE_MEMBER']),
+  deny('socket acquisition through proven target policy', 'end result socket through wrapper', inListener(`(response.end('x') as any).socket.write('x');`), ['RESPONSE_MEMBER']),
+  deny('socket acquisition through proven target policy', 'setHeader result write', inListener(`response.setHeader('a', 'b').write('x');`), ['RESPONSE_MEMBER']),
+  deny('socket acquisition through proven target policy', 'static element key call result', withServer(`server['listen'](1)['on']('x', () => {});`), ['SERVER_MEMBER']),
+  deny('socket acquisition through proven target policy', 'listen result destructured', withServer(`const { on } = server.listen(1);`), ['SERVER_DESTRUCTURING']),
+  allow('socket acquisition through proven target policy', 'listen result close chain', withServer(`server.listen(1).close();`)),
+  allow('socket acquisition through proven target policy', 'setHeader result end chain', inListener(`response.setHeader('a', 'b').end('x');`)),
+  allow('socket acquisition through proven target policy', 'listen result as void operand', withServer(`void server.listen(1);`)),
+  allow('socket acquisition through proven target policy', 'chained allowed calls of arbitrary length', withServer(`server.listen(1).close().listen(2).close();`)),
 ];
 
 // ---------------------------------------------------------------------------
@@ -454,6 +497,8 @@ const RUNTIME_KEYS: readonly RegressionRow[] = [
   deny('runtime keys', 'computed destructuring assignment key from globalThis', `declare const k: string;\nlet v;\n({ [k]: v } = globalThis);`, ['GLOBAL_RECEIVER_RUNTIME_KEY']),
   deny('runtime keys', 'parameter key on request', inListener(`function read(k: string) { return request[k]; }`), ['REQUEST_MEMBER']),
   deny('runtime keys', 'http[k] with parameter', `${NS}\nfunction pick(k: string) { return http[k]; }`, ['HTTP_NAMESPACE_RUNTIME_KEY']),
+  deny('runtime keys', 'server[k]() result keeps existing member verdict', withServer(`declare const k: string;\nserver[k]().on('x', () => {});`), ['SERVER_MEMBER']),
+  deny('runtime keys', 'globalThis[k]() result keeps existing runtime-key verdict', `declare const k: string;\nglobalThis[k]().fetch('x');`, ['GLOBAL_RECEIVER_RUNTIME_KEY']),
 ];
 
 // ---------------------------------------------------------------------------
@@ -481,6 +526,14 @@ const ALIAS: readonly RegressionRow[] = [
   deny('alias propagation', 'alias then escape', withServer(`const a = server;\nuse(a);`), ['SERVER_ESCAPE']),
   deny('alias propagation', 'alias then non-allowed member', inListener(`const q = request;\nq.socket;`), ['REQUEST_MEMBER']),
   deny('alias propagation', 'ambient const alias', withServer(`declare const a: typeof server;\nconst b = server;\nb.on('x', () => {});`), ['SERVER_MEMBER']),
+  // PR #67 F2: a const alias of an allowed member call result carries the receiver's authority.
+  deny('alias propagation', 'const alias of listen result then escape (PR #67 F2)', withServer(`const leaked = server.listen(1);\nuse(leaked);`), ['SERVER_ESCAPE']),
+  deny('alias propagation', 'const alias of setHeader result then escape', inListener(`const r2 = response.setHeader('a', 'b');\nuse(r2);`), ['RESPONSE_ESCAPE']),
+  deny('alias propagation', 'const alias of end result then socket', inListener(`const r2 = response.end('x');\nr2.socket;`), ['RESPONSE_MEMBER']),
+  deny('alias propagation', 'alias chain through allowed call results', withServer(`const a = server.listen(1);\nconst b = a.close();\nb.on('x', () => {});`), ['SERVER_MEMBER']),
+  deny('alias propagation', 'PARAM-derived call result alias escapes', withServer(`function setup(s: http.Server) { const t = s.listen(1); use(t); }\nsetup(server);`), ['SERVER_ESCAPE']),
+  deny('alias propagation', 'let binding of listen result', withServer(`let started = server.listen(1);`), ['SERVER_MUTABLE_BINDING']),
+  allow('alias propagation', 'const alias of listen result used within policy', withServer(`const started = server.listen(1);\nstarted.close();`)),
 ];
 
 // ---------------------------------------------------------------------------
@@ -836,6 +889,16 @@ const RESULT: readonly RegressionRow[] = [
   deny('result confinement', 'result in a nullish expression', `${NS}\nconst s = http.createServer(${L}) ?? null;`, ['SERVER_ESCAPE']),
   deny('result confinement', 'result in an equality test', `${NS}\nif (http.createServer(${L}) === null) {}`, ['SERVER_ESCAPE']),
   deny('result confinement', 'result as heritage expression', `${NS}\nclass Sub extends (http.createServer(${L}) as any) {}`, ['SERVER_ESCAPE']),
+  // PR #67 F2: allowed member call results are confined exactly like the values they were called on.
+  deny('result confinement', 'listen result as call argument (PR #67 F2)', withServer(`use(server.listen(1));`), ['SERVER_ESCAPE']),
+  deny('result confinement', 'createServer result listen chain non-allowed member', `${NS}\nhttp.createServer(${L}).listen(1).on('x', () => {});`, ['SERVER_MEMBER']),
+  deny('result confinement', 'listen result in container', withServer(`const a = [server.listen(1)];`), ['SERVER_ESCAPE']),
+  deny('result confinement', 'listen result returned from an unconfined function', withServer(`function start() { return server.listen(1); }`), ['SERVER_UNCONFINED_RETURN']),
+  deny('result confinement', 'end result returned from an arrow body', inListener(`const send = () => response.end('x');`), ['RESPONSE_UNCONFINED_RETURN']),
+  deny('result confinement', 'listen result assigned', withServer(`let s;\ns = server.listen(1);`), ['SERVER_ESCAPE']),
+  deny('result confinement', 'listen result propagated then misused', withServer(`function setup(s: http.Server) { s.on('x', () => {}); }\nsetup(server.listen(1));`), ['SERVER_MEMBER']),
+  allow('result confinement', 'listen result passed to an eligible local callee', withServer(`function setup(s: http.Server) { s.close(); }\nsetup(server.listen(1));`)),
+  allow('result confinement', 'listen result as expression statement', withServer(`server.listen(4317, '127.0.0.1', () => { console.log('up'); });`)),
 ];
 
 // ---------------------------------------------------------------------------
@@ -853,6 +916,10 @@ const EXPORT: readonly RegressionRow[] = [
   deny('export confinement', 'export = server', withServer(`export = server;`), ['SERVER_EXPORT'], { closes: ['F-7'] }),
   deny('export confinement', 'export of a const alias of server', withServer(`const alias = server;\nexport { alias };`), ['SERVER_EXPORT'], { closes: ['F-7'] }),
   deny('export confinement', 'exported const alias of server', withServer(`export const alias = server;`), ['SERVER_EXPORT'], { closes: ['F-7'] }),
+  // PR #67 F2: exporting an allowed member call result exports the receiver's authority.
+  deny('export confinement', 'export const leaked = server.listen(...) (PR #67 F2)', withServer(`export const leaked = server.listen(4317, '127.0.0.1');`), ['SERVER_EXPORT']),
+  deny('export confinement', 'export default server.listen(...)', withServer(`export default server.listen(1);`), ['SERVER_EXPORT']),
+  deny('export confinement', 'export of a const alias of a listen result', withServer(`const leaked = server.listen(1);\nexport { leaked };`), ['SERVER_EXPORT']),
   allow('export confinement', 'export function factory', withFactory(``)),
   allow('export confinement', 'export { factory }', `${NS}\nfunction createCockpitServer() { return http.createServer(${L}); }\nexport { createCockpitServer };`),
   allow('export confinement', 'export default function factory', `${NS}\nexport default function createCockpitServer() { return http.createServer(${L}); }`),
@@ -871,6 +938,7 @@ const FIXPOINT: readonly RegressionRow[] = [
   deny('convergence/exhaustion', 'exhaustion denies even an otherwise-allowed real host shape', REAL_HOST_SHAPE, ['FIXPOINT_EXHAUSTED'], { options: { fixpointCeiling: 1 } }),
   allow('convergence/exhaustion', 'recursive alias/factory cycle converges', withServer(`function get() { return server; }\nfunction again() { return get(); }\nagain().close();\nget().listen(1);`)),
   allow('convergence/exhaustion', 'empty file converges', ``),
+  allow('convergence/exhaustion', 'alias chain through allowed call results converges', withServer(`const a = server.listen(1);\nconst b = a.close();\nb.close();`)),
 ];
 
 // ---------------------------------------------------------------------------
@@ -896,6 +964,11 @@ const EXTRA_PARAMETERS: readonly RegressionRow[] = [
   allow('extra parameter false positives', 'callee third parameter unprivileged even when first two are privileged', `${NS}\nfunction f(req: any, res: any, ctx: any) { ctx.socket; res.end(); }\nhttp.createServer((request, response) => { f(request, response, {}); });`, {
     closes: ['F-1'],
   }),
+  // PR #67: call results inherit authority only from a receiver that already carries it.
+  allow('extra parameter false positives', 'user-defined method named like an allowed server member on an unprivileged receiver', withServer(`const o = { listen: () => ({ on: (x: string) => x }) };\no.listen().on('x');\nserver.close();`)),
+  allow('extra parameter false positives', 'user-defined method named like an allowed response member on an unprivileged receiver', inListener(`const box = { end: () => ({ socket: 1 }) };\nbox.end().socket;\nresponse.end();`)),
+  allow('extra parameter false positives', 'call result of an unrelated const receiver', withServer(`const o = { close: () => ({ address: () => 1 }) };\nconst r = o.close();\nr.address();\nserver.close();`)),
+  allow('extra parameter false positives', 'user-defined method call result on a shadowed global name', `const self = { valueOf: () => ({ fetch: 1 }) };\nconst v = self.valueOf();\nv.fetch;`),
 ];
 
 // ---------------------------------------------------------------------------
