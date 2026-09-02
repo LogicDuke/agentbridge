@@ -1446,6 +1446,21 @@ const staticKeyText = (key: ts.Node | undefined): string | null => {
   return null;
 };
 
+// MECH-D3 positive-operation allowlists (D3 STRUCTURAL provenance/position model). These are the
+// FINITE approved operations for each proven target class — the demonstrated host requirements and
+// nothing more. They are POSITIVE allowlists, NOT banned-name tables: `SOCKET_DELIVERY_MEMBERS` and
+// `META_MUTATION_APIS` are frozen and untouched. The mechanism denies-by-default, so an unknown
+// member (`futureMemberX`) is rejected by ABSENCE from these sets, never by presence in a deny list —
+// which is exactly what makes the rule key/name-independent (no dangerous spelling is ever enumerated).
+//   SERVER   — may be CALLED only as `.listen(...)` / `.close(...)`.
+//   REQUEST  — may be READ only as `.method` / `.url`.
+//   RESPONSE — may be CALLED only as `.setHeader(...)` / `.end(...)`, or WRITTEN `statusCode =` a
+//              NumericLiteral.
+const D3_SERVER_CALL_MEMBERS: ReadonlySet<string> = new Set(['listen', 'close']);
+const D3_REQUEST_READ_MEMBERS: ReadonlySet<string> = new Set(['method', 'url']);
+const D3_RESPONSE_CALL_MEMBERS: ReadonlySet<string> = new Set(['setHeader', 'end']);
+const D3_RESPONSE_WRITE_MEMBERS: ReadonlySet<string> = new Set(['statusCode']);
+
 const acquiresInboundServerSocket = (checker: ts.TypeChecker, sourceFile: ts.SourceFile): boolean => {
   // MECH-1 (Day-7 convergence): the privileged createServer BOUNDARY is a CallExpression OR a
   //     NewExpression whose callee is binder-proven CREATE_SERVER. `new http.createServer(…)` runs the
@@ -2107,6 +2122,369 @@ const acquiresInboundServerSocket = (checker: ts.TypeChecker, sourceFile: ts.Sou
     ts.forEachChild(node, visit);
   };
   ts.forEachChild(sourceFile, visit);
+
+  // ==========================================================================================
+  // MECH-D3 (structural provenance/position model) — the AUTHORIZED D3 repair, layered OVER the
+  //   receiver-independent name bans above as defense-in-depth (this pass only ADDS denials, so no
+  //   historical DENY is weakened). The invariant is a single positive rule:
+  //
+  //       PROVEN PRIVILEGED TARGET  +  NON-ALLOWLISTED OPERATION  =  DENY.
+  //
+  //   A proven SERVER / REQUEST / RESPONSE may occur ONLY in its finite approved operations
+  //   (`D3_*_MEMBERS`, plus alias / factory-return / propagation / neutral positions); EVERY other
+  //   operation denies STRUCTURALLY, without this code ever naming the dangerous member. So
+  //   `server.futureMemberX = …` denies exactly as `server.emit = …` would — key/name-independently,
+  //   with no deny list to grow. Provenance is decided ONLY through the EXISTING bounded roots — the
+  //   createServer call/new result, the createServer listener parameters, unique non-exported `const`
+  //   aliases, approved local SERVER factories, and one-hop local-function parameter propagation —
+  //   with binder identity and finite hop/visit bounds. NO module graph, taint, unrestricted call
+  //   graph, or runtime interpretation: a resolved node's value/body is never interpreted, only its
+  //   syntactic POSITION is classified.
+  // ==========================================================================================
+  {
+    type D3Class = 'SERVER' | 'REQUEST' | 'RESPONSE';
+    const D3_ITERATION_CAP = 64;
+
+    // A binder-proven LOCAL runnable function an identifier denotes — a bodied, non-ambient
+    // `FunctionDeclaration`, or a unique `const` bound to an Arrow/FunctionExpression — else null.
+    // NEVER an import, ambient declaration, method, or member: a propagation/factory callee must be
+    // in-file code whose parameters and returns this pass can inspect. This is the ONLY callee shape
+    // a proven target may be passed to (besides the free reflective-read shape); every other callee
+    // (`Object.defineProperty`, an aliased mutator, a comma/element callee) is unresolvable here and
+    // the argument denies.
+    const resolveLocalFunction = (
+      callee: ts.Expression,
+    ): ts.FunctionDeclaration | ts.ArrowFunction | ts.FunctionExpression | null => {
+      const u = binderUnwrap(callee);
+      if (!ts.isIdentifier(u)) return null;
+      const symbol = checker.getSymbolAtLocation(u);
+      const decls = symbol?.declarations;
+      if (decls === undefined || decls.length !== 1) return null;
+      const decl = decls[0];
+      if (decl === undefined) return null;
+      if (ts.isFunctionDeclaration(decl)) {
+        return decl.body !== undefined && !isInAmbientContext(decl) ? decl : null;
+      }
+      const constDecl = netUniqueConstDecl(u, checker);
+      if (constDecl === null || constDecl.initializer === undefined || isInAmbientContext(constDecl)) return null;
+      const init = binderUnwrap(constDecl.initializer);
+      return ts.isArrowFunction(init) || ts.isFunctionExpression(init) ? init : null;
+    };
+
+    // Whether a VariableDeclaration is a UNIQUE NON-EXPORTED `const` with an identifier name — the
+    // sole approved alias / createServer-result binding shape. A `let`/`var`, an exported binding, or
+    // a destructuring name is NOT confined and denies (an unsupported result shape / identity escape).
+    const isConfinedConstBinding = (vd: ts.VariableDeclaration): boolean => {
+      if (!ts.isIdentifier(vd.name)) return false;
+      const list = vd.parent as ts.Node | undefined;
+      if (list === undefined || !ts.isVariableDeclarationList(list) || (list.flags & ts.NodeFlags.Const) === 0) {
+        return false;
+      }
+      const statement = list.parent as ts.Node | undefined;
+      if (
+        statement !== undefined &&
+        ts.isVariableStatement(statement) &&
+        ts.getModifiers(statement)?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword) === true
+      ) {
+        return false;
+      }
+      return true;
+    };
+
+    const provenClasses = new Map<ts.Symbol, Set<D3Class>>();
+    const serverFactories = new Set<ts.Node>();
+    const addClass = (symbol: ts.Symbol | undefined, cls: D3Class): boolean => {
+      if (symbol === undefined) return false;
+      let set = provenClasses.get(symbol);
+      if (set === undefined) {
+        set = new Set<D3Class>();
+        provenClasses.set(symbol, set);
+      }
+      if (set.has(cls)) return false;
+      set.add(cls);
+      return true;
+    };
+
+    // A value expression that PRODUCES a proven SERVER: a createServer call/new, a reference to a
+    // proven SERVER binding, or a call to a proven local SERVER factory. (Depends on the current
+    // fixpoint state, so it is re-evaluated each iteration.)
+    const exprIsServerValue = (e: ts.Expression): boolean => {
+      const u = binderUnwrap(e);
+      if (isCreateServerCall(u)) return true;
+      if (ts.isIdentifier(u)) {
+        const symbol = checker.getSymbolAtLocation(u);
+        return symbol !== undefined && provenClasses.get(symbol)?.has('SERVER') === true;
+      }
+      if (ts.isCallExpression(u)) {
+        const fn = resolveLocalFunction(u.expression);
+        return fn !== null && serverFactories.has(fn);
+      }
+      return false;
+    };
+
+    // The classes an initializer confers on its binding: SERVER for a server value; the alias
+    // source's classes for a proven-binding identifier (so `const r = req` carries REQUEST).
+    const classesOfValue = (e: ts.Expression): readonly D3Class[] => {
+      const out: D3Class[] = [];
+      if (exprIsServerValue(e)) out.push('SERVER');
+      const u = binderUnwrap(e);
+      if (ts.isIdentifier(u)) {
+        const symbol = checker.getSymbolAtLocation(u);
+        const set = symbol !== undefined ? provenClasses.get(symbol) : undefined;
+        if (set !== undefined) {
+          for (const c of set) if (!out.includes(c)) out.push(c);
+        }
+      }
+      return out;
+    };
+
+    // The finite OWN-body return values of a function (its arrow expression body, or the argument of
+    // every `return` NOT inside a nested function/class scope). No value flow — the returned nodes are
+    // only tested for the server-value SHAPE by the factory rule below.
+    const ownReturnValues = (
+      fn: ts.FunctionDeclaration | ts.ArrowFunction | ts.FunctionExpression,
+    ): ts.Expression[] => {
+      if (ts.isArrowFunction(fn) && !ts.isBlock(fn.body)) return [fn.body];
+      const body = fn.body;
+      if (body === undefined || !ts.isBlock(body)) return [];
+      const out: ts.Expression[] = [];
+      const walk = (n: ts.Node): void => {
+        if (
+          ts.isFunctionDeclaration(n) ||
+          ts.isFunctionExpression(n) ||
+          ts.isArrowFunction(n) ||
+          ts.isMethodDeclaration(n) ||
+          ts.isGetAccessorDeclaration(n) ||
+          ts.isSetAccessorDeclaration(n) ||
+          ts.isClassDeclaration(n) ||
+          ts.isClassExpression(n)
+        ) {
+          return; // a nested scope: its returns are not this function's
+        }
+        if (ts.isReturnStatement(n) && n.expression !== undefined) out.push(n.expression);
+        ts.forEachChild(n, walk);
+      };
+      ts.forEachChild(body, walk);
+      return out;
+    };
+
+    // Visit every function-like createServer listener argument's parameter list (through the EXISTING
+    // bounded `resolveCreateServerArgument`, so a named / const-bound handler is covered exactly like
+    // a direct inline one). Object-literal (options) arguments are skipped.
+    const eachListenerParams = (visit: (params: ts.NodeArray<ts.ParameterDeclaration>) => void): void => {
+      const walk = (n: ts.Node): void => {
+        if (isCreateServerCall(n)) {
+          for (const arg of n.arguments ?? []) {
+            const src = resolveCreateServerArgument(arg);
+            if (ts.isArrowFunction(src) || ts.isFunctionExpression(src) || ts.isFunctionDeclaration(src)) {
+              visit(src.parameters);
+            }
+          }
+        }
+        ts.forEachChild(n, walk);
+      };
+      ts.forEachChild(sourceFile, walk);
+    };
+
+    // ---- Phase A — bounded fixpoint over provenance (roots, aliases, factories, propagation). ----
+    for (let iter = 0; iter < D3_ITERATION_CAP; iter++) {
+      // A holder object (not a bare `let`), so the flag mutated inside the nested walk callbacks is
+      //     read as `boolean` after those calls return — a plain `let` would be flow-narrowed to its
+      //     `false` initializer (closure mutations are invisible to the checker) and the loop guard
+      //     would read as an always-true `!changed`.
+      const flags = { changed: false };
+      // (a) createServer listener parameters: parameter 0 → REQUEST, parameter 1 → RESPONSE (a plain
+      //     identifier, non-rest; destructured/rest parameters stay with the existing RULE A2 machinery).
+      eachListenerParams((params) => {
+        params.forEach((param, index) => {
+          if (index > 1 || param.dotDotDotToken !== undefined || !ts.isIdentifier(param.name)) return;
+          if (addClass(checker.getSymbolAtLocation(param.name), index === 0 ? 'REQUEST' : 'RESPONSE')) {
+            flags.changed = true;
+          }
+        });
+      });
+      // (b) confined-`const` bindings: a server value, or an alias of a proven binding.
+      const walkBindings = (n: ts.Node): void => {
+        if (ts.isVariableDeclaration(n) && n.initializer !== undefined && isConfinedConstBinding(n)) {
+          const symbol = checker.getSymbolAtLocation(n.name);
+          for (const cls of classesOfValue(n.initializer)) if (addClass(symbol, cls)) flags.changed = true;
+        }
+        ts.forEachChild(n, walkBindings);
+      };
+      ts.forEachChild(sourceFile, walkBindings);
+      // (c) approved local SERVER factories: a local function whose (≥1) own returns are ALL server values.
+      const walkFactories = (n: ts.Node): void => {
+        if (
+          (ts.isFunctionDeclaration(n) || ts.isFunctionExpression(n) || ts.isArrowFunction(n)) &&
+          !serverFactories.has(n) &&
+          n.body !== undefined &&
+          !isInAmbientContext(n)
+        ) {
+          const returns = ownReturnValues(n);
+          if (returns.length > 0 && returns.every((r) => exprIsServerValue(r))) {
+            serverFactories.add(n);
+            flags.changed = true;
+          }
+        }
+        ts.forEachChild(n, walkFactories);
+      };
+      ts.forEachChild(sourceFile, walkFactories);
+      // (d) one-hop propagation: a proven target passed to a local function taints that parameter.
+      const walkPropagation = (n: ts.Node): void => {
+        if (ts.isCallExpression(n)) {
+          const fn = resolveLocalFunction(n.expression);
+          if (fn !== null) {
+            n.arguments.forEach((arg, index) => {
+              if (ts.isSpreadElement(arg)) return;
+              const classes = classesOfValue(arg);
+              if (classes.length === 0) return;
+              const param = fn.parameters[index];
+              if (param === undefined || param.dotDotDotToken !== undefined || !ts.isIdentifier(param.name)) return;
+              const symbol = checker.getSymbolAtLocation(param.name);
+              for (const cls of classes) if (addClass(symbol, cls)) flags.changed = true;
+            });
+          }
+        }
+        ts.forEachChild(n, walkPropagation);
+      };
+      ts.forEachChild(sourceFile, walkPropagation);
+      if (!flags.changed) break;
+    }
+
+    // ---- Phase B — classify every USE of a proven target by its structural POSITION. ----
+    const memberReadAllowed = (name: string, cls: D3Class): boolean =>
+      cls === 'REQUEST' && D3_REQUEST_READ_MEMBERS.has(name);
+
+    const isAssignmentOp = (kind: ts.SyntaxKind): boolean =>
+      kind >= ts.SyntaxKind.FirstAssignment && kind <= ts.SyntaxKind.LastAssignment;
+
+    // Classify a member/element operation on a proven target by its parent form: an assignment
+    // (only `RESPONSE.statusCode = NumericLiteral` allowed), compound/update/delete (write → DENY),
+    // a call (the class call allowlist), or a plain read (the class read allowlist). The member NAME
+    // is compared ONLY against the small positive allowlists — never a deny list.
+    const memberOpAllowed = (
+      access: ts.PropertyAccessExpression | ts.ElementAccessExpression,
+      name: string,
+      cls: D3Class,
+    ): boolean => {
+      const top = outermostTransparentWrapper(access);
+      const gp = top.parent as ts.Node | undefined;
+      if (gp === undefined) return false;
+      if (ts.isBinaryExpression(gp) && gp.left === top && isAssignmentOp(gp.operatorToken.kind)) {
+        return (
+          gp.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+          cls === 'RESPONSE' &&
+          D3_RESPONSE_WRITE_MEMBERS.has(name) &&
+          ts.isNumericLiteral(binderUnwrap(gp.right))
+        );
+      }
+      if (ts.isPostfixUnaryExpression(gp) && gp.operand === top) return false; // update ++/--
+      if (
+        ts.isPrefixUnaryExpression(gp) &&
+        (gp.operator === ts.SyntaxKind.PlusPlusToken || gp.operator === ts.SyntaxKind.MinusMinusToken) &&
+        gp.operand === top
+      ) {
+        return false; // update ++/--
+      }
+      if (ts.isDeleteExpression(gp) && gp.expression === top) return false; // delete
+      if (ts.isCallExpression(gp) && gp.expression === top) {
+        if (cls === 'SERVER') return D3_SERVER_CALL_MEMBERS.has(name);
+        if (cls === 'RESPONSE') return D3_RESPONSE_CALL_MEMBERS.has(name);
+        return D3_REQUEST_READ_MEMBERS.has(name); // REQUEST: `.method`/`.url` read, then the string is called
+      }
+      return memberReadAllowed(name, cls); // a plain read
+    };
+
+    // Whether the operation applied to a proven-target occurrence `w` (already unwrapped through
+    // transparent wrappers) is in the approved set for `cls`.
+    const opAllowedForClass = (w: ts.Node, cls: D3Class): boolean => {
+      const p = w.parent as ts.Node | undefined;
+      if (p === undefined) return false;
+      // neutral / terminal positions (any class)
+      if (ts.isExpressionStatement(p) && p.expression === w) return true;
+      if (ts.isVoidExpression(p) && p.expression === w) return true;
+      if (ts.isTypeOfExpression(p) && p.expression === w) return true;
+      // factory return / arrow expression body (SERVER only)
+      if (ts.isReturnStatement(p) && p.expression === w) return cls === 'SERVER';
+      if (ts.isArrowFunction(p) && p.body === w) return cls === 'SERVER';
+      // a variable binding: a unique non-exported `const` IDENTIFIER binding is the approved alias /
+      //     result form; a BINDING-PATTERN name is a DESTRUCTURING whose per-key disposition off a
+      //     tracked REQUEST/RESPONSE is already owned by the existing RULE A2 / A(c) machinery
+      //     (static-harmless allowed, socket-name / object-rest / indeterminate-key denied there), so
+      //     this pass defers it; a SERVER destructured here is an unsupported result-shape escape.
+      if (ts.isVariableDeclaration(p) && p.initializer === w) {
+        if (ts.isIdentifier(p.name)) return isConfinedConstBinding(p);
+        return cls !== 'SERVER';
+      }
+      // a destructuring ASSIGNMENT `({ … } = req)` / `[ … ] = req` off a tracked REQUEST/RESPONSE is
+      //     likewise owned by the existing RULE A2 assignment machinery; a SERVER (or an assignment
+      //     into a plain identifier/member target) is an escape.
+      if (ts.isBinaryExpression(p) && p.operatorToken.kind === ts.SyntaxKind.EqualsToken && p.right === w) {
+        const lhs = binderUnwrap(p.left);
+        if (ts.isObjectLiteralExpression(lhs) || ts.isArrayLiteralExpression(lhs)) return cls !== 'SERVER';
+        return false;
+      }
+      // member / element operation
+      if (ts.isPropertyAccessExpression(p) && p.expression === w) return memberOpAllowed(p, p.name.text, cls);
+      if (ts.isElementAccessExpression(p) && p.expression === w) {
+        const key = sockResolveKey(p.argumentExpression, checker, sockMemo);
+        if (key.kind !== 'resolved') return false; // runtime / oversized-static key on a proven target: DENY
+        return memberOpAllowed(p, key.value, cls);
+      }
+      // call / new argument — the CALLEE RULE
+      if (ts.isCallExpression(p) && p.expression !== w && p.arguments.some((a) => a === w)) {
+        // (1) the existing binder-proven free reflective-read shape, subject to key policy (arg0 only)
+        if (isSockReflectiveReadCallee(p.expression, checker, sourceFile) && p.arguments[0] === w) {
+          const keyArg = p.arguments[1];
+          if (keyArg === undefined || ts.isSpreadElement(keyArg)) return false;
+          const key = sockResolveKey(keyArg, checker, sockMemo);
+          return key.kind === 'resolved' && memberReadAllowed(key.value, cls);
+        }
+        // (2) an approved propagating local function (the parameter was tainted in Phase A)
+        if (resolveLocalFunction(p.expression) !== null) return true;
+        return false; // any other callee: DENY (Object.defineProperty, aliased mutator, comma/element callee, …)
+      }
+      if (ts.isNewExpression(p) && (p.arguments ?? []).some((a) => a === w)) return false;
+      return false; // container element / object value / spread / export / any other escape
+    };
+
+    const classifyUse = (node: ts.Node, classes: Iterable<D3Class>): void => {
+      const w = outermostTransparentWrapper(node);
+      for (const cls of classes) {
+        if (!opAllowedForClass(w, cls)) {
+          found = true;
+          return;
+        }
+      }
+    };
+
+    const SERVER_ONLY: readonly D3Class[] = ['SERVER'];
+    const classifyWalk = (n: ts.Node): void => {
+      // THIS RESERVATION — a whole-file ThisExpression is rejected: `this` can re-derive a privileged
+      //     receiver, and the real host has no ThisExpression. No `this` provenance is modeled.
+      if (n.kind === ts.SyntaxKind.ThisKeyword) found = true;
+      if (isCreateServerCall(n)) {
+        classifyUse(n, SERVER_ONLY); // the createServer result value's own position
+      } else if (ts.isCallExpression(n)) {
+        const fn = resolveLocalFunction(n.expression);
+        if (fn !== null && serverFactories.has(fn)) classifyUse(n, SERVER_ONLY); // a factory-call result value
+      } else if (ts.isIdentifier(n) && isBinderValueReference(n)) {
+        // A shorthand `{ server }` reads the VALUE binding through `getShorthandAssignmentValueSymbol`
+        //     (the name identifier alone resolves to the fresh property symbol); every other value
+        //     reference resolves directly. The shorthand's POSITION then denies as a container escape.
+        const parent = n.parent as ts.Node | undefined;
+        const symbol =
+          parent !== undefined && ts.isShorthandPropertyAssignment(parent) && parent.name === n
+            ? checker.getShorthandAssignmentValueSymbol(parent)
+            : checker.getSymbolAtLocation(n);
+        const set = symbol !== undefined ? provenClasses.get(symbol) : undefined;
+        if (set !== undefined && set.size > 0) classifyUse(n, set);
+      }
+      ts.forEachChild(n, classifyWalk);
+    };
+    ts.forEachChild(sourceFile, classifyWalk);
+  }
+
   return found;
 };
 
@@ -6190,9 +6568,13 @@ describe('D3 host restricts the createServer constructor to direct-call position
     // 14–15 — a direct destructuring call and a renamed destructuring call.
     { form: 'a direct destructured createServer call', source: `import * as http from 'node:http';\nconst { createServer } = http;\ncreateServer(() => {});` },
     { form: 'a direct renamed destructured createServer call', source: `import * as http from 'node:http';\nconst { createServer: mk } = http;\nmk(() => {});` },
-    // 16–17 — storing and exporting the CALL RESULT (the Server object, capability NONE).
+    // 16 — storing the CALL RESULT in a confined const (the Server object, capability NONE).
     { form: 'storing the createServer call RESULT', source: `import http from 'node:http';\nconst server = http.createServer(() => {});\nvoid server;` },
-    { form: 'exporting the createServer call RESULT', source: `import http from 'node:http';\nexport const server = http.createServer(() => {});` },
+    // (17 — EXPORTING the call result was formerly allowed here as a capability-NONE value; it now
+    //  DENIES under the D3 STRUCTURAL CREATE-SERVER RESULT CONFINEMENT — an exported createServer
+    //  result is an unsupported result position — asserted just below the loop as an ALLOW→DENY flip.
+    //  The createServer-ALIAS policy `isCreateServerSafePosition` still treats it as capability-NONE;
+    //  the denial comes from SOCK, so `exportsHttpCapability` stays false for the same source.)
     // 18–19 — an unrelated local createServer, and a shadowed parameter createServer.
     { form: 'an unrelated local object method createServer', source: `const local = {\n  createServer() {},\n};\nlocal.createServer();` },
     { form: 'a shadowed parameter named createServer', source: `function f(createServer: () => void) {\n  createServer();\n}\nvoid f;` },
@@ -6204,6 +6586,13 @@ describe('D3 host restricts the createServer constructor to direct-call position
       expect(usesOutboundNetwork(source)).toBe(false);
     });
   }
+
+  // The former "exporting the createServer call RESULT" ALLOW row, flipped to DENY by the D3
+  // STRUCTURAL CREATE-SERVER RESULT CONFINEMENT (an exported createServer result is not an approved
+  // result position). Source byte-identical to the relocated `createServerAllow` entry.
+  it('DENIES exporting the createServer call RESULT (flipped ALLOW→DENY: unsupported result position)', () => {
+    expect(usesOutboundNetwork(`import http from 'node:http';\nexport const server = http.createServer(() => {});`)).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -6540,10 +6929,9 @@ describe('D3 host enforces the final bounded socket-capability source policy (D3
     { form: 'unrelated text[character] indexing', source: `const text = 'abc';\nconst character = 1;\nvoid text[character];` },
     { form: 'unrelated object[key] indexing', source: `const object: Record<string, number> = {};\nconst key = 'a';\nvoid object[key];` },
     { form: 'a non-socket ordinary member on an unrelated object', source: `const obj = { value: 1 };\nvoid obj.value;` },
-    // Matrix item 17 — the frozen honest boundary stays OUTSIDE the proof; the mechanism must
-    // NOT be broadened to close it (doing so would need alias/type/whole-program analysis).
-    { form: 'the frozen alias + runtime-key residual on req (remains allowed)', source: handler(`const r = req;\nconst k = req.url ?? '';\nvoid r[k];`) },
-    { form: 'the frozen runtime-computed server[k] residual (remains allowed)', source: wrapperHead + `const k = String(4317);\nvoid server[k];` },
+    // Matrix item 17 — the FORMER frozen alias + runtime-key residuals (`const r = req; r[k]`,
+    // `server[String(4317)]`) are now CLOSED by the D3 STRUCTURAL model and relocated to
+    // `structuralFlipReject` below (a proven req/server target with a runtime element key DENIES).
   ];
   for (const { form, source } of sockAllow) {
     it(`allows ${form}`, () => {
@@ -6571,19 +6959,11 @@ describe('D3 host enforces the final bounded socket-capability source policy (D3
     });
   }
 
-  // --- DDR-B: the frozen runtime-computed boundary stays OUTSIDE the proof — MUST ALLOW.
-  //     A key the binder cannot pin to a static string (a call result, an ambient runtime name) is
-  //     Indeterminate; closing it would need alias/type/whole-program flow, deliberately excluded. ---
-  const ddrBAllow: readonly { readonly form: string; readonly source: string }[] = [
-    { form: 'a genuinely runtime server[runtimeKey] (declared, unresolvable)', source: wrapperHead + `declare const runtimeKey: string;\nvoid server[runtimeKey];` },
-    { form: 'a call-result key server[String(4317)] (unresolvable)', source: wrapperHead + `void server[String(4317)];` },
-    { form: 'a harmless resolvable non-socket key server["lis" + "ten"]', source: wrapperHead + `void server['lis' + 'ten'];` },
-  ];
-  for (const { form, source } of ddrBAllow) {
-    it(`allows ${form}`, () => {
-      expect(usesOutboundNetwork(source)).toBe(false);
-    });
-  }
+  // --- DDR-B: the FORMER frozen runtime-computed boundary is now CLOSED by the D3 STRUCTURAL model
+  //     (a proven SERVER with ANY runtime / non-resolved element key DENIES — key policy: runtime key
+  //     DENY on a proven target) and its rows are relocated to `structuralFlipReject` below. Only a
+  //     runtime key on an UNRELATED (unproven) receiver stays outside the proof (see `binderKeyAllow`
+  //     M-rows and the frozen-boundary allow block). ---
 
   // --- DDR-B (STATIC-TEMPLATE PARITY): a socket-acquisition KEY spelled as a SUBSTITUTED template
   //     `` server[`o${'n'}`] `` denotes the same static string as `server['on']` / `server['o'+'n']`,
@@ -6612,21 +6992,12 @@ describe('D3 host enforces the final bounded socket-capability source policy (D3
     });
   }
 
-  // --- DDR-B (STATIC-TEMPLATE PARITY): the frozen indeterminate boundary is UNCHANGED — a template
-  //     with ANY non-bounded-static substitution (runtime/ambient identifier, mutable `let` binding,
-  //     unresolvable call) stays Indeterminate, so on a non-req/res receiver it is NOT flagged. Only a
-  //     fully binder-static template folds. MUST ALLOW. ---
-  const ddrBTemplateAllow: readonly { readonly form: string; readonly source: string }[] = [
-    { form: 'a runtime-substituted server[`o${runtime}n`] (declared, unresolvable)', source: wrapperHead + 'declare const runtime: string;\nvoid server[`o${runtime}n`];' },
-    { form: 'a mutable-binding server[`${a}n`] with let a = \'o\'', source: wrapperHead + 'let a = \'o\';\na = \'o\';\nvoid server[`${a}n`];' },
-    { form: 'a call-result substitution server[`o${String(1)}`] (unresolvable)', source: wrapperHead + 'void server[`o${String(1)}`];' },
-    { form: 'a harmless resolvable non-socket template server[`lis${\'ten\'}`]', source: wrapperHead + 'void server[`lis${\'ten\'}`];' },
-  ];
-  for (const { form, source } of ddrBTemplateAllow) {
-    it(`allows ${form}`, () => {
-      expect(usesOutboundNetwork(source)).toBe(false);
-    });
-  }
+  // --- DDR-B (STATIC-TEMPLATE PARITY): the template rows on a PROVEN server (`server[`o${runtime}n`]`,
+  //     `server[`lis${'ten'}`]`, …) are now CLOSED by the D3 STRUCTURAL model — a runtime/mutable/
+  //     call-result template key DENIES (runtime key on a proven target), and even a fully-resolved
+  //     harmless template like `` server[`lis${'ten'}`] `` DENIES because it is a bare READ of a
+  //     non-called member. Relocated to `structuralFlipReject`. The unproven-receiver template
+  //     boundary is unchanged (a template on `globalThis`/an unrelated object still folds by binder). ---
 
   // --- ASSIGNMENT-DESTRUCTURING PARITY (SOCK, DELIVERY/REGISTRAR members ONLY): `({ on: register } =
   //     server)` extracts the registrar off `server` exactly like the declaration twin
@@ -6664,7 +7035,9 @@ describe('D3 host enforces the final bounded socket-capability source policy (D3
   const assignDestructureAllow: readonly { readonly form: string; readonly source: string }[] = [
     // The accepted D3-CX-CODEX-ASSIGN invariant, asserted adjacently here as a preservation guard.
     { form: 'the preserved ({ socket: localSocket } = unrelatedObject) capability invariant', source: `const unrelatedObject = { socket: 123 };\nlet localSocket: unknown;\n({ socket: localSocket } = unrelatedObject);\nvoid localSocket;` },
-    { form: 'a capability ({ socket: s } = server) stays req/res-bound (NOT delivery-broadened)', source: wrapperHead + `let s: unknown;\n({ socket: s } = server as unknown as { socket: unknown });\nvoid s;` },
+    // `({ socket: s } = server)` on a PROVEN server is now CLOSED by the D3 STRUCTURAL model (a
+    // destructuring READ off a proven target is a non-allowlisted escape) — relocated to
+    // `structuralFlipReject`. The UNRELATED-receiver capability invariant below is unchanged.
     { form: 'a capability ({ connection: c } = unrelatedObject) is NOT globally banned', source: `const unrelatedObject = { connection: 1 };\nlet c: unknown;\n({ connection: c } = unrelatedObject);\nvoid c;` },
     { form: 'a harmless ({ harmless: x } = arbitraryObject)', source: `const arbitraryObject: Record<string, unknown> = {};\nlet x: unknown;\n({ harmless: x } = arbitraryObject);\nvoid x;` },
     { form: 'a harmless shorthand ({ method } = arbitraryObject)', source: `const arbitraryObject: Record<string, unknown> = {};\nlet method: unknown;\n({ method } = arbitraryObject);\nvoid method;` },
@@ -6728,8 +7101,10 @@ describe('D3 host enforces the final bounded socket-capability source policy (D3
   const emitAllow: readonly { readonly form: string; readonly source: string }[] = [
     { form: 'an object-literal DATA key { emit: 1 }', source: `const config = { emit: 1 };\nvoid config;` },
     { form: "a bare string binding const label = 'emit'", source: `const label = 'emit';\nvoid label;` },
-    { form: 'a superstring member server.emitter', source: wrapperHead + `void server.emitter;` },
-    { form: 'a superstring member server.emitted', source: wrapperHead + `void server.emitted;` },
+    // `server.emitter` / `server.emitted` on a PROVEN server were formerly allowed as superstrings of
+    // the banned `emit`; under the D3 STRUCTURAL model ANY non-allowlisted member READ of a proven
+    // server DENIES (name-independently), so both are relocated to `structuralFlipReject`. The
+    // non-acquisition-position rows below (object-literal data key, string, type signature) stay allowed.
     { form: 'a type-position emit method signature', source: `interface Sink {\n  emit(x: number): void;\n}\ndeclare const s: Sink;\nvoid s;` },
     { form: "an unrelated call arg log('emit')", source: `declare function log(m: string): void;\nlog('emit');` },
   ];
@@ -6786,11 +7161,13 @@ describe('D3 host enforces the final bounded socket-capability source policy (D3
     { form: 'Object.defineProperty(config, "socket", …) on an unrelated object', source: `const config = { a: 1 };\nObject.defineProperty(config, 'socket', { value() { return true; } });` },
     { form: 'Object.assign({}, harmless)', source: `const harmless = { a: 1 };\nObject.assign({}, harmless);` },
     { form: 'Object.assign({}, { emit: 1 })', source: `Object.assign({}, { emit: 1 });` },
-    { form: 'Object.assign({}, server) — reading FROM a privileged server (arg0 unprivileged)', source: metaServerHead + `Object.assign({}, server);` },
+    // `Object.assign({}, server)` and `Object.freeze(server)` on a PROVEN server were formerly allowed
+    // (arg0-unprivileged / non-mutating). Under the D3 STRUCTURAL CALLEE RULE a proven target passed
+    // as ANY argument to a non-approved callee DENIES (the reading/freezing is not claimed — the
+    // ESCAPE is), so both are relocated to `structuralFlipReject`. Benign UNRELATED-target ops stay allowed.
     { form: 'Object.freeze(benignObject)', source: `const benignObject = { a: 1 };\nObject.freeze(benignObject);` },
     { form: 'Object.seal(benignObject)', source: `const benignObject = { a: 1 };\nObject.seal(benignObject);` },
     { form: 'Object.preventExtensions(benignObject)', source: `const benignObject = { a: 1 };\nObject.preventExtensions(benignObject);` },
-    { form: 'Object.freeze(server) on a privileged target — non-mutating, outside META_MUTATION_APIS', source: metaServerHead + `Object.freeze(server);` },
     { form: 'ordinary benign Object.defineProperty on an unrelated target', source: `const obj = { a: 1 };\nObject.defineProperty(obj, 'x', { value: 1 });\nvoid Object.keys(obj);` },
     { form: "res.setHeader('connection', 'close')", source: handler(`res.setHeader('connection', 'close');`) },
     { form: "map.get('connection')", source: `declare const map: { get(k: string): unknown };\nvoid map.get('connection');` },
@@ -6812,7 +7189,10 @@ describe('D3 host enforces the final bounded socket-capability source policy (D3
   //     `server.emit` on these servers; only the target-gated meta-mutation is out of reach. ---
   const metaBoundaryAllow: readonly { readonly form: string; readonly source: string }[] = [
     { form: 'Object.defineProperty(getServer(), "emit", …) — arbitrary call-result target', source: H + `declare function getServer(): http.Server;\nObject.defineProperty(getServer(), 'emit', { value() { return true; } });` },
-    { form: 'a function-return server (const server = makeServer()) target', source: wrapperHead + `Object.defineProperty(server, 'emit', { value() { return true; } });` },
+    // NOTE: the former `const server = makeServer()` (function-return) row is now CLOSED by the D3
+    // STRUCTURAL model — `makeServer` is a proven local SERVER FACTORY, so its result is a proven
+    // target and the meta-mutation DENIES. Relocated to `structuralFlipReject`. `getServer()` above
+    // stays outside the proof: it is an AMBIENT `declare function` (no inspectable body), not a factory.
   ];
   for (const { form, source } of metaBoundaryAllow) {
     it(`leaves outside the finite proof (documented boundary): ${form}`, () => {
@@ -6888,11 +7268,12 @@ describe('D3 host enforces the final bounded socket-capability source policy (D3
   //     identity — a harmless key is NEVER flipped by a shadowing socket-named sibling const
   //     (M16 exercises binder identity in the ALLOW direction). MUST ALLOW. ---
   const binderKeyAllow: readonly { readonly form: string; readonly source: string }[] = [
-    { form: "M11: server[runtimeKey] on an unrelated receiver stays outside the proof", source: wrapperHead + `declare const runtimeKey: string;\nvoid server[runtimeKey];` },
-    { form: "M12: server[String(4317)] stays outside the static proof", source: wrapperHead + `void server[String(4317)];` },
+    // M11 (`server[runtimeKey]`), M12 (`server[String(4317)]`), M15 (`server['listen']` read),
+    // and M16 (a harmless resolved key read) were formerly allowed on a PROVEN server. Under the D3
+    // STRUCTURAL model a runtime element key on a proven target DENIES (M11/M12), and a bare READ of a
+    // non-called member — even the known method `listen` — DENIES (M15/M16, method extraction).
+    // Relocated to `structuralFlipReject`. M14 stays: `req['method']` is a demonstrated REQUEST read.
     { form: "M14: req['method'] stays allowed", source: handler(`void req['method'];`) },
-    { form: "M15: harmless static server['listen'] stays allowed", source: wrapperHead + `void server['listen'];` },
-    { form: "M16: a harmless key is not flipped by a shadowing socket-named sibling const", source: wrapperHead + `const k = 'listen';\nfunction unrelated(): void {\n  const k = 'on';\n  void k;\n}\nvoid server[k];\nvoid unrelated;` },
   ];
   for (const { form, source } of binderKeyAllow) {
     it(`allows ${form}`, () => {
@@ -7388,10 +7769,11 @@ describe('D3 host enforces the final bounded socket-capability source policy (D3
   // ---- MECH-2 (8, preserve): a static harmless key on the chain, and a chain NOT rooted at a
   //      tracked req/res param, keep their disposition (no alias / value flow). ----
   const staticChainAllow: readonly { readonly form: string; readonly source: string }[] = [
-    { form: "a static harmless key on the chain res.req['method']", source: handler(`void (res as any).req['method'];`) },
-    { form: 'a dotted harmless chain res.req.method', source: handler(`void (res as any).req.method;`) },
+    // The chains ROOTED at a proven `res` (`res.req['method']`, `res.req.method`,
+    // `res.getHeader('x')[rk]`) are now CLOSED by the D3 STRUCTURAL model — `.req` / `.getHeader`
+    // are non-allowlisted RESPONSE members, so the very first hop DENIES (member-chain closure).
+    // Relocated to `structuralFlipReject`. A chain rooted at an UNRELATED object stays outside the proof.
     { form: 'a chain rooted at an unrelated object unrelated.req[runtimeKey]', source: RK + `const unrelated: any = {};\nvoid unrelated.req[rk];` },
-    { form: 'a chain broken by a call res.getHeader("x")[runtimeKey] (frozen callee boundary)', source: handler(RK + `void (res as any).getHeader('x')[rk];`) },
   ];
   for (const { form, source } of staticChainAllow) {
     it(`allows ${form}`, () => {
@@ -7433,15 +7815,17 @@ describe('D3 host enforces the final bounded socket-capability source policy (D3
   const reflectiveAllow: readonly { readonly form: string; readonly source: string }[] = [
     { form: "Reflect.get(local, 'fetch') (non-socket name, non-global receiver)", source: `const local = { fetch() {} };\nReflect.get(local, 'fetch')();` },
     { form: "Reflect.get(globalThis, 'crypto') (non-socket, non-network name)", source: `void Reflect.get(globalThis, 'crypto');` },
-    { form: "a user-shadowed Reflect.get(req, 'socket') (ordinary object, not the built-in)", source: handler(`const Reflect = { get(_t: unknown, _k: string): unknown { return 1; } };\nvoid Reflect.get(req, 'socket');`) },
-    { form: "a user-shadowed Object.getOwnPropertyDescriptor(req, 'socket')", source: handler(`const Object = { getOwnPropertyDescriptor(_t: unknown, _k: string): unknown { return 1; } };\nvoid Object.getOwnPropertyDescriptor(req, 'socket');`) },
+    // A user-SHADOWED `Reflect.get`/`Object.getOwnPropertyDescriptor`, and `Reflect.has`/`Reflect.ownKeys`
+    // (not the approved free reflective-READ shape), pass a PROVEN `req` to a non-approved callee — now
+    // CLOSED by the D3 STRUCTURAL CALLEE RULE (an escape to any callee outside the free Reflect.get read
+    // shape / an approved local function DENIES). Relocated to `structuralFlipReject`. The genuine free
+    // `Reflect.get(req, 'method')` with a harmless resolved key STAYS allowed (key policy), as do all
+    // UNPROVEN-target rows.
     { form: "res.setHeader('connection', 'close') (an ordinary method call, not a reflective read)", source: handler(`res.setHeader('connection', 'close');`) },
     { form: "map.get('connection') (a non-builtin .get)", source: `const map = new Map<string, number>();\nvoid map.get('connection');` },
     { form: "log('socket') (a plain call with a socket-named string)", source: `declare function log(s: string): void;\nlog('socket');` },
     { form: "Reflect.get(req, 'method') (harmless resolved key)", source: handler(`void Reflect.get(req, 'method');`) },
     { form: 'Reflect.get(unrelated, runtimeKey) (indeterminate key on an UNTRACKED target)', source: RK + `const unrelated: Record<string, unknown> = {};\nvoid Reflect.get(unrelated, rk);` },
-    { form: "Reflect.has(req, 'socket') (not an acquisition API)", source: handler(`void Reflect.has(req, 'socket');`) },
-    { form: "Reflect.ownKeys(req) (no property-key argument)", source: handler(`void Reflect.ownKeys(req);`) },
   ];
   for (const { form, source } of reflectiveAllow) {
     it(`allows ${form}`, () => {
@@ -7508,18 +7892,13 @@ describe('D3 host enforces the final bounded socket-capability source policy (D3
   // ---- OUTSIDE_BOUNDARY (frozen — deliberately NOT closed by this repair; asserted so the
   //      mechanism is provably not broadened into alias / value-flow analysis). ----
   const frozenOutsideBoundaryAllow: readonly { readonly form: string; readonly source: string }[] = [
-    { form: 'the alias + runtime key const r = req; r[k] (frozen)', source: handler(RK + `const r = req;\nvoid r[rk];`) },
-    { form: 'the array-wrapped [req][0][k] (frozen)', source: handler(RK + `void [req][0][rk];`) },
-    { form: 'the spread-copy ({ ...req })[k] (frozen)', source: handler(RK + `void ({ ...req } as any)[rk];`) },
-    { form: 'Object.values(req) (frozen)', source: handler(`void Object.values(req);`) },
-    { form: 'Object.entries(req) (frozen)', source: handler(`void Object.entries(req);`) },
-    { form: 'Object.assign({}, req) (frozen)', source: handler(`void Object.assign({}, req);`) },
-    { form: 'Object.getOwnPropertyDescriptors(req) (frozen — not the recognized single-key API)', source: handler(`void Object.getOwnPropertyDescriptors(req);`) },
-    { form: "an aliased Reflect const R = Reflect; R.get(req, 'socket') (frozen)", source: handler(`const R = Reflect;\nvoid R.get(req, 'socket');`) },
-    { form: "a global-object member spelling globalThis.Reflect.get(req, 'socket') (frozen — the aliased-Reflect indirection class, same boundary as NET F1)", source: handler(`void (globalThis as any).Reflect.get(req, 'socket');`) },
-    { form: "a call-chained Reflect.get.call(Reflect, req, 'socket') (frozen — call/apply/bind indirection)", source: handler(`void Reflect.get.call(Reflect, req, 'socket');`) },
-    { form: 'a renamed destructuring alias ({ req: r }) => r[k] (frozen — the req/res alias family)', source: H + RK + `http.createServer((_req: any, { req: r }: any) => {\n  void r[rk];\n});` },
-    { form: 'the runtime-computed server[String(4317)] (frozen)', source: wrapperHead + `void server[String(4317)];` },
+    // Most former frozen-boundary rows are now CLOSED by the D3 STRUCTURAL model and relocated to
+    // `structuralFlipReject`: `const r = req; r[rk]` (proven alias + runtime key), `[req][0][rk]` /
+    // `({ ...req })[rk]` (container escapes), `Object.values/entries/assign/getOwnPropertyDescriptors(req)`
+    // and the aliased/global/call-chained `Reflect.get(req, …)` forms (proven target passed to a
+    // non-approved callee), and `server[String(4317)]` (runtime key). What STAYS outside the proof is
+    // ONLY the nested-destructuring RENAME whose local binding this pass does not track as a root:
+    { form: 'a renamed destructuring alias ({ req: r }) => r[k] (still outside — nested-rename binding, not a tracked root)', source: H + RK + `http.createServer((_req: any, { req: r }: any) => {\n  void r[rk];\n});` },
   ];
   for (const { form, source } of frozenOutsideBoundaryAllow) {
     it(`allows (frozen, outside the boundary) ${form}`, () => {
@@ -7790,6 +8169,197 @@ describe('D3 host enforces the final bounded socket-capability source policy (D3
       expect(usesOutboundNetwork(source)).toBe(false);
     });
   }
+
+  // =====================================================================================
+  // D3 STRUCTURAL REPAIR — ALLOW→DENY FLIPS. Each row below was a previously documented FROZEN /
+  //   residual ALLOW that the receiver-independent NAME ban left open on a PROVEN target. The D3
+  //   STRUCTURAL provenance/position model (MECH-D3) now CLOSES every one of them structurally
+  //   (PROVEN TARGET + NON-ALLOWLISTED OPERATION = DENY), so their expectation flips to DENY. The
+  //   SOURCES are byte-identical to the relocated entries (nothing is deleted; coverage is preserved
+  //   with an inverted assertion, exactly like the earlier `optionsBoundaryReject` O1–O6 / L1–L2
+  //   flips). NO historical DENY is weakened — only these ALLOW residuals move. ---
+  // =====================================================================================
+  const structuralFlipReject: readonly { readonly reason: string; readonly form: string; readonly source: string }[] = [
+    // Runtime / non-resolved element key on a proven target (key policy: runtime key DENY).
+    { reason: 'proven-req alias + runtime key', form: "sockAllow: const r = req; const k = req.url ?? ''; r[k]", source: handler(`const r = req;\nconst k = req.url ?? '';\nvoid r[k];`) },
+    { reason: 'proven-server runtime key', form: 'sockAllow: const k = String(4317); server[k]', source: wrapperHead + `const k = String(4317);\nvoid server[k];` },
+    { reason: 'proven-server runtime key', form: 'ddrBAllow: server[runtimeKey] (declared)', source: wrapperHead + `declare const runtimeKey: string;\nvoid server[runtimeKey];` },
+    { reason: 'proven-server runtime key', form: 'ddrBAllow: server[String(4317)]', source: wrapperHead + `void server[String(4317)];` },
+    { reason: 'proven-server non-called member read', form: "ddrBAllow: server['lis' + 'ten'] (resolves to listen, read)", source: wrapperHead + `void server['lis' + 'ten'];` },
+    { reason: 'proven-server runtime key', form: 'ddrBTemplateAllow: server[`o${runtime}n`]', source: wrapperHead + 'declare const runtime: string;\nvoid server[`o${runtime}n`];' },
+    { reason: 'proven-server runtime key', form: "ddrBTemplateAllow: server[`${a}n`] with let a", source: wrapperHead + 'let a = \'o\';\na = \'o\';\nvoid server[`${a}n`];' },
+    { reason: 'proven-server runtime key', form: 'ddrBTemplateAllow: server[`o${String(1)}`]', source: wrapperHead + 'void server[`o${String(1)}`];' },
+    { reason: 'proven-server non-called member read', form: "ddrBTemplateAllow: server[`lis${'ten'}`] (resolves to listen, read)", source: wrapperHead + 'void server[`lis${\'ten\'}`];' },
+    // Destructuring READ off a proven target (non-allowlisted extraction / escape).
+    { reason: 'proven-server destructuring read', form: 'assignDestructureAllow: ({ socket: s } = server)', source: wrapperHead + `let s: unknown;\n({ socket: s } = server as unknown as { socket: unknown });\nvoid s;` },
+    // Non-allowlisted member READ of a proven server (name-independent; formerly allowed as superstrings).
+    { reason: 'proven-server unknown-member read', form: 'emitAllow: server.emitter', source: wrapperHead + `void server.emitter;` },
+    { reason: 'proven-server unknown-member read', form: 'emitAllow: server.emitted', source: wrapperHead + `void server.emitted;` },
+    // Proven target passed as an argument to a non-approved callee (CALLEE RULE escape).
+    { reason: 'proven-server escape into Object.assign', form: 'metaAllow: Object.assign({}, server)', source: metaServerHead + `Object.assign({}, server);` },
+    { reason: 'proven-server escape into Object.freeze', form: 'metaAllow: Object.freeze(server)', source: metaServerHead + `Object.freeze(server);` },
+    // Factory-result provenance: makeServer() is a proven SERVER factory.
+    { reason: 'proven factory-result meta-mutation', form: 'metaBoundaryAllow: const server = makeServer(); Object.defineProperty(server, ...)', source: wrapperHead + `Object.defineProperty(server, 'emit', { value() { return true; } });` },
+    // Runtime key / method-extraction on a proven server (binder-key matrix).
+    { reason: 'proven-server runtime key', form: 'binderKeyAllow M11: server[runtimeKey]', source: wrapperHead + `declare const runtimeKey: string;\nvoid server[runtimeKey];` },
+    { reason: 'proven-server runtime key', form: 'binderKeyAllow M12: server[String(4317)]', source: wrapperHead + `void server[String(4317)];` },
+    { reason: 'proven-server method extraction', form: "binderKeyAllow M15: server['listen'] (read, not called)", source: wrapperHead + `void server['listen'];` },
+    { reason: 'proven-server method extraction', form: "binderKeyAllow M16: server[k] with const k = 'listen' (read)", source: wrapperHead + `const k = 'listen';\nfunction unrelated(): void {\n  const k = 'on';\n  void k;\n}\nvoid server[k];\nvoid unrelated;` },
+    // Member-chain closure: the FIRST hop off a proven res (`.req` / `.getHeader`) is non-allowlisted.
+    { reason: 'proven-res unknown-member chain', form: "staticChainAllow: res.req['method']", source: handler(`void (res as any).req['method'];`) },
+    { reason: 'proven-res unknown-member chain', form: 'staticChainAllow: res.req.method', source: handler(`void (res as any).req.method;`) },
+    { reason: 'proven-res unknown-member call', form: "staticChainAllow: res.getHeader('x')[rk]", source: handler(RK + `void (res as any).getHeader('x')[rk];`) },
+    // Proven req passed to a non-approved callee (shadowed/aliased Reflect, non-read reflective APIs).
+    { reason: 'proven-req escape into user callee', form: "reflectiveAllow: user-shadowed Reflect.get(req, 'socket')", source: handler(`const Reflect = { get(_t: unknown, _k: string): unknown { return 1; } };\nvoid Reflect.get(req, 'socket');`) },
+    { reason: 'proven-req escape into user callee', form: "reflectiveAllow: user-shadowed Object.getOwnPropertyDescriptor(req, 'socket')", source: handler(`const Object = { getOwnPropertyDescriptor(_t: unknown, _k: string): unknown { return 1; } };\nvoid Object.getOwnPropertyDescriptor(req, 'socket');`) },
+    { reason: 'proven-req escape into non-read Reflect API', form: "reflectiveAllow: Reflect.has(req, 'socket')", source: handler(`void Reflect.has(req, 'socket');`) },
+    { reason: 'proven-req escape into non-read Reflect API', form: 'reflectiveAllow: Reflect.ownKeys(req)', source: handler(`void Reflect.ownKeys(req);`) },
+    // Former frozen-outside-boundary residuals on a proven req/server, now closed.
+    { reason: 'proven-req alias + runtime key', form: 'frozen: const r = req; r[rk]', source: handler(RK + `const r = req;\nvoid r[rk];`) },
+    { reason: 'proven-req container escape', form: 'frozen: [req][0][rk]', source: handler(RK + `void [req][0][rk];`) },
+    { reason: 'proven-req spread escape', form: 'frozen: ({ ...req })[rk]', source: handler(RK + `void ({ ...req } as any)[rk];`) },
+    { reason: 'proven-req escape into callee', form: 'frozen: Object.values(req)', source: handler(`void Object.values(req);`) },
+    { reason: 'proven-req escape into callee', form: 'frozen: Object.entries(req)', source: handler(`void Object.entries(req);`) },
+    { reason: 'proven-req escape into callee', form: 'frozen: Object.assign({}, req)', source: handler(`void Object.assign({}, req);`) },
+    { reason: 'proven-req escape into callee', form: 'frozen: Object.getOwnPropertyDescriptors(req)', source: handler(`void Object.getOwnPropertyDescriptors(req);`) },
+    { reason: 'proven-req escape into aliased Reflect', form: "frozen: const R = Reflect; R.get(req, 'socket')", source: handler(`const R = Reflect;\nvoid R.get(req, 'socket');`) },
+    { reason: 'proven-req escape into global Reflect', form: "frozen: globalThis.Reflect.get(req, 'socket')", source: handler(`void (globalThis as any).Reflect.get(req, 'socket');`) },
+    { reason: 'proven-req escape into call-chained Reflect', form: "frozen: Reflect.get.call(Reflect, req, 'socket')", source: handler(`void Reflect.get.call(Reflect, req, 'socket');`) },
+    { reason: 'proven-server runtime key', form: 'frozen: server[String(4317)]', source: wrapperHead + `void server[String(4317)];` },
+  ];
+  for (const { reason, form, source } of structuralFlipReject) {
+    it(`rejects (flipped ALLOW→DENY: ${reason}) ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // =====================================================================================
+  // D3 STRUCTURAL provenance/position model (MECH-D3) — the AUTHORIZED structural repair.
+  //
+  //   INVARIANT:  PROVEN PRIVILEGED TARGET  +  NON-ALLOWLISTED OPERATION  =  DENY.
+  //
+  // This replaces witness-by-witness mutation detection with ONE positive-operation model:
+  // a proven SERVER / REQUEST / RESPONSE may occur ONLY in its finite approved operations;
+  // EVERY other operation denies STRUCTURALLY, without the detector naming the dangerous
+  // member. The witnesses below therefore use an UNKNOWN member `futureMemberX` (a name the
+  // detector logic must not contain): if `futureMemberX` denies exactly as `emit` does, the
+  // rule is provably key/name-independent (criterion #3). Categories, not permutations —
+  // each category is spelled dotted / static-computed / folded / template where meaningful.
+  //
+  //   SERVER roots exercised:  a DIRECT `const server = http.createServer(...)` (metaServerHead),
+  //   a local-FACTORY result `const server = makeServer()` (wrapperHead), and the bare
+  //   createServer call/new result. REQUEST/RESPONSE roots: the createServer listener
+  //   parameters 0/1 (handler(...)). Provenance flows through unique non-exported `const`
+  //   aliases and one-hop local-function parameter propagation only.
+  // =====================================================================================
+  describe('D3 STRUCTURAL provenance/position model (PROVEN TARGET + NON-ALLOWLISTED OPERATION = DENY)', () => {
+    const S = metaServerHead; // `const server = http.createServer(() => {})` — a proven SERVER binding.
+
+    // ---- MUST-DENY category matrix (proven target, non-allowlisted operation). ----
+    const structuralDeny: readonly { readonly category: string; readonly form: string; readonly source: string }[] = [
+      // SERVER — direct unknown-member WRITE (dotted / static-computed / template / folded key).
+      { category: 'SERVER direct unknown-member write', form: 'dotted server.futureMemberX = fn', source: S + `server.futureMemberX = function () { return true; };` },
+      { category: 'SERVER direct unknown-member write', form: "static-computed server['futureMemberX'] = fn", source: S + `server['futureMemberX'] = function () { return true; };` },
+      { category: 'SERVER direct unknown-member write', form: 'template server[`futureMemberX`] = fn', source: S + 'server[`futureMemberX`] = function () { return true; };' },
+      { category: 'SERVER direct unknown-member write', form: "folded-key const k = 'futureMemberX'; server[k] = fn", source: S + `const k = 'futureMemberX';\nserver[k] = function () { return true; };` },
+      // SERVER — compound / update / delete.
+      { category: 'SERVER compound/update/delete', form: 'compound server.futureMemberX += 1', source: S + `(server as any).futureMemberX += 1;` },
+      { category: 'SERVER compound/update/delete', form: 'update server.futureMemberX++', source: S + `(server as any).futureMemberX++;` },
+      { category: 'SERVER compound/update/delete', form: 'prefix update ++server.futureMemberX', source: S + `++(server as any).futureMemberX;` },
+      { category: 'SERVER compound/update/delete', form: 'delete server.futureMemberX', source: S + `delete (server as any).futureMemberX;` },
+      // SERVER — unknown-member READ, including a method EXTRACTION (a known method read, uncalled).
+      { category: 'SERVER unknown-member read', form: 'dotted read void server.futureMemberX', source: S + `void server.futureMemberX;` },
+      { category: 'SERVER unknown-member read', form: "static-computed read void server['futureMemberX']", source: S + `void server['futureMemberX'];` },
+      { category: 'SERVER unknown-member read', form: 'template read void server[`futureMemberX`]', source: S + 'void server[`futureMemberX`];' },
+      { category: 'SERVER unknown-member read', form: "folded-key read const k = 'futureMemberX'; void server[k]", source: S + `const k = 'futureMemberX';\nvoid server[k];` },
+      { category: 'SERVER unknown-member read', form: 'method EXTRACTION void server.listen (uncalled known method)', source: S + `void server.listen;` },
+      { category: 'SERVER unknown-member read', form: "method EXTRACTION const m = server['close']", source: S + `const m = server['close'];\nvoid m;` },
+      // SERVER — unknown-member CALL.
+      { category: 'SERVER unknown-member call', form: 'server.futureMemberX()', source: S + `server.futureMemberX();` },
+      { category: 'SERVER unknown-member call', form: "server['futureMemberX']()", source: S + `server['futureMemberX']();` },
+      // SERVER — passed to an unknown / indirect callee (mutator never identified).
+      { category: 'SERVER passed to unknown/indirect callee', form: 'declared sink(server)', source: S + `declare function sink(x: unknown): void;\nsink(server);` },
+      { category: 'SERVER passed to unknown/indirect callee', form: 'const define = Object.defineProperty; define(server, ...)', source: S + `const define = Object.defineProperty;\ndefine(server, 'futureMemberX', { value: 1 });` },
+      { category: 'SERVER passed to unknown/indirect callee', form: 'const { defineProperty } = Object; defineProperty(server, ...)', source: S + `const { defineProperty } = Object;\ndefineProperty(server, 'futureMemberX', { value: 1 });` },
+      { category: 'SERVER passed to unknown/indirect callee', form: 'Object.defineProperty.call(Object, server, ...)', source: S + `Object.defineProperty.call(Object, server, 'futureMemberX', { value: 1 });` },
+      { category: 'SERVER passed to unknown/indirect callee', form: 'Reflect.apply(sink, null, [server]) (server in array arg)', source: S + `declare function sink(x: unknown): void;\nReflect.apply(sink, null, [server]);` },
+      { category: 'SERVER passed to unknown/indirect callee', form: 'comma-callee (0, sink)(server)', source: S + `declare function sink(x: unknown): void;\n(0, sink)(server);` },
+      { category: 'SERVER passed to unknown/indirect callee', form: 'element-callee [sink][0](server)', source: S + `declare function sink(x: unknown): void;\n[sink][0](server);` },
+      { category: 'SERVER passed to unknown/indirect callee', form: 'globalThis.Object.defineProperty(server, ...)', source: S + `globalThis.Object.defineProperty(server, 'futureMemberX', { value: 1 });` },
+      // SERVER — member-chain mutation (closes at the first non-allowlisted hop).
+      { category: 'SERVER chain mutation', form: 'server.futureMemberX.deeper = fn', source: S + `(server as any).futureMemberX.deeper = function () { return true; };` },
+      { category: 'SERVER chain mutation', form: 'server.close.call = fn (mutation off a known method value)', source: S + `(server.close as any).call = 1;` },
+      // SERVER — container / value escape.
+      { category: 'SERVER container/value escape', form: 'array literal [server]', source: S + `const holder = [server];\nvoid holder;` },
+      { category: 'SERVER container/value escape', form: 'object value { s: server }', source: S + `const holder = { s: server };\nvoid holder;` },
+      { category: 'SERVER container/value escape', form: 'shorthand object value { server }', source: S + `const holder = { server };\nvoid holder;` },
+      // SERVER — unsupported createServer RESULT shapes.
+      { category: 'SERVER unsupported createServer result shape', form: 'let s = http.createServer(...)', source: H + `let s = http.createServer(() => {});\nvoid s;` },
+      { category: 'SERVER unsupported createServer result shape', form: 'var s = http.createServer(...)', source: H + `var s = http.createServer(() => {});\nvoid s;` },
+      { category: 'SERVER unsupported createServer result shape', form: 'array [http.createServer(...)]', source: H + `const holder = [http.createServer(() => {})];\nvoid holder;` },
+      { category: 'SERVER unsupported createServer result shape', form: 'object { s: http.createServer(...) }', source: H + `const holder = { s: http.createServer(() => {}) };\nvoid holder;` },
+      { category: 'SERVER unsupported createServer result shape', form: 'call argument sink(http.createServer(...))', source: H + `declare function sink(x: unknown): void;\nsink(http.createServer(() => {}));` },
+      { category: 'SERVER unsupported createServer result shape', form: 'destructuring const { listen } = http.createServer(...)', source: H + `const { listen } = http.createServer(() => {});\nvoid listen;` },
+      { category: 'SERVER unsupported createServer result shape', form: 'exported result export const srv = http.createServer(...)', source: H + `export const srv = http.createServer(() => {});` },
+      { category: 'SERVER unsupported createServer result shape', form: 'new-result let s = new http.createServer(...)', source: H + `let s = new http.createServer(() => {});\nvoid s;` },
+      // REQUEST — unknown read / write / escape.
+      { category: 'REQUEST unknown-member read', form: 'dotted read void req.futureMemberX', source: handler(`void req.futureMemberX;`) },
+      { category: 'REQUEST unknown-member read', form: "static-computed void req['futureMemberX']", source: handler(`void req['futureMemberX'];`) },
+      { category: 'REQUEST unknown-member write', form: 'req.futureMemberX = 1', source: handler(`(req as any).futureMemberX = 1;`) },
+      { category: 'REQUEST unknown-member write', form: 'req.method = "X" (write to a KNOWN read member)', source: handler(`(req as any).method = 'X';`) },
+      { category: 'REQUEST escape', form: 'sink(req)', source: handler(`declare function sink(x: unknown): void;\nsink(req);`) },
+      { category: 'REQUEST escape', form: 'array [req]', source: handler(`const holder = [req];\nvoid holder;`) },
+      // RESPONSE — unknown read / call, non-literal write, escape.
+      { category: 'RESPONSE unknown-member read', form: 'dotted read void res.futureMemberX', source: handler(`void res.futureMemberX;`) },
+      { category: 'RESPONSE unknown-member call', form: 'res.futureMemberX()', source: handler(`res.futureMemberX();` ) },
+      { category: 'RESPONSE unknown-member call', form: 'res.writeHead(200) (a non-allowlisted method call)', source: handler(`(res as any).writeHead(200);`) },
+      { category: 'RESPONSE non-literal write', form: 'res.statusCode = code (non-literal RHS)', source: handler(`declare const code: number;\nres.statusCode = code;`) },
+      { category: 'RESPONSE non-literal write', form: 'res.statusCode = req.method ? 200 : 404', source: handler(`res.statusCode = req.method === 'GET' ? 200 : 404;`) },
+      { category: 'RESPONSE escape', form: 'sink(res)', source: handler(`declare function sink(x: unknown): void;\nsink(res);`) },
+      // this-based privileged access — whole-file ThisExpression reservation.
+      { category: 'this-based privileged access', form: 'a bare ThisExpression in the scanned file', source: H + `void (function (this: unknown) {\n  return (this as any).futureMemberX;\n});` },
+      { category: 'this-based privileged access', form: 'a listener reaching this', source: H + `http.createServer(function (this: any) {\n  void this.futureMemberX;\n});` },
+      // factory-result provenance — a local factory return is a proven SERVER.
+      { category: 'factory-result provenance', form: 'wrapperHead server (makeServer() result) misuse', source: wrapperHead + `server.futureMemberX = 1;` },
+      { category: 'factory-result provenance', form: 'inline factory then misuse', source: H + `function make() {\n  return http.createServer(() => {});\n}\nconst s = make();\ns.futureMemberX = 1;` },
+      { category: 'factory-result provenance', form: 'arrow factory then misuse', source: H + `const make = () => http.createServer(() => {});\nconst s = make();\nvoid s.futureMemberX;` },
+      // propagated-parameter provenance — a proven target into a local function propagates.
+      { category: 'propagated-parameter provenance', form: 'SERVER into local use(s) then s misuse', source: S + `function use(s: any): void {\n  s.futureMemberX = 1;\n}\nuse(server);` },
+      { category: 'propagated-parameter provenance', form: 'RESPONSE into local leak(r) then r misuse', source: H + `function leak(r: any): void {\n  void r.futureMemberX;\n}\nhttp.createServer((req: any, res: any) => {\n  leak(res);\n});` },
+      { category: 'propagated-parameter provenance', form: 'REQUEST into local grab(r) then r escape', source: H + `declare function sink(x: unknown): void;\nfunction grab(r: any): void {\n  sink(r);\n}\nhttp.createServer((req: any) => {\n  grab(req);\n});` },
+      // two-hop const-alias provenance.
+      { category: 'two-hop const-alias provenance', form: 'SERVER const s2 = server; const s3 = s2; s3 misuse', source: S + `const s2 = server;\nconst s3 = s2;\ns3.futureMemberX = 1;` },
+      { category: 'two-hop const-alias provenance', form: 'REQUEST const r = req; const r2 = r; r2 misuse', source: handler(`const r = req;\nconst r2 = r;\nvoid r2.futureMemberX;`) },
+    ];
+    for (const { category, form, source } of structuralDeny) {
+      it(`DENIES [${category}] ${form}`, () => {
+        expect(usesOutboundNetwork(source)).toBe(true);
+      });
+    }
+
+    // ---- MUST-ALLOW preservation under the new mechanism: the real host's finite operations. ----
+    const structuralAllow: readonly { readonly form: string; readonly source: string }[] = [
+      { form: 'SERVER .listen(...) on a direct const binding', source: S + `server.listen(4317, '127.0.0.1');` },
+      { form: 'SERVER .close(...) on a direct const binding', source: S + `server.close();` },
+      { form: 'SERVER .listen(...) on a factory result', source: wrapperHead + `server.listen(4317, '127.0.0.1');` },
+      { form: 'SERVER neutral expression-statement position', source: S + `server;` },
+      { form: 'SERVER neutral void position', source: S + `void server;` },
+      { form: 'SERVER two-hop const alias then .listen(...)', source: S + `const s2 = server;\nconst s3 = s2;\ns3.listen(4317);` },
+      { form: 'SERVER factory-return position (return http.createServer(...))', source: H + `function make(): http.Server {\n  return http.createServer(() => {});\n}\nvoid make;` },
+      { form: 'REQUEST .method read', source: handler(`const m = req.method ?? '';\nvoid m;`) },
+      { form: 'REQUEST .url read', source: handler(`const u = req.url ?? '';\nvoid u;`) },
+      { form: "REQUEST static-computed req['method'] read", source: handler(`void req['method'];`) },
+      { form: 'RESPONSE the full demonstrated surface', source: handler(`res.statusCode = 200;\nres.setHeader('X', 'Y');\nres.end('ok');`) },
+      { form: 'RESPONSE statusCode = numeric literal 405', source: handler(`res.statusCode = 405;`) },
+      { form: 'RESPONSE propagation through a local applySecurityHeaders(res)', source: H + `function applySecurityHeaders(r: http.ServerResponse): void {\n  r.setHeader('X', 'Y');\n}\nhttp.createServer((req: http.IncomingMessage, res: http.ServerResponse): void => {\n  applySecurityHeaders(res);\n  res.statusCode = 200;\n  res.end(req.method ?? '');\n});` },
+      { form: 'the exact real-host createCockpitServer shape', source: H + `function applySecurityHeaders(response: http.ServerResponse): void {\n  response.setHeader('Content-Security-Policy', "default-src 'none'");\n}\nfunction pathOf(url: string): string {\n  const q = url.indexOf('?');\n  return q === -1 ? url : url.slice(0, q);\n}\nfunction createCockpitServer(): http.Server {\n  return http.createServer((request: http.IncomingMessage, response: http.ServerResponse): void => {\n    applySecurityHeaders(response);\n    const method = request.method ?? '';\n    if (method !== 'GET') {\n      response.statusCode = 405;\n      response.setHeader('Allow', 'GET');\n      response.end('nope');\n      return;\n    }\n    const path = pathOf(request.url ?? '');\n    void path;\n    response.statusCode = 200;\n    response.end('ok');\n  });\n}\nconst server = createCockpitServer();\nserver.listen(4317, '127.0.0.1');` },
+    ];
+    for (const { form, source } of structuralAllow) {
+      it(`ALLOWS ${form}`, () => {
+        expect(usesOutboundNetwork(source)).toBe(false);
+      });
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
