@@ -1809,6 +1809,36 @@ const acquiresInboundServerSocket = (checker: ts.TypeChecker, sourceFile: ts.Sou
     return symbol !== undefined && reqResSymbols.has(symbol);
   };
 
+  // META-MUTATION CIRCUIT BREAKER — whether an expression is a PROVEN PRIVILEGED TARGET, decided ONLY
+  //     through the EXISTING bounded roots (no new alias graph / taint / call graph / value flow):
+  //       (C/D) a tracked req/res root or its bounded static member chain (`receiverIsReqRes`); OR
+  //       (A) a DIRECT `http.createServer(…)` call / `new` result (`isCreateServerCall`); OR
+  //       (B) that result reached through the SAME bounded unique-`const` alias spine the createServer
+  //           argument resolver uses — `binderUnwrap` transparent wrappers plus `netUniqueConstDecl`
+  //           (binder identity, exactly one `const` declaration), iterated so `const b = a; const a =
+  //           http.createServer(…)` resolves, with an explicit hop cap and a visited-declaration set for
+  //           termination.
+  //     Every OTHER target — a `let`/`var`/parameter/property, a call result (`getServer()`), a spread,
+  //     an ambient binding, an alias cycle — is NOT proven privileged and stays OUTSIDE the finite proof
+  //     (allowed here; the receiver-independent NAME bans still see a syntactic `server.emit`). This is
+  //     bounded local NORMALIZATION scoped to the meta-mutation boundary, NOT value flow: the resolved
+  //     node's value/body/constructor is never read.
+  const targetIsPrivileged = (expr: ts.Expression): boolean => {
+    if (receiverIsReqRes(expr)) return true;
+    let cur: ts.Expression = binderUnwrap(expr);
+    const seen = new Set<ts.Declaration>();
+    for (let hops = 0; hops < CS_ARG_RESOLVE_HOP_CAP; hops++) {
+      if (isCreateServerCall(cur)) return true;
+      if (!ts.isIdentifier(cur)) return false;
+      const decl = netUniqueConstDecl(cur, checker);
+      if (decl === null || decl.initializer === undefined) return false; // let/var/param/property/no-init: stop
+      if (seen.has(decl)) return false; // alias cycle: stop in finite time
+      seen.add(decl);
+      cur = binderUnwrap(decl.initializer); // unique `const` hop (const→const spine included)
+    }
+    return false;
+  };
+
   // RULE A2 (assignment-target walk — MECH-2 object-rest + nested fail-close) — the assignment twin of
   //     `scanReqResBindingPattern`, walked over the finite ObjectLiteral/ArrayLiteral DESTRUCTURING
   //     TARGET of an `=` whose right-hand side is a tracked req/res receiver. Per property: a
@@ -2049,6 +2079,29 @@ const acquiresInboundServerSocket = (checker: ts.TypeChecker, sourceFile: ts.Sou
         } else if (key.kind === 'indeterminate' && target !== undefined && receiverIsReqRes(target)) {
           found = true;
         }
+      }
+    }
+    // META-MUTATION CIRCUIT BREAKER — a direct call to a FREE, unshadowed built-in META-MUTATION API
+    //     (`isMetaMutationCallee`: `Object.defineProperty`/`defineProperties`/`assign`/`setPrototypeOf`,
+    //     `Reflect.defineProperty`/`setPrototypeOf`/`set` — dotted or bounded static element form) INSTALLS
+    //     behavior on / re-parents its FIRST argument as a first-class value, so no `server.emit` member
+    //     node exists for RULE A's name ban to see. The disposition is TARGET-GATED, never key-gated:
+    //     DENY iff the target argument is a PROVEN PRIVILEGED TARGET (`targetIsPrivileged` — a createServer
+    //     result, direct or via the bounded unique-`const` spine, or a tracked req/res root). The member
+    //     KEY / descriptor / source / prototype is NEVER inspected — that is the entire circuit-breaker:
+    //     `Object.defineProperty(server, 'futureMemberX', …)` denies exactly like `…(server, 'emit', …)`,
+    //     with no `emit`/`on`/`constructor` enumeration. An UNPRIVILEGED target
+    //     (`Object.defineProperty(config, 'emit', …)`, `Object.assign({}, { emit: 1 })`), a non-mutating
+    //     API outside the inventory (`Object.freeze(server)`), reading FROM a server into a fresh object
+    //     (`Object.assign({}, server)`), and an unprovable target (`Object.defineProperty(getServer(), …)`
+    //     — value flow / arbitrary return, outside the finite proof) all stay allowed. A SPREAD in the
+    //     target position (`Object.defineProperty(...args)`) is unsupported target propagation and stays
+    //     outside the proof. Because the gate is on the target, an indeterminate KEY at a privileged
+    //     target is already fail-closed (the target alone denies); no key resolution is needed.
+    if (ts.isCallExpression(node) && isMetaMutationCallee(node.expression, checker, sourceFile)) {
+      const target = node.arguments[0];
+      if (target !== undefined && !ts.isSpreadElement(target) && targetIsPrivileged(target)) {
+        found = true;
       }
     }
     ts.forEachChild(node, visit);
@@ -2410,6 +2463,64 @@ const isSockReflectiveReadCallee = (callee: ts.Expression, checker: ts.TypeCheck
   } else {
     try {
       const key = netResolveKey(c.argumentExpression, checker, new Set<ts.Declaration>(), new Map<ts.Declaration, NetKey>(), { spent: 0 }, 0, MAX_SOCK_REFLECTIVE_API_LENGTH);
+      member = key.kind === 'resolved' ? key.value : null;
+    } catch (error) {
+      if (!(error instanceof NetResolveAbort)) throw error;
+      member = null;
+    }
+  }
+  return member !== null && apis.has(member);
+};
+
+// META-MUTATION CIRCUIT BREAKER (reflective/meta-mutation sibling family) — the FINITE, closed
+// inventory of free built-in META-MUTATION APIs that INSTALL behavior on / RE-PARENT a target object by
+// operating on it as a first-class value (a KEY/DESCRIPTOR/SOURCE/PROTOTYPE argument), bypassing RULE
+// A's syntactic member-name ban: `Object.defineProperty`/`defineProperties`/`assign`/`setPrototypeOf`
+// and `Reflect.defineProperty`/`setPrototypeOf`/`set` (`Reflect.set` is the reflective property WRITE, the
+// function twin of `server[key] = fn`, installing behavior under a key with no member node).
+// Node invokes a server's OWN `emit('connection', socket)`
+// internally, so replacing (or shadowing, via a re-parented prototype) ANY member of a privileged server
+// delivers the live socket — the danger is the MUTATION of a privileged target, not a particular member
+// name. This is the mutation twin of `SOCK_REFLECTIVE_READ_APIS`, keyed by base identifier the SAME way;
+// like it, it is NOT a general reflective/value-flow model. Pure READS that merely EXPOSE the surface
+// (`Object.getOwnPropertyDescriptors`, `Object.getPrototypeOf`, `Reflect.getPrototypeOf`) are DELIBERATELY
+// excluded: their weaponization requires either NAMING the extracted member (already denied
+// receiver-independently by RULE A — `getPrototypeOf(server).emit` is a `.emit` access) or VALUE FLOW
+// (outside the frozen boundary); a read creates no authority, so no authority-creation reason admits it.
+// Capability-REMOVING APIs (`Object.freeze`/`seal`/`preventExtensions`) are excluded for the same reason.
+const META_MUTATION_APIS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  ['Object', new Set(['defineProperty', 'defineProperties', 'assign', 'setPrototypeOf'])],
+  ['Reflect', new Set(['defineProperty', 'setPrototypeOf', 'set'])],
+]);
+// The longest API name (`defineProperties` = 16), DERIVED from the inventory so a static element-access
+// spelling of the member (`Object['definePro' + 'perties']`) folds to it rather than being pruned as
+// NotCapability under the narrower socket/network ceilings.
+const MAX_META_MUTATION_API_LENGTH = Math.max(
+  ...[...META_MUTATION_APIS.values()].flatMap((names) => [...names]).map((name) => name.length),
+);
+// Whether a call callee is a DIRECT free built-in META-MUTATION member: a dotted
+// `Object.defineProperty` / `Reflect.setPrototypeOf` (optional chaining included) or a bounded static
+// element access `Object['assign']` / `Object['definePro' + 'perties']`, with the member name resolved by
+// the SAME `netResolveKey` machinery (binder identity, never identifier text) at the API-name ceiling,
+// off a BASE identifier the binder proves UNSHADOWED — the `isSockReflectiveReadCallee` structure reused
+// verbatim (`hasLocalRuntimeShadow`): a local `const Object = { defineProperty() {} }` is an ordinary
+// object. An aliased base (`const O = Object`), a runtime member key (`Object[k]`), or a shadowed base all
+// fail this — one statically identifiable built-in member, no alias, no call/apply/bind, no wrapper.
+const isMetaMutationCallee = (callee: ts.Expression, checker: ts.TypeChecker, sourceFile: ts.SourceFile): boolean => {
+  const c = binderUnwrap(callee);
+  if (!ts.isPropertyAccessExpression(c) && !ts.isElementAccessExpression(c)) return false;
+  const base = binderUnwrap(c.expression);
+  if (!ts.isIdentifier(base)) return false;
+  const apis = META_MUTATION_APIS.get(base.text);
+  if (apis === undefined) return false;
+  const symbol = checker.getSymbolAtLocation(base);
+  if (symbol !== undefined && hasLocalRuntimeShadow(symbol, sourceFile)) return false;
+  let member: string | null;
+  if (ts.isPropertyAccessExpression(c)) {
+    member = c.name.text;
+  } else {
+    try {
+      const key = netResolveKey(c.argumentExpression, checker, new Set<ts.Declaration>(), new Map<ts.Declaration, NetKey>(), { spent: 0 }, 0, MAX_META_MUTATION_API_LENGTH);
       member = key.kind === 'resolved' ? key.value : null;
     } catch (error) {
       if (!(error instanceof NetResolveAbort)) throw error;
@@ -6624,6 +6735,123 @@ describe('D3 host enforces the final bounded socket-capability source policy (D3
   ];
   for (const { form, source } of emitAllow) {
     it(`allows ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+
+  // --- META-MUTATION CIRCUIT BREAKER (reflective/meta-mutation sibling family) — a GENERIC
+  //     meta-mutation built-in (`Object.defineProperty`/`defineProperties`/`assign`/`setPrototypeOf`,
+  //     `Reflect.defineProperty`/`setPrototypeOf`) applied to a PROVEN PRIVILEGED TARGET installs
+  //     attacker-controlled behavior under a member WITHOUT any `server.emit` member node for RULE A's
+  //     name ban to see — Node then invokes the server's OWN `emit('connection', socket)` internally and
+  //     delivers the live socket. Closed by ONE canonical rule: recognized `META_MUTATION_APIS` callee +
+  //     `targetIsPrivileged(arg0)`. The TARGET gate is the whole mechanism, so the specific member key is
+  //     IRRELEVANT (no `emit`/`on`/`constructor`/`futureMemberX` enumeration) — #15 is the key-independence
+  //     witness. A privileged target is proven ONLY through existing bounded roots: a direct
+  //     `http.createServer` call/new, that result through the bounded unique-`const` alias spine, or a
+  //     tracked req/res root (`receiverIsReqRes`). MUST REJECT. ---
+  const metaServerHead = H + `const server = http.createServer(() => {});\n`;
+  const metaReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: '1. Object.defineProperty(server, "emit", { value })', source: metaServerHead + `Object.defineProperty(server, 'emit', { value() { return true; } });` },
+    { form: '2. Object.defineProperty(server, "on", { value })', source: metaServerHead + `Object.defineProperty(server, 'on', { value() { return true; } });` },
+    { form: '3. Object.defineProperty(server, "constructor", { value })', source: metaServerHead + `Object.defineProperty(server, 'constructor', { value() { return true; } });` },
+    { form: '4. Reflect.defineProperty(server, "emit", descriptor)', source: metaServerHead + `Reflect.defineProperty(server, 'emit', { value() { return true; } });` },
+    { form: '5. Object.defineProperties(server, { emit: { value } })', source: metaServerHead + `Object.defineProperties(server, { emit: { value() { return true; } } });` },
+    { form: '6. Object.assign(server, { emit })', source: metaServerHead + `Object.assign(server, { emit() { return true; } });` },
+    { form: '7. Object.setPrototypeOf(server, evilProto)', source: metaServerHead + `Object.setPrototypeOf(server, {});` },
+    { form: '8. Reflect.setPrototypeOf(server, evilProto)', source: metaServerHead + `Reflect.setPrototypeOf(server, {});` },
+    { form: '9a. server reached through the bounded const-alias spine', source: metaServerHead + `const s2 = server;\nconst s3 = s2;\nObject.defineProperty(s3, 'emit', { value() { return true; } });` },
+    { form: '9b. the direct createServer call result as target', source: H + `Object.defineProperty(http.createServer(() => {}), 'emit', { value() { return true; } });` },
+    { form: '10. a proven req target', source: handler(`Object.defineProperty(req, 'emit', { value() { return true; } });`) },
+    { form: '11. a proven res target', source: handler(`Object.defineProperty(res, 'emit', { value() { return true; } });`) },
+    { form: '12. computed-static key const k = "emit"; …(server, k, …)', source: metaServerHead + `const k = 'emit';\nObject.defineProperty(server, k, { value() { return true; } });` },
+    { form: '13. binder-resolved concatenated key …(server, "em" + "it", …)', source: metaServerHead + `Object.defineProperty(server, 'em' + 'it', { value() { return true; } });` },
+    { form: '14. full Codex emit replacement + live-socket outbound reconnect witness', source: metaServerHead + `Object.defineProperty(server, 'emit', {\n  value(event: string, ...values: unknown[]): boolean {\n    if (event === 'connection') {\n      const socket = values[0] as { destroy(): void; connect(p: number, h: string): void };\n      socket.destroy();\n      setTimeout(() => socket.connect(80, 'example.com'), 50);\n    }\n    return true;\n  },\n});` },
+    { form: '15. future-member key witness …(server, "futureMemberX", …) — key-independence', source: metaServerHead + `Object.defineProperty(server, 'futureMemberX', { value() { return true; } });` },
+  ];
+  for (const { form, source } of metaReject) {
+    it(`rejects a meta-mutation of a privileged target: ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // --- META-MUTATION CIRCUIT BREAKER — FALSE-POSITIVE CONTROLS. The rule is TARGET-GATED, never
+  //     key-gated: a meta-mutation of an UNRELATED target stays allowed even when the key is `emit`/
+  //     `socket`; benign non-mutating `Object.*` APIs (`freeze`/`seal`/`preventExtensions`, which REMOVE
+  //     capability and are deliberately outside `META_MUTATION_APIS`) stay allowed on any target; reading
+  //     FROM a privileged server into a fresh object (`Object.assign({}, server)`) is arg0-unprivileged;
+  //     and ordinary host/string uses are untouched. MUST ALLOW. ---
+  const metaAllow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'Object.defineProperty(config, "emit", …) on an unrelated object', source: `const config = { a: 1 };\nObject.defineProperty(config, 'emit', { value() { return true; } });` },
+    { form: 'Object.defineProperty(config, "socket", …) on an unrelated object', source: `const config = { a: 1 };\nObject.defineProperty(config, 'socket', { value() { return true; } });` },
+    { form: 'Object.assign({}, harmless)', source: `const harmless = { a: 1 };\nObject.assign({}, harmless);` },
+    { form: 'Object.assign({}, { emit: 1 })', source: `Object.assign({}, { emit: 1 });` },
+    { form: 'Object.assign({}, server) — reading FROM a privileged server (arg0 unprivileged)', source: metaServerHead + `Object.assign({}, server);` },
+    { form: 'Object.freeze(benignObject)', source: `const benignObject = { a: 1 };\nObject.freeze(benignObject);` },
+    { form: 'Object.seal(benignObject)', source: `const benignObject = { a: 1 };\nObject.seal(benignObject);` },
+    { form: 'Object.preventExtensions(benignObject)', source: `const benignObject = { a: 1 };\nObject.preventExtensions(benignObject);` },
+    { form: 'Object.freeze(server) on a privileged target — non-mutating, outside META_MUTATION_APIS', source: metaServerHead + `Object.freeze(server);` },
+    { form: 'ordinary benign Object.defineProperty on an unrelated target', source: `const obj = { a: 1 };\nObject.defineProperty(obj, 'x', { value: 1 });\nvoid Object.keys(obj);` },
+    { form: "res.setHeader('connection', 'close')", source: handler(`res.setHeader('connection', 'close');`) },
+    { form: "map.get('connection')", source: `declare const map: { get(k: string): unknown };\nvoid map.get('connection');` },
+    { form: "log('socket')", source: `declare function log(m: string): void;\nlog('socket');` },
+    { form: "log('emit')", source: `declare function log(m: string): void;\nlog('emit');` },
+  ];
+  for (const { form, source } of metaAllow) {
+    it(`allows a benign / unprivileged meta-op: ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+
+  // --- META-MUTATION CIRCUIT BREAKER — DOCUMENTED OUTSIDE BOUNDARY. Target propagation through an
+  //     arbitrary call result or a function return is NOT part of the finite proof (no value flow, call
+  //     graph, or container round-trip). These meta-mutations of a genuinely-privileged-at-runtime server
+  //     reached through an unprovable target therefore stay OUTSIDE the boundary and are NOT closed here
+  //     — asserted so the boundary is explicit and honest, exactly as `createServer(getOptions())` stays
+  //     outside the frozen positive model. The receiver-independent NAME bans still catch a syntactic
+  //     `server.emit` on these servers; only the target-gated meta-mutation is out of reach. ---
+  const metaBoundaryAllow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'Object.defineProperty(getServer(), "emit", …) — arbitrary call-result target', source: H + `declare function getServer(): http.Server;\nObject.defineProperty(getServer(), 'emit', { value() { return true; } });` },
+    { form: 'a function-return server (const server = makeServer()) target', source: wrapperHead + `Object.defineProperty(server, 'emit', { value() { return true; } });` },
+  ];
+  for (const { form, source } of metaBoundaryAllow) {
+    it(`leaves outside the finite proof (documented boundary): ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+
+  // --- META-MUTATION CIRCUIT BREAKER — FINAL FAMILY MEMBER `Reflect.set` (reflective property WRITE).
+  //     `Reflect.set(target, key, value)` is the function twin of `target[key] = value`: it installs
+  //     attacker behavior under ANY member of a proven privileged target with NO `server.emit` member
+  //     node, exactly like `Reflect.defineProperty`. It joins the SAME target-gated `META_MUTATION_APIS`
+  //     family (`Reflect` → …, `'set'`) — no `Reflect.set`-specific branch, no `emit`/key logic; the
+  //     target gate alone decides, so any key (`emit`/`on`/`constructor`/`futureMemberX`) denies on a
+  //     proven server/req/res. MUST REJECT. ---
+  const reflectSetReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: "Reflect.set(server, 'emit', fn)", source: metaServerHead + `Reflect.set(server, 'emit', function () { return true; });` },
+    { form: "Reflect.set(server, 'on', fn)", source: metaServerHead + `Reflect.set(server, 'on', function () { return true; });` },
+    { form: "Reflect.set(server, 'constructor', fn)", source: metaServerHead + `Reflect.set(server, 'constructor', function () { return true; });` },
+    { form: "computed-static key const k = 'emit'; Reflect.set(server, k, fn)", source: metaServerHead + `const k = 'emit';\nReflect.set(server, k, function () { return true; });` },
+    { form: "Reflect.set(constAliasServer, 'futureMemberX', fn) — spine + key-independence", source: metaServerHead + `const s2 = server;\nReflect.set(s2, 'futureMemberX', function () { return true; });` },
+    { form: "Reflect.set(req, 'futureMemberX', fn)", source: handler(`Reflect.set(req, 'futureMemberX', function () { return true; });`) },
+    { form: "Reflect.set(res, 'futureMemberX', fn)", source: handler(`Reflect.set(res, 'futureMemberX', function () { return true; });`) },
+  ];
+  for (const { form, source } of reflectSetReject) {
+    it(`rejects the reflective-write final family member: ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // --- META-MUTATION CIRCUIT BREAKER — `Reflect.set` FALSE-POSITIVE CONTROLS: the rule stays
+  //     TARGET-gated, never key-gated, so a reflective write to an UNRELATED target is allowed even with
+  //     an `emit`/`socket`/future-member key. MUST ALLOW. ---
+  const reflectSetAllow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: "Reflect.set(config, 'emit', fn) on an unrelated object", source: `const config = { a: 1 };\nReflect.set(config, 'emit', function () { return true; });` },
+    { form: "Reflect.set({}, 'socket', value)", source: `Reflect.set({}, 'socket', 1);` },
+    { form: "Reflect.set(unrelatedObject, 'futureMemberX', value)", source: `const unrelatedObject = { a: 1 };\nReflect.set(unrelatedObject, 'futureMemberX', 1);` },
+  ];
+  for (const { form, source } of reflectSetAllow) {
+    it(`allows a reflective write to an unprivileged target: ${form}`, () => {
       expect(usesOutboundNetwork(source)).toBe(false);
     });
   }
