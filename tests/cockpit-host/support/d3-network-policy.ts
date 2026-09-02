@@ -21,6 +21,7 @@
  * One concept, one implementation: `valueSymbolOf` is the only symbol
  * resolution path; `resolveStaticKey` is the only key resolver;
  * `resolvePropagationParameter` is the only parameter-propagation predicate;
+ * `expressionFacts` is the only expression-authority lookup;
  * `Context.facts` is the only provenance map; `runFixpoint` is the only fixpoint.
  */
 
@@ -790,12 +791,40 @@ function factsOf(ctx: Context, symbol: ts.Symbol | undefined): readonly Fact[] {
   });
 }
 
-/** Authority classes carried by an expression (createServer result, factory result, or proven identifier). */
-function classesOf(ctx: Context, expression: ts.Expression): ReadonlySet<AuthorityClass> {
+/**
+ * THE expression-authority lookup: the facts an expression carries — SERVER:ROOT
+ * for a proven createServer or confined factory result, a proven identifier's
+ * facts, or, through receiver-call result authority inheritance, the facts of
+ * the receiver named by `inheritingReceiverOf`.
+ */
+function expressionFacts(ctx: Context, expression: ts.Expression): readonly Fact[] {
   const node = unwrap(expression);
-  if (isProvenCreateServerCall(ctx, node) || isConfinedFactoryCall(ctx, node)) return new Set(['SERVER']);
-  if (ts.isIdentifier(node)) return new Set(factsOf(ctx, valueSymbolOf(ctx.checker, node)).map((fact) => fact.authority));
-  return new Set();
+  if (isProvenCreateServerCall(ctx, node) || isConfinedFactoryCall(ctx, node)) return [{ authority: 'SERVER', origin: 'ROOT' }];
+  if (ts.isIdentifier(node)) return factsOf(ctx, valueSymbolOf(ctx.checker, node));
+  const receiver = inheritingReceiverOf(ctx, node);
+  return receiver === null ? [] : expressionFacts(ctx, receiver);
+}
+
+/**
+ * Receiver-call result authority inheritance: the receiver whose authority a
+ * call result conservatively retains. `node` must be a direct, non-optional
+ * call whose callee is a member access on an authority-carrying receiver that
+ * passes the positive member policy of every class the receiver carries.
+ * Nothing about the member's runtime semantics is proven by its name; the
+ * result is simply never allowed to become an unrestricted value.
+ */
+function inheritingReceiverOf(ctx: Context, node: ts.Node): ts.Expression | null {
+  if (!ts.isCallExpression(node) || node.questionDotToken !== undefined) return null;
+  const callee = unwrap(node.expression);
+  if (!isMemberAccess(callee)) return null;
+  const classes = classesOf(ctx, callee.expression);
+  if (classes.size === 0) return null;
+  return [...classes].every((authority) => memberAllowed(ctx, authority, callee)) ? callee.expression : null;
+}
+
+/** Authority classes carried by an expression, through `expressionFacts`. */
+function classesOf(ctx: Context, expression: ts.Expression): ReadonlySet<AuthorityClass> {
+  return new Set(expressionFacts(ctx, expression).map((fact) => fact.authority));
 }
 
 /** Whether a symbol is SERVER through a non-PARAM origin (root result or alias of one). */
@@ -885,8 +914,8 @@ function runFixpoint(ctx: Context): FixpointReport {
       const initializer = unwrap(declaration.initializer);
       if (isProvenCreateServerCall(ctx, initializer) || isConfinedFactoryCall(ctx, initializer)) {
         if (addFact(ctx, symbol, { authority: 'SERVER', origin: 'ROOT' })) changed = true;
-      } else if (ts.isIdentifier(initializer)) {
-        for (const fact of factsOf(ctx, valueSymbolOf(ctx.checker, initializer))) {
+      } else {
+        for (const fact of expressionFacts(ctx, initializer)) {
           const origin: AuthorityOrigin = fact.origin === 'PARAM' ? 'PARAM' : 'ALIAS';
           if (addFact(ctx, symbol, { authority: fact.authority, origin })) changed = true;
         }
@@ -919,9 +948,22 @@ function runFixpoint(ctx: Context): FixpointReport {
 // Phase B: classification against the positive policies
 // ---------------------------------------------------------------------------
 
-const isDirectCallee = (access: ts.Expression): boolean => {
+/** The direct, non-optional call whose callee is `access` (through wrappers), or null. */
+const directCallOf = (access: ts.Expression): ts.CallExpression | null => {
   const { node, parent } = climb(access);
-  return ts.isCallExpression(parent) && parent.expression === node && parent.questionDotToken === undefined;
+  return ts.isCallExpression(parent) && parent.expression === node && parent.questionDotToken === undefined ? parent : null;
+};
+
+const isDirectCallee = (access: ts.Expression): boolean => directCallOf(access) !== null;
+
+/**
+ * The call, optional or not, whose callee is `access` (through wrappers), or
+ * null. Global-receiver path only: an optional call of a permitted global
+ * member yields the same result as the plain call, so both are followed.
+ */
+const memberCallOf = (access: ts.Expression): ts.CallExpression | null => {
+  const { node, parent } = climb(access);
+  return ts.isCallExpression(parent) && parent.expression === node ? parent : null;
 };
 
 const isNumericLiteralAssignment = (access: ts.Expression): boolean => {
@@ -1072,11 +1114,16 @@ function checkCreateServerBindingUse(ctx: Context, id: ts.Identifier): void {
   }
 }
 
-/** Shared verdict for a key read off a global receiver; `onSelfHop` handles a resolved global-root key. */
-function checkGlobalKey(ctx: Context, key: StaticKey, at: ts.Node, onSelfHop: () => void): void {
+/**
+ * Shared verdict for a key read off a global receiver; `onSelfHop` handles a
+ * resolved global-root key. Returns whether the key is a permitted static member.
+ */
+function checkGlobalKey(ctx: Context, key: StaticKey, at: ts.Node, onSelfHop: () => void): boolean {
   if (key.kind === 'INDETERMINATE') deny(ctx, 'GLOBAL_RECEIVER_RUNTIME_KEY', at);
   else if (isResolvedTo(key, NETWORK_GLOBAL_NAMES)) deny(ctx, 'GLOBAL_RECEIVER_NETWORK_MEMBER', at);
   else if (isResolvedTo(key, GLOBAL_RECEIVER_NAMES)) onSelfHop();
+  else return true;
+  return false;
 }
 
 function checkGlobalBindingPattern(ctx: Context, pattern: ts.BindingPattern): void {
@@ -1126,9 +1173,14 @@ function checkGlobalReceiverUse(ctx: Context, expression: ts.Expression): void {
   const { node, parent } = climb(expression);
   if (ts.isExpressionStatement(parent) || ts.isVoidExpression(parent) || ts.isTypeOfExpression(parent)) return;
   if (isMemberAccess(parent) && parent.expression === node) {
-    checkGlobalKey(ctx, memberKey(ctx, parent), parent, () => {
+    const permitted = checkGlobalKey(ctx, memberKey(ctx, parent), parent, () => {
       checkGlobalReceiverUse(ctx, parent);
     });
+    // Receiver-call result authority inheritance: the result of a call of a
+    // permitted static member, optional or not, conservatively retains
+    // global-root authority and is checked as such.
+    const call = permitted ? memberCallOf(parent) : null;
+    if (call !== null) checkGlobalReceiverUse(ctx, call);
     return;
   }
   if (ts.isVariableDeclaration(parent) && parent.initializer === node) {
@@ -1164,8 +1216,13 @@ function classify(ctx: Context): void {
     if (classes.size > 0) for (const id of reads) checkTargetUse(ctx, id, classes);
   }
   for (const call of ctx.calls) {
-    if (isProvenCreateServerCall(ctx, call)) checkCreateServerCall(ctx, call);
-    else if (isConfinedFactoryCall(ctx, call)) checkTargetUse(ctx, call, new Set(['SERVER']));
+    if (isProvenCreateServerCall(ctx, call)) {
+      checkCreateServerCall(ctx, call);
+      continue;
+    }
+    // Confined factory results and receiver-call results carry authority into their use site.
+    const classes = classesOf(ctx, call);
+    if (classes.size > 0) checkTargetUse(ctx, call, classes);
   }
 }
 
