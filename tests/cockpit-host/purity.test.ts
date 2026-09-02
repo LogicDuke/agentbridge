@@ -2171,6 +2171,18 @@ const acquiresInboundServerSocket = (checker: ts.TypeChecker, sourceFile: ts.Sou
       return ts.isArrowFunction(init) || ts.isFunctionExpression(init) ? init : null;
     };
 
+    // SHARED PROPAGATION ELIGIBILITY (the single source of truth for BOTH phases). The ONLY parameter
+    // shape into which Phase A propagates a proven authority class, and therefore the ONLY shape at
+    // which Phase B may allow a proven argument to escape into a local callee: a PRESENT, NON-REST,
+    // plain-IDENTIFIER parameter. A rest parameter, an object/array destructuring pattern, or a missing
+    // parameter (fewer parameters than arguments) is UNSUPPORTED — it never receives the class in
+    // Phase A, so allowing the call would let the argument escape the structural policy. Both phases
+    // consult this rule, so the Phase-A propagation set and the Phase-B allow set cannot disagree: a
+    // call is NOT permitted merely because `resolveLocalFunction` succeeds. Returns the parameter's
+    // binding identifier when supported (Phase A keys provenance by its symbol), else null.
+    const supportedPropagationParamName = (param: ts.ParameterDeclaration | undefined): ts.Identifier | null =>
+      param !== undefined && param.dotDotDotToken === undefined && ts.isIdentifier(param.name) ? param.name : null;
+
     // Whether a VariableDeclaration is a UNIQUE NON-EXPORTED `const` with an identifier name — the
     // sole approved alias / createServer-result binding shape. A `let`/`var`, an exported binding, or
     // a destructuring name is NOT confined and denies (an unsupported result shape / identity escape).
@@ -2287,6 +2299,15 @@ const acquiresInboundServerSocket = (checker: ts.TypeChecker, sourceFile: ts.Sou
     };
 
     // ---- Phase A — bounded fixpoint over provenance (roots, aliases, factories, propagation). ----
+    // TERMINATION: provenance facts (a symbol gaining an authority class; a node becoming a factory)
+    //     are added MONOTONICALLY and never removed, over a FINITE symbol × {SERVER,REQUEST,RESPONSE}
+    //     lattice, so the loop strictly ascends and must reach a fixed point in finitely many steps;
+    //     `D3_ITERATION_CAP` bounds the work regardless. The loop has an EXPLICIT terminal state:
+    //     CONVERGED (an iteration adds no fact → `break` with `converged = true`) or EXHAUSTED (the
+    //     cap is consumed while a fact was still added on the final iteration → `converged` stays
+    //     false). A reverse-ordered forwarding chain advances one authority hop per pass, so a chain
+    //     longer than the cap EXHAUSTS with its deepest parameter still unclassified.
+    let converged = false;
     for (let iter = 0; iter < D3_ITERATION_CAP; iter++) {
       // A holder object (not a bare `let`), so the flag mutated inside the nested walk callbacks is
       //     read as `boolean` after those calls return — a plain `let` would be flow-narrowed to its
@@ -2338,9 +2359,10 @@ const acquiresInboundServerSocket = (checker: ts.TypeChecker, sourceFile: ts.Sou
               if (ts.isSpreadElement(arg)) return;
               const classes = classesOfValue(arg);
               if (classes.length === 0) return;
-              const param = fn.parameters[index];
-              if (param === undefined || param.dotDotDotToken !== undefined || !ts.isIdentifier(param.name)) return;
-              const symbol = checker.getSymbolAtLocation(param.name);
+              // Propagate ONLY into a SUPPORTED parameter shape (the same rule Phase B allows on).
+              const name = supportedPropagationParamName(fn.parameters[index]);
+              if (name === null) return; // rest / destructuring / missing parameter: no propagation
+              const symbol = checker.getSymbolAtLocation(name);
               for (const cls of classes) if (addClass(symbol, cls)) flags.changed = true;
             });
           }
@@ -2348,8 +2370,15 @@ const acquiresInboundServerSocket = (checker: ts.TypeChecker, sourceFile: ts.Sou
         ts.forEachChild(n, walkPropagation);
       };
       ts.forEachChild(sourceFile, walkPropagation);
-      if (!flags.changed) break;
+      if (!flags.changed) {
+        converged = true;
+        break;
+      }
     }
+    // CONVERGENCE GATE (F2): if the fixpoint EXHAUSTED the cap while still adding provenance, the map
+    //     is known-partial — a privileged parameter may remain unclassified and its capability read
+    //     would escape Phase B — so fail CLOSED rather than classify against an incomplete map.
+    if (!converged) found = true;
 
     // ---- Phase B — classify every USE of a proven target by its structural POSITION. ----
     const memberReadAllowed = (name: string, cls: D3Class): boolean =>
@@ -2440,9 +2469,17 @@ const acquiresInboundServerSocket = (checker: ts.TypeChecker, sourceFile: ts.Sou
           const key = sockResolveKey(keyArg, checker, sockMemo);
           return key.kind === 'resolved' && memberReadAllowed(key.value, cls);
         }
-        // (2) an approved propagating local function (the parameter was tainted in Phase A)
-        if (resolveLocalFunction(p.expression) !== null) return true;
-        return false; // any other callee: DENY (Object.defineProperty, aliased mutator, comma/element callee, …)
+        // (2) an approved propagating local function — allowed ONLY if the corresponding parameter
+        //     position is a SUPPORTED shape (the identical `supportedPropagationParamName` rule Phase A
+        //     propagates on). A rest / destructuring / missing parameter never carried the class in
+        //     Phase A, so letting the argument escape here would defeat the structural policy: DENY.
+        //     A call is NEVER allowed merely because the callee resolves locally.
+        const fn = resolveLocalFunction(p.expression);
+        if (fn !== null) {
+          const argIndex = p.arguments.indexOf(w as ts.Expression);
+          if (argIndex >= 0 && supportedPropagationParamName(fn.parameters[argIndex]) !== null) return true;
+        }
+        return false; // any other callee / unsupported parameter: DENY (Object.defineProperty, aliased mutator, comma/element callee, rest/destructuring parameter, …)
       }
       if (ts.isNewExpression(p) && (p.arguments ?? []).some((a) => a === w)) return false;
       return false; // container element / object value / spread / export / any other escape
@@ -8359,6 +8396,102 @@ describe('D3 host enforces the final bounded socket-capability source policy (D3
         expect(usesOutboundNetwork(source)).toBe(false);
       });
     }
+  });
+
+  // =====================================================================================
+  // PR #64 — PROVENANCE PROPAGATION SOUNDNESS + CONVERGENCE (Codex F1 + F2). ONE structural
+  // family: bounded local-parameter propagation that is sound (F1) and terminating (F2).
+  //
+  //   F1 (LOCAL PROPAGATION PERMISSION): a proven SERVER/REQUEST/RESPONSE argument may escape into
+  //     a local callee ONLY when the corresponding parameter position is itself SUPPORTED — a
+  //     present, non-rest, plain-identifier parameter that actually receives the authority class in
+  //     Phase A. A rest / object-destructuring / array-destructuring / missing parameter never
+  //     carries the class, so the call-site MUST fail closed. Phase-A propagation and the Phase-B
+  //     call-allowance derive from the SAME `supportedPropagationParamName` rule, so they cannot
+  //     disagree — a call is NOT allowed merely because the callee resolves locally.
+  //
+  //   F2 (CONVERGENCE): the bounded provenance fixpoint has an explicit terminal state. CONVERGED —
+  //     an iteration adds no new fact — proceeds to Phase B. EXHAUSTED — the final permitted
+  //     iteration still added a fact — DENIES the source (the map is known-partial; a privileged
+  //     parameter may remain unclassified). Termination measure: a finite symbol × authority-class
+  //     lattice with MONOTONIC fact addition, bounded by the 64-iteration cap. A reverse-ordered
+  //     forwarding chain advances exactly one authority hop per pass, so a chain longer than the cap
+  //     EXHAUSTS and fails closed instead of letting the deepest parameter escape unclassified.
+  // =====================================================================================
+  describe('D3 propagation soundness + convergence (PR #64 F1/F2)', () => {
+    // ---- F1: a proven argument into an UNSUPPORTED parameter shape MUST DENY. ----
+    const f1Deny: readonly { readonly form: string; readonly source: string }[] = [
+      { form: '1. REQUEST into a rest parameter use(...values)', source: H + RK + `function use(...values: any[]): void {\n  const s = values[0][rk];\n  s.connect(80, 'example.com');\n}\nhttp.createServer((req: any) => {\n  use(req);\n});` },
+      { form: '2. RESPONSE into a rest parameter use(...values)', source: H + `function use(...values: any[]): void {\n  values[0].futureMemberX();\n}\nhttp.createServer((req: any, res: any) => {\n  use(res);\n});` },
+      { form: '3. SERVER into a rest parameter use(...values)', source: metaServerHead + `function use(...values: any[]): void {\n  values[0].futureMemberX = 1;\n}\nuse(server);` },
+      { form: '4. REQUEST into an object-destructuring parameter use({ url })', source: H + `function use({ url }: any): void {\n  void url;\n}\nhttp.createServer((req: any) => {\n  use(req);\n});` },
+      { form: '5. REQUEST into an array-destructuring parameter use([first])', source: H + `function use([first]: any): void {\n  void first;\n}\nhttp.createServer((req: any) => {\n  use(req);\n});` },
+      { form: '6. RESPONSE into an object-destructuring parameter use({ end })', source: H + `function use({ end }: any): void {\n  void end;\n}\nhttp.createServer((req: any, res: any) => {\n  use(res);\n});` },
+      { form: '7. SERVER into an object-destructuring parameter use({ listen })', source: metaServerHead + `function use({ listen }: any): void {\n  void listen;\n}\nuse(server);` },
+      { form: '8. REQUEST where the callee has NO corresponding parameter use()', source: H + `function use(): void {}\nhttp.createServer((req: any) => {\n  use(req);\n});` },
+    ];
+    for (const { form, source } of f1Deny) {
+      it(`DENIES (F1 unsupported-parameter escape) ${form}`, () => {
+        expect(usesOutboundNetwork(source)).toBe(true);
+      });
+    }
+
+    // ---- F1: a proven argument into a SUPPORTED simple-identifier parameter, plus a benign call
+    //      into an unsupported shape (no proven argument), stay ALLOWED (preserve real-host policy). ----
+    const f1Allow: readonly { readonly form: string; readonly source: string }[] = [
+      { form: '9. REQUEST into a simple identifier use(r) then r.method', source: H + `function use(r: any): void {\n  void r.method;\n}\nhttp.createServer((req: any) => {\n  use(req);\n});` },
+      { form: '10. RESPONSE into a simple identifier use(r) then r.end()', source: H + `function use(r: any): void {\n  r.end();\n}\nhttp.createServer((req: any, res: any) => {\n  use(res);\n});` },
+      { form: '11. SERVER into a simple identifier use(s) then s.listen()', source: metaServerHead + `function use(s: any): void {\n  s.listen(4317);\n}\nuse(server);` },
+      { form: '12. a benign non-proven argument into a rest parameter use(1)', source: H + `function use(...values: any[]): void {\n  void values.length;\n}\nuse(1);\nhttp.createServer(() => {});` },
+    ];
+    for (const { form, source } of f1Allow) {
+      it(`ALLOWS (F1 supported-parameter / benign) ${form}`, () => {
+        expect(usesOutboundNetwork(source)).toBe(false);
+      });
+    }
+
+    // ---- F2 helper: a REVERSE-ordered forwarding chain. `f<n>` is the sink; `f<n-1>`..`f1` forward
+    //      their parameter one hop. The sink is declared FIRST and the seed `f1(req)` LAST, so a
+    //      top-down provenance pass advances exactly ONE hop — n passes are needed, exceeding the
+    //      64-iteration cap when n > 64. Under the OLD loop the deepest parameter stayed unclassified
+    //      and its `p[rk]` socket read escaped; the convergence terminal now fails such a chain closed.
+    const reverseChain = (n: number, sinkBody: string): string => {
+      const lines: string[] = [`function f${String(n)}(p: any): void {\n${sinkBody}\n}`];
+      for (let k = n - 1; k >= 1; k--) lines.push(`function f${String(k)}(p: any): void {\n  f${String(k + 1)}(p);\n}`);
+      return H + RK + lines.join('\n') + `\nhttp.createServer((req: any) => {\n  f1(req);\n});`;
+    };
+    const misuseSink = `  const s = p[rk];\n  s.connect(80, 'example.com');`;
+    const benignSink = `  void p.method;`;
+
+    // ---- F2: chains longer than the cap EXHAUST → fail closed (65 = cap+1 is the minimal case). ----
+    for (const n of [65, 80]) {
+      it(`DENIES (F2 exhaustion, reverse chain of ${String(n)} hops > 64-cap)`, () => {
+        expect(usesOutboundNetwork(reverseChain(n, misuseSink))).toBe(true);
+      });
+    }
+
+    // ---- F2: within-bound convergence, cycles, and real hosts behave under NORMAL policy. ----
+    it('DENIES (F2 within-bound converged reverse chain of 40 hops with a misuse — normal policy)', () => {
+      expect(usesOutboundNetwork(reverseChain(40, misuseSink))).toBe(true);
+    });
+    it('ALLOWS (F2 within-bound converged reverse chain of 40 hops, benign sink)', () => {
+      expect(usesOutboundNetwork(reverseChain(40, benignSink))).toBe(false);
+    });
+    it('ALLOWS (F2 simple cycle a<->b, benign — terminates and converges)', () => {
+      expect(
+        usesOutboundNetwork(H + `function a(x: any): void {\n  b(x);\n}\nfunction b(x: any): void {\n  a(x);\n}\nhttp.createServer((req: any) => {\n  a(req);\n});`),
+      ).toBe(false);
+    });
+    it('DENIES (F2 mutually-recursive cycle with a misuse — terminates and fails closed)', () => {
+      expect(
+        usesOutboundNetwork(H + RK + `function a(x: any): void {\n  const s = x[rk];\n  s.connect(80, 'example.com');\n  b(x);\n}\nfunction b(x: any): void {\n  a(x);\n}\nhttp.createServer((req: any) => {\n  a(req);\n});`),
+      ).toBe(true);
+    });
+    it('ALLOWS (F2 no-propagation real host converges immediately)', () => {
+      expect(
+        usesOutboundNetwork(H + `http.createServer((req: http.IncomingMessage, res: http.ServerResponse): void => {\n  res.statusCode = 200;\n  res.end(req.method ?? '');\n});`),
+      ).toBe(false);
+    });
   });
 });
 
