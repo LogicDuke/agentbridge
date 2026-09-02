@@ -171,6 +171,8 @@ interface Context {
   readonly confinedFactories: Set<ts.Symbol>;
   readonly keyMemo: Map<ts.Declaration, StaticKey>;
   keyWork: number;
+  /** Number of `expressionFacts` evaluations (complexity witness for the inspection API). */
+  expressionFactsEvaluations: number;
   readonly fixpointCeiling: number;
 }
 
@@ -795,31 +797,37 @@ function factsOf(ctx: Context, symbol: ts.Symbol | undefined): readonly Fact[] {
  * THE expression-authority lookup: the facts an expression carries — SERVER:ROOT
  * for a proven createServer or confined factory result, a proven identifier's
  * facts, or, through receiver-call result authority inheritance, the facts of
- * the receiver named by `inheritingReceiverOf`.
+ * the inheriting receiver as computed once by `inheritingReceiverOf`.
  */
 function expressionFacts(ctx: Context, expression: ts.Expression): readonly Fact[] {
+  ctx.expressionFactsEvaluations += 1;
   const node = unwrap(expression);
   if (isProvenCreateServerCall(ctx, node) || isConfinedFactoryCall(ctx, node)) return [{ authority: 'SERVER', origin: 'ROOT' }];
   if (ts.isIdentifier(node)) return factsOf(ctx, valueSymbolOf(ctx.checker, node));
-  const receiver = inheritingReceiverOf(ctx, node);
-  return receiver === null ? [] : expressionFacts(ctx, receiver);
+  return inheritingReceiverOf(ctx, node) ?? [];
 }
 
 /**
- * Receiver-call result authority inheritance: the receiver whose authority a
- * call result conservatively retains. `node` must be a direct, non-optional
- * call whose callee is a member access on an authority-carrying receiver that
- * passes the positive member policy of every class the receiver carries.
- * Nothing about the member's runtime semantics is proven by its name; the
- * result is simply never allowed to become an unrestricted value.
+ * Receiver-call result authority inheritance: the facts of the receiver whose
+ * authority a call result conservatively retains, or null when the result
+ * inherits nothing. `node` must be a direct, non-optional call whose callee is
+ * a member access on an authority-carrying receiver that passes the positive
+ * member policy of every class the receiver carries. Nothing about the
+ * member's runtime semantics is proven by its name; the result is simply never
+ * allowed to become an unrestricted value.
+ *
+ * The receiver's facts are evaluated exactly once here and handed back to
+ * `expressionFacts` as the call result's facts, so a receiver-call chain costs
+ * one evaluation per level rather than re-evaluating the receiver per level.
  */
-function inheritingReceiverOf(ctx: Context, node: ts.Node): ts.Expression | null {
+function inheritingReceiverOf(ctx: Context, node: ts.Node): readonly Fact[] | null {
   if (!ts.isCallExpression(node) || node.questionDotToken !== undefined) return null;
   const callee = unwrap(node.expression);
   if (!isMemberAccess(callee)) return null;
-  const classes = classesOf(ctx, callee.expression);
-  if (classes.size === 0) return null;
-  return [...classes].every((authority) => memberAllowed(ctx, authority, callee)) ? callee.expression : null;
+  const facts = expressionFacts(ctx, callee.expression);
+  if (facts.length === 0) return null;
+  const classes = new Set(facts.map((fact) => fact.authority));
+  return [...classes].every((authority) => memberAllowed(ctx, authority, callee)) ? facts : null;
 }
 
 /** Authority classes carried by an expression, through `expressionFacts`. */
@@ -1250,6 +1258,7 @@ function createContext(source: string, options: NetworkPolicyOptions): Context {
     confinedFactories: new Set(),
     keyMemo: new Map(),
     keyWork: 0,
+    expressionFactsEvaluations: 0,
     fixpointCeiling: options.fixpointCeiling ?? DEFAULT_FIXPOINT_CEILING,
   };
 }
@@ -1271,6 +1280,8 @@ export interface NetworkPolicyInspection {
   readonly isConfinedFactory: (symbol: ts.Symbol) => boolean;
   readonly declaredSymbolCount: number;
   readonly fixpointBound: number;
+  /** Total `expressionFacts` evaluations performed by the analysis (deterministic complexity witness). */
+  readonly expressionFactsEvaluations: number;
 }
 
 function analyze(source: string, options: NetworkPolicyOptions): { ctx: Context; result: NetworkPolicyResult } {
@@ -1305,5 +1316,6 @@ export function inspectNetworkPolicy(source: string, options: NetworkPolicyOptio
     isConfinedFactory: (symbol) => ctx.confinedFactories.has(symbol),
     declaredSymbolCount: ctx.declaredSymbols.size,
     fixpointBound: fixpointBound(ctx),
+    expressionFactsEvaluations: ctx.expressionFactsEvaluations,
   };
 }

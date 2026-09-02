@@ -745,6 +745,58 @@ describe('D3 network policy receiver-call result authority inheritance (PR #67 F
     }
   });
 
+  it('evaluates receiver facts once per chain level: long allowed chains stay polynomial, correct and CONVERGED', () => {
+    // Receiver-call result authority inheritance once recomputed the receiver's
+    // facts at every level (2^depth evaluations for `server.close().close()...`).
+    // `inheritingReceiverOf` now computes them exactly once and `expressionFacts`
+    // consumes that result, so one evaluation is linear in chain depth and
+    // classifying every nested call node of a depth-n chain is O(n^2) overall.
+    // The witness is the deterministic evaluation counter, not wall-clock time.
+    const DEPTHS = [8, 16, 24];
+    const chains: Record<string, (depth: number) => string> = {
+      server: (depth) => withServer(`server${'.close()'.repeat(depth)};`),
+      response: (depth) => inListener(`response${".setHeader('a', 'b')".repeat(depth)};`),
+    };
+    for (const [name, build] of Object.entries(chains)) {
+      for (const depth of DEPTHS) {
+        const label = `${name} chain depth ${String(depth)}`;
+        const inspection = inspectNetworkPolicy(build(depth));
+        expect(inspection.result.reasons, label).toEqual([]);
+        expect(inspection.result.verdict, label).toBe('ALLOW');
+        expect(inspection.result.fixpoint.state, label).toBe('CONVERGED');
+        expect(inspection.result.fixpoint.iterations, label).toBeLessThanOrEqual(inspection.fixpointBound);
+        // Polynomial ceiling, and strictly below the exponential floor of per-level re-evaluation.
+        expect(inspection.expressionFactsEvaluations, label).toBeLessThanOrEqual((depth + 3) ** 2);
+        expect(inspection.expressionFactsEvaluations, label).toBeLessThan(2 ** depth);
+        // One more level costs at most a linear number of extra evaluations.
+        const deeper = inspectNetworkPolicy(build(depth + 1));
+        expect(deeper.expressionFactsEvaluations - inspection.expressionFactsEvaluations, label).toBeGreaterThan(0);
+        expect(deeper.expressionFactsEvaluations - inspection.expressionFactsEvaluations, label).toBeLessThanOrEqual(4 * depth);
+        // Deterministic: the same source always costs the same number of evaluations.
+        expect(inspectNetworkPolicy(build(depth)).expressionFactsEvaluations, label).toBe(inspection.expressionFactsEvaluations);
+      }
+    }
+    // Verdict semantics are unchanged at the end of a long chain: one finding, existing reason codes.
+    const deniedServer = analyzeNetworkPolicy(withServer(`server${'.close()'.repeat(24)}.on('x', () => {});`));
+    expect(deniedServer.reasons, describeFindings(deniedServer)).toEqual(['SERVER_MEMBER']);
+    expect(deniedServer.findings).toHaveLength(1);
+    expect(deniedServer.fixpoint.state).toBe('CONVERGED');
+    const deniedResponse = analyzeNetworkPolicy(inListener(`response${".end('x')".repeat(24)}.socket;`));
+    expect(deniedResponse.reasons, describeFindings(deniedResponse)).toEqual(['RESPONSE_MEMBER']);
+    expect(deniedResponse.findings).toHaveLength(1);
+    const tail = factsOfConst(withServer(`const tail = server${'.close()'.repeat(24)};\ntail.close();`), 'tail');
+    expect(tail.facts).toEqual(['SERVER:ALIAS']);
+    expect(tail.result.verdict, describeFindings(tail.result)).toBe('ALLOW');
+    expect(tail.result.fixpoint.state).toBe('CONVERGED');
+    expect(tail.result.fixpoint.iterations).toBeLessThanOrEqual(tail.bound);
+    // The fixpoint still fail-closes on a chain when the ceiling is reached.
+    const exhausted = analyzeNetworkPolicy(withServer(`server${'.close()'.repeat(24)};`), { fixpointCeiling: 1 });
+    expect(exhausted.fixpoint).toEqual({ state: 'EXHAUSTED', iterations: 1, bound: 1 });
+    expect(exhausted.reasons).toEqual(['FIXPOINT_EXHAUSTED']);
+    // The counter sits at the entry of the single expression-authority lookup.
+    expect(occurrences(readFileSync(detectorPath, 'utf8'), 'expressionFactsEvaluations += 1')).toBe(1);
+  });
+
   it('is structural: one expression-authority lookup, no member-name special cases', () => {
     const detector = readFileSync(detectorPath, 'utf8');
     expect(occurrences(detector, 'function expressionFacts(')).toBe(1);
