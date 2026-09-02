@@ -1343,7 +1343,10 @@ const isDynamicNodeHttpImport = (node: ts.Node): boolean => {
 // not this source policy.
 // The SOCKET-VALUE names (RULE A family i) — the duplex socket itself. Still used verbatim by
 // the RULE A2 req/res-bound branches below, whose socket/connection semantics are preserved.
-const SOCKET_CAPABILITY_NAMES: ReadonlySet<string> = new Set(['socket', 'connection']);
+// MECH-2 (Day-7 convergence): `client` is IncomingMessage's third alias of the SAME duplex socket
+// (`req.client === req.socket` on the installed Node 24 API), so it joins family (i) — one inventory,
+// receiver-independent like `socket`/`connection`, with no parallel name list.
+const SOCKET_CAPABILITY_NAMES: ReadonlySet<string> = new Set(['socket', 'connection', 'client']);
 // The SOCKET-DELIVERY member names (RULE A family ii) — the permitted http.Server callbacks
 // that hand a socket to a handler. `setTimeout` (the one-shot 'timeout' socket — F1) sits
 // beside the five event registrars; the whole family is banned by NAME at any position (F2),
@@ -1357,11 +1360,62 @@ const SOCKET_DELIVERY_MEMBERS: ReadonlySet<string> = new Set([
   'prependOnceListener',
   'setTimeout',
 ]);
-// The full RULE A static name family (i ∪ ii), tested at every statically identifiable
+// RULE A family (iii) — CONSTRUCTOR RE-DERIVATION (Day-7 F2). The permitted createServer CALL RESULT
+// is an http.Server whose ordinary `constructor` property (inherited from `http.Server.prototype`) IS
+// the privileged Server constructor: `new (http.createServer() as any).constructor(listener)` builds a
+// second server whose listener/options never pass through the createServer argument boundary, and
+// `Object.getPrototypeOf(server.constructor)` reaches `net.Server`. The name joins the SAME
+// receiver-independent static-name ban as the delivery members — dotted, static/binder-resolved element,
+// declaration destructuring, ASSIGNMENT destructuring, and the structural reflective read — so every
+// statically spelled `constructor` acquisition is rejected where the name appears, with no server
+// identity tracked and no constructor-specific dataflow. A ConstructorDeclaration (`class X {
+// constructor() {} }`), an object-literal DATA key `{ constructor: 1 }`, the string `'constructor'`, and a
+// superstring (`constructorName`) are not this name at a member/binding/assignment-key position and are
+// untouched. (RC rule (a) already bans the dotted/static spelling by TEXT for code generation; this
+// entry gives NET the binder-identity, destructuring, assignment, and reflective parity RC lacks.)
+const CONSTRUCTOR_REDERIVATION_NAMES: ReadonlySet<string> = new Set(['constructor']);
+// RULE A family (iv) — PROTOTYPE REACH (Day-7 MECH-1 prototype-inheritance closure). A supported
+// createServer options literal (inline, or reached through a confined const spine) inherits from
+// `Object.prototype`, and Node reads `options.IncomingMessage` / `options.ServerResponse` with an
+// ordinary GET that walks the prototype chain — so polluting `Object.prototype` (`Object.prototype.X =`,
+// `Object.assign/defineProperty/defineProperties(Object.prototype, …)`, `Reflect.set(Object.prototype, …)`,
+// an inherited GETTER) makes an otherwise clean `{}` deliver the live socket (verified on Node 24; the
+// no-options form is immune because Node substitutes a frozen null-prototype object). No static rule can
+// prove `Object.prototype` pristine, and a boundary-local check (only in files that pass options) is
+// UNSOUND across the scanned host tree — the pollution site and the options literal may sit in different
+// host files. The closure is therefore the SAME receiver-independent static-name reservation the other
+// RULE A families use: every statically spelled path to an object's prototype names `prototype`
+// (`Object.prototype`, `Object['proto' + 'type']`, `const { prototype } = Object`), `__proto__`
+// (`({}).__proto__`, `const { __proto__: p } = x`, `x.__proto__ = …`), or `getPrototypeOf`
+// (`Object.getPrototypeOf({})`, `Reflect.getPrototypeOf(…)`, `const { getPrototypeOf } = Object`), and
+// each is rejected where the NAME appears — dotted, binder-resolved element, declaration destructuring,
+// assignment destructuring, and the structural reflective read (`Reflect.get(Object, 'prototype')`,
+// `Object.getOwnPropertyDescriptor(Object, 'prototype')`). `setPrototypeOf` is NOT needed here:
+// `Object.prototype` is an immutable-prototype exotic object (`Object.setPrototypeOf` throws,
+// `Reflect.setPrototypeOf` returns false), and re-prototyping the options object itself is already
+// rejected by the argument-shape / const-spine confinement rules. No prototype graph is traversed and no
+// receiver is tracked. The object-literal `__proto__:` DATA key stays a separate options-literal rule
+// (it sets the literal's own prototype); an object-literal data key `{ prototype: 1 }`, the strings
+// `'prototype'` / `'__proto__'`, a superstring (`prototypeName`), a class declaration, and a type-position
+// member are not this name at a member / binding / assignment-key position and are untouched. The real
+// host names none of these (it is an accepted RULE A policy false positive elsewhere, like `camera.socket`).
+const PROTOTYPE_REACH_NAMES: ReadonlySet<string> = new Set(['prototype', '__proto__', 'getPrototypeOf']);
+// The receiver-INDEPENDENT ASSIGNMENT-destructuring family: the delivery/registrar members (family ii),
+// constructor re-derivation (family iii), and prototype reach (family iv). The socket-value names (family i)
+// are deliberately NOT here — their assignment extraction stays req/res-bound (see
+// `scanSocketAssignmentTarget`).
+const RECEIVER_INDEPENDENT_ASSIGNMENT_NAMES: ReadonlySet<string> = new Set([
+  ...SOCKET_DELIVERY_MEMBERS,
+  ...CONSTRUCTOR_REDERIVATION_NAMES,
+  ...PROTOTYPE_REACH_NAMES,
+]);
+// The full RULE A static name family (i ∪ ii ∪ iii ∪ iv), tested at every statically identifiable
 // property/binding-key position (dotted, static-computed, destructured), receiver-independent.
 const STATIC_SOCKET_ACQUISITION_NAMES: ReadonlySet<string> = new Set([
   ...SOCKET_CAPABILITY_NAMES,
   ...SOCKET_DELIVERY_MEMBERS,
+  ...CONSTRUCTOR_REDERIVATION_NAMES,
+  ...PROTOTYPE_REACH_NAMES,
 ]);
 // RULE A3 — the finite Node http.Server CONSTRUCTOR-INJECTION option family. `createServer`'s options
 // object may name a custom request/response constructor class; Node then constructs the supplied
@@ -1384,8 +1438,14 @@ const staticKeyText = (key: ts.Node | undefined): string | null => {
 };
 
 const acquiresInboundServerSocket = (checker: ts.TypeChecker, sourceFile: ts.SourceFile): boolean => {
-  const isCreateServerCall = (node: ts.Node): boolean =>
-    ts.isCallExpression(node) && classifyHttpExpression(node.expression, checker) === 'CREATE_SERVER';
+  // MECH-1 (Day-7 convergence): the privileged createServer BOUNDARY is a CallExpression OR a
+  //     NewExpression whose callee is binder-proven CREATE_SERVER. `new http.createServer(…)` runs the
+  //     same factory with the same arguments (and the constructor position is already a NET-safe
+  //     position for the capability), so it is the SAME boundary — argument disposition is identical
+  //     for both forms; `arguments ?? []` covers the argument-less `new http.createServer` spelling.
+  const isCreateServerCall = (node: ts.Node): node is ts.CallExpression | ts.NewExpression =>
+    (ts.isCallExpression(node) || ts.isNewExpression(node)) &&
+    classifyHttpExpression(node.expression, checker) === 'CREATE_SERVER';
 
   // DDR-NET-STATIC-KEY-PARITY (SOCK): socket acquisition keys are resolved by TypeScript BINDER
   // identity via the shared bounded `netResolveKey` (see `sockResolveKey`) — the SAME resolver NET's
@@ -1422,7 +1482,10 @@ const acquiresInboundServerSocket = (checker: ts.TypeChecker, sourceFile: ts.Sou
   //     `staticKeyText`/`sockResolveKey` machinery. A DIRECT inline function / object-literal argument
   //     is returned unchanged (the loop never runs), so existing direct-form behavior is identical.
   const CS_ARG_RESOLVE_HOP_CAP = 64;
-  const resolveCreateServerArgument = (arg: ts.Expression): ts.Node => {
+  // `spine` (optional out-parameter) receives every unique-`const` declaration the resolution passed
+  // through, boundary-side first (`createServer(b)` with `const b = a; const a = {…}` yields [b, a]).
+  // The options-literal CONFINEMENT check below needs the spine bindings, not only the final node.
+  const resolveCreateServerArgument = (arg: ts.Expression, spine?: ts.VariableDeclaration[]): ts.Node => {
     let cur: ts.Expression = binderUnwrap(arg);
     const seen = new Set<ts.Declaration>();
     for (let hops = 0; ts.isIdentifier(cur) && hops < CS_ARG_RESOLVE_HOP_CAP; hops++) {
@@ -1435,44 +1498,343 @@ const acquiresInboundServerSocket = (checker: ts.TypeChecker, sourceFile: ts.Sou
       if (ts.isFunctionDeclaration(decl)) return decl; // unique named-function handler: the function IS the source
       const constDecl = netUniqueConstDecl(cur, checker);
       if (constDecl === null || constDecl.initializer === undefined) return cur; // let/var/param/property/no-init: stop
+      spine?.push(constDecl);
       cur = binderUnwrap(constDecl.initializer); // unique `const` hop (const→const spine included)
     }
     return cur;
   };
 
-  // Pass 1 (RULE A2 support) — collect the createServer request/response parameter symbols.
-  // Direct identifier params only; a destructured param `({ socket })` is a RULE A binding
-  // pattern, rejected in pass 2 like any other. The listener argument is first normalized through
-  // the bounded createServer argument resolver, so a unique-`const`/`FunctionDeclaration`-bound
-  // named handler (`function handler(req){…}; createServer(handler)`) contributes its parameters
-  // exactly as a direct inline arrow/function expression does (ROOT-FAMILY-CS-ARGUMENT-RESOLUTION F1).
-  const reqResSymbols = new Set<ts.Symbol>();
-  const collect = (node: ts.Node): void => {
-    if (isCreateServerCall(node)) {
-      for (const arg of (node as ts.CallExpression).arguments) {
-        const handler = resolveCreateServerArgument(arg);
-        if (ts.isArrowFunction(handler) || ts.isFunctionExpression(handler) || ts.isFunctionDeclaration(handler)) {
-          for (const param of handler.parameters) {
-            if (ts.isIdentifier(param.name)) {
-              const symbol = checker.getSymbolAtLocation(param.name);
-              if (symbol !== undefined) reqResSymbols.add(symbol);
-            }
-          }
+  // Day-7 MECH-1 — CONST-SPINE CONFINEMENT of a resolved OPTIONS LITERAL. A `const` freezes the
+  //     BINDING, not the OBJECT: `const o = {}; o.IncomingMessage = Capture; http.createServer(o, …)`
+  //     resolves `o` to the literal `{}` while Node reads the mutated object at call time. Property /
+  //     element / computed / const-key / runtime-key assignment, `Object.assign` / `defineProperty` /
+  //     `setPrototypeOf` / `Reflect.set`, `o.__proto__ = …`, a mutation through an alias or a bounded alias
+  //     chain, a mutation inside a function or closure, and a mutation textually AFTER the call (execution
+  //     order is not statically provable) all deliver the live socket. Static object immutability cannot
+  //     be proven inside this bounded mechanism, so the disposition is POSITIONAL and fail-closed, the same
+  //     shape as `isCreateServerSafePosition` / `isHttpNsSafePosition`: the literal reached through a
+  //     spine is a supported source ONLY IF every binding on the spine is referenced NOWHERE except
+  //       (1) as the initializer of the previous spine binding (`const b = a` — the spine itself), and
+  //       (2) as an argument of a binder-proven createServer call / `new` (through the transparent
+  //           wrappers the resolver strips),
+  //     and no spine binding is `export`ed (a live import binding elsewhere could mutate the object).
+  //     ANY other occurrence — an assignment target receiver, a benign-looking read, a side alias
+  //     (`const c = a`), a call argument, a container element, an object value (shorthand included), a
+  //     return, an export specifier / default export, a closure capture, a type query — is an escape of
+  //     the object's IDENTITY and DENIES at the boundary. Nothing is claimed about what the escape does:
+  //     the object might be mutated, so it is not a supported source. References are inventoried ONCE
+  //     per traversal by BINDER SYMBOL (a same-text binding in another scope is a different symbol and
+  //     is irrelevant); a shorthand `{ o }` resolves through `getShorthandAssignmentValueSymbol` and an
+  //     `export { o }` through `getExportSpecifierLocalTargetSymbol`; a same-text VALUE identifier the
+  //     binder cannot resolve at all is treated as a reference (fail-closed). A function-like source is
+  //     NOT subject to this rule: a function's code cannot be replaced through its object. Total and
+  //     terminating: one file walk builds the inventory, each spine binding's references are visited
+  //     once, each site is classified by a constant-depth parent walk; no value flow, no alias graph.
+  let referenceInventory: { readonly refs: ReadonlyMap<ts.Symbol, readonly ts.Node[]>; readonly unresolved: ReadonlySet<string> } | null = null;
+  const inventoryValueReferences = (): NonNullable<typeof referenceInventory> => {
+    if (referenceInventory !== null) return referenceInventory;
+    const refs = new Map<ts.Symbol, ts.Node[]>();
+    const unresolved = new Set<string>();
+    const record = (symbol: ts.Symbol | undefined, site: ts.Node, text: string): void => {
+      if (symbol === undefined) {
+        unresolved.add(text);
+        return;
+      }
+      const list = refs.get(symbol);
+      if (list === undefined) refs.set(symbol, [site]);
+      else list.push(site);
+    };
+    const walk = (node: ts.Node): void => {
+      if (ts.isIdentifier(node) && isBinderValueReference(node)) {
+        const p = node.parent;
+        if (ts.isShorthandPropertyAssignment(p) && p.name === node) {
+          record(checker.getShorthandAssignmentValueSymbol(p), node, node.text);
+        } else {
+          record(checker.getSymbolAtLocation(node), node, node.text);
+        }
+      } else if (ts.isExportSpecifier(node)) {
+        record(checker.getExportSpecifierLocalTargetSymbol(node), node, (node.propertyName ?? node.name).text);
+      }
+      ts.forEachChild(node, walk);
+    };
+    ts.forEachChild(sourceFile, walk);
+    referenceInventory = { refs, unresolved };
+    return referenceInventory;
+  };
+  // Walk up through the transparent wrappers the resolver strips (paren / as / satisfies / `!` /
+  // type-assertion / await) and return the outermost wrapped node.
+  const outermostTransparentWrapper = (site: ts.Node): ts.Node => {
+    let cur: ts.Node = site;
+    for (;;) {
+      const p = cur.parent as ts.Node | undefined;
+      if (
+        p !== undefined &&
+        (ts.isParenthesizedExpression(p) ||
+          ts.isAsExpression(p) ||
+          ts.isSatisfiesExpression(p) ||
+          ts.isNonNullExpression(p) ||
+          ts.isTypeAssertionExpression(p) ||
+          ts.isAwaitExpression(p)) &&
+        p.expression === cur
+      ) {
+        cur = p;
+        continue;
+      }
+      return cur;
+    }
+  };
+  const isCreateServerBoundaryArgument = (site: ts.Node): boolean => {
+    const cur = outermostTransparentWrapper(site);
+    const p = cur.parent as ts.Node | undefined;
+    return p !== undefined && isCreateServerCall(p) && (p.arguments ?? []).some((a) => a === cur);
+  };
+  const isInitializerOf = (site: ts.Node, decl: ts.VariableDeclaration): boolean => {
+    const cur = outermostTransparentWrapper(site);
+    return cur.parent === decl && decl.initializer === cur;
+  };
+  const optionsSpineIsConfined = (spine: readonly ts.VariableDeclaration[]): boolean => {
+    const { refs, unresolved } = inventoryValueReferences();
+    for (let i = 0; i < spine.length; i++) {
+      const decl = spine[i];
+      if (decl === undefined || !ts.isIdentifier(decl.name)) return false;
+      const statement = decl.parent.parent as ts.Node | undefined;
+      if (
+        statement !== undefined &&
+        ts.isVariableStatement(statement) &&
+        ts.getModifiers(statement)?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword) === true
+      ) {
+        return false; // an exported binding is a live (mutable-object) import elsewhere
+      }
+      if (unresolved.has(decl.name.text)) return false; // a same-text reference the binder could not pin
+      const symbol = checker.getSymbolAtLocation(decl.name);
+      if (symbol === undefined) return false;
+      const previous = i > 0 ? spine[i - 1] : undefined;
+      for (const site of refs.get(symbol) ?? []) {
+        if (isCreateServerBoundaryArgument(site)) continue;
+        if (previous !== undefined && isInitializerOf(site, previous)) continue;
+        return false; // any other occurrence: the object's identity escaped / may be mutated
+      }
+    }
+    return true;
+  };
+
+  let found = false;
+
+  // RULE A2 (binding-pattern walk — MECH-2 object-rest + nested fail-close) — walk ONE finite binding
+  //     pattern whose ROOT is a tracked req/res receiver (a createServer listener PARAMETER pattern, or
+  //     the `= req/res` initializer of a DECLARATION pattern). Two things reject, at ANY nesting depth
+  //     of the pattern: (a) an OBJECT-REST element (`{ ...rest }`) — the rest object carries every
+  //     own enumerable property of the receiver, socket included, into an untracked binding, so the
+  //     acquisition is rejected HERE and the rest object is never propagated/followed; (b) an
+  //     INDETERMINATE computed key — the SAME predicate the top-level RULE A2 declaration branch has
+  //     always used (`staticKeyText === null`), now applied at every depth so `{ req: { [k]: s } }`
+  //     off `res` fails closed exactly like `res.req[k]`. Nesting is walked STRUCTURALLY through the
+  //     finite binding AST only (object and array sub-patterns; an array hole is skipped; an ARRAY rest
+  //     `[...r]` is not an object rest and is not rejected), terminating at the pattern leaves — no
+  //     value flow, no alias following. A statically resolvable harmless key (`{ method }`) is
+  //     unaffected; a socket-acquisition NAME is already rejected by RULE A (c).
+  const scanReqResBindingPattern = (pattern: ts.BindingPattern): void => {
+    for (const el of pattern.elements) {
+      if (!ts.isBindingElement(el)) continue; // an array-pattern hole (OmittedExpression)
+      if (ts.isObjectBindingPattern(pattern)) {
+        if (el.dotDotDotToken !== undefined) found = true; // object rest of a tracked receiver
+        if (el.propertyName !== undefined && ts.isComputedPropertyName(el.propertyName) && staticKeyText(el.propertyName) === null) {
+          found = true; // indeterminate computed key (unchanged A2 predicate, at any depth)
         }
       }
+      if (ts.isObjectBindingPattern(el.name) || ts.isArrayBindingPattern(el.name)) scanReqResBindingPattern(el.name);
+    }
+  };
+
+  // RULE A3 (createServer OPTIONS literal — MECH-1 disposition). Node reads `options.IncomingMessage` /
+  //     `options.ServerResponse` with an ordinary property GET and constructs the supplied class with
+  //     the LIVE connection socket / the request, so the options literal is a socket/request-capability
+  //     delivery surface. Each ObjectLiteralElementLike is dispositioned by its FINITE AST KIND and its
+  //     KEY only — the element VALUE / body / RHS is never inspected, and no prototype is traversed:
+  //       - SpreadAssignment `{ ...x }` → DENY: an unsupported (value-flow) shape at the privileged
+  //         boundary; nothing is claimed about `x`.
+  //       - PropertyAssignment whose NON-COMPUTED identifier/string name is `__proto__` → DENY
+  //         regardless of value: this is the one literal form that sets the options PROTOTYPE, so
+  //         Node's ordinary read walks into a caller-controlled object. Computed `['__proto__']`,
+  //         shorthand `{ __proto__ }`, a `__proto__` accessor, and a `__proto__` concise method all
+  //         define an ORDINARY own property (never the prototype) and stay allowed.
+  //       - an INDETERMINATE computed key (runtime / ambient / call-result / resource abort), on ANY
+  //         element kind → DENY: a key that MIGHT be a reserved name at runtime must not pass by being
+  //         unresolvable at a privileged boundary.
+  //       - a RESOLVED `IncomingMessage` / `ServerResponse` key on a data property (PropertyAssignment /
+  //         ShorthandPropertyAssignment) or a GETTER → DENY (the already-supported delivering kinds).
+  //         A SET-only accessor reads as `undefined` (Node falls back to its own default) and a concise
+  //         METHOD is not constructable (`new` throws), so the reserved-key setter/method forms deliver
+  //         no usable constructor and stay allowed; a numeric/bigint/benign key is harmless; an exact-set
+  //         test never matches a superstring key (`IncomingMessageLimit`).
+  //     Keys are resolved by the SAME `staticKeyText`/`sockResolveKey` machinery as every other SOCK key.
+  const scanCreateServerOptions = (options: ts.ObjectLiteralExpression): void => {
+    for (const prop of options.properties) {
+      if (ts.isSpreadAssignment(prop)) {
+        found = true; // unsupported shape at the privileged boundary
+        continue;
+      }
+      if (ts.isShorthandPropertyAssignment(prop)) {
+        if (CONSTRUCTOR_INJECTION_OPTIONS.has(prop.name.text)) found = true;
+        continue;
+      }
+      // PropertyAssignment / GetAccessorDeclaration / SetAccessorDeclaration / MethodDeclaration
+      let name: string | null;
+      if (ts.isComputedPropertyName(prop.name)) {
+        const key = sockResolveKey(prop.name.expression, checker, sockMemo);
+        if (key.kind === 'indeterminate') {
+          found = true; // fail-closed: an unresolvable key at the privileged boundary
+          continue;
+        }
+        name = key.kind === 'resolved' ? key.value : null; // NotCapability: provably not a reserved name
+      } else {
+        name = staticKeyText(prop.name);
+        if (ts.isPropertyAssignment(prop) && name === '__proto__') found = true; // prototype-setting data key
+      }
+      if (
+        name !== null &&
+        CONSTRUCTOR_INJECTION_OPTIONS.has(name) &&
+        (ts.isPropertyAssignment(prop) || ts.isGetAccessorDeclaration(prop))
+      ) {
+        found = true;
+      }
+    }
+  };
+
+  // Pass 1 — MECH-1 createServer ARGUMENT disposition (ROOT-FAMILY-CS-ARGUMENT-RESOLUTION + Day-7
+  //     fail-closed boundary), and RULE A2 support (collect the request/response parameter symbols).
+  //     Every argument of a proven createServer call/new is first normalized through the EXISTING
+  //     bounded `resolveCreateServerArgument` (transparent wrappers, unique-`const` spines, a unique
+  //     `FunctionDeclaration`) and then classified by FINITE AST SHAPE — nothing else:
+  //       - FUNCTION-LIKE (ArrowFunction / FunctionExpression / FunctionDeclaration) → the request
+  //         listener: a direct identifier parameter is tracked as a req/res symbol; a destructured
+  //         parameter PATTERN is walked by `scanReqResBindingPattern` (object rest / indeterminate key
+  //         fail closed), and its socket-named elements are RULE A (c) binding elements as before.
+  //       - OBJECT LITERAL → the options object: `scanCreateServerOptions`.
+  //       - ANY OTHER SHAPE → DENY. A `let`/`var` binding, a parameter, a default parameter, a call
+  //         result, a member/element access, a `new` expression (class instance, Proxy), a conditional,
+  //         a spread argument, an ambient binding, a primitive literal, … — we make NO claim about what
+  //         the shape EVALUATES to; it is rejected solely because an unsupported shape is being supplied
+  //         to a privileged createServer capability boundary. This replaces the former "stays outside the
+  //         proof" allowance for these shapes (the frozen positive model denied only what it could
+  //         prove; the Day-7 boundary fails closed on what it cannot). No value-flow analysis is
+  //         introduced: the resolver is unchanged, and an unresolvable argument simply never becomes a
+  //         function-like or object-literal node.
+  const reqResSymbols = new Set<ts.Symbol>();
+  const disposeCreateServerArgument = (arg: ts.Expression): void => {
+    const spine: ts.VariableDeclaration[] = [];
+    const source = resolveCreateServerArgument(arg, spine);
+    // Day-7 F1 — an AMBIENT or BODILESS source is NOT a supported shape. A `declare function listener`
+    //     (or `export declare function`, a `declare global`/`declare namespace` member, a `declare const
+    //     h = …` initializer) and a bodiless overload signature emit NO runtime value in this file, so
+    //     the runtime binding the emitted `createServer(listener)` reaches is whatever the global
+    //     environment supplies — its parameters are not the parameters of the code that will run. The
+    //     resolved node is dispositioned by the EXISTING ambient predicate (`isInAmbientContext`, walks
+    //     the `declare` modifier up the ancestors) and the structural `body === undefined` test for a
+    //     FunctionDeclaration (an ArrowFunction / FunctionExpression always carries a body); both are
+    //     purely syntactic — no body analysis, no value flow — and the shape falls to the same
+    //     fail-closed unsupported-shape branch below.
+    if (isInAmbientContext(source) || (ts.isFunctionDeclaration(source) && source.body === undefined)) {
+      found = true; // ambient / bodiless source at the privileged createServer boundary
+      return;
+    }
+    if (ts.isArrowFunction(source) || ts.isFunctionExpression(source) || ts.isFunctionDeclaration(source)) {
+      for (const param of source.parameters) {
+        if (ts.isIdentifier(param.name)) {
+          const symbol = checker.getSymbolAtLocation(param.name);
+          if (symbol !== undefined) reqResSymbols.add(symbol);
+        } else {
+          scanReqResBindingPattern(param.name);
+        }
+      }
+      return;
+    }
+    if (ts.isObjectLiteralExpression(source)) {
+      // Day-7 MECH-1 const-spine confinement: a literal reached through one or more `const` hops is a
+      //     supported source only while every spine binding stays confined to the spine and the boundary
+      //     (see `optionsSpineIsConfined`); an inline literal (empty spine) has no binding to escape.
+      if (spine.length > 0 && !optionsSpineIsConfined(spine)) {
+        found = true; // the options object may have been mutated / its identity escaped: fail closed
+        return;
+      }
+      scanCreateServerOptions(source);
+      return;
+    }
+    found = true; // unsupported argument shape at the privileged createServer boundary
+  };
+  const collect = (node: ts.Node): void => {
+    if (isCreateServerCall(node)) {
+      for (const arg of node.arguments ?? []) disposeCreateServerArgument(arg);
     }
     ts.forEachChild(node, collect);
   };
   ts.forEachChild(sourceFile, collect);
 
+  // Whether an expression is a tracked req/res RECEIVER: the tracked parameter identifier itself
+  //     (unchanged), or — MECH-2 (Day-7 convergence) — a bounded STATIC MEMBER CHAIN rooted at one:
+  //     dotted / optional-chained property hops (`res.req`, `req.headers`) and element hops whose key
+  //     RESOLVES statically through the shared bounded `sockResolveKey` (`res['req']`, `res['r' + 'eq']`,
+  //     `const k = 'req'; res[k]`), through the transparent wrappers `binderUnwrap` strips. This closes
+  //     `res.req[k]` (ServerResponse exposes its IncomingMessage as `.req`) so RULE A2's fail-closed
+  //     disposition follows the static chain. It is purely syntactic and finite (each step descends one
+  //     AST level of ONE expression; no declaration is followed): an alias (`const r = res.req; r[k]`), a
+  //     call in the chain (`res.getHeader(x)[k]`), an array wrapper, or a spread copy is NOT a chain and
+  //     stays at the frozen boundary. An INDETERMINATE element hop stops the chain — that inner access
+  //     is itself rejected by RULE A2 when its own receiver is tracked, so nothing is lost by stopping.
   const receiverIsReqRes = (expr: ts.Expression): boolean => {
-    const e = binderUnwrap(expr);
+    let e = binderUnwrap(expr);
+    for (;;) {
+      if (ts.isPropertyAccessExpression(e)) {
+        e = binderUnwrap(e.expression);
+        continue;
+      }
+      if (ts.isElementAccessExpression(e)) {
+        if (sockResolveKey(e.argumentExpression, checker, sockMemo).kind !== 'resolved') return false;
+        e = binderUnwrap(e.expression);
+        continue;
+      }
+      break;
+    }
     if (!ts.isIdentifier(e)) return false;
     const symbol = checker.getSymbolAtLocation(e);
     return symbol !== undefined && reqResSymbols.has(symbol);
   };
 
-  let found = false;
+  // RULE A2 (assignment-target walk — MECH-2 object-rest + nested fail-close) — the assignment twin of
+  //     `scanReqResBindingPattern`, walked over the finite ObjectLiteral/ArrayLiteral DESTRUCTURING
+  //     TARGET of an `=` whose right-hand side is a tracked req/res receiver. Per property: a
+  //     SpreadAssignment `{ ...rest }` REJECTS (object rest of a tracked receiver, never propagated); a
+  //     `socket`/`connection`/`client` key rejects; an indeterminate computed key fails closed; a static
+  //     harmless key is allowed — byte-for-byte the former top-level rules, now also applied to a NESTED
+  //     object-literal target (`({ req: { ...rest } } = res)`), through a nested array target, and
+  //     through a defaulted nested target (`({ req: { ...rest } = {} } = res)`, whose target is the LEFT
+  //     of the inner `=`). Finite: it descends only nested literal targets and terminates at the leaves.
+  const scanReqResAssignmentTarget = (value: ts.Expression): void => {
+    let target = binderUnwrap(value);
+    if (ts.isBinaryExpression(target) && target.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+      target = binderUnwrap(target.left); // a defaulted nested target: `{ … } = default`
+    }
+    if (ts.isArrayLiteralExpression(target)) {
+      for (const el of target.elements) scanReqResAssignmentTarget(el);
+      return;
+    }
+    if (!ts.isObjectLiteralExpression(target)) return;
+    for (const prop of target.properties) {
+      if (ts.isSpreadAssignment(prop)) {
+        found = true; // object rest of a tracked receiver
+      } else if (ts.isShorthandPropertyAssignment(prop)) {
+        if (SOCKET_CAPABILITY_NAMES.has(prop.name.text)) found = true;
+      } else if (ts.isPropertyAssignment(prop)) {
+        const key = staticKeyText(prop.name);
+        if (ts.isComputedPropertyName(prop.name)) {
+          if (key === null || SOCKET_CAPABILITY_NAMES.has(key)) found = true;
+        } else if (key !== null && SOCKET_CAPABILITY_NAMES.has(key)) {
+          found = true;
+        }
+        scanReqResAssignmentTarget(prop.initializer);
+      }
+    }
+  };
   // RULE A (c, assignment parity — DELIVERY/REGISTRAR members ONLY) — the assignment-AST twin of the
   //     RULE A (c) per-binding-element key check, walked over the finite ObjectLiteralExpression
   //     destructuring TARGET of an `=`, but DELIBERATELY SCOPED to the receiver-independent
@@ -1493,10 +1855,13 @@ const acquiresInboundServerSocket = (checker: ts.TypeChecker, sourceFile: ts.Sou
   //     the finite AST depth with NO value flow, alias following, or receiver tracking. An INDETERMINATE
   //     computed key is NOT globally failed closed here (only a Resolved delivery name rejects); the
   //     req/res A2 branch below retains its own fail-closed behavior.
+  //     Day-7 F2: the receiver-independent set is `RECEIVER_INDEPENDENT_ASSIGNMENT_NAMES` = the delivery
+  //     members plus `constructor` (family iii), so `({ constructor: S } = server)` is rejected exactly like
+  //     `({ on: register } = server)`; the socket-value exclusion above is unchanged.
   const scanSocketAssignmentTarget = (target: ts.ObjectLiteralExpression): void => {
     for (const prop of target.properties) {
       if (ts.isShorthandPropertyAssignment(prop)) {
-        if (SOCKET_DELIVERY_MEMBERS.has(prop.name.text)) found = true;
+        if (RECEIVER_INDEPENDENT_ASSIGNMENT_NAMES.has(prop.name.text)) found = true;
       } else if (ts.isPropertyAssignment(prop)) {
         let name: string | null = null;
         if (ts.isComputedPropertyName(prop.name)) {
@@ -1505,63 +1870,21 @@ const acquiresInboundServerSocket = (checker: ts.TypeChecker, sourceFile: ts.Sou
         } else {
           name = staticKeyText(prop.name);
         }
-        if (name !== null && SOCKET_DELIVERY_MEMBERS.has(name)) found = true;
+        if (name !== null && RECEIVER_INDEPENDENT_ASSIGNMENT_NAMES.has(name)) found = true;
         const value = binderUnwrap(prop.initializer);
         if (ts.isObjectLiteralExpression(value)) scanSocketAssignmentTarget(value);
       }
     }
   };
   const visit = (node: ts.Node): void => {
-    // RULE A3 — CONSTRUCTOR-INJECTION options on a permitted createServer call. Node constructs a
-    //     supplied `IncomingMessage` subclass with the LIVE connection socket and a supplied
-    //     `ServerResponse` subclass with the request, so an option naming either is a socket/request
-    //     capability delivery. Only an OBJECT-LITERAL argument is inspected — the requestListener
-    //     FUNCTION argument is skipped, and the check runs ONLY when `isCreateServerCall` already
-    //     proved this is the node:http createServer capability, so an unrelated `foo.createServer({
-    //     IncomingMessage })` and any object literal OUTSIDE a createServer call are untouched. A
-    //     property KEY is resolved by the SAME `staticKeyText`/`sockResolveKey` machinery as every
-    //     other SOCK key (plain/quoted key is its own text; a computed key folds off the binder); a
-    //     RESOLVED `IncomingMessage`/`ServerResponse` name REJECTS at this acquisition site — the
-    //     supplied class value, its body, and its constructor are NEVER inspected (no taint/type/
-    //     whole-program, no alias following). A runtime/indeterminate key is no match here (unchanged
-    //     SOCK disposition, not globally failed closed), and the exact-set test never matches a
-    //     superstring key (`IncomingMessageLimit`).
-    if (isCreateServerCall(node)) {
-      for (const arg of (node as ts.CallExpression).arguments) {
-        // ROOT-FAMILY-CS-ARGUMENT-RESOLUTION (F2): normalize the argument through the bounded
-        //     createServer argument resolver first, so a unique-`const`-bound alias of the options
-        //     object (`const options = { IncomingMessage: Capture }; createServer(options as any, …)`,
-        //     including a computed-static option key and a const→const spine) is reserved exactly like
-        //     a direct object literal. A `let`/parameter/call-result/spread options argument does not
-        //     resolve to an ObjectLiteralExpression and stays outside the proof (frozen positive model).
-        const optionsObject = resolveCreateServerArgument(arg);
-        if (!ts.isObjectLiteralExpression(optionsObject)) continue;
-        for (const prop of optionsObject.properties) {
-          // PROPERTY-KIND PARITY (Codex P1): reserve the constructor-option KEY for every element whose
-          //     property READ delivers the caller's value to Node — a data property (PropertyAssignment /
-          //     ShorthandPropertyAssignment) OR a GETTER (GetAccessorDeclaration: Node reads the option
-          //     with an ordinary property GET, which RUNS the getter, then constructs its return with the
-          //     live connection socket). A SET-only accessor (property read is `undefined`, so Node falls
-          //     back to its own default), an object-literal concise MethodDeclaration (a concise method is
-          //     NOT constructable — `new` throws), and a SpreadAssignment (outside the frozen value-flow
-          //     boundary) deliver no usable constructor and are skipped. The element VALUE/body is never
-          //     inspected; only the KEY is resolved, by the same staticKeyText/sockResolveKey machinery.
-          if (
-            !ts.isPropertyAssignment(prop) &&
-            !ts.isShorthandPropertyAssignment(prop) &&
-            !ts.isGetAccessorDeclaration(prop)
-          ) continue;
-          let name: string | null;
-          if (!ts.isShorthandPropertyAssignment(prop) && ts.isComputedPropertyName(prop.name)) {
-            const key = sockResolveKey(prop.name.expression, checker, sockMemo);
-            name = key.kind === 'resolved' ? key.value : null;
-          } else {
-            name = staticKeyText(prop.name);
-          }
-          if (name !== null && CONSTRUCTOR_INJECTION_OPTIONS.has(name)) found = true;
-        }
-      }
-    }
+    // RULE A3 — CONSTRUCTOR-INJECTION options on a permitted createServer call/new. The check runs
+    //     ONLY where `isCreateServerCall` proved the node:http createServer capability, so an unrelated
+    //     `foo.createServer({ IncomingMessage })` and any object literal OUTSIDE a createServer call are
+    //     untouched. MECH-1 (Day-7): the whole createServer argument disposition — the options-literal
+    //     reservation (property-kind parity, `__proto__`, spread, indeterminate key), the listener
+    //     parameter collection, and the fail-closed unsupported-shape boundary — is decided ONCE in
+    //     pass 1 (`disposeCreateServerArgument` / `scanCreateServerOptions` above), for the call AND
+    //     `new` forms, so this pass no longer re-inspects createServer arguments.
     // RULE A (a) — GLOBAL dotted socket-acquisition NAME: `.socket`/`.connection` or a delivery
     //     member `.on`/`.once`/`.addListener`/`.prependListener`/`.prependOnceListener`/
     //     `.setTimeout` (optional chaining included), any receiver, any position. This is the node
@@ -1626,15 +1949,9 @@ const acquiresInboundServerSocket = (checker: ts.TypeChecker, sourceFile: ts.Sou
       node.initializer !== undefined &&
       receiverIsReqRes(node.initializer)
     ) {
-      for (const el of node.name.elements) {
-        if (
-          el.propertyName !== undefined &&
-          ts.isComputedPropertyName(el.propertyName) &&
-          staticKeyText(el.propertyName) === null
-        ) {
-          found = true;
-        }
-      }
+      // MECH-2 (Day-7): the same top-level predicate, walked through the finite pattern by
+      //     `scanReqResBindingPattern` — plus the object-rest rejection — at every nesting depth.
+      scanReqResBindingPattern(node.name);
     }
     // RULE A2 (assignment) — an object DESTRUCTURING ASSIGNMENT `({ socket: s } = req)` reads
     //     the property off the req/res param exactly like a declaration destructuring, but the
@@ -1648,22 +1965,10 @@ const acquiresInboundServerSocket = (checker: ts.TypeChecker, sourceFile: ts.Sou
       node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
       receiverIsReqRes(node.right)
     ) {
-      const target = binderUnwrap(node.left);
-      if (ts.isObjectLiteralExpression(target)) {
-        for (const prop of target.properties) {
-          if (ts.isShorthandPropertyAssignment(prop)) {
-            if (SOCKET_CAPABILITY_NAMES.has(prop.name.text)) found = true;
-          } else if (ts.isPropertyAssignment(prop)) {
-            if (ts.isComputedPropertyName(prop.name)) {
-              const key = staticKeyText(prop.name);
-              if (key === null || SOCKET_CAPABILITY_NAMES.has(key)) found = true;
-            } else {
-              const key = staticKeyText(prop.name);
-              if (key !== null && SOCKET_CAPABILITY_NAMES.has(key)) found = true;
-            }
-          }
-        }
-      }
+      // MECH-2 (Day-7): the same top-level rules, walked through the finite literal target by
+      //     `scanReqResAssignmentTarget` — plus the object-rest (SpreadAssignment) rejection — at every
+      //     nesting depth.
+      scanReqResAssignmentTarget(node.left);
     }
     // RULE A (c, assignment parity — DELIVERY/REGISTRAR members ONLY) — receiver-INDEPENDENT
     //     delivery/registrar-member NAME in an object DESTRUCTURING ASSIGNMENT target:
@@ -1690,6 +1995,53 @@ const acquiresInboundServerSocket = (checker: ts.TypeChecker, sourceFile: ts.Sou
     //     `.call`/`.apply`/`.bind`/`Reflect.apply`/method-extraction indirection (F2) and the
     //     `setTimeout` delivery surface (F1) — with NO witness-specific `.call`/`.apply`/`.bind`
     //     blacklist and NO event-name enumeration. No separate call-shaped rule remains.
+    // MECH-2 (Day-7) — `arguments` delivery. A non-arrow function receives its request/response
+    //     objects through the `arguments` object as well as through its named parameters, so a
+    //     listener (or any function the listener reaches) can recover `req`/`res` with `arguments[0]`
+    //     without a tracked parameter ever appearing. In this strict ESM host `arguments` has no
+    //     legitimate use, so a value-position Identifier whose text is exactly `arguments` is a
+    //     WHOLE-FILE syntactic reservation — no alias / data-flow analysis (`const a = arguments`,
+    //     `const [req] = arguments`, an arrow capturing it, `Reflect.get(arguments, 0)` are all caught at
+    //     the read of the identifier itself). The two existing name-position guards are BOTH required —
+    //     `isValueReference` (RC/HA: declaration names, class members, type-position members,
+    //     object-literal keys, member names) and `isBinderValueReference` (NET: additionally the
+    //     destructuring SOURCE key `{ arguments: a }` and import/export specifiers) — so a property
+    //     NAME (`obj.arguments`), an object-literal / destructuring KEY, a declaration name, a
+    //     type-position member, and a string literal are all kept out: none of those read the binding.
+    //     An unrelated `arguments.length` is an accepted policy false positive (no host/cockpit source
+    //     uses `arguments`).
+    if (ts.isIdentifier(node) && node.text === 'arguments' && isValueReference(node) && isBinderValueReference(node)) {
+      found = true;
+    }
+    // MECH-2 (Day-7) — STRUCTURAL reflective acquisition. A direct call to the FREE, unshadowed
+    //     built-in `Reflect.get` / `Reflect.getOwnPropertyDescriptor` / `Object.getOwnPropertyDescriptor`
+    //     (`isSockReflectiveReadCallee`: base identifier binder-proven unshadowed, member name resolved
+    //     statically to the approved API — dotted or bounded static element form) reads a property by a
+    //     KEY ARGUMENT instead of by a syntactic member name, so RULE A's name ban never sees it. The
+    //     property-key argument is classified by the SAME bounded `sockResolveKey`: a key that RESOLVES
+    //     to a static socket-acquisition name DENIES on ANY target (`Reflect.get(server, 'on')`, exactly
+    //     as `server['on']` does); an INDETERMINATE key DENIES only on a tracked req/res target (RULE A2
+    //     parity — `Reflect.get(unrelated, k)` stays at the frozen boundary); a resolved harmless key
+    //     (`'method'`) is allowed. A spread in the target/key position is an unsupported argument shape
+    //     at this reflective boundary and fails closed. This is NOT the rejected broad "deny any call
+    //     argument whose string equals socket/on/…" rule: `res.setHeader('connection', 'close')`,
+    //     `map.get('connection')`, `log('socket')`, a user-shadowed `Reflect`/`Object`, and an aliased
+    //     `const R = Reflect` (frozen) are untouched — only the recognized free-builtin callee STRUCTURE
+    //     is inspected, and nothing is followed after the acquisition.
+    if (ts.isCallExpression(node) && isSockReflectiveReadCallee(node.expression, checker, sourceFile)) {
+      const target = node.arguments[0];
+      const keyArg = node.arguments[1];
+      if ((target !== undefined && ts.isSpreadElement(target)) || (keyArg !== undefined && ts.isSpreadElement(keyArg))) {
+        found = true; // unsupported argument shape at the reflective boundary
+      } else if (keyArg !== undefined) {
+        const key = sockResolveKey(keyArg, checker, sockMemo);
+        if (key.kind === 'resolved') {
+          if (STATIC_SOCKET_ACQUISITION_NAMES.has(key.value)) found = true;
+        } else if (key.kind === 'indeterminate' && target !== undefined && receiverIsReqRes(target)) {
+          found = true;
+        }
+      }
+    }
     ts.forEachChild(node, visit);
   };
   ts.forEachChild(sourceFile, visit);
@@ -2008,6 +2360,54 @@ const sockResolveKey = (
     if (error instanceof NetResolveAbort) return NET_INDETERMINATE;
     throw error;
   }
+};
+
+// MECH-2 (Day-7 convergence, SOCK reflective acquisition) — the FINITE family of free built-in
+// reflective READ APIs that acquire a property by a KEY ARGUMENT (bypassing RULE A's syntactic member
+// name): `Reflect.get`, `Reflect.getOwnPropertyDescriptor`, `Object.getOwnPropertyDescriptor`. This is a
+// closed inventory keyed by base identifier; it is NOT a general reflective/value-flow model
+// (`Reflect.has`/`ownKeys`, `Object.values`/`entries`/`assign`/`getOwnPropertyDescriptors`, an aliased
+// `const R = Reflect`, a `.call`/`.apply`/`.bind` chain, and a wrapper all stay at the frozen boundary).
+const SOCK_REFLECTIVE_READ_APIS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  ['Reflect', new Set(['get', 'getOwnPropertyDescriptor'])],
+  ['Object', new Set(['getOwnPropertyDescriptor'])],
+]);
+// The longest API name (`getOwnPropertyDescriptor` = 24), DERIVED from the inventory so a static
+// element-access spelling of the member (`Object['getOwnProperty' + 'Descriptor']`) folds to it rather
+// than being pruned as NotCapability under the narrower socket/network ceilings.
+const MAX_SOCK_REFLECTIVE_API_LENGTH = Math.max(
+  ...[...SOCK_REFLECTIVE_READ_APIS.values()].flatMap((names) => [...names]).map((name) => name.length),
+);
+// Whether a call callee is a DIRECT free built-in reflective READ member: a dotted `Reflect.get` /
+// `Object.getOwnPropertyDescriptor` (optional chaining included) or a bounded static element access
+// `Reflect['get']` / `Object['getOwnProperty' + 'Descriptor']`, with the member name resolved by the
+// SAME `netResolveKey` machinery (binder identity, never identifier text) at the API-name ceiling, off a
+// BASE identifier the binder proves UNSHADOWED — the `isFreeReflect` identifier rule reused verbatim
+// (`hasLocalRuntimeShadow`): a local `const Reflect = { get() {} }` / `const Object = …` is an ordinary
+// object. An aliased base (`const R = Reflect`), a runtime member key (`Reflect[k]`), or a shadowed base
+// all fail this — one statically identifiable built-in member, no alias, no call/apply/bind, no wrapper.
+const isSockReflectiveReadCallee = (callee: ts.Expression, checker: ts.TypeChecker, sourceFile: ts.SourceFile): boolean => {
+  const c = binderUnwrap(callee);
+  if (!ts.isPropertyAccessExpression(c) && !ts.isElementAccessExpression(c)) return false;
+  const base = binderUnwrap(c.expression);
+  if (!ts.isIdentifier(base)) return false;
+  const apis = SOCK_REFLECTIVE_READ_APIS.get(base.text);
+  if (apis === undefined) return false;
+  const symbol = checker.getSymbolAtLocation(base);
+  if (symbol !== undefined && hasLocalRuntimeShadow(symbol, sourceFile)) return false;
+  let member: string | null;
+  if (ts.isPropertyAccessExpression(c)) {
+    member = c.name.text;
+  } else {
+    try {
+      const key = netResolveKey(c.argumentExpression, checker, new Set<ts.Declaration>(), new Map<ts.Declaration, NetKey>(), { spent: 0 }, 0, MAX_SOCK_REFLECTIVE_API_LENGTH);
+      member = key.kind === 'resolved' ? key.value : null;
+    } catch (error) {
+      if (!(error instanceof NetResolveAbort)) throw error;
+      member = null;
+    }
+  }
+  return member !== null && apis.has(member);
 };
 
 // DDR-NET-STATIC-KEY-PARITY (nested authority) — the self-reference HOP NAME a DESTRUCTURING key
@@ -6249,7 +6649,6 @@ describe('D3 host enforces the final bounded socket-capability source policy (D3
     { form: 'an unrelated foo.createServer({ IncomingMessage: X }) that is not the node:http capability', source: `const foo = { createServer(_o: unknown, _h: () => void): void {} };\nclass X {}\nfoo.createServer({ IncomingMessage: X }, () => {});` },
     { form: 'an object literal with an IncomingMessage key OUTSIDE any createServer call', source: H + `class X {}\nconst options = { IncomingMessage: X };\nvoid options;\nhttp.createServer(() => {});` },
     { form: 'a benign superstring key { IncomingMessageLimit: 10 } (exact-set, not substring)', source: H + `http.createServer({ IncomingMessageLimit: 10 } as any, () => {});` },
-    { form: 'a genuinely runtime option key { [runtimeKey]: X } stays outside the proof', source: H + `declare const runtimeKey: string;\nclass X {}\nhttp.createServer({ [runtimeKey]: X } as any, () => {});` },
   ];
   for (const { form, source } of injectionAllow) {
     it(`allows ${form}`, () => {
@@ -6315,7 +6714,6 @@ describe('D3 host enforces the final bounded socket-capability source policy (D3
   const accessorInjectionAllow: readonly { readonly form: string; readonly source: string }[] = [
     { form: 'a SET-only accessor { set IncomingMessage(v) {} } (property read is undefined → default)', source: H + `http.createServer({ set IncomingMessage(_v: any) {} } as any, () => {});` },
     { form: 'a concise METHOD { IncomingMessage() {} } (a concise method is not constructable)', source: H + `http.createServer({ IncomingMessage() {} } as any, () => {});` },
-    { form: 'a SPREAD element { ...base } carrying a getter stays outside the value-flow boundary', source: H + `class Capture {}\nconst base = { get IncomingMessage() { return Capture; } };\nhttp.createServer({ ...base } as any, () => {});` },
     { form: 'a benign non-reserved getter { get maxHeaderSize() { return 8192; } }', source: H + `http.createServer({ get maxHeaderSize() { return 8192; } } as any, () => {});` },
     { form: 'a superstring-key getter { get IncomingMessageLimit() { … } } (exact-set miss)', source: H + `http.createServer({ get IncomingMessageLimit() { return 10; } } as any, () => {});` },
     { form: 'a reserved-key getter OUTSIDE any createServer call', source: H + `class X {}\nconst options = { get IncomingMessage() { return X; } };\nvoid options;\nhttp.createServer(() => {});` },
@@ -6360,8 +6758,6 @@ describe('D3 host enforces the final bounded socket-capability source policy (D3
     { form: 'a benign FunctionDeclaration handler (no socket capability)', source: H + `function handler(req: any, res: any) {\n  res.end('ok');\n}\nhttp.createServer(handler);` },
     { form: 'a benign const-arrow handler (static harmless key)', source: H + `const handler = (req: any, res: any) => {\n  const m = req['method'];\n  void m;\n};\nhttp.createServer(handler);` },
     { form: 'the inline-arrow baseline with a benign body (unchanged)', source: H + `http.createServer((req: any, res: any) => {\n  res.end('ok');\n});` },
-    { form: 'a MUTABLE let handler with req[runtimeKey] stays outside the proof', source: H + RK + `let handler = (req: any, res: any) => {\n  const s = req[rk];\n  s.connect(80, 'example.com');\n};\nhttp.createServer(handler);` },
-    { form: 'a parameter-supplied handler stays outside the proof', source: H + RK + `function mount(handler: any) {\n  http.createServer(handler);\n}\nvoid mount;` },
   ];
   for (const { form, source } of namedHandlerAllow) {
     it(`allows ${form}`, () => {
@@ -6397,13 +6793,699 @@ describe('D3 host enforces the final bounded socket-capability source policy (D3
   const aliasedOptionsAllow: readonly { readonly form: string; readonly source: string }[] = [
     { form: 'a benign const options alias { maxHeaderSize: 8192 }', source: H + `const options = { maxHeaderSize: 8192 };\nhttp.createServer(options, () => {});` },
     { form: 'a benign const alias superstring key { IncomingMessageLimit: 10 }', source: H + `const options = { IncomingMessageLimit: 10 };\nhttp.createServer(options as any, () => {});` },
-    { form: 'a MUTABLE let options alias stays outside the proof', source: H + `class Capture {}\nlet options = { IncomingMessage: Capture };\nhttp.createServer(options as any, () => {});` },
-    { form: 'a parameter-supplied options object stays outside the proof', source: H + `function mount(options: any) {\n  http.createServer(options as any, () => {});\n}\nvoid mount;` },
-    { form: 'a call-result options object stays outside the proof', source: H + `declare function getOptions(): any;\nhttp.createServer(getOptions(), () => {});` },
-    { form: 'a spread-copied const options object stays outside the proof (spread not value-followed)', source: H + `class Capture {}\nconst base = { IncomingMessage: Capture };\nconst options = { ...base };\nhttp.createServer(options as any, () => {});` },
     { form: 'a const options object with the key OUTSIDE any createServer call', source: H + `class X {}\nconst options = { IncomingMessage: X };\nvoid options;\nhttp.createServer(() => {});` },
   ];
   for (const { form, source } of aliasedOptionsAllow) {
+    it(`allows ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+
+  // =====================================================================================
+  // DAY-7 FINAL CONVERGENCE (PR #64) — two mechanisms established by the independent Day-7 audits.
+  //
+  //   MECH-1 — createServer CALL / ARGUMENT / OPTIONS disposition. The privileged node:http
+  //     createServer boundary is the CallExpression OR NewExpression whose callee is binder-proven
+  //     CREATE_SERVER. Every argument is normalized through the EXISTING bounded
+  //     `resolveCreateServerArgument` and then classified by FINITE AST SHAPE: a function-like node
+  //     (ArrowFunction / FunctionExpression / FunctionDeclaration) is the request listener; an
+  //     ObjectLiteralExpression is the options object; ANY OTHER SHAPE is DENIED at the boundary —
+  //     no claim is made about what the shape evaluates to, it is rejected solely because an
+  //     unsupported shape is being supplied to a privileged capability boundary (no value flow).
+  //     Inside an options literal a SpreadAssignment, a non-computed `__proto__` data key (any
+  //     value, never inspected), an INDETERMINATE computed key, and the resolved reserved
+  //     `IncomingMessage`/`ServerResponse` data/shorthand/getter keys DENY; the setter-only and
+  //     concise-method reserved forms, computed `['__proto__']`, shorthand `{ __proto__ }`, and
+  //     benign keys stay allowed. No prototype traversal, no `__proto__` RHS inspection.
+  //
+  //   MECH-2 — request/socket DELIVERY inventory. `client` joins the socket-value name family;
+  //     `receiverIsReqRes` accepts a bounded STATIC member chain rooted at a tracked req/res param
+  //     (closing `res.req[k]`); an OBJECT-REST binding derived from a tracked receiver in the
+  //     parameter / declaration / assignment forms DENIES (the rest object is never propagated);
+  //     a value-position `arguments` identifier is a whole-file syntactic reservation (strict ESM
+  //     host — no alias/data-flow analysis); and a STRUCTURAL reflective read through the free,
+  //     unshadowed built-ins `Reflect.get` / `Reflect.getOwnPropertyDescriptor` /
+  //     `Object.getOwnPropertyDescriptor` DENIES when its property-key argument resolves (via the
+  //     existing bounded socket key resolver) to a static socket-acquisition name on ANY target, or
+  //     is INDETERMINATE on a tracked req/res target. The rejected broad rule "deny any call
+  //     argument whose string equals socket/on/…" is NOT implemented (`res.setHeader('connection',
+  //     'close')`, `map.get('connection')`, `log('socket')` stay allowed).
+  //
+  //   FROZEN (deliberately NOT closed here): `const r = req; r[k]`, `[req][0][k]`, `{...req}` then
+  //     indexing, `Object.values/entries/assign/getOwnPropertyDescriptors(req)`, for-in recovery,
+  //     req forwarded to non-builtin callees, aliased Reflect (`const R = Reflect`), runtime
+  //     `server[k]` / `server[String(…)]`, cross-file flow.
+  // =====================================================================================
+
+  // ---- MECH-1 (1): NewExpression parity — `new http.createServer(…)` is the SAME privileged
+  //      boundary as the call form (the constructor position is already a NET-safe position). ----
+  const newExpressionReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'N1: new http.createServer({ IncomingMessage: Capture }, …) reserved option', source: H + `class Capture {\n  constructor(socket: any) {\n    socket.connect(80, 'example.com');\n  }\n}\nvoid new http.createServer({ IncomingMessage: Capture } as any, () => {});` },
+    { form: 'N2: new http.createServer(function (req) { req[runtimeKey] }) tracks the listener param', source: H + RK + `void new http.createServer(function (req: any) {\n  const s = req[rk];\n  s.connect(80, 'example.com');\n});` },
+    { form: 'N3: new http.createServer(letListener) unsupported shape', source: H + RK + `let handler = (req: any) => {\n  const s = req[rk];\n  s.connect(80, 'example.com');\n};\nvoid new http.createServer(handler);` },
+    { form: 'N4: new http.createServer({ __proto__: proto }) prototype option', source: H + `class Capture {}\nconst proto = { IncomingMessage: Capture };\nvoid new http.createServer({ __proto__: proto } as any, () => {});` },
+  ];
+  for (const { form, source } of newExpressionReject) {
+    it(`rejects ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // ---- MECH-1 (2): `__proto__` constructor options — a NON-COMPUTED identifier / string
+  //      `__proto__` data key sets the options PROTOTYPE, so Node's ordinary property read of
+  //      `options.IncomingMessage` walks into a caller-controlled object. The key is reserved
+  //      REGARDLESS of its value (the RHS is never inspected, no prototype recursion). ----
+  const protoOptionReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'P1: an identifier key { __proto__: { IncomingMessage: Capture } }', source: H + `class Capture {\n  constructor(socket: any) {\n    socket.connect(80, 'example.com');\n  }\n}\nhttp.createServer({ __proto__: { IncomingMessage: Capture } } as any, () => {});` },
+    { form: "P2: a string key { '__proto__': { IncomingMessage: Capture } }", source: H + `class Capture {\n  constructor(socket: any) {\n    socket.connect(80, 'example.com');\n  }\n}\nhttp.createServer({ '__proto__': { IncomingMessage: Capture } } as any, () => {});` },
+    { form: 'P3: a const-resolved prototype witness { __proto__: proto }', source: H + `class Capture {\n  constructor(socket: any) {\n    socket.connect(80, 'example.com');\n  }\n}\nconst proto = { IncomingMessage: Capture };\nhttp.createServer({ __proto__: proto } as any, () => {});` },
+    { form: 'P4: a nested prototype witness { __proto__: { __proto__: { IncomingMessage: Capture } } }', source: H + `class Capture {\n  constructor(socket: any) {\n    socket.connect(80, 'example.com');\n  }\n}\nhttp.createServer({ __proto__: { __proto__: { IncomingMessage: Capture } } } as any, () => {});` },
+    { form: 'P5: a const options alias carrying { __proto__: proto } (bounded arg resolver)', source: H + `class Capture {}\nconst proto = { IncomingMessage: Capture };\nconst options = { __proto__: proto };\nhttp.createServer(options as any, () => {});` },
+    { form: 'P6: { __proto__: null } is reserved regardless of value (value never inspected)', source: H + `http.createServer({ __proto__: null } as any, () => {});` },
+    { form: 'P7: a __proto__ key on the options-first single-argument overload', source: H + `class Capture {}\nhttp.createServer({ __proto__: { IncomingMessage: Capture } } as any);` },
+    { form: 'P8: a __proto__ key beside a benign key { maxHeaderSize: 1, __proto__: proto }', source: H + `class Capture {}\nconst proto = { IncomingMessage: Capture };\nhttp.createServer({ maxHeaderSize: 1, __proto__: proto } as any, () => {});` },
+  ];
+  for (const { form, source } of protoOptionReject) {
+    it(`rejects ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // ---- MECH-1 (3): createServer OPTIONS privileged-boundary denial — an options argument whose
+  //      normalized shape is not an ObjectLiteralExpression, or an ObjectLiteralExpression carrying
+  //      a spread / indeterminate computed key, is an UNSUPPORTED shape at the privileged boundary
+  //      and fails CLOSED. Nothing about the value is claimed or followed. ----
+  const optionsBoundaryReject: readonly { readonly form: string; readonly source: string }[] = [
+    // The FOUR former `aliasedOptionsAllow` / `injectionAllow` / `accessorInjectionAllow` ALLOW
+    // assertions the Day-7 audit identified as unsupported privileged shapes — flipped to DENY here
+    // (see the H section of the repair report). Their sources are byte-identical to the removed entries.
+    { form: 'O1 (flipped ALLOW→DENY): a spread literal { ...base } carrying a getter', source: H + `class Capture {}\nconst base = { get IncomingMessage() { return Capture; } };\nhttp.createServer({ ...base } as any, () => {});` },
+    { form: 'O2 (flipped ALLOW→DENY): an indeterminate computed option key { [runtimeKey]: X }', source: H + `declare const runtimeKey: string;\nclass X {}\nhttp.createServer({ [runtimeKey]: X } as any, () => {});` },
+    { form: 'O3 (flipped ALLOW→DENY): a MUTABLE let options alias', source: H + `class Capture {}\nlet options = { IncomingMessage: Capture };\nhttp.createServer(options as any, () => {});` },
+    { form: 'O4 (flipped ALLOW→DENY): a parameter-supplied options object', source: H + `function mount(options: any) {\n  http.createServer(options as any, () => {});\n}\nvoid mount;` },
+    { form: 'O5 (flipped ALLOW→DENY): a call-result options object', source: H + `declare function getOptions(): any;\nhttp.createServer(getOptions(), () => {});` },
+    { form: 'O6 (flipped ALLOW→DENY): a spread-copied const options object', source: H + `class Capture {}\nconst base = { IncomingMessage: Capture };\nconst options = { ...base };\nhttp.createServer(options as any, () => {});` },
+    // Remaining approved-matrix shapes.
+    { form: 'O7: a spread literal { ...base } (data-property base)', source: H + `class Capture {}\nconst base = { IncomingMessage: Capture };\nhttp.createServer({ ...base } as any, () => {});` },
+    { form: 'O8: an indeterminate computed GETTER key { get [runtimeKey]() {} }', source: H + `declare const runtimeKey: string;\nclass X {}\nhttp.createServer({ get [runtimeKey]() { return X; } } as any, () => {});` },
+    { form: 'O9: an indeterminate computed SETTER key { set [runtimeKey](v) {} } (fail-closed at the boundary)', source: H + `declare const runtimeKey: string;\nhttp.createServer({ set [runtimeKey](_v: any) {} } as any, () => {});` },
+    { form: 'O10: an indeterminate computed METHOD key { [runtimeKey]() {} } (fail-closed at the boundary)', source: H + `declare const runtimeKey: string;\nhttp.createServer({ [runtimeKey]() {} } as any, () => {});` },
+    { form: 'O11: a call-result computed key { [String(1)]: X }', source: H + `class X {}\nhttp.createServer({ [String(1)]: X } as any, () => {});` },
+    { form: 'O12: a var-bound options object', source: H + `class Capture {}\nvar options = { IncomingMessage: Capture };\nhttp.createServer(options as any, () => {});` },
+    { form: 'O13: a default-parameter options object', source: H + `class Capture {}\nfunction mount(options: any = { IncomingMessage: Capture }) {\n  http.createServer(options, () => {});\n}\nvoid mount;` },
+    { form: 'O14: Object.create(proto) options', source: H + `class Capture {}\nhttp.createServer(Object.create({ IncomingMessage: Capture }) as any, () => {});` },
+    { form: 'O15: Object.setPrototypeOf({}, proto) options', source: H + `class Capture {}\nhttp.createServer(Object.setPrototypeOf({}, { IncomingMessage: Capture }) as any, () => {});` },
+    { form: 'O16: Object.assign({}, proto) options', source: H + `class Capture {}\nhttp.createServer(Object.assign({}, { IncomingMessage: Capture }) as any, () => {});` },
+    { form: 'O17: a class-instance options object new Opts()', source: H + `class Capture {}\nclass Opts {\n  IncomingMessage = Capture;\n}\nhttp.createServer(new Opts() as any, () => {});` },
+    { form: 'O18: a const-bound class-instance options object', source: H + `class Capture {}\nclass Opts {\n  IncomingMessage = Capture;\n}\nconst options = new Opts();\nhttp.createServer(options as any, () => {});` },
+    { form: 'O19: a Proxy options object', source: H + `class Capture {}\nhttp.createServer(new Proxy({}, { get: () => Capture }) as any, () => {});` },
+    { form: 'O20: an array-element options object opts[0]', source: H + `class Capture {}\nconst opts = [{ IncomingMessage: Capture }];\nhttp.createServer(opts[0] as any, () => {});` },
+    { form: 'O21: a member-access options object holder.options', source: H + `class Capture {}\nconst holder = { options: { IncomingMessage: Capture } };\nhttp.createServer(holder.options as any, () => {});` },
+    { form: 'O22: a conditional options expression', source: H + `class Capture {}\ndeclare const flag: boolean;\nhttp.createServer((flag ? { IncomingMessage: Capture } : {}) as any, () => {});` },
+    { form: 'O23: a spread ARGUMENT createServer(...args)', source: H + `class Capture {}\nconst args = [{ IncomingMessage: Capture }, () => {}] as const;\nhttp.createServer(...(args as any));` },
+    { form: 'O24: a const alias of a let options binding (resolver stops at the let)', source: H + `class Capture {}\nlet base = { IncomingMessage: Capture };\nconst options = base;\nhttp.createServer(options as any, () => {});` },
+    { form: 'O25: an ambient (declare const) options binding', source: H + `declare const options: any;\nhttp.createServer(options, () => {});` },
+    { form: 'O26: a primitive literal argument createServer(null, …)', source: H + `http.createServer(null as any, () => {});` },
+  ];
+  for (const { form, source } of optionsBoundaryReject) {
+    it(`rejects ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // ---- MECH-1 (4): request LISTENER privileged-boundary denial — a listener argument whose
+  //      normalized shape is not function-like is an UNSUPPORTED shape at the privileged boundary
+  //      and fails CLOSED (its parameters cannot be tracked, so its req/res delivery is unprovable). ----
+  const listenerBoundaryReject: readonly { readonly form: string; readonly source: string }[] = [
+    // The TWO former `namedHandlerAllow` ALLOW assertions the Day-7 audit identified — flipped to DENY.
+    { form: 'L1 (flipped ALLOW→DENY): a MUTABLE let handler with req[runtimeKey]', source: H + RK + `let handler = (req: any, res: any) => {\n  const s = req[rk];\n  s.connect(80, 'example.com');\n};\nhttp.createServer(handler);` },
+    { form: 'L2 (flipped ALLOW→DENY): a parameter-supplied handler', source: H + RK + `function mount(handler: any) {\n  http.createServer(handler);\n}\nvoid mount;` },
+    // Remaining approved-matrix shapes.
+    { form: 'L3: a wrapper-forwarded listener createServer(wrap(handler))', source: H + RK + `declare function wrap(h: any): any;\nconst handler = (req: any) => {\n  const s = req[rk];\n  s.connect(80, 'example.com');\n};\nhttp.createServer(wrap(handler));` },
+    { form: 'L4: an arrow wrapper forwarding its parameter const mount = (h) => http.createServer(h)', source: H + RK + `const mount = (h: any) => http.createServer(h);\nmount((req: any) => {\n  const s = req[rk];\n  s.connect(80, 'example.com');\n});` },
+    { form: 'L5: an array-element listener handlers[0]', source: H + RK + `const handlers = [(req: any) => {\n  const s = req[rk];\n  s.connect(80, 'example.com');\n}];\nhttp.createServer(handlers[0]);` },
+    { form: 'L6: an object method listener obj.handle', source: H + RK + `const obj = {\n  handle(req: any) {\n    const s = req[rk];\n    s.connect(80, 'example.com');\n  },\n};\nhttp.createServer(obj.handle);` },
+    { form: 'L7: a class method listener new C().handle', source: H + RK + `class C {\n  handle(req: any) {\n    const s = req[rk];\n    s.connect(80, 'example.com');\n  }\n}\nhttp.createServer(new C().handle);` },
+    { form: 'L8: a class prototype method listener C.prototype.handle', source: H + RK + `class C {\n  handle(req: any) {\n    const s = req[rk];\n    s.connect(80, 'example.com');\n  }\n}\nhttp.createServer(C.prototype.handle);` },
+    { form: 'L9: a default-parameter listener', source: H + RK + `function mount(h: any = (req: any) => {\n  const s = req[rk];\n  s.connect(80, 'example.com');\n}) {\n  http.createServer(h);\n}\nvoid mount;` },
+    { form: 'L10: a bound listener handler.bind(null)', source: H + RK + `const handler = (req: any) => {\n  const s = req[rk];\n  s.connect(80, 'example.com');\n};\nhttp.createServer(handler.bind(null));` },
+    { form: 'L11: a var-bound listener', source: H + RK + `var handler = (req: any) => {\n  const s = req[rk];\n  s.connect(80, 'example.com');\n};\nhttp.createServer(handler);` },
+    { form: 'L12: a conditional listener expression', source: H + RK + `declare const flag: boolean;\nconst a = (req: any) => {\n  const s = req[rk];\n  s.connect(80, 'example.com');\n};\nhttp.createServer(flag ? a : a);` },
+    { form: 'L13: a listener supplied as the SECOND argument in an unsupported shape', source: H + RK + `let handler = (req: any) => {\n  const s = req[rk];\n  s.connect(80, 'example.com');\n};\nhttp.createServer({}, handler);` },
+    { form: 'L14: a benign-looking unsupported listener shape is still denied (shape, not value)', source: H + `declare const listener: any;\nhttp.createServer(listener);` },
+  ];
+  for (const { form, source } of listenerBoundaryReject) {
+    it(`rejects ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // ---- MECH-1 (preserve): the SUPPORTED shapes — direct/const/FunctionDeclaration listeners and
+  //      object-literal options — keep their existing disposition, for BOTH call and `new` forms;
+  //      an unsupported shape supplied to an UNRELATED `.createServer` is untouched. ----
+  const createServerShapeAllow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a zero-argument createServer()', source: H + `http.createServer();` },
+    { form: 'a zero-argument new http.createServer()', source: H + `void new http.createServer();` },
+    { form: 'a benign new http.createServer(() => {}) (NewExpression parity in the allow direction)', source: H + `void new http.createServer(() => {});` },
+    { form: 'a benign new http.createServer({ maxHeaderSize: 8192 }, handler) with a FunctionDeclaration', source: H + `function handler(req: any, res: any) {\n  res.end('ok');\n}\nvoid new http.createServer({ maxHeaderSize: 8192 }, handler);` },
+    { form: 'a benign options + inline listener createServer({ keepAlive: true }, (req, res) => …)', source: H + `http.createServer({ keepAlive: true }, (req: any, res: any) => {\n  res.end(req.method);\n});` },
+    { form: 'a benign const->const listener spine', source: H + `const base = (req: any, res: any) => {\n  res.end('ok');\n};\nconst handler = base;\nhttp.createServer(handler);` },
+    { form: 'a benign as-wrapped FunctionDeclaration listener', source: H + `function handler(req: any, res: any) {\n  res.end('ok');\n}\nhttp.createServer(handler as any);` },
+    { form: 'a benign satisfies-wrapped inline listener', source: H + `http.createServer(((req: any, res: any) => {\n  res.end('ok');\n}) satisfies (req: any, res: any) => void);` },
+    { form: 'an unrelated foo.createServer(getOptions()) (not the privileged boundary)', source: `declare function getOptions(): any;\nconst foo = { createServer(_o: unknown): void {} };\nfoo.createServer(getOptions());` },
+    { form: 'an unrelated foo.createServer(letListener) (not the privileged boundary)', source: `let listener = () => {};\nconst foo = { createServer(_h: unknown): void {} };\nfoo.createServer(listener);` },
+    { form: 'a numeric option key { 1: X } is a harmless non-reserved key', source: H + `class X {}\nhttp.createServer({ 1: X } as any, () => {});` },
+    { form: "a resolvable harmless computed key { ['maxHeader' + 'Size']: 1 }", source: H + `http.createServer({ ['maxHeader' + 'Size']: 1 } as any, () => {});` },
+  ];
+  for (const { form, source } of createServerShapeAllow) {
+    it(`allows ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+
+  // ---- MECH-2 (5): `arguments` delivery — in this strict ESM host a value-position `arguments`
+  //      identifier is a WHOLE-FILE syntactic reservation (no alias / data-flow analysis; the
+  //      binder value-reference guard keeps property names / keys / declarations out). ----
+  const argumentsReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'G1: arguments[0][runtimeKey] inside a function-expression listener', source: H + RK + `http.createServer(function () {\n  const s = arguments[0][rk];\n  s.connect(80, 'example.com');\n});` },
+    { form: 'G2: arguments[1][runtimeKey] (the response object)', source: H + RK + `http.createServer(function () {\n  const s = arguments[1][rk];\n  s.connect(80, 'example.com');\n});` },
+    { form: 'G3: an alias const a = arguments; a[0][runtimeKey]', source: H + RK + `http.createServer(function () {\n  const a = arguments;\n  const s = a[0][rk];\n  s.connect(80, 'example.com');\n});` },
+    { form: 'G4: an array-destructuring alias const [req] = arguments', source: H + RK + `http.createServer(function () {\n  const [req] = arguments;\n  const s = req[rk];\n  s.connect(80, 'example.com');\n});` },
+    { form: 'G5: an object-destructuring alias const { 0: req } = arguments', source: H + RK + `http.createServer(function () {\n  const { 0: req } = arguments;\n  const s = req[rk];\n  s.connect(80, 'example.com');\n});` },
+    { form: 'G6: an arrow-captured arguments inside the listener', source: H + RK + `http.createServer(function () {\n  const grab = () => arguments[0][rk];\n  grab().connect(80, 'example.com');\n});` },
+    { form: 'G7: Reflect.get(arguments, 0)', source: H + RK + `http.createServer(function () {\n  const req = Reflect.get(arguments, 0);\n  const s = req[rk];\n  s.connect(80, 'example.com');\n});` },
+    { form: 'G8: a named FunctionDeclaration listener using arguments', source: H + RK + `function handler() {\n  const s = arguments[0][rk];\n  s.connect(80, 'example.com');\n}\nhttp.createServer(handler);` },
+    { form: 'G9: a const function-expression listener using arguments', source: H + RK + `const handler = function () {\n  const s = arguments[0][rk];\n  s.connect(80, 'example.com');\n};\nhttp.createServer(handler);` },
+    { form: 'G10: a shorthand { arguments } capture', source: H + `http.createServer(function () {\n  const box = { arguments };\n  void box;\n});` },
+    { form: 'G11: arguments forwarded as a call argument', source: H + `declare function leak(a: unknown): void;\nhttp.createServer(function () {\n  leak(arguments);\n});` },
+    { form: 'G12: an unrelated function reading arguments.length (accepted whole-file reservation)', source: `function sum(): number {\n  return arguments.length;\n}\nvoid sum;` },
+  ];
+  for (const { form, source } of argumentsReject) {
+    it(`rejects ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // ---- MECH-2 (5, preserve): `arguments` in a NON-value position is not a read of the binding. ----
+  const argumentsAllow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a member NAME obj.arguments', source: `const obj = { arguments: 1 };\nvoid obj.arguments;` },
+    { form: 'an object-literal KEY { arguments: 1 }', source: `const obj = { arguments: 1 };\nvoid obj;` },
+    { form: 'a destructuring source KEY const { arguments: a } = obj', source: `const obj = { arguments: 1 };\nconst { arguments: a } = obj;\nvoid a;` },
+    { form: 'a type-position property signature { arguments: number }', source: `type T = { arguments: number };\ndeclare const t: T;\nvoid t;` },
+    { form: 'a class METHOD named arguments', source: `class K {\n  arguments(): void {}\n}\nvoid new K();` },
+    { form: 'a class FIELD named arguments', source: `class K {\n  arguments = 1;\n}\nvoid new K();` },
+    { form: 'a class GETTER named arguments', source: `class K {\n  get arguments(): number {\n    return 1;\n  }\n}\nvoid new K();` },
+    { form: 'an object-literal GETTER / METHOD named arguments', source: `const obj = {\n  get arguments(): number {\n    return 1;\n  },\n  arguments2(): void {},\n};\nvoid obj;` },
+    { form: "a string literal 'arguments' (text, not an identifier)", source: `const s = 'arguments';\nvoid s;` },
+  ];
+  for (const { form, source } of argumentsAllow) {
+    it(`allows ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+
+  // ---- MECH-2 (6): OBJECT-REST delivery — a rest binding element derived from a tracked req/res
+  //      receiver (listener parameter pattern, declaration off req/res, assignment off req/res),
+  //      at any finite pattern depth, DENIES; the resulting rest object is never propagated. ----
+  const objectRestReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'R1: a listener parameter ({ ...rest }) => rest[runtimeKey]', source: H + RK + `http.createServer(({ ...rest }: any) => {\n  const s = rest[rk];\n  s.connect(80, 'example.com');\n});` },
+    { form: 'R2: a second-parameter ({ ...rest }) response rest', source: H + RK + `http.createServer((_req: any, { ...rest }: any) => {\n  const s = rest[rk];\n  s.connect(80, 'example.com');\n});` },
+    { form: 'R3: a mixed listener parameter ({ method, ...rest })', source: H + RK + `http.createServer(({ method, ...rest }: any) => {\n  void method;\n  const s = rest[rk];\n  s.connect(80, 'example.com');\n});` },
+    { form: 'R4: a declaration const { ...rest } = req', source: handler(RK + `const { ...rest } = req;\nconst s = rest[rk];\ns.connect(80, 'example.com');`) },
+    { form: 'R5: a declaration const { method, ...rest } = res', source: handler(RK + `const { method, ...rest } = res as any;\nvoid method;\nconst s = rest[rk];\ns.connect(80, 'example.com');`) },
+    { form: 'R6: an assignment ({ ...rest } = req)', source: handler(RK + `let rest: any;\n({ ...rest } = req);\nconst s = rest[rk];\ns.connect(80, 'example.com');`) },
+    { form: 'R7: an assignment ({ method: m, ...rest } = req)', source: handler(RK + `let rest: any;\nlet m: unknown;\n({ method: m, ...rest } = req as any);\nvoid m;\nconst s = rest[rk];\ns.connect(80, 'example.com');`) },
+    { form: 'R8: a nested listener parameter (_req, { req: { ...rest } }) (the res.req static-chain twin)', source: H + RK + `http.createServer((_req: any, { req: { ...rest } }: any) => {\n  const s = rest[rk];\n  s.connect(80, 'example.com');\n});` },
+    { form: 'R9: a nested declaration const { req: { ...rest } } = res', source: handler(RK + `const { req: { ...rest } } = res as any;\nconst s = rest[rk];\ns.connect(80, 'example.com');`) },
+    { form: 'R10: a nested assignment ({ req: { ...rest } } = res)', source: handler(RK + `let rest: any;\n({ req: { ...rest } } = res as any);\nconst s = rest[rk];\ns.connect(80, 'example.com');`) },
+    { form: 'R11: a declaration from the res.req static chain const { ...rest } = res.req', source: handler(RK + `const { ...rest } = (res as any).req;\nconst s = rest[rk];\ns.connect(80, 'example.com');`) },
+    { form: 'R12: a rest inside a nested array pattern const { a: [{ ...rest }] } = req', source: handler(RK + `const { a: [{ ...rest }] } = req as any;\nconst s = rest[rk];\ns.connect(80, 'example.com');`) },
+    { form: 'R13: a FunctionDeclaration listener with a rest parameter pattern', source: H + RK + `function handler({ ...rest }: any) {\n  const s = rest[rk];\n  s.connect(80, 'example.com');\n}\nhttp.createServer(handler);` },
+    { form: 'R14: a defaulted nested assignment target ({ req: { ...rest } = {} } = res)', source: handler(RK + `let rest: any;\n({ req: { ...rest } = {} } = res as any);\nconst s = rest[rk];\ns.connect(80, 'example.com');`) },
+  ];
+  for (const { form, source } of objectRestReject) {
+    it(`rejects ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // ---- MECH-2 (6, preserve): an object rest off an UNTRACKED receiver is not a req/res delivery. ----
+  const objectRestAllow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a rest off an unrelated object const { ...rest } = cfg', source: `const cfg = { a: 1, b: 2 };\nconst { a, ...rest } = cfg;\nvoid a;\nvoid rest;` },
+    { form: 'a rest parameter on an unrelated function', source: `function f({ ...rest }: Record<string, unknown>): void {\n  void rest;\n}\nvoid f;` },
+    { form: 'a rest assignment off an unrelated object', source: `const cfg: Record<string, unknown> = {};\nlet rest: unknown;\n({ ...rest } = cfg);\nvoid rest;` },
+    { form: 'an ARRAY rest parameter (...args) with a static harmless read', source: H + `http.createServer((...args: any[]) => {\n  void args.length;\n});` },
+  ];
+  for (const { form, source } of objectRestAllow) {
+    it(`allows ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+
+  // ---- MECH-2 (7): `req.client` — the third IncomingMessage socket-value alias joins the
+  //      socket-value name family (RULE A, receiver-independent like `socket`/`connection`). ----
+  const clientReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'C1: a direct req.client member', source: handler(`req.client.connect(80, 'example.com');`) },
+    { form: "C2: a static-computed req['client']", source: handler(`void req['client'];`) },
+    { form: 'C3: a { client } destructuring off req', source: handler(`const { client } = req as any;\nvoid client;`) },
+    { form: 'C4: a renamed { client: c } destructuring off res', source: handler(`const { client: c } = res as any;\nvoid c;`) },
+    { form: "C5: a concatenated req['cli' + 'ent']", source: handler(`void req['cli' + 'ent'];`) },
+    { form: "C6: a const-bound key const k = 'client'; req[k]", source: handler(`const k = 'client';\nvoid req[k];`) },
+    { form: 'C7: an assignment ({ client: c } = req)', source: handler(`let c: unknown;\n({ client: c } = req as any);\nvoid c;`) },
+    { form: 'C8: an inline ({ client }) listener parameter', source: H + `http.createServer(({ client }: any) => {\n  void client;\n});` },
+    { form: 'C9: an unrelated api.client (accepted global false positive, parity with camera.socket)', source: `const api = { client: 1 };\nvoid api.client;` },
+    { form: "C10: Reflect.get(req, 'client')", source: handler(`void Reflect.get(req, 'client');`) },
+  ];
+  for (const { form, source } of clientReject) {
+    it(`rejects ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // ---- MECH-2 (8): `res.req[k]` — a bounded STATIC member chain rooted at a tracked req/res
+  //      parameter (dotted / optional / static-key element hops, through transparent wrappers) is
+  //      a tracked receiver for RULE A2, so an indeterminate key on `res.req` fails closed. ----
+  const staticChainReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'S1: res.req[runtimeKey]', source: handler(RK + `const s = (res as any).req[rk];\ns.connect(80, 'example.com');`) },
+    { form: "S2: res['req'][runtimeKey]", source: handler(RK + `const s = (res as any)['req'][rk];\ns.connect(80, 'example.com');`) },
+    { form: "S3: res['r' + 'eq'][runtimeKey] (resolved static hop)", source: handler(RK + `const s = (res as any)['r' + 'eq'][rk];\ns.connect(80, 'example.com');`) },
+    { form: 'S4: (res.req as any)[runtimeKey] (wrapped chain)', source: handler(RK + `const s = ((res as any).req as any)[rk];\ns.connect(80, 'example.com');`) },
+    { form: 'S5: res?.req?.[runtimeKey] (optional chain)', source: handler(RK + `const s = (res as any)?.req?.[rk];\ns.connect(80, 'example.com');`) },
+    { form: 'S6: res.req.headers[runtimeKey] (deeper static chain)', source: handler(RK + `void (res as any).req.headers[rk];`) },
+    { form: 'S7: a declaration const { [runtimeKey]: s } = res.req', source: handler(RK + `const { [rk]: s } = (res as any).req;\ns.connect(80, 'example.com');`) },
+    { form: 'S8: an assignment ({ [runtimeKey]: s } = res.req)', source: handler(RK + `let s: any;\n({ [rk]: s } = (res as any).req);\ns.connect(80, 'example.com');`) },
+    { form: 'S9: an assignment ({ socket: s } = res.req) (capability name on the chain receiver)', source: handler(`let s: unknown;\n({ socket: s } = (res as any).req);\nvoid s;`) },
+    { form: "S10: a const-key hop const k = 'req'; res[k][runtimeKey]", source: handler(RK + `const k = 'req';\nvoid (res as any)[k][rk];`) },
+    { form: 'S11: a non-null chain res!.req![runtimeKey]', source: handler(RK + `void (res as any)!.req![rk];`) },
+    { form: 'S12: req.headers[runtimeKey] (any static chain rooted at req fails closed)', source: handler(RK + `void req.headers[rk];`) },
+  ];
+  for (const { form, source } of staticChainReject) {
+    it(`rejects ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // ---- MECH-2 (8, preserve): a static harmless key on the chain, and a chain NOT rooted at a
+  //      tracked req/res param, keep their disposition (no alias / value flow). ----
+  const staticChainAllow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: "a static harmless key on the chain res.req['method']", source: handler(`void (res as any).req['method'];`) },
+    { form: 'a dotted harmless chain res.req.method', source: handler(`void (res as any).req.method;`) },
+    { form: 'a chain rooted at an unrelated object unrelated.req[runtimeKey]', source: RK + `const unrelated: any = {};\nvoid unrelated.req[rk];` },
+    { form: 'a chain broken by a call res.getHeader("x")[runtimeKey] (frozen callee boundary)', source: handler(RK + `void (res as any).getHeader('x')[rk];`) },
+  ];
+  for (const { form, source } of staticChainAllow) {
+    it(`allows ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+
+  // ---- MECH-2 (9): STRUCTURAL reflective acquisition — a direct call to the free, unshadowed
+  //      built-in `Reflect.get` / `Reflect.getOwnPropertyDescriptor` / `Object.getOwnPropertyDescriptor`
+  //      whose property-key argument RESOLVES (bounded socket key resolver) to a static
+  //      socket-acquisition name DENIES on any target; an INDETERMINATE key DENIES on a tracked
+  //      req/res target. Recognized by the callee STRUCTURE — never by a call argument's text. ----
+  const reflectiveReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: "X1: Reflect.get(req, 'socket')", source: handler(`const s = Reflect.get(req, 'socket');\ns.connect(80, 'example.com');`) },
+    { form: "X2: a folded key Reflect.get(req, 'sock' + 'et')", source: handler(`void Reflect.get(req, 'sock' + 'et');`) },
+    { form: "X3: a const-bound key const k = 'socket'; Reflect.get(req, k)", source: handler(`const k = 'socket';\nvoid Reflect.get(req, k);`) },
+    { form: "X4: Reflect.get(server, 'on') (delivery member on any target)", source: wrapperHead + `const on = Reflect.get(server, 'on');\nvoid on;` },
+    { form: "X5: Reflect.getOwnPropertyDescriptor(req, 'socket')", source: handler(`void Reflect.getOwnPropertyDescriptor(req, 'socket');`) },
+    { form: "X6: Object.getOwnPropertyDescriptor(req, 'socket')", source: handler(`void Object.getOwnPropertyDescriptor(req, 'socket');`) },
+    { form: 'X7: an indeterminate key Reflect.get(req, runtimeKey) on a tracked req', source: handler(RK + `const s = Reflect.get(req, rk);\ns.connect(80, 'example.com');`) },
+    { form: 'X8: an indeterminate key Object.getOwnPropertyDescriptor(res, runtimeKey) on a tracked res', source: handler(RK + `void Object.getOwnPropertyDescriptor(res, rk);`) },
+    { form: 'X9: an indeterminate key on the res.req static chain Reflect.get(res.req, runtimeKey)', source: handler(RK + `void Reflect.get((res as any).req, rk);`) },
+    { form: "X10: a static-element callee Reflect['get'](req, 'socket')", source: handler(`void Reflect['get'](req, 'socket');`) },
+    { form: "X11: a folded callee Object['getOwnProperty' + 'Descriptor'](req, 'socket')", source: handler(`void Object['getOwnProperty' + 'Descriptor'](req, 'socket');`) },
+    { form: "X12: a template key Reflect.get(req, `connection`)", source: handler('void Reflect.get(req, `connection`);') },
+    { form: "X13: an unrelated target Reflect.get(camera, 'socket') (static name, any target)", source: `const camera = { socket: 1 };\nvoid Reflect.get(camera, 'socket');` },
+    { form: 'X14: a spread argument list Reflect.get(...pair) (unsupported shape at the reflective boundary)', source: handler(`const pair = [req, 'socket'] as const;\nvoid Reflect.get(...(pair as any));`) },
+    { form: "X15: an optional-call Reflect.get?.(req, 'socket')", source: handler(`void Reflect.get?.(req, 'socket');`) },
+    { form: "X16: Reflect.get(req, 'setTimeout') (delivery member)", source: handler(`void Reflect.get(req, 'setTimeout');`) },
+  ];
+  for (const { form, source } of reflectiveReject) {
+    it(`rejects ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // ---- MECH-2 (9, preserve): the rejected broad "any string argument" rule is NOT implemented —
+  //      only the STRUCTURAL free-builtin reflective read is recognized. ----
+  const reflectiveAllow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: "Reflect.get(local, 'fetch') (non-socket name, non-global receiver)", source: `const local = { fetch() {} };\nReflect.get(local, 'fetch')();` },
+    { form: "Reflect.get(globalThis, 'crypto') (non-socket, non-network name)", source: `void Reflect.get(globalThis, 'crypto');` },
+    { form: "a user-shadowed Reflect.get(req, 'socket') (ordinary object, not the built-in)", source: handler(`const Reflect = { get(_t: unknown, _k: string): unknown { return 1; } };\nvoid Reflect.get(req, 'socket');`) },
+    { form: "a user-shadowed Object.getOwnPropertyDescriptor(req, 'socket')", source: handler(`const Object = { getOwnPropertyDescriptor(_t: unknown, _k: string): unknown { return 1; } };\nvoid Object.getOwnPropertyDescriptor(req, 'socket');`) },
+    { form: "res.setHeader('connection', 'close') (an ordinary method call, not a reflective read)", source: handler(`res.setHeader('connection', 'close');`) },
+    { form: "map.get('connection') (a non-builtin .get)", source: `const map = new Map<string, number>();\nvoid map.get('connection');` },
+    { form: "log('socket') (a plain call with a socket-named string)", source: `declare function log(s: string): void;\nlog('socket');` },
+    { form: "Reflect.get(req, 'method') (harmless resolved key)", source: handler(`void Reflect.get(req, 'method');`) },
+    { form: 'Reflect.get(unrelated, runtimeKey) (indeterminate key on an UNTRACKED target)', source: RK + `const unrelated: Record<string, unknown> = {};\nvoid Reflect.get(unrelated, rk);` },
+    { form: "Reflect.has(req, 'socket') (not an acquisition API)", source: handler(`void Reflect.has(req, 'socket');`) },
+    { form: "Reflect.ownKeys(req) (no property-key argument)", source: handler(`void Reflect.ownKeys(req);`) },
+  ];
+  for (const { form, source } of reflectiveAllow) {
+    it(`allows ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+
+  // ---- MECH-1/2 negative controls (preserve): the existing controls asserted elsewhere in this
+  //      suite (setter-only / concise-method reserved options, `IncomingMessageLimit`, unrelated
+  //      `foo.createServer`, a reserved key outside createServer, the five real host files) are
+  //      untouched; the `__proto__`-specific controls are pinned here. ----
+  const protoControlAllow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: "a computed ['__proto__'] key (an ordinary own property, never the prototype)", source: H + `class X {}\nhttp.createServer({ ['__proto__']: { IncomingMessage: X } } as any, () => {});` },
+    { form: 'a shorthand { __proto__ } key (an ordinary own property, never the prototype)', source: H + `class X {}\nconst __proto__ = { IncomingMessage: X };\nhttp.createServer({ __proto__ } as any, () => {});` },
+    { form: 'a __proto__ concise METHOD { __proto__() {} } (an own method, never the prototype)', source: H + `http.createServer({ __proto__() { return 1; } } as any, () => {});` },
+    { form: 'a __proto__ GETTER { get __proto__() {} } (an own accessor, never the prototype)', source: H + `http.createServer({ get __proto__() { return 1; } } as any, () => {});` },
+    { form: 'a __proto__ data key OUTSIDE any createServer call', source: H + `class X {}\nconst options = { __proto__: { IncomingMessage: X } };\nvoid options;\nhttp.createServer(() => {});` },
+    { form: 'a __proto__ data key on an unrelated foo.createServer', source: `class X {}\nconst foo = { createServer(_o: unknown): void {} };\nfoo.createServer({ __proto__: { IncomingMessage: X } });` },
+  ];
+  for (const { form, source } of protoControlAllow) {
+    it(`allows ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+
+  // ---- ADVERSARIAL CLOSURE AUDIT (siblings INSIDE the authorized finite grammar, pinned) ----
+  const closureSiblingReject: readonly { readonly form: string; readonly source: string }[] = [
+    // MECH-1 — every supported createServer callee spine reaches the same boundary.
+    { form: 'A1: a named-import new createServer(letListener)', source: `import { createServer } from 'node:http';\n` + RK + `let handler = (req: any) => {\n  const s = req[rk];\n  s.connect(80, 'example.com');\n};\nvoid new createServer(handler);` },
+    { form: 'A2: a destructured const { createServer: cs } = http; cs(letListener)', source: H + RK + `const { createServer: cs } = http;\nlet handler = (req: any) => {\n  const s = req[rk];\n  s.connect(80, 'example.com');\n};\ncs(handler);` },
+    { form: "A3: a static-element callee http['createServer'](letListener)", source: H + RK + `let handler = (req: any) => {\n  const s = req[rk];\n  s.connect(80, 'example.com');\n};\nhttp['createServer'](handler);` },
+    // MECH-1 — other non-function / non-literal argument shapes.
+    { form: 'A4: a class declaration supplied as the listener', source: H + `class L {}\nhttp.createServer(L as any);` },
+    { form: 'A5: a const class expression supplied as the listener', source: H + `const L = class {};\nhttp.createServer(L as any);` },
+    { form: 'A6: a comma-expression listener (0, handler)', source: H + RK + `const handler = (req: any) => {\n  const s = req[rk];\n  s.connect(80, 'example.com');\n};\nhttp.createServer((0, handler));` },
+    { form: 'A7: an async arrow listener still tracks its parameter (function-like parity)', source: H + RK + `http.createServer(async (req: any) => {\n  const s = req[rk];\n  s.connect(80, 'example.com');\n});` },
+    { form: 'A8: a generator function-expression listener still tracks its parameter', source: H + RK + `http.createServer(function* (req: any) {\n  const s = req[rk];\n  s.connect(80, 'example.com');\n} as any);` },
+    { form: 'A9: a type-assertion-wrapped let listener <any>handler', source: H + RK + `let handler = (req: any) => {\n  const s = req[rk];\n  s.connect(80, 'example.com');\n};\nhttp.createServer(<any>handler);` },
+    { form: 'A10: a tagged-template options argument', source: H + `declare function tag(s: TemplateStringsArray): any;\nhttp.createServer(tag\`x\`, () => {});` },
+    // MECH-1 — every ObjectLiteralElementLike kind inside the options literal.
+    { form: 'A11: a reserved key beside a spread { IncomingMessage: X, ...rest }', source: H + `class X {}\nconst rest = {};\nhttp.createServer({ IncomingMessage: X, ...rest } as any, () => {});` },
+    { form: 'A12: a getter + setter pair { get IncomingMessage() {}, set IncomingMessage(v) {} }', source: H + `class X {}\nhttp.createServer({ get IncomingMessage() { return X; }, set IncomingMessage(_v: any) {} } as any, () => {});` },
+    { form: "A13: a computed getter resolving to __proto__ is NOT the prototype, but { ['Incoming' + 'Message']: X } beside it is reserved", source: H + `class X {}\nhttp.createServer({ get ['__proto__']() { return 1; }, ['Incoming' + 'Message']: X } as any, () => {});` },
+    { form: 'A14: a template-substituted __proto__ data key is a computed own property, but a substituted reserved key is caught', source: H + `class X {}\nhttp.createServer({ [\`__pro\${'to__'}\`]: {}, [\`Server\${'Response'}\`]: X } as any, () => {});` },
+    { form: 'A15: a reserved option in the SECOND-argument literal (every argument is dispositioned)', source: H + `class X {}\nhttp.createServer(() => {}, { IncomingMessage: X } as any);` },
+    // MECH-2 — object-rest / chain / reflective siblings.
+    { form: 'A16: an object rest assigned into a member target ({ ...holder.rest } = req)', source: handler(`const holder: any = {};\n({ ...holder.rest } = req as any);`) },
+    { form: 'A17: a computed-key nested rest ({ [k]: { ...rest } } = req) fails closed on the key', source: handler(RK + `let rest: any;\n({ [rk]: { ...rest } } = req as any);\nvoid rest;`) },
+    { form: 'A18: a rest parameter pattern on a const arrow listener', source: H + RK + `const handler = ({ ...rest }: any) => {\n  const s = rest[rk];\n  s.connect(80, 'example.com');\n};\nhttp.createServer(handler);` },
+    { form: "A19: a parenthesized reflective callee (Reflect).get(req, 'socket')", source: handler(`void (Reflect).get(req, 'socket');`) },
+    { form: "A20: a parenthesized reflective member (Reflect.get)(req, 'socket')", source: handler(`void (Reflect.get)(req, 'socket');`) },
+    { form: "A21: Reflect.get(req, 'socket', receiver) with a third argument", source: handler(`void Reflect.get(req, 'socket', {});`) },
+    { form: 'A22: Reflect.get(req, 0) — a numeric (indeterminate) key on a tracked req fails closed', source: handler(`void Reflect.get(req, 0 as any);`) },
+    { form: "A23: Reflect.getOwnPropertyDescriptor(server, 'on') (delivery member, any target)", source: wrapperHead + `void Reflect.getOwnPropertyDescriptor(server, 'on');` },
+    { form: 'A24: an indeterminate chain hop inside a longer chain res[k1][k2] is caught at the inner access', source: handler(RK + `declare const other: string;\nvoid (res as any)[rk][other];`) },
+    { form: 'A25: arguments read through a nested object method inside the listener', source: H + RK + `http.createServer(function () {\n  const helper = {\n    grab() {\n      return arguments[0];\n    },\n  };\n  void helper;\n});` },
+  ];
+  for (const { form, source } of closureSiblingReject) {
+    it(`rejects ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // ---- OUTSIDE_BOUNDARY (frozen — deliberately NOT closed by this repair; asserted so the
+  //      mechanism is provably not broadened into alias / value-flow analysis). ----
+  const frozenOutsideBoundaryAllow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'the alias + runtime key const r = req; r[k] (frozen)', source: handler(RK + `const r = req;\nvoid r[rk];`) },
+    { form: 'the array-wrapped [req][0][k] (frozen)', source: handler(RK + `void [req][0][rk];`) },
+    { form: 'the spread-copy ({ ...req })[k] (frozen)', source: handler(RK + `void ({ ...req } as any)[rk];`) },
+    { form: 'Object.values(req) (frozen)', source: handler(`void Object.values(req);`) },
+    { form: 'Object.entries(req) (frozen)', source: handler(`void Object.entries(req);`) },
+    { form: 'Object.assign({}, req) (frozen)', source: handler(`void Object.assign({}, req);`) },
+    { form: 'Object.getOwnPropertyDescriptors(req) (frozen — not the recognized single-key API)', source: handler(`void Object.getOwnPropertyDescriptors(req);`) },
+    { form: "an aliased Reflect const R = Reflect; R.get(req, 'socket') (frozen)", source: handler(`const R = Reflect;\nvoid R.get(req, 'socket');`) },
+    { form: "a global-object member spelling globalThis.Reflect.get(req, 'socket') (frozen — the aliased-Reflect indirection class, same boundary as NET F1)", source: handler(`void (globalThis as any).Reflect.get(req, 'socket');`) },
+    { form: "a call-chained Reflect.get.call(Reflect, req, 'socket') (frozen — call/apply/bind indirection)", source: handler(`void Reflect.get.call(Reflect, req, 'socket');`) },
+    { form: 'a renamed destructuring alias ({ req: r }) => r[k] (frozen — the req/res alias family)', source: H + RK + `http.createServer((_req: any, { req: r }: any) => {\n  void r[rk];\n});` },
+    { form: 'the runtime-computed server[String(4317)] (frozen)', source: wrapperHead + `void server[String(4317)];` },
+  ];
+  for (const { form, source } of frozenOutsideBoundaryAllow) {
+    it(`allows (frozen, outside the boundary) ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+
+  // =====================================================================================
+  // DAY-7 F1 — AMBIENT / BODILESS listener source (MECH-1 disposition). `resolveCreateServerArgument`
+  //   resolves a unique FunctionDeclaration (or a unique-const initializer) to its declaration node,
+  //   and the disposition previously accepted ANY function-like node as the supported listener — an
+  //   ambient `declare function listener(req)` / `export declare function` / `declare global` member /
+  //   `declare const h = …` initializer and a bodiless overload signature were therefore treated as
+  //   SUPPORTED although they emit NO runtime value in this file: the emitted `createServer(listener)`
+  //   binds to whatever the global environment supplies, so the tracked parameters are not the
+  //   parameters of the code that will run. The disposition now rejects a resolved source that is in an
+  //   ambient context (`isInAmbientContext`) or is a FunctionDeclaration with `body === undefined` —
+  //   the same fail-closed unsupported-shape branch, decided syntactically (no body analysis).
+  // =====================================================================================
+  const ambientListenerReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'F1-1: the reported ambient `declare function listener(req)` supplied to createServer', source: H + `declare function listener(req: any): void;\nhttp.createServer(listener);` },
+    { form: 'F1-2: an `export declare function listener(req)`', source: H + `export declare function listener(req: any): void;\nhttp.createServer(listener);` },
+    { form: 'F1-3: a bodiless overload signature with no implementation', source: H + `function listener(req: any): void;\nhttp.createServer(listener);` },
+    { form: 'F1-4: a const alias resolving to the ambient declaration', source: H + `declare function listener(req: any): void;\nconst h = listener;\nhttp.createServer(h);` },
+    { form: 'F1-5: a bounded const chain resolving to the ambient declaration', source: H + `declare function listener(req: any): void;\nconst a = listener;\nconst b = a;\nhttp.createServer(b);` },
+    { form: 'F1-6: an as-wrapped ambient identifier (transparent wrapper)', source: H + `declare function listener(req: any): void;\nhttp.createServer(listener as any);` },
+    { form: 'F1-7: a parenthesized / non-null-wrapped ambient identifier', source: H + `declare function listener(req: any): void;\nhttp.createServer((listener)!);` },
+    { form: 'F1-8: a `declare global { function listener }` member', source: H + `declare global {\n  function listener(req: any): void;\n}\nhttp.createServer(listener);` },
+    { form: 'F1-9: a `declare const h = arrow` ambient initializer (resolver reaches the arrow)', source: H + `declare const h: any = (req: any) => {\n  void req;\n};\nhttp.createServer(h);` },
+    { form: 'F1-10: a `declare const h = function` ambient initializer', source: H + `declare const h = function (req: any): void {\n  void req;\n};\nhttp.createServer(h);` },
+    { form: 'F1-11: a `declare function` that carries a body is still ambient (emits nothing)', source: H + `declare function listener(req: any): void {}\nhttp.createServer(listener);` },
+    { form: 'F1-12: an ambient listener on the `new http.createServer(…)` boundary', source: H + `declare function listener(req: any): void;\nvoid new http.createServer(listener);` },
+    { form: 'F1-13: an ambient listener supplied as the SECOND argument', source: H + `declare function listener(req: any): void;\nhttp.createServer({ keepAlive: true }, listener);` },
+    { form: 'F1-14: an ambient `declare const options = {…}` literal (same ambient-source rule, options side)', source: H + `declare const options = { maxHeaderSize: 1 };\nhttp.createServer(options, () => {});` },
+    { form: 'F1-15: an ambient listener reached through a named createServer import', source: `import { createServer } from 'node:http';\ndeclare function listener(req: any): void;\ncreateServer(listener);` },
+  ];
+  for (const { form, source } of ambientListenerReject) {
+    it(`rejects ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // ---- F1 (preserve): every previously supported EXECUTABLE listener shape keeps its disposition. ----
+  const ambientListenerAllow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'an ordinary FunctionDeclaration WITH a body', source: H + `function listener(req: any, res: any): void {\n  res.end(req.method);\n}\nhttp.createServer(listener);` },
+    { form: 'an ordinary const function expression', source: H + `const listener = function (req: any, res: any): void {\n  res.end(req.method);\n};\nhttp.createServer(listener);` },
+    { form: 'an ordinary inline arrow listener', source: H + `http.createServer((req: any, res: any) => {\n  res.end(req.method);\n});` },
+    { form: 'a bounded const chain to a bodied FunctionDeclaration', source: H + `function listener(req: any, res: any): void {\n  res.end('ok');\n}\nconst a = listener;\nconst b = a;\nhttp.createServer(b);` },
+    { form: 'an overload pair whose implementation has a body (two declarations: resolver stops, executable code still inspected)', source: H + `function listener(req: any, res: any): void;\nfunction listener(req: any, res: any): void {\n  res.end('ok');\n}\nvoid listener;\nhttp.createServer((req: any, res: any) => {\n  res.end(req.method);\n});` },
+    { form: 'an unrelated ambient declaration beside a bodied listener', source: H + `declare function other(): void;\nfunction listener(req: any, res: any): void {\n  res.end('ok');\n}\nhttp.createServer(listener);\nvoid other;` },
+    { form: 'an ambient function supplied to an UNRELATED foo.createServer (not the privileged boundary)', source: `declare function listener(req: any): void;\nconst foo = { createServer(_h: unknown): void {} };\nfoo.createServer(listener);` },
+  ];
+  for (const { form, source } of ambientListenerAllow) {
+    it(`allows ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+
+  // =====================================================================================
+  // DAY-7 F2 — CONSTRUCTOR RE-DERIVATION (RULE A family iii). The createServer call RESULT exposes
+  //   the privileged Server constructor as its ordinary `constructor` property, so
+  //   `new (http.createServer() as any).constructor(listener)` builds a server whose arguments never
+  //   pass the createServer boundary, and `Object.getPrototypeOf(server.constructor)` reaches
+  //   `net.Server`. `constructor` joins the SAME receiver-independent static-name family as the delivery
+  //   members: dotted, static / binder-resolved element key, declaration destructuring, ASSIGNMENT
+  //   destructuring (receiver-independent parity), and the structural reflective read. RC rule (a)
+  //   already rejects the dotted / static-string spelling by TEXT; NET now rejects the whole grammar by
+  //   binder identity, so a same-text shadow, a template substitution, a destructuring, or a
+  //   `Reflect.get(server, 'constructor')` cannot launder it.
+  // =====================================================================================
+  const constructorRederivationReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'F2-1: the reported new (http.createServer() as any).constructor(listener) re-derivation', source: H + RK + `void new (http.createServer() as any).constructor((req: any) => {\n  const s = req[rk];\n  s.connect(80, 'example.com');\n});` },
+    { form: 'F2-2: a dotted server.constructor', source: wrapperHead + `void server.constructor;` },
+    { form: 'F2-3: an optional-chained server?.constructor', source: wrapperHead + `void server?.constructor;` },
+    { form: "F2-4: a static-element server['constructor']", source: wrapperHead + `void server['constructor'];` },
+    { form: 'F2-5: a template-element server[`constructor`]', source: wrapperHead + 'void server[`constructor`];' },
+    { form: "F2-6: a concatenated server['construc' + 'tor']", source: wrapperHead + `void server['construc' + 'tor'];` },
+    { form: 'F2-7: a substituted-template server[`construc${\'tor\'}`] (binder fold; RC text fold misses it)', source: wrapperHead + 'void server[`construc${\'tor\'}`];' },
+    { form: "F2-8: a const-bound key const key = 'constructor'; server[key]", source: wrapperHead + `const key = 'constructor';\nvoid server[key];` },
+    { form: 'F2-9: the const-bound key under an unrelated same-text shadow in another scope (binder identity; RC text fold misses it)', source: wrapperHead + `function other(): void {\n  const key = 'x';\n  void key;\n}\nconst key = 'constructor';\nvoid server[key];\nvoid other;` },
+    { form: 'F2-10: a declaration destructuring const { constructor: S } = server', source: wrapperHead + `const { constructor: S } = server as any;\nvoid S;` },
+    { form: 'F2-11: a shorthand declaration destructuring const { constructor } = server', source: wrapperHead + `const { constructor } = server as any;\nvoid constructor;` },
+    { form: "F2-12: a computed declaration destructuring const { ['construc' + 'tor']: S } = server", source: wrapperHead + `const { ['construc' + 'tor']: S } = server as any;\nvoid S;` },
+    { form: 'F2-13: a nested declaration destructuring const { a: { constructor: S } } = wrap', source: wrapperHead + `const wrap = { a: server };\nconst { a: { constructor: S } } = wrap as any;\nvoid S;` },
+    { form: 'F2-14: an assignment destructuring ({ constructor: S } = server)', source: wrapperHead + `let S: any;\n({ constructor: S } = server as any);\nvoid S;` },
+    { form: 'F2-15: a shorthand assignment destructuring ({ constructor } = server)', source: wrapperHead + `let constructor: any;\n({ constructor } = server as any);\nvoid constructor;` },
+    { form: "F2-16: a computed assignment destructuring ({ ['construc' + 'tor']: S } = server)", source: wrapperHead + `let S: any;\n({ ['construc' + 'tor']: S } = server as any);\nvoid S;` },
+    { form: 'F2-17: a nested assignment destructuring ({ a: { constructor: S } } = wrap)', source: wrapperHead + `const wrap = { a: server };\nlet S: any;\n({ a: { constructor: S } } = wrap as any);\nvoid S;` },
+    { form: "F2-18: a reflective Reflect.get(server, 'constructor')", source: wrapperHead + `void Reflect.get(server, 'constructor');` },
+    { form: "F2-19: a reflective Reflect.get(server, 'construc' + 'tor') (computed-static key)", source: wrapperHead + `void Reflect.get(server, 'construc' + 'tor');` },
+    { form: "F2-20: a reflective Reflect.getOwnPropertyDescriptor(proto, 'constructor') on the prototype", source: wrapperHead + `void Reflect.getOwnPropertyDescriptor(Object.getPrototypeOf(server), 'constructor');` },
+    { form: "F2-21: a reflective Object.getOwnPropertyDescriptor(proto, 'constructor') on the prototype", source: wrapperHead + `void Object.getOwnPropertyDescriptor(Object.getPrototypeOf(server), 'constructor');` },
+    { form: 'F2-22: the direct http.createServer().constructor chain', source: H + `void http.createServer().constructor;` },
+    { form: "F2-23: a wrapped ((server) as any)['constructor']", source: wrapperHead + `void ((server) as any)['constructor'];` },
+    { form: 'F2-24: Object.getPrototypeOf(server.constructor) — the net.Server path needs the name', source: wrapperHead + `void Object.getPrototypeOf(server.constructor);` },
+    { form: 'F2-25: a parameter destructuring function f({ constructor }) (receiver-independent binding key)', source: `function f({ constructor }: any): void {\n  void constructor;\n}\nvoid f;` },
+    { form: 'F2-26: a class extends clause reading server.constructor', source: wrapperHead + `class S extends (server.constructor as any) {}\nvoid S;` },
+  ];
+  for (const { form, source } of constructorRederivationReject) {
+    it(`rejects ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // ---- F2 (preserve): a constructor DECLARATION, an object-literal DATA key, string data, a
+  //      superstring, a type-position member, and ordinary host usage are not the acquisition name at a
+  //      member / binding / assignment-key position. ----
+  const constructorRederivationAllow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a class constructor DECLARATION and ordinary new', source: `class X {\n  constructor(private readonly v: number) {}\n}\nvoid new X(1);` },
+    { form: "string data 'constructor'", source: `const s = 'constructor';\nvoid s;` },
+    { form: 'a superstring member constructorName', source: `const o = { constructorName: 'x' };\nvoid o.constructorName;` },
+    { form: 'an object-literal DATA key { constructor: 1 } (not a destructuring target)', source: `const o = { constructor: 1 };\nvoid o;` },
+    { form: 'a type-literal member named constructor', source: `type T = { constructor: number };\ndeclare const t: T;\nvoid t;` },
+    { form: 'the ordinary host-like server.listen(…) usage', source: wrapperHead + `server.listen(4317, '127.0.0.1');` },
+  ];
+  for (const { form, source } of constructorRederivationAllow) {
+    it(`allows ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+
+  // =====================================================================================
+  // DAY-7 MECH-1 — CONST-SPINE CONFINEMENT of a resolved options literal. A `const` freezes the
+  //   binding, not the object: the bounded argument resolver normalized `const o = {}; …;
+  //   http.createServer(o, …)` to the literal `{}` while Node reads the object as it is AT CALL TIME —
+  //   after any property / element / computed / const-key / runtime-key assignment, `Object.assign`,
+  //   `Object.defineProperty`, `Object.setPrototypeOf`, `Reflect.set`, `o.__proto__ = …`, a mutation
+  //   through an alias or alias chain, inside a function / closure, or textually after the call. Static
+  //   object immutability cannot be proven inside the bounded mechanism, so the disposition is
+  //   POSITIONAL and fail-closed: a spine-resolved literal is supported ONLY when every spine binding is
+  //   referenced nowhere except the spine's own initializer chain and proven createServer argument
+  //   positions, and no spine binding is exported. Any other occurrence — mutation, benign read, side
+  //   alias, call argument, container, object value, return, export, closure capture, type query — is an
+  //   identity escape and DENIES. No value flow / alias graph: references are inventoried once by binder
+  //   symbol and classified by a constant-depth parent walk.
+  // =====================================================================================
+  const OPTS_CAPTURE = `class Capture {\n  constructor(s: any) {\n    s.connect(80, 'example.com');\n  }\n}\n`;
+  const mutatedOptionsReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'M1: the reported direct property mutation o.IncomingMessage = Capture', source: H + OPTS_CAPTURE + `const o: any = {};\no.IncomingMessage = Capture;\nhttp.createServer(o, () => {});` },
+    { form: "M2: a static element mutation o['IncomingMessage'] = Capture", source: H + OPTS_CAPTURE + `const o: any = { maxHeaderSize: 1 };\no['IncomingMessage'] = Capture;\nhttp.createServer(o, () => {});` },
+    { form: "M3: a computed-static mutation o['Incoming' + 'Message'] = Capture", source: H + OPTS_CAPTURE + `const o: any = {};\no['Incoming' + 'Message'] = Capture;\nhttp.createServer(o, () => {});` },
+    { form: "M4: a binder-resolved const-key mutation const k = 'IncomingMessage'; o[k] = Capture", source: H + OPTS_CAPTURE + `const o: any = {};\nconst k = 'IncomingMessage';\no[k] = Capture;\nhttp.createServer(o, () => {});` },
+    { form: 'M5: a runtime-key mutation o[rk] = Capture', source: H + OPTS_CAPTURE + RK + `const o: any = {};\no[rk] = Capture;\nhttp.createServer(o, () => {});` },
+    { form: 'M6: Object.assign(o, { IncomingMessage: Capture })', source: H + OPTS_CAPTURE + `const o = {};\nObject.assign(o, { IncomingMessage: Capture });\nhttp.createServer(o as any, () => {});` },
+    { form: "M7: Object.defineProperty(o, 'IncomingMessage', { value: Capture })", source: H + OPTS_CAPTURE + `const o = {};\nObject.defineProperty(o, 'IncomingMessage', { value: Capture });\nhttp.createServer(o as any, () => {});` },
+    { form: 'M8: Object.setPrototypeOf(o, { IncomingMessage: Capture })', source: H + OPTS_CAPTURE + `const o = {};\nObject.setPrototypeOf(o, { IncomingMessage: Capture });\nhttp.createServer(o as any, () => {});` },
+    { form: 'M9: an o.__proto__ = { IncomingMessage: Capture } assignment', source: H + OPTS_CAPTURE + `const o: any = {};\no.__proto__ = { IncomingMessage: Capture };\nhttp.createServer(o, () => {});` },
+    { form: "M10: Reflect.set(o, 'IncomingMessage', Capture)", source: H + OPTS_CAPTURE + `const o = {};\nReflect.set(o, 'IncomingMessage', Capture);\nhttp.createServer(o as any, () => {});` },
+    { form: 'M11: a mutation through a const alias (const a = o; a.IncomingMessage = Capture)', source: H + OPTS_CAPTURE + `const o: any = {};\nconst a = o;\na.IncomingMessage = Capture;\nhttp.createServer(o, () => {});` },
+    { form: 'M12: a mutation through a bounded const-alias chain (a = o, b = a, b.X = …)', source: H + OPTS_CAPTURE + `const o: any = {};\nconst a = o;\nconst b = a;\nb.IncomingMessage = Capture;\nhttp.createServer(o, () => {});` },
+    { form: 'M13: the spine alias at the boundary while the root is mutated (const b = o; o.X = …; createServer(b))', source: H + OPTS_CAPTURE + `const o: any = {};\nconst b = o;\no.IncomingMessage = Capture;\nhttp.createServer(b, () => {});` },
+    { form: 'M14: a side alias off the spine that mutates (a = {}, b = a, c = a, c.X = …; createServer(b))', source: H + OPTS_CAPTURE + `const a: any = {};\nconst b = a;\nconst c = a;\nc.IncomingMessage = Capture;\nhttp.createServer(b, () => {});` },
+    { form: 'M15: a mutation textually AFTER the createServer call (order not statically provable)', source: H + OPTS_CAPTURE + `const o: any = {};\nhttp.createServer(o, () => {});\no.IncomingMessage = Capture;` },
+    { form: 'M16: a mutation inside a function body', source: H + OPTS_CAPTURE + `const o: any = {};\nfunction poison(): void {\n  o.IncomingMessage = Capture;\n}\npoison();\nhttp.createServer(o, () => {});` },
+    { form: 'M17: a closure capture that mutates', source: H + OPTS_CAPTURE + `const o: any = {};\nconst later = () => {\n  o.IncomingMessage = Capture;\n};\nvoid later;\nhttp.createServer(o, () => {});` },
+    { form: 'M18: an escape to an unknown call f(o)', source: H + OPTS_CAPTURE + `declare function f(x: unknown): void;\nconst o = {};\nf(o);\nhttp.createServer(o as any, () => {});` },
+    { form: 'M19: an escape into a container [o]', source: H + OPTS_CAPTURE + `const o = {};\nconst holder = [o];\nvoid holder;\nhttp.createServer(o as any, () => {});` },
+    { form: 'M20: an escape into a shorthand object value { o }', source: H + OPTS_CAPTURE + `const o = {};\nconst holder = { o };\nvoid holder;\nhttp.createServer(o as any, () => {});` },
+    { form: 'M21: an escape via return', source: H + OPTS_CAPTURE + `const o = {};\nfunction get(): unknown {\n  return o;\n}\nvoid get;\nhttp.createServer(o as any, () => {});` },
+    { form: 'M22: an exported declaration export const o = {}', source: H + OPTS_CAPTURE + `export const o = {};\nhttp.createServer(o as any, () => {});` },
+    { form: 'M23: an export specifier export { o }', source: H + OPTS_CAPTURE + `const o = {};\nexport { o };\nhttp.createServer(o as any, () => {});` },
+    { form: 'M24: an export default o', source: H + OPTS_CAPTURE + `const o = {};\nexport default o;\nhttp.createServer(o as any, () => {});` },
+    { form: 'M25: a mutation through a shorthand-wrapped alias ({ o }).o.X = …', source: H + OPTS_CAPTURE + `const o: any = {};\n({ o }).o.IncomingMessage = Capture;\nhttp.createServer(o, () => {});` },
+    { form: 'M26: a mutation through a parenthesized / as-wrapped reference', source: H + OPTS_CAPTURE + `const o = {};\n((o as any)).IncomingMessage = Capture;\nhttp.createServer(o as any, () => {});` },
+    { form: 'M27: a destructuring-assignment target that writes into the object', source: H + OPTS_CAPTURE + `const o: any = {};\n({ a: o.IncomingMessage } = { a: Capture });\nhttp.createServer(o, () => {});` },
+    { form: 'M28: a benign-looking READ of the binding (conservative: any other reference is an escape)', source: H + `const o = { maxHeaderSize: 1 };\nvoid o.maxHeaderSize;\nhttp.createServer(o, () => {});` },
+    { form: 'M29: the binding supplied to an UNRELATED foo.createServer (not a boundary position)', source: H + OPTS_CAPTURE + `const o: any = {};\nconst foo = {\n  createServer(x: any): void {\n    x.IncomingMessage = Capture;\n  },\n};\nfoo.createServer(o);\nhttp.createServer(o, () => {});` },
+    { form: 'M30: the new-form boundary with a mutated const', source: H + OPTS_CAPTURE + `const o: any = {};\no.IncomingMessage = Capture;\nvoid new http.createServer(o, () => {});` },
+    { form: 'M31: a type query typeof o (conservative reference)', source: H + `const o = { maxHeaderSize: 1 };\ntype T = typeof o;\nexport type { T };\nhttp.createServer(o, () => {});` },
+    { form: 'M32: a for-of / block-scoped re-declaration that shadows the spine name is a different symbol, but the outer binding mutated still denies', source: H + OPTS_CAPTURE + `const o: any = {};\n{\n  const o = 1;\n  void o;\n}\no.IncomingMessage = Capture;\nhttp.createServer(o, () => {});` },
+  ];
+  for (const { form, source } of mutatedOptionsReject) {
+    it(`rejects ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // ---- MECH-1 const-spine confinement (preserve): a genuinely confined const spine keeps every
+  //      existing supported disposition; an inline literal has no binding to escape; a listener const is
+  //      not subject to the rule (a function's code cannot be replaced through its object). ----
+  const confinedOptionsAllow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a direct inline object literal', source: H + `http.createServer({ maxHeaderSize: 8192 }, () => {});` },
+    { form: 'the existing supported const alias used ONLY at the boundary', source: H + `const options = { maxHeaderSize: 8192 };\nhttp.createServer(options, () => {});` },
+    { form: 'a const→const spine used only at the boundary', source: H + `const base = { maxHeaderSize: 8192 };\nconst options = base;\nhttp.createServer(options, () => {});` },
+    { form: 'a const alias reused at TWO createServer boundaries', source: H + `const options = { maxHeaderSize: 8192 };\nhttp.createServer(options, () => {});\nhttp.createServer(options, () => {});` },
+    { form: 'an as-wrapped const alias at the boundary', source: H + `const options = { maxHeaderSize: 8192 };\nhttp.createServer(options as any, () => {});` },
+    { form: 'the new-form boundary with an unmutated const alias', source: H + `const options = { maxHeaderSize: 8192 };\nvoid new http.createServer(options, () => {});` },
+    { form: 'a benign getter key in a confined const alias', source: H + `const options = { get maxHeaderSize() { return 8192; } };\nhttp.createServer(options as any, () => {});` },
+    { form: 'a setter-only reserved key in a confined const alias (existing disposition)', source: H + `const options = { set IncomingMessage(_v: any) {} };\nhttp.createServer(options as any, () => {});` },
+    { form: 'a superstring key in a confined const alias', source: H + `const options = { IncomingMessageLimit: 10 };\nhttp.createServer(options as any, () => {});` },
+    { form: 'a same-text binding in ANOTHER scope that is mutated (different binder symbol)', source: H + `const options = { maxHeaderSize: 8192 };\nfunction other(): void {\n  const options: any = {};\n  options.IncomingMessage = 1;\n}\nvoid other;\nhttp.createServer(options, () => {});` },
+    { form: 'an object-literal KEY spelled like the binding is not a reference', source: H + `const options = { maxHeaderSize: 8192 };\nconst other = { options: 1 };\nvoid other.options;\nhttp.createServer(options, () => {});` },
+    { form: 'a property NAME spelled like the binding is not a reference', source: H + `const options = { maxHeaderSize: 8192 };\ndeclare const holder: { options: number };\nvoid holder.options;\nhttp.createServer(options, () => {});` },
+    { form: 'the real host shape: inline listener, no options', source: H + `http.createServer((req: any, res: any) => {\n  res.end(req.method);\n});` },
+    { form: 'a listener const with other references stays supported (functions are not mutable delivery sources)', source: H + `const handler = (req: any, res: any) => {\n  res.end(req.method);\n};\nvoid handler;\nhttp.createServer(handler);` },
+  ];
+  for (const { form, source } of confinedOptionsAllow) {
+    it(`allows ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(false);
+    });
+  }
+
+  // =====================================================================================
+  // DAY-7 MECH-1 — PROTOTYPE-INHERITANCE closure (RULE A family iv). A supported options literal
+  //   inherits from `Object.prototype`; Node's ordinary GET of `options.IncomingMessage` /
+  //   `options.ServerResponse` walks that chain, so polluting `Object.prototype` (own value, inherited
+  //   getter, `Object.assign` / `defineProperty` / `defineProperties`, `Reflect.set`) makes a clean `{}` or
+  //   a confined const alias deliver the live socket (Node 24 verified; the no-options form is immune
+  //   because Node substitutes a frozen null-prototype object). Every statically spelled path to a
+  //   prototype names `prototype`, `__proto__`, or `getPrototypeOf`, so the three names join the SAME
+  //   receiver-independent static-name reservation as `socket` / `on` / `constructor` — member, element
+  //   (binder-resolved), declaration destructuring, assignment destructuring, and reflective read.
+  //   The pollution SITE itself is rejected in whichever host file it appears, which is what makes the
+  //   rule sound across the scanned host tree (a boundary-local check would not be). No prototype graph.
+  // =====================================================================================
+  const prototypePollutionReject: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'PP1: the reported Object.prototype.IncomingMessage pollution + inline {} options', source: H + OPTS_CAPTURE + `(Object.prototype as any).IncomingMessage = Capture;\nhttp.createServer({}, () => {});` },
+    { form: 'PP2: Object.prototype.ServerResponse pollution', source: H + OPTS_CAPTURE + `(Object.prototype as any).ServerResponse = Capture;\nhttp.createServer({}, () => {});` },
+    { form: 'PP3: ({}).__proto__.IncomingMessage pollution', source: H + OPTS_CAPTURE + `({} as any).__proto__.IncomingMessage = Capture;\nhttp.createServer({}, () => {});` },
+    { form: 'PP4: Object.assign(Object.prototype, { IncomingMessage })', source: H + OPTS_CAPTURE + `Object.assign(Object.prototype, { IncomingMessage: Capture });\nhttp.createServer({}, () => {});` },
+    { form: "PP5: Object.defineProperty(Object.prototype, 'IncomingMessage', { value })", source: H + OPTS_CAPTURE + `Object.defineProperty(Object.prototype, 'IncomingMessage', { value: Capture });\nhttp.createServer({}, () => {});` },
+    { form: "PP6: an inherited GETTER Object.defineProperty(Object.prototype, 'IncomingMessage', { get })", source: H + OPTS_CAPTURE + `Object.defineProperty(Object.prototype, 'IncomingMessage', { get: () => Capture });\nhttp.createServer({}, () => {});` },
+    { form: 'PP7: Object.defineProperties(Object.prototype, {...})', source: H + OPTS_CAPTURE + `Object.defineProperties(Object.prototype, { IncomingMessage: { value: Capture } });\nhttp.createServer({}, () => {});` },
+    { form: "PP8: Reflect.set(Object.prototype, 'IncomingMessage', Capture)", source: H + OPTS_CAPTURE + `Reflect.set(Object.prototype, 'IncomingMessage', Capture);\nhttp.createServer({}, () => {});` },
+    { form: 'PP9: Object.getPrototypeOf({}).IncomingMessage = Capture (prototype reached without spelling `prototype`)', source: H + OPTS_CAPTURE + `(Object.getPrototypeOf({}) as any).IncomingMessage = Capture;\nhttp.createServer({}, () => {});` },
+    { form: 'PP10: Reflect.getPrototypeOf({}).IncomingMessage = Capture', source: H + OPTS_CAPTURE + `(Reflect.getPrototypeOf({}) as any).IncomingMessage = Capture;\nhttp.createServer({}, () => {});` },
+    { form: "PP11: a static element Object['prototype']", source: H + OPTS_CAPTURE + `(Object as any)['prototype'].IncomingMessage = Capture;\nhttp.createServer({}, () => {});` },
+    { form: "PP12: a concatenated Object['proto' + 'type']", source: H + OPTS_CAPTURE + `(Object as any)['proto' + 'type'].IncomingMessage = Capture;\nhttp.createServer({}, () => {});` },
+    { form: 'PP13: a template element Object[`prototype`]', source: H + OPTS_CAPTURE + '(Object as any)[`prototype`].IncomingMessage = Capture;\nhttp.createServer({}, () => {});' },
+    { form: "PP14: a binder-resolved const key const key = 'prototype'; Object[key]", source: H + OPTS_CAPTURE + `const key = 'prototype';\n(Object as any)[key].IncomingMessage = Capture;\nhttp.createServer({}, () => {});` },
+    { form: 'PP15: an optional-chained Object?.prototype', source: H + OPTS_CAPTURE + `(Object?.prototype as any).IncomingMessage = Capture;\nhttp.createServer({}, () => {});` },
+    { form: 'PP16: a declaration destructuring const { prototype: p } = Object', source: H + OPTS_CAPTURE + `const { prototype: p } = Object as any;\np.IncomingMessage = Capture;\nhttp.createServer({}, () => {});` },
+    { form: 'PP17: a declaration destructuring const { getPrototypeOf: g } = Object', source: H + OPTS_CAPTURE + `const { getPrototypeOf: g } = Object;\n(g({}) as any).IncomingMessage = Capture;\nhttp.createServer({}, () => {});` },
+    { form: 'PP18: a declaration destructuring const { __proto__: p } = {}', source: H + OPTS_CAPTURE + `const { __proto__: p } = {} as any;\np.IncomingMessage = Capture;\nhttp.createServer({}, () => {});` },
+    { form: 'PP19: an assignment destructuring ({ prototype: p } = Object)', source: H + OPTS_CAPTURE + `let p: any;\n({ prototype: p } = Object as any);\np.IncomingMessage = Capture;\nhttp.createServer({}, () => {});` },
+    { form: "PP20: a reflective Reflect.get(Object, 'prototype')", source: H + OPTS_CAPTURE + `(Reflect.get(Object, 'prototype') as any).IncomingMessage = Capture;\nhttp.createServer({}, () => {});` },
+    { form: "PP21: a reflective Object.getOwnPropertyDescriptor(Object, 'prototype').value", source: H + OPTS_CAPTURE + `(Object.getOwnPropertyDescriptor(Object, 'prototype') as any).value.IncomingMessage = Capture;\nhttp.createServer({}, () => {});` },
+    { form: 'PP22: pollution beside CONFINED const-spine options', source: H + OPTS_CAPTURE + `(Object.prototype as any).IncomingMessage = Capture;\nconst o = { maxHeaderSize: 1 };\nhttp.createServer(o, () => {});` },
+    { form: 'PP23: pollution inside a function body, options {} at module level', source: H + OPTS_CAPTURE + `function pollute(): void {\n  (Object.prototype as any).IncomingMessage = Capture;\n}\npollute();\nhttp.createServer({}, () => {});` },
+    { form: 'PP24: pollution via globalThis.Object.prototype', source: H + OPTS_CAPTURE + `(globalThis.Object.prototype as any).IncomingMessage = Capture;\nhttp.createServer({}, () => {});` },
+    { form: 'PP25: the pollution SITE in a file with NO createServer options (cross-file soundness: the site denies on its own)', source: H + OPTS_CAPTURE + `(Object.prototype as any).IncomingMessage = Capture;\nhttp.createServer(() => {});` },
+    { form: 'PP26: a bare x.__proto__ = {…} re-prototyping (the name is reserved wherever it appears)', source: H + `const x: any = {};\nx.__proto__ = {};\nhttp.createServer({}, () => {});` },
+    { form: 'PP27: Object.getPrototypeOf(server) (formerly asserted allowed as a frozen forwarding row; now the reach name itself denies)', source: wrapperHead + `void Object.getPrototypeOf(server);` },
+  ];
+  for (const { form, source } of prototypePollutionReject) {
+    it(`rejects ${form}`, () => {
+      expect(usesOutboundNetwork(source)).toBe(true);
+    });
+  }
+
+  // ---- MECH-1 prototype-inheritance closure (preserve): benign forms that do not NAME a prototype
+  //      reach keep their disposition; the reservation is exact-name, position-specific. ----
+  const prototypePollutionAllow: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'a direct inline {} options literal with no pollution', source: H + `http.createServer({}, () => {});` },
+    { form: 'confined const-spine options with no pollution', source: H + `const o = { maxHeaderSize: 1 };\nhttp.createServer(o, () => {});` },
+    { form: 'the no-options createServer(handler) form', source: H + `http.createServer((req: any, res: any) => {\n  res.end(req.method);\n});` },
+    { form: 'a superstring member obj.prototypeName', source: `const obj = { prototypeName: 'x' };\nvoid obj.prototypeName;` },
+    { form: "string data 'prototype' / '__proto__' / 'getPrototypeOf'", source: `const a = 'prototype';\nconst b = '__proto__';\nconst c = 'getPrototypeOf';\nvoid a;\nvoid b;\nvoid c;` },
+    { form: 'object-literal DATA keys { prototype: 1, getPrototypeOf: 2 } (not a destructuring target)', source: `const o = { prototype: 1, getPrototypeOf: 2 };\nvoid o;` },
+    { form: 'a class declaration and ordinary new (no prototype member is named)', source: `class X {\n  run(): number {\n    return 1;\n  }\n}\nvoid new X().run();` },
+    { form: 'Object.keys / Object.freeze / Object.entries on a local object', source: `const o = { a: 1 };\nvoid Object.keys(o);\nvoid Object.freeze(o);\nvoid Object.entries(o);` },
+    { form: 'a type-position `prototype` member', source: `type T = { prototype: number };\ndeclare const t: T;\nvoid t;` },
+    { form: "the computed ['__proto__'] and shorthand { __proto__ } object-literal keys stay own properties", source: H + `class X {}\nconst __proto__ = { IncomingMessage: X };\nvoid __proto__;\nhttp.createServer({ ['__proto__']: { IncomingMessage: X } } as any, () => {});` },
+    { form: 'the real host shape (helper forwarding of res, inline typed listener)', source: H + `function apply(r: http.ServerResponse): void {\n  r.setHeader('X', 'Y');\n}\nhttp.createServer((req: http.IncomingMessage, res: http.ServerResponse): void => {\n  apply(res);\n  res.end(req.method ?? '');\n});` },
+  ];
+  for (const { form, source } of prototypePollutionAllow) {
     it(`allows ${form}`, () => {
       expect(usesOutboundNetwork(source)).toBe(false);
     });
