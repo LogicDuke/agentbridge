@@ -197,9 +197,15 @@ const srcFileUrl = (name: string): URL => new URL(name.split('/').map(encodeURIC
 
 /**
  * The closure member a runtime relative import executes: resolved through the one
- * resolver, then the NodeNext `.js` specifier mapped to its `.ts` source. Throws
- * when the import cannot be read as a `src/` source file — an executable
+ * resolver, then the NodeNext ESM `.js` specifier mapped to its `.ts` source.
+ * Throws when the import cannot be read as a `src/` source file — an executable
  * dependency the tree cannot analyze is exactly the gap the closure closes.
+ *
+ * The closure is ESM-only, so only the ES-module output extensions are mapped
+ * (`.js`→`.ts`, `.mjs`→`.mts`). The CommonJS `.cjs`→`.cts` mapping is deliberately
+ * absent: the real project uses no CommonJS, so a `.cjs` import has no admitted
+ * source and fails closed here rather than pulling a CommonJS member into the
+ * runtime closure.
  */
 const closureMemberOf = (importerFileUrl: URL, specifier: string): string => {
   const resolvedUrl = resolveRelativeImport(importerFileUrl, specifier);
@@ -212,7 +218,7 @@ const closureMemberOf = (importerFileUrl: URL, specifier: string): string => {
   const sourceUrl = new URL(resolvedUrl.href);
   sourceUrl.search = '';
   sourceUrl.hash = '';
-  sourceUrl.pathname = sourceUrl.pathname.replace(/\.js$/, '.ts').replace(/\.mjs$/, '.mts').replace(/\.cjs$/, '.cts');
+  sourceUrl.pathname = sourceUrl.pathname.replace(/\.js$/, '.ts').replace(/\.mjs$/, '.mts');
   const name = srcRelativeName(sourceUrl);
   if (!existsSync(fileURLToPath(sourceUrl))) {
     throw new Error(`D3-NET: runtime import ${specifier} from ${importerFileUrl.href} has no source file ${name}`);
@@ -284,12 +290,14 @@ const isAllowedNodeBuiltin = (specifier: string): boolean => ALLOWED_NODE_BUILTI
  *   - dynamic `import('S')` / `import('S', { … })` — a call whose callee is the
  *     `import` keyword; its first argument surfaces only as a `StringLiteral` or a
  *     substitution-free `NoSubstitutionTemplateLiteral`, never a substituted
- *     `TemplateExpression` (a computed specifier);
- *   - CommonJS `require('S')` — a call whose callee is the bare identifier
- *     `require`; its first argument surfaces on the same static-string rule as
- *     dynamic `import`. A `.cts`/`.cjs` closure member loads its dependencies
- *     through `require`, so this is a genuine runtime module edge — `obj.require(…)`
- *     (a property call) and `require.resolve(…)` are not.
+ *     `TemplateExpression` (a computed specifier).
+ *
+ * The closure is ESM-only (`package.json` `"type": "module"`, NodeNext): a bare
+ * runtime `require(...)` is not a module edge here — it is forbidden outright by
+ * `hasBareRuntimeRequire` in the discipline layer, so it is not modelled or
+ * resolved as a specifier. (The TypeScript `import x = require('S')` external-module
+ * reference above is a compile-time ESM-interop form, parsed as an
+ * `ImportEqualsDeclaration`, not a `require` call, and is unaffected.)
  *
  * Excluded structurally, with no special-casing: `import.meta` (a meta-property,
  * not a call), `obj.import(…)` (a property call), and a member/property/class-field
@@ -366,18 +374,6 @@ function extractModuleSpecifiers(source: string, options: { readonly runtimeOnly
       // never reaches this branch.
       const arg = node.arguments[0];
       if (arg !== undefined && ts.isStringLiteralLike(arg)) specifiers.push(arg.text);
-    } else if (
-      ts.isCallExpression(node) &&
-      ts.isIdentifier(node.expression) &&
-      node.expression.text === 'require'
-    ) {
-      // CommonJS `require('S')`: a bare-identifier `require` call — the runtime
-      // load form of a `.cts`/`.cjs` closure member. Its first argument surfaces
-      // on the same static-string rule as dynamic `import`. `obj.require(…)` (a
-      // property call) and `require.resolve(…)` have a non-identifier callee and
-      // never reach this branch.
-      const arg = node.arguments[0];
-      if (arg !== undefined && ts.isStringLiteralLike(arg)) specifiers.push(arg.text);
     }
     ts.forEachChild(node, visit);
   };
@@ -415,6 +411,36 @@ const hasUnverifiableDynamicImport = (source: string): boolean => {
       const arg = node.arguments[0];
       if (arg === undefined || !ts.isStringLiteralLike(arg)) found = true;
     }
+    ts.forEachChild(node, visit);
+  };
+  ts.forEachChild(sourceFile, visit);
+  return found;
+};
+
+/**
+ * Report whether the source contains a bare runtime `require(...)` call
+ * (D3-CX-POLICY-ESM). The executable closure is ESM-only (`package.json`
+ * `"type": "module"`, NodeNext, `.ts` sources); a bare `require` is not a binding
+ * an ES module has at runtime, so such a call is either a `ReferenceError` or a
+ * `createRequire`-smuggled CommonJS load. The closure forbids it outright with one
+ * structural policy violation — no target is inspected, so a literal, a computed,
+ * a conditional, or a laundered specifier is refused identically, closing the
+ * outbound path a CommonJS helper could otherwise open.
+ *
+ * A *bare* runtime require is a `CallExpression` whose callee is exactly the
+ * identifier `require`. This deliberately does NOT match, so the following keep
+ * their meaning: `obj.require(…)` and `require.resolve(…)` (the callee is a
+ * property access, not the bare identifier), a member/property/class field named
+ * `require` (`{ require: 'S' }`, `class C { require = 'S' }`; not a call), and the
+ * TypeScript `import x = require('S')` external-module reference (an
+ * `ImportEqualsDeclaration`, never a `require` call node). Comments and string
+ * literals are not identifier nodes and are never matched.
+ */
+const hasBareRuntimeRequire = (source: string): boolean => {
+  const sourceFile = ts.createSourceFile('module.ts', source, ts.ScriptTarget.Latest, /* setParentNodes */ false, ts.ScriptKind.TS);
+  let found = false;
+  const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'require') found = true;
     ts.forEachChild(node, visit);
   };
   ts.forEachChild(sourceFile, visit);
@@ -3525,6 +3551,8 @@ describe('D3 executable closure outbound-capability discipline (D3-NET single so
         hasUnverifiableDynamicImport(text),
         `${file} contains an unverifiable (computed) dynamic import`,
       ).toBe(false);
+      // The closure is ESM-only: no member may reach for a bare runtime `require(...)`.
+      expect(hasBareRuntimeRequire(text), `${file} contains a bare runtime require()`).toBe(false);
       expect(outboundCapabilityViolation(text), `${file} imports an outbound-capable module`).toBeNull();
     }
   });
@@ -3581,23 +3609,32 @@ describe('D3 executable closure outbound-capability discipline (D3-NET single so
 
 describe('D3 executable-closure module-graph correctness (Codex P1/P2)', () => {
   // The closure walk must enumerate the true runtime module graph and resolve each
-  // edge with the project's TypeScript/Node semantics. These are the three audited
-  // cases; the outbound rule here is the same `relative-or-allow-listed` predicate
-  // the discipline block enforces.
-  const outboundOk = (specifier: string): boolean => isRelativeImportSpecifier(specifier) || isAllowedNodeBuiltin(specifier);
+  // edge with the project's TypeScript/Node semantics. The closure is ESM-only, so
+  // a bare runtime `require(...)` is a policy violation, not a modelled edge.
 
-  // (1) CommonJS `require` in a `.cts`/`.cjs` closure member is a runtime edge.
-  it('surfaces a bare require() as a runtime module edge', () => {
-    expect(extractModuleSpecifiers(`const https = require('node:https');\nhttps.get('x');`, { runtimeOnly: true })).toEqual(['node:https']);
-    expect(extractModuleSpecifiers(`const sibling = require('./helper.cjs');`, { runtimeOnly: true })).toEqual(['./helper.cjs']);
-    // A builtin require is refused by the outbound rule; a relative require is followed as a closure edge.
-    expect(outboundOk('node:https')).toBe(false);
-    expect(isRelativeImportSpecifier('./helper.cjs')).toBe(true);
+  // (1a) The closure is ESM-only: a bare runtime `require(...)` is forbidden with
+  // one structural rule, whatever its target — literal, computed, or laundered.
+  it('rejects a bare runtime require() regardless of target', () => {
+    expect(hasBareRuntimeRequire(`const https = require('node:https');\nhttps.get('x');`)).toBe(true); // literal
+    expect(hasBareRuntimeRequire(`const net = require(chosen);`)).toBe(true); // computed (identifier)
+    expect(hasBareRuntimeRequire(`const net = require('node:' + name);`)).toBe(true); // computed (concatenation)
+    expect(hasBareRuntimeRequire(`const net = require(\`node:\${name}\`);`)).toBe(true); // computed (template)
+    expect(hasBareRuntimeRequire(`const sibling = require('./helper.js');`)).toBe(true); // even a relative literal
+    // A bare require is not a module edge either — the extractor never surfaces it.
+    expect(extractModuleSpecifiers(`const https = require('node:https');`, { runtimeOnly: true })).toEqual([]);
+    expect(extractModuleSpecifiers(`const sibling = require('./helper.js');`, { runtimeOnly: true })).toEqual([]);
   });
-  it('does not treat require.resolve or a property/keyed require as a module edge', () => {
-    expect(extractModuleSpecifiers(`const p = require.resolve('node:https');`, { runtimeOnly: true })).toEqual([]);
-    expect(extractModuleSpecifiers(`const x = obj.require('node:https');`, { runtimeOnly: true })).toEqual([]);
-    expect(extractModuleSpecifiers(`const x = { require: 'node:https' };`, { runtimeOnly: true })).toEqual([]);
+
+  // (1b) Only the *bare* `require(...)` call is a violation — these keep their meaning.
+  it('does not misclassify obj.require, require.resolve, a require property, or import-equals', () => {
+    expect(hasBareRuntimeRequire(`const x = obj.require('node:https');`)).toBe(false); // property call
+    expect(hasBareRuntimeRequire(`const p = require.resolve('node:https');`)).toBe(false); // require.resolve
+    expect(hasBareRuntimeRequire(`const x = { require: 'node:https' };`)).toBe(false); // property name
+    expect(hasBareRuntimeRequire(`class C { require = 'node:https'; }`)).toBe(false); // class field name
+    // The TypeScript `import x = require('S')` external-module reference is not a
+    // `require` call node; it keeps its existing behavior (not flagged, still an edge).
+    expect(hasBareRuntimeRequire(`import Ns = require('./loaded.js');`)).toBe(false);
+    expect(extractModuleSpecifiers(`import Ns = require('./loaded.js');`, { runtimeOnly: true })).toEqual(['./loaded.js']);
   });
 
   // (2) A named clause whose specifiers are all `type` erases at runtime.
