@@ -110,7 +110,8 @@ export type StaticKey =
 // ---------------------------------------------------------------------------
 
 export const HTTP_MODULE_SPECIFIERS: ReadonlySet<string> = new Set(['node:http', 'http']);
-export const NETWORK_GLOBAL_NAMES: ReadonlySet<string> = new Set(['fetch', 'WebSocket']);
+/** Global outbound-network capabilities of the supported Node runtime: HTTP, WebSocket and server-sent events. */
+export const NETWORK_GLOBAL_NAMES: ReadonlySet<string> = new Set(['fetch', 'WebSocket', 'EventSource']);
 export const GLOBAL_RECEIVER_NAMES: ReadonlySet<string> = new Set(['globalThis', 'window', 'self', 'global']);
 const CREATE_SERVER = 'createServer';
 const SERVER_LISTEN = 'listen';
@@ -412,12 +413,14 @@ const isPlainConst = (declaration: ts.VariableDeclaration): boolean => {
 };
 
 /** A declaration that produces a runtime binding (shadows a global at runtime). */
-function isRuntimeDeclaration(declaration: ts.Declaration): boolean {
+function isRuntimeDeclaration(checker: ts.TypeChecker, declaration: ts.Declaration, visiting: Set<ts.Symbol>): boolean {
   if (isAmbient(declaration)) return false;
   if (ts.isVariableDeclaration(declaration) || ts.isBindingElement(declaration) || ts.isParameter(declaration)) {
     return true;
   }
   if (ts.isFunctionDeclaration(declaration)) return declaration.body !== undefined;
+  // A named function expression binds its name inside its own body at runtime.
+  if (ts.isFunctionExpression(declaration)) return true;
   if (ts.isClassDeclaration(declaration) || ts.isClassExpression(declaration)) return true;
   if (ts.isImportClause(declaration)) return !isTypeOnlyImportClause(declaration);
   if (ts.isNamespaceImport(declaration)) return !isTypeOnlyImportClause(declaration.parent);
@@ -427,20 +430,32 @@ function isRuntimeDeclaration(declaration: ts.Declaration): boolean {
   if (ts.isEnumDeclaration(declaration)) {
     return (ts.getCombinedModifierFlags(declaration) & ts.ModifierFlags.Const) === 0;
   }
-  if (ts.isModuleDeclaration(declaration)) return isInstantiatedNamespace(declaration);
-  if (ts.isImportEqualsDeclaration(declaration)) return isRuntimeImportEquals(declaration);
+  if (ts.isModuleDeclaration(declaration)) return isInstantiatedNamespace(checker, declaration, visiting);
+  if (ts.isImportEqualsDeclaration(declaration)) return isRuntimeImportEquals(checker, declaration, visiting);
   return false;
 }
 
 /**
  * THE runtime import-equals predicate. A non-type-only `import x = ...` is a
- * runtime alias when it references an external module (`require(...)`) or is
+ * runtime alias when it references an external module (`require(...)`), is
  * exported — the binder's own rule for what instantiates an enclosing namespace
- * (`export import get = Local.get` emits `fetch.get = Local.get`). A type-only or
- * private entity alias is erased.
+ * (`export import get = Local.get` emits `fetch.get = Local.get`) — or is a
+ * private entity alias whose target is a value: an entity that resolves to a
+ * runtime declaration, or one this single-file program cannot resolve at all
+ * (an unresolved target is emitted as a value, exactly as `tsc` does). A
+ * type-only alias, or a private alias of a type-only entity, is erased.
  */
-const isRuntimeImportEquals = (declaration: ts.ImportEqualsDeclaration): boolean =>
-  !declaration.isTypeOnly && (ts.isExternalModuleReference(declaration.moduleReference) || isExported(declaration));
+function isRuntimeImportEquals(
+  checker: ts.TypeChecker,
+  declaration: ts.ImportEqualsDeclaration,
+  visiting: Set<ts.Symbol>,
+): boolean {
+  if (declaration.isTypeOnly) return false;
+  if (ts.isExternalModuleReference(declaration.moduleReference) || isExported(declaration)) return true;
+  const target = valueSymbolOf(checker, declaration.moduleReference);
+  if (target?.declarations === undefined || target.declarations.length === 0) return true;
+  return isRuntimeShadowed(checker, target, visiting);
+}
 
 /**
  * A non-ambient `namespace` produces a runtime binding only when it is
@@ -448,22 +463,27 @@ const isRuntimeImportEquals = (declaration: ts.ImportEqualsDeclaration): boolean
  * a variable, a bodied function, a class, or a runtime enum. A namespace that
  * holds only types is erased and shadows nothing at runtime.
  */
-function isInstantiatedNamespace(declaration: ts.ModuleDeclaration): boolean {
+function isInstantiatedNamespace(checker: ts.TypeChecker, declaration: ts.ModuleDeclaration, visiting: Set<ts.Symbol>): boolean {
   if (!ts.isIdentifier(declaration.name) || declaration.body === undefined) return false;
-  if (ts.isModuleDeclaration(declaration.body)) return isInstantiatedNamespace(declaration.body);
+  if (ts.isModuleDeclaration(declaration.body)) return isInstantiatedNamespace(checker, declaration.body, visiting);
   if (!ts.isModuleBlock(declaration.body)) return false;
   return declaration.body.statements.some((statement) => {
     if (isAmbient(statement)) return false;
     if (ts.isVariableStatement(statement) || ts.isClassDeclaration(statement)) return true;
     if (ts.isFunctionDeclaration(statement)) return statement.body !== undefined;
     if (ts.isEnumDeclaration(statement)) return (ts.getCombinedModifierFlags(statement) & ts.ModifierFlags.Const) === 0;
-    if (ts.isModuleDeclaration(statement)) return isInstantiatedNamespace(statement);
-    if (ts.isImportEqualsDeclaration(statement)) return isRuntimeImportEquals(statement);
+    if (ts.isModuleDeclaration(statement)) return isInstantiatedNamespace(checker, statement, visiting);
+    if (ts.isImportEqualsDeclaration(statement)) return isRuntimeImportEquals(checker, statement, visiting);
     return false;
   });
 }
 
-const isRuntimeShadowed = (symbol: ts.Symbol): boolean => (symbol.declarations ?? []).some(isRuntimeDeclaration);
+/** Whether a symbol has any runtime declaration; `visiting` bounds alias cycles (a cyclic alias is erased). */
+function isRuntimeShadowed(checker: ts.TypeChecker, symbol: ts.Symbol, visiting: Set<ts.Symbol> = new Set()): boolean {
+  if (visiting.has(symbol)) return false;
+  visiting.add(symbol);
+  return (symbol.declarations ?? []).some((declaration) => isRuntimeDeclaration(checker, declaration, visiting));
+}
 
 const writeCount = (ctx: Context, symbol: ts.Symbol): number => ctx.writeCounts.get(symbol) ?? 0;
 
@@ -1282,7 +1302,7 @@ function classify(ctx: Context): void {
   for (const node of ctx.thisExpressions) deny(ctx, 'THIS_EXPRESSION', node);
   for (const id of ctx.unboundValueReads) checkFreeGlobal(ctx, id);
   for (const [symbol, reads] of ctx.valueReads) {
-    if (!isRuntimeShadowed(symbol)) {
+    if (!isRuntimeShadowed(ctx.checker, symbol)) {
       for (const id of reads) checkFreeGlobal(ctx, id);
     }
     if (ctx.httpNamespaces.has(symbol)) for (const id of reads) checkHttpNamespaceUse(ctx, id);

