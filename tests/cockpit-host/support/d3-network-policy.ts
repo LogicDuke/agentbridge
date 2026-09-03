@@ -63,6 +63,7 @@ export type ReasonCode =
   | 'GLOBAL_RECEIVER_ESCAPE'
   | 'GLOBAL_RECEIVER_DESTRUCTURING'
   | 'GLOBAL_RECEIVER_WRITE'
+  | 'GLOBAL_RECEIVER_CALL'
   | 'PROCESS_GLOBAL_USE'
   | 'HTTP_CLIENT_CAPABILITY'
   | 'HTTP_IMPORT_EQUALS'
@@ -1112,9 +1113,11 @@ const isDirectCallee = (access: ts.Expression): boolean => directCallOf(access) 
  * null. Global-receiver path only: an optional call of a permitted global
  * member yields the same result as the plain call, so both are followed.
  */
-const memberCallOf = (access: ts.Expression): ts.CallExpression | null => {
+/** The invocation — call (optional or not), construct, or tagged template — whose callee is `access`, or null. */
+const memberCallOf = (access: ts.Expression): ts.CallExpression | ts.NewExpression | ts.TaggedTemplateExpression | null => {
   const { node, parent } = climb(access);
-  return ts.isCallExpression(parent) && parent.expression === node ? parent : null;
+  if ((ts.isCallExpression(parent) || ts.isNewExpression(parent)) && parent.expression === node) return parent;
+  return ts.isTaggedTemplateExpression(parent) && parent.tag === node ? parent : null;
 };
 
 const isNumericLiteralAssignment = (access: ts.Expression): boolean => {
@@ -1451,7 +1454,7 @@ function checkGlobalAssignmentPattern(ctx: Context, target: ts.Expression): void
   }
 }
 
-/** A free global receiver root (or a static self-hop from one) may only be read through static, non-network keys; no member is ever written. */
+/** A free global receiver root (or a static self-hop from one) may only be read through static, non-network keys; no member is ever written or invoked. */
 function checkGlobalReceiverUse(ctx: Context, expression: ts.Expression): void {
   const { node, parent } = climb(expression);
   if (ts.isExpressionStatement(parent) || ts.isVoidExpression(parent) || ts.isTypeOfExpression(parent)) return;
@@ -1469,11 +1472,12 @@ function checkGlobalReceiverUse(ctx: Context, expression: ts.Expression): void {
       deny(ctx, 'GLOBAL_RECEIVER_WRITE', parent);
       return;
     }
-    // Receiver-call result authority inheritance: the result of a call of a
-    // permitted static member, optional or not, conservatively retains
-    // global-root authority and is checked as such.
-    const call = permitted ? memberCallOf(parent) : null;
-    if (call !== null) checkGlobalReceiverUse(ctx, call);
+    // A permitted static member is never invoked through the receiver: an
+    // inherited mutator or a code generator called with the global as its
+    // receiver rebinds globals exactly as a write does, so every call, optional
+    // call, construct and tagged-template form is denied as one family. A free
+    // global call such as `String(1)` goes through no receiver and is unaffected.
+    if (permitted && memberCallOf(parent) !== null) deny(ctx, 'GLOBAL_RECEIVER_CALL', parent);
     return;
   }
   if (ts.isVariableDeclaration(parent) && parent.initializer === node) {

