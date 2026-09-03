@@ -1576,7 +1576,21 @@ function checkInstantiationSites(ctx: Context): void {
         pass: cond + Math.max(thenFlow.exits ? 0 : thenFlow.pass, elseFlow.exits ? 0 : elseFlow.pass),
       };
     }
-    // Any other statement (expression / variable / loop / switch / try): every
+    if (
+      ts.isForStatement(stmt) ||
+      ts.isForInStatement(stmt) ||
+      ts.isForOfStatement(stmt) ||
+      ts.isWhileStatement(stmt) ||
+      ts.isDoStatement(stmt)
+    ) {
+      // A loop body can run more than once, so any server instantiated anywhere in
+      // the loop makes the factory multi-instantiating — the exact per-iteration
+      // count is irrelevant to the "more than one" bound. Fail closed to the cap
+      // when the loop contains any instantiation, and to zero when it contains none.
+      const servers = exprServers(stmt) >= 1 ? 2 : 0;
+      return { max: servers, exits: false, pass: servers };
+    }
+    // Any other statement (expression / variable / switch / try): every
     // instantiating call it contains runs and control falls through — an upper
     // bound for branchy forms, which therefore fail closed toward the bound.
     const servers = exprServers(stmt);
@@ -1838,18 +1852,42 @@ function hostExportsOf(ctx: Context): HostModuleExports {
   // shadowed by it and contributes no fact.
   const explicitNames = new Set<string>();
   const starStatements: ts.ExportDeclaration[] = [];
+  // Every identifier a binding name introduces, recursing through object and array
+  // destructuring patterns (and their nested and rest elements). `export const { a }`
+  // and `export const [a] = …` bind `a` exactly as `export const a` does, so each
+  // must shadow a same-name star export.
+  const bindingIdentifiers = (name: ts.BindingName): ts.Identifier[] => {
+    if (ts.isIdentifier(name)) return [name];
+    const identifiers: ts.Identifier[] = [];
+    for (const element of name.elements) {
+      if (ts.isBindingElement(element)) identifiers.push(...bindingIdentifiers(element.name));
+    }
+    return identifiers;
+  };
+  // Record one explicit export name and classify whatever fact its binding proves.
+  // The name alone shadows a same-name star export even when it proves no fact.
+  const recordExplicit = (symbol: ts.Symbol | undefined, exportName: string): void => {
+    explicitNames.add(exportName);
+    classifyBinding(symbol, exportName);
+  };
   for (const statement of ctx.sourceFile.statements) {
     if (isAmbient(statement)) continue;
     if (ts.isFunctionDeclaration(statement) && statement.name !== undefined && hasExportModifier(statement)) {
-      const exportName = hasDefaultModifier(statement) ? 'default' : statement.name.text;
-      explicitNames.add(exportName);
-      classifyBinding(valueSymbolOf(ctx.checker, statement.name), exportName);
+      recordExplicit(valueSymbolOf(ctx.checker, statement.name), hasDefaultModifier(statement) ? 'default' : statement.name.text);
+    }
+    // A `class`/`enum` export binds a runtime value that likewise shadows a star
+    // export of the same name (it carries no proven string/factory fact of its own).
+    if (ts.isClassDeclaration(statement) && hasExportModifier(statement)) {
+      const exportName = hasDefaultModifier(statement) ? 'default' : statement.name?.text;
+      if (exportName !== undefined) recordExplicit(statement.name === undefined ? undefined : valueSymbolOf(ctx.checker, statement.name), exportName);
+    }
+    if (ts.isEnumDeclaration(statement) && hasExportModifier(statement)) {
+      recordExplicit(valueSymbolOf(ctx.checker, statement.name), statement.name.text);
     }
     if (ts.isVariableStatement(statement) && hasExportModifier(statement)) {
       for (const declaration of statement.declarationList.declarations) {
-        if (ts.isIdentifier(declaration.name)) {
-          explicitNames.add(declaration.name.text);
-          classifyBinding(valueSymbolOf(ctx.checker, declaration.name), declaration.name.text);
+        for (const identifier of bindingIdentifiers(declaration.name)) {
+          recordExplicit(valueSymbolOf(ctx.checker, identifier), identifier.text);
         }
       }
     }
@@ -1864,6 +1902,10 @@ function hostExportsOf(ctx: Context): HostModuleExports {
       if (clause === undefined && specifier !== undefined) {
         // `export * from 'S'` — an effective-export computation deferred below.
         starStatements.push(statement);
+      } else if (clause !== undefined && ts.isNamespaceExport(clause)) {
+        // `export * as ns [from 'S']` — an explicit namespace binding that shadows
+        // a same-name star export (the namespace object proves no fact of its own).
+        explicitNames.add(clause.name.text);
       } else if (specifier !== undefined && clause !== undefined && ts.isNamedExports(clause)) {
         // `export { a, b as c } from 'S'` — explicit named re-exports.
         const source = ts.isStringLiteralLike(specifier) ? ctx.hostImports.get(specifier.text) : undefined;

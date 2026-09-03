@@ -1759,6 +1759,49 @@ get().close();`,
     });
     expect(reasonsOf(crossSingle, 'main.ts')).toEqual([]);
   });
+
+  it('shadows a star export with every explicit binding form, not just an identifier (Codex P1)', () => {
+    // A same-name explicit export takes ECMAScript precedence over `export *`,
+    // whatever its binding form: an object or array destructuring pattern, or a
+    // class. In each case the explicit `chunk` is not a proven string, so the
+    // star's proven-string fact must not survive — `response.end(chunk)` is denied.
+    const server = `${NS}\nimport { chunk } from './barrel.js';\nhttp.createServer((request, response) => { response.end(chunk); });`;
+    for (const explicit of [
+      `export const { chunk } = { chunk: (): void => {} };`, // object pattern (the witness)
+      `export const [chunk] = [(): void => {}];`, // array pattern
+      `export const { inner: { chunk } } = { inner: { chunk: (): void => {} } };`, // nested pattern
+      `export class chunk {}`, // class declaration
+    ]) {
+      const result = tree({
+        'safe.ts': `export const chunk = 'safe-body';`,
+        'barrel.ts': `export * from './safe.js';\n${explicit}`,
+        'server.ts': server,
+      });
+      expect(reasonsOf(result, 'barrel.ts'), explicit).toEqual([]);
+      expect(reasonsOf(result, 'server.ts'), explicit).toEqual(['RESPONSE_END_ARGUMENT']);
+    }
+    // Control: with no shadowing explicit binding the star's proven string still flows.
+    const nonShadowed = tree({
+      'safe.ts': `export const chunk = 'safe-body';`,
+      'barrel.ts': `export * from './safe.js';`,
+      'server.ts': server,
+    });
+    expect(reasonsOf(nonShadowed, 'server.ts')).toEqual([]);
+  });
+
+  it('counts servers created inside a loop body as more than one (server cardinality)', () => {
+    // A confined factory that instantiates inside a loop can create more than one
+    // server per invocation, so a single invocation is still denied.
+    const loop = analyzeNetworkPolicy(
+      `${NS}\nfunction make() { for (let i = 0; i < 2; i += 1) { http.createServer(${L}); } return http.createServer(${L}); }\nmake().listen(4317, '127.0.0.1');`,
+    );
+    expect(loop.reasons).toEqual(['CREATE_SERVER_MULTIPLE']);
+    // A loop that instantiates nothing leaves a single trailing creation allowed.
+    const loopNoServer = analyzeNetworkPolicy(
+      `${NS}\nfunction make() { for (let i = 0; i < 2; i += 1) { void i; } return http.createServer(${L}); }\nmake().listen(4317, '127.0.0.1');`,
+    );
+    expect(loopNoServer.reasons).toEqual([]);
+  });
 });
 
 // ---------------------------------------------------------------------------
