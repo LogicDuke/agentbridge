@@ -657,11 +657,15 @@ const memberNameOf = (node: ts.Node, constMap: ReadonlyMap<string, string>): str
 };
 
 // The SOURCE property name read by a destructuring binding element: `{ x }` and
-// `{ x: y }` both read property `x`. Handles a quoted key `{ 'x': y }`.
-const bindingPropertyName = (node: ts.BindingElement): string | null => {
+// `{ x: y }` both read property `x`. Handles a quoted key `{ 'x': y }` and a
+// statically-resolvable computed key `{ ['con' + 'structor']: y }` through the same
+// static-string machinery a computed member access uses — an unresolved computed
+// key stays null (unknown).
+const bindingPropertyName = (node: ts.BindingElement, constMap: ReadonlyMap<string, string>): string | null => {
   const key = node.propertyName ?? node.name;
   if (ts.isIdentifier(key)) return key.text;
   if (ts.isStringLiteralLike(key)) return key.text;
+  if (ts.isComputedPropertyName(key)) return staticStringOf(key.expression, constMap);
   return null;
 };
 
@@ -701,6 +705,13 @@ const isValueReference = (id: ts.Identifier): boolean => {
   if (ts.isPropertySignature(p) && p.name === id) return false;
   if (ts.isQualifiedName(p) && p.right === id) return false;
   if (ts.isTypeReferenceNode(p)) return false;
+  // An identifier inside a `typeof X` TYPE query (a `TypeQueryNode`) is a type-level
+  // name that erases at runtime — never a value read. Its `exprName` is an
+  // `EntityName`, so walk up any `QualifiedName` (`typeof A.B`) to reach the query.
+  // A runtime `typeof x` is a `TypeOfExpression`, a different node, and is untouched.
+  let entity: ts.Node = id;
+  while (ts.isQualifiedName(entity.parent)) entity = entity.parent;
+  if (ts.isTypeQueryNode(entity.parent) && entity.parent.exprName === entity) return false;
   return true;
 };
 
@@ -747,8 +758,12 @@ const servesAsAccessObject = (node: ts.Node): boolean => {
  *   - (b) any member access named `eval` / `Function` read off a global receiver
  *     (`globalThis`/`window`/`self`/`global`, through `as`/paren wrappers), e.g.
  *     `globalThis.eval`, `globalThis['ev' + 'al']`, `(globalThis as any)['eval']`;
- *   - (c) any destructuring of a property named `eval` / `Function`
- *     (`const { eval: e } = globalThis`);
+ *   - (c) any destructuring of a reserved code-generation property — `constructor`
+ *     on any receiver, or `eval` / `Function` — including a statically-resolvable
+ *     computed key (`const { ['con' + 'structor']: C } = fn`);
+ *   - (c2) reflective recovery `Reflect.get(obj, K)` whose key is `constructor`, is
+ *     `eval` / `Function` off a global receiver, or is not statically resolvable, and
+ *     any `Reflect.construct(...)`; `Reflect.apply` (invocation) is never matched;
  *   - (d) any *value reference* to the global `eval` / `Function` primitive — as a
  *     call callee, initializer, object-property value, array element, return
  *     value, or argument — so `[eval]`, `{ e: eval }`, `return eval` are caught at
@@ -783,10 +798,38 @@ const usesRuntimeCodeGeneration = (source: string): boolean => {
         found = true;
       }
     }
-    // (c) destructuring a property named eval / Function.
+    // (c) destructuring a reserved code-generation property. Mirrors (a)/(b): the
+    //     `constructor` chain on ANY receiver, `eval`/`Function` as established. The
+    //     key resolves through the shared static-string machinery, so a computed key
+    //     `const { ['con' + 'structor']: C } = fn` is caught exactly as `fn['con' +
+    //     'structor']` is.
     if (ts.isBindingElement(node)) {
-      const name = bindingPropertyName(node);
-      if (name !== null && RC_PRIMITIVE_NAMES.has(name)) found = true;
+      const name = bindingPropertyName(node, constMap);
+      if (name === 'constructor' || (name !== null && RC_PRIMITIVE_NAMES.has(name))) found = true;
+    }
+    // (c2) reflective recovery. `Reflect.get(obj, K)` is a property read whose key is
+    //      the second argument, and `Reflect.construct(...)` reflectively invokes a
+    //      constructor; neither is benign data indexing in this closure, so — unlike
+    //      bracket indexing on an arbitrary object — the reflective route fails closed
+    //      on an unresolved key. The method name resolves through the same static-key
+    //      machinery as a member access, so `Reflect['get']` / `Reflect['con' + 'struct']`
+    //      are caught exactly as `Reflect.get` is. `Reflect.apply` (invocation, used by
+    //      the real host) is a different method and is never matched.
+    if (
+      ts.isCallExpression(node) &&
+      (ts.isPropertyAccessExpression(node.expression) || ts.isElementAccessExpression(node.expression)) &&
+      ts.isIdentifier(unwrapExpr(node.expression.expression)) &&
+      (unwrapExpr(node.expression.expression) as ts.Identifier).text === 'Reflect'
+    ) {
+      const method = memberNameOf(node.expression, constMap);
+      if (method === 'construct') found = true;
+      else if (method === 'get') {
+        const keyArg = node.arguments[1];
+        const key = keyArg !== undefined ? staticStringOf(keyArg, constMap) : null;
+        const receiver = node.arguments[0];
+        if (key === null || key === 'constructor') found = true;
+        else if (RC_PRIMITIVE_NAMES.has(key) && receiver !== undefined && isGlobalReceiver(receiver)) found = true;
+      }
     }
     // (d) a value reference to the global eval / Function primitive.
     if (ts.isIdentifier(node) && RC_PRIMITIVE_NAMES.has(node.text) && isValueReference(node)) {
@@ -895,9 +938,10 @@ const acquiresHiddenBuiltin = (source: string): boolean => {
       const member = memberNameOf(node, constMap);
       if (member !== null && HIDDEN_BUILTIN_METHODS.has(member)) found = true;
     }
-    // (b) destructuring a property named getBuiltinModule / binding.
+    // (b) destructuring a property named getBuiltinModule / binding (key resolved
+    //     through the shared static-string machinery, so a computed key is caught too).
     if (ts.isBindingElement(node)) {
-      const name = bindingPropertyName(node);
+      const name = bindingPropertyName(node, constMap);
       if (name !== null && HIDDEN_BUILTIN_METHODS.has(name)) found = true;
     }
     // (c) forwarding the process global as a value (not a direct process operation).
@@ -3112,6 +3156,74 @@ describe('D3 host RC forwarding closure rejects laundered code generation (D3-CX
     // forwarding (see the RC v3 suite); a DIRECT global member access stays allowed.
     expect(usesRuntimeCodeGeneration(`globalThis.console.log('x');`)).toBe(false);
     expect(usesRuntimeCodeGeneration(`globalThis.setTimeout(() => {}, 0);`)).toBe(false);
+  });
+});
+
+describe('D3 host RC property-recovery consistency and reflective route (bounded correction)', () => {
+  // Every structurally distinguishable recovery of a reserved code-generation key is
+  // rejected uniformly: member access, computed access, destructuring, and reflective
+  // `Reflect.get`/`Reflect.construct`. `constructor` is reserved on any receiver.
+  const rejected: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'static constructor member access', source: `(async () => {}).constructor('return fetch()')();` },
+    { form: 'statically-computed constructor member access', source: `(async () => {})['con' + 'structor']('return fetch()')();` },
+    { form: 'destructured constructor', source: `const { constructor: C } = (async () => {});\nC('return fetch()')();` },
+    { form: 'statically-computed destructuring key for constructor', source: `const { ['con' + 'structor']: C } = (async () => {});\nC('return fetch()')();` },
+    { form: 'destructured Function', source: `const { Function: F } = globalThis;\nF('return fetch()')();` },
+    { form: 'statically-computed destructuring key for eval', source: `const { ['ev' + 'al']: e } = globalThis;\ne('fetch()');` },
+    { form: 'Reflect.get of constructor on any receiver', source: `Reflect.get(async () => {}, 'constructor')('return fetch()')();` },
+    { form: 'Reflect.get of eval off the global receiver', source: `Reflect.get(globalThis, 'eval')('fetch()');` },
+    { form: 'Reflect.get with an unresolved dynamic key fails closed', source: `declare const k: string;\nconst v = Reflect.get({}, k);\nvoid v;` },
+    { form: 'Reflect.construct of any target', source: `const o = Reflect.construct(Object, []);\nvoid o;` },
+    { form: "computed Reflect['get'] of constructor", source: `Reflect['get'](async () => {}, 'constructor')('return fetch()')();` },
+  ];
+  for (const { form, source } of rejected) {
+    it(`rejects ${form}`, () => {
+      expect(usesRuntimeCodeGeneration(source)).toBe(true);
+    });
+  }
+
+  it('preserves legitimate Reflect.apply and a non-reserved reflective read', () => {
+    // The real closure captures `Reflect.apply` to invoke a method poison-resistantly.
+    expect(usesRuntimeCodeGeneration(`const reflectApply = Reflect.apply;\nreflectApply(String.prototype.trim, ' x ', []);`)).toBe(false);
+    // A reflective read of a non-reserved, statically-known data property is not recovery.
+    expect(usesRuntimeCodeGeneration(`const v = Reflect.get({ label: 'x' }, 'label');\nvoid v;`)).toBe(false);
+  });
+
+  it('preserves legitimate arbitrary non-global computed indexing (finite enforcement boundary)', () => {
+    // A dynamic computed key on an arbitrary non-global object is indistinguishable
+    // from data indexing and is NOT rejected — the real closure indexes pervasively.
+    for (const source of [
+      `const results: string[] = [];\nconst index = 0;\nconst r = results[index];\nvoid r;`,
+      `const list: Record<string, number> = {};\nconst key = 'a';\nconst v = list[key];\nvoid v;`,
+      `const HTML_ESCAPES: Record<string, string> = {};\nfunction esc(character: string) { return HTML_ESCAPES[character]; }\nvoid esc;`,
+    ]) {
+      expect(usesRuntimeCodeGeneration(source), source).toBe(false);
+    }
+  });
+});
+
+describe('D3 host type-query identifiers are not runtime value reads (bounded correction)', () => {
+  // `typeof X` in a TYPE position erases at runtime; the reserved name inside it is a
+  // type-level reference, never a value read, so it must not trip the RC/HA guards.
+  for (const name of ['Function', 'eval', 'globalThis', 'process']) {
+    const source = `type X = typeof ${name};\nconst x: X = null as unknown as X;\nvoid x;`;
+    it(`does not flag a type query \`typeof ${name}\``, () => {
+      expect(usesRuntimeCodeGeneration(source)).toBe(false);
+      expect(acquiresHiddenBuiltin(source)).toBe(false);
+    });
+  }
+  it('handles a qualified type query `typeof ns.member`', () => {
+    const source = `declare const ns: { eval: unknown };\ntype X = typeof ns.eval;\nconst x: X = null as unknown as X;\nvoid x;`;
+    expect(usesRuntimeCodeGeneration(source)).toBe(false);
+  });
+  it('still detects an actual runtime reference to the reserved capability', () => {
+    // The type-query suppression is specific to type position: a runtime value use of
+    // the same names is still rejected.
+    expect(usesRuntimeCodeGeneration(`const e = eval;\ne('fetch()');`)).toBe(true);
+    expect(usesRuntimeCodeGeneration(`const g = globalThis;\nvoid g;`)).toBe(true);
+    expect(acquiresHiddenBuiltin(`const p = process;\nvoid p;`)).toBe(true);
+    // A runtime `typeof` OPERATOR (a value expression, not a type query) still reads the value.
+    expect(usesRuntimeCodeGeneration(`const t = typeof globalThis;\nvoid t;`)).toBe(true);
   });
 });
 

@@ -1771,6 +1771,7 @@ get().close();`,
       `export const [chunk] = [(): void => {}];`, // array pattern
       `export const { inner: { chunk } } = { inner: { chunk: (): void => {} } };`, // nested pattern
       `export class chunk {}`, // class declaration
+      `export import chunk = Number;`, // export-modified import-equals alias
     ]) {
       const result = tree({
         'safe.ts': `export const chunk = 'safe-body';`,

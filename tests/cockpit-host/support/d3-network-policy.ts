@@ -1884,6 +1884,11 @@ function hostExportsOf(ctx: Context): HostModuleExports {
     if (ts.isEnumDeclaration(statement) && hasExportModifier(statement)) {
       recordExplicit(valueSymbolOf(ctx.checker, statement.name), statement.name.text);
     }
+    // `export import X = …` (a non-type-only export-modified import-equals) binds a
+    // runtime alias `X` that likewise shadows a same-name star export.
+    if (ts.isImportEqualsDeclaration(statement) && hasExportModifier(statement) && !statement.isTypeOnly) {
+      recordExplicit(valueSymbolOf(ctx.checker, statement.name), statement.name.text);
+    }
     if (ts.isVariableStatement(statement) && hasExportModifier(statement)) {
       for (const declaration of statement.declarationList.declarations) {
         for (const identifier of bindingIdentifiers(declaration.name)) {
