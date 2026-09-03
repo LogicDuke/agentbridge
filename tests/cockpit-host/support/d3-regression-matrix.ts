@@ -1,7 +1,7 @@
 /**
  * Cockpit D3 network policy — semantic regression matrix.
  *
- * Data-driven rows grouped into the eighteen frozen semantic categories. Each
+ * Data-driven rows grouped into the twenty frozen semantic categories. Each
  * row carries one of three expectations:
  *
  *   MUST_DENY                  the policy must reject the source; every listed
@@ -36,7 +36,9 @@ export type RegressionCategory =
   | 'export confinement'
   | 'convergence/exhaustion'
   | 'extra parameter false positives'
-  | 'real host acceptance';
+  | 'real host acceptance'
+  | 'loopback listen binding'
+  | 'server instantiation site bound';
 
 export const REGRESSION_CATEGORIES: readonly RegressionCategory[] = [
   'free-global identity',
@@ -57,6 +59,8 @@ export const REGRESSION_CATEGORIES: readonly RegressionCategory[] = [
   'convergence/exhaustion',
   'extra parameter false positives',
   'real host acceptance',
+  'loopback listen binding',
+  'server instantiation site bound',
 ];
 
 export type Expectation = 'MUST_DENY' | 'MUST_ALLOW' | 'OUTSIDE_DECLARED_BOUNDARY';
@@ -401,7 +405,7 @@ const STATIC_KEYS: readonly RegressionRow[] = [
   allow('static/computed keys', 'scope-sensitive inner const resolves', `${NS}\nconst K = 'request';\n{\n  const K = 'createServer';\n  http[K](${L});\n}`),
   allow('static/computed keys', 'request static element key', inListener(`request['url'];\nrequest['met' + 'hod'];`)),
   allow('static/computed keys', 'response static element key', inListener(`response['statusCode'] = 200;\nresponse['end']();`)),
-  allow('static/computed keys', 'server static element key', withServer(`server['listen'](1);`)),
+  allow('static/computed keys', 'server static element key', withServer(`server['listen'](4317, '127.0.0.1');`)),
   deny('static/computed keys', 'outer const resolves to client key', `${NS}\nconst K = 'request';\n{\n  const K = 'createServer';\n}\nhttp[K]('x');`, ['HTTP_CLIENT_CAPABILITY']),
   deny('static/computed keys', 'let key is indeterminate', `${NS}\nlet K = 'createServer';\nhttp[K](${L});`, ['HTTP_NAMESPACE_RUNTIME_KEY']),
   deny('static/computed keys', 'written const key is indeterminate', `${NS}\nconst K = 'createServer';\n(K as any) = 'x';\nhttp[K](${L});`, ['HTTP_NAMESPACE_RUNTIME_KEY']),
@@ -461,26 +465,26 @@ const SOCKET: readonly RegressionRow[] = [
   deny('socket acquisition through proven target policy', 'server.listen read without call', withServer(`const l = server.listen;`), ['SERVER_MEMBER']),
   deny('socket acquisition through proven target policy', 'server.listen.call nested chain', withServer(`server.listen.call(server, 1);`), ['SERVER_MEMBER', 'SERVER_ESCAPE']),
   deny('socket acquisition through proven target policy', 'server.close.bind', withServer(`const c = server.close.bind(server);`), ['SERVER_MEMBER', 'SERVER_ESCAPE']),
-  deny('socket acquisition through proven target policy', 'optional-chained listen', withServer(`server?.listen(1);`), ['SERVER_MEMBER']),
+  deny('socket acquisition through proven target policy', 'optional-chained listen', withServer(`server?.listen(4317, '127.0.0.1');`), ['SERVER_MEMBER']),
   deny('socket acquisition through proven target policy', 'server.connections', withServer(`server.connections;`), ['SERVER_MEMBER']),
   allow('socket acquisition through proven target policy', 'listen with callback', withServer(`server.listen(4317, '127.0.0.1', () => { console.log('up'); });`)),
   allow('socket acquisition through proven target policy', 'close', withServer(`server.close();`)),
   allow('socket acquisition through proven target policy', 'request.method and request.url', inListener(`const m = request.method ?? '';\nconst u = request.url;\nm + u;`)),
   allow('socket acquisition through proven target policy', 'response setHeader/end/statusCode', inListener(`response.statusCode = 404;\nresponse.setHeader('a', 'b');\nresponse.end('x');`)),
   // PR #67 F2: the result of a direct non-optional allowed member call retains the receiver's authority.
-  deny('socket acquisition through proven target policy', 'listen result subscribes to connection (PR #67 F2)', withServer(`server.listen(1).on('connection', (socket) => { socket.write('x'); });`), ['SERVER_MEMBER']),
+  deny('socket acquisition through proven target policy', 'listen result subscribes to connection (PR #67 F2)', withServer(`server.listen(4317, '127.0.0.1').on('connection', (socket) => { socket.write('x'); });`), ['SERVER_MEMBER']),
   deny('socket acquisition through proven target policy', 'close result subscribes', withServer(`server.close().on('close', () => {});`), ['SERVER_MEMBER']),
-  deny('socket acquisition through proven target policy', 'listen result address', withServer(`server.listen(1).address();`), ['SERVER_MEMBER']),
+  deny('socket acquisition through proven target policy', 'listen result address', withServer(`server.listen(4317, '127.0.0.1').address();`), ['SERVER_MEMBER']),
   deny('socket acquisition through proven target policy', 'setHeader result socket', inListener(`response.setHeader('a', 'b').socket;`), ['RESPONSE_MEMBER']),
   deny('socket acquisition through proven target policy', 'end result socket', inListener(`response.end('x').socket;`), ['RESPONSE_MEMBER']),
   deny('socket acquisition through proven target policy', 'end result socket through wrapper', inListener(`(response.end('x') as any).socket.write('x');`), ['RESPONSE_MEMBER']),
   deny('socket acquisition through proven target policy', 'setHeader result write', inListener(`response.setHeader('a', 'b').write('x');`), ['RESPONSE_MEMBER']),
-  deny('socket acquisition through proven target policy', 'static element key call result', withServer(`server['listen'](1)['on']('x', () => {});`), ['SERVER_MEMBER']),
-  deny('socket acquisition through proven target policy', 'listen result destructured', withServer(`const { on } = server.listen(1);`), ['SERVER_DESTRUCTURING']),
-  allow('socket acquisition through proven target policy', 'listen result close chain', withServer(`server.listen(1).close();`)),
+  deny('socket acquisition through proven target policy', 'static element key call result', withServer(`server['listen'](4317, '127.0.0.1')['on']('x', () => {});`), ['SERVER_MEMBER']),
+  deny('socket acquisition through proven target policy', 'listen result destructured', withServer(`const { on } = server.listen(4317, '127.0.0.1');`), ['SERVER_DESTRUCTURING']),
+  allow('socket acquisition through proven target policy', 'listen result close chain', withServer(`server.listen(4317, '127.0.0.1').close();`)),
   allow('socket acquisition through proven target policy', 'setHeader result end chain', inListener(`response.setHeader('a', 'b').end('x');`)),
-  allow('socket acquisition through proven target policy', 'listen result as void operand', withServer(`void server.listen(1);`)),
-  allow('socket acquisition through proven target policy', 'chained allowed calls of arbitrary length', withServer(`server.listen(1).close().listen(2).close();`)),
+  allow('socket acquisition through proven target policy', 'listen result as void operand', withServer(`void server.listen(4317, '127.0.0.1');`)),
+  allow('socket acquisition through proven target policy', 'chained allowed calls of arbitrary length', withServer(`server.listen(4317, '127.0.0.1').close().listen(4317, '127.0.0.1').close();`)),
 ];
 
 // ---------------------------------------------------------------------------
@@ -506,7 +510,7 @@ const RUNTIME_KEYS: readonly RegressionRow[] = [
 // ---------------------------------------------------------------------------
 
 const ALIAS: readonly RegressionRow[] = [
-  allow('alias propagation', 'const alias chain of server', withServer(`const a = server;\nconst b = a;\nb.listen(1);`)),
+  allow('alias propagation', 'const alias chain of server', withServer(`const a = server;\nconst b = a;\nb.listen(4317, '127.0.0.1');`)),
   allow('alias propagation', 'wrapped alias', withServer(`const a = (server as http.Server)!;\na.close();`)),
   allow('alias propagation', 'alias of request and response in listener', inListener(`const q = request;\nconst s = response;\nq.url;\ns.end();`)),
   allow('alias propagation', 'alias used as statement, void, typeof', withServer(`const a = server;\na;\nvoid a;\ntypeof a;`)),
@@ -527,13 +531,13 @@ const ALIAS: readonly RegressionRow[] = [
   deny('alias propagation', 'alias then non-allowed member', inListener(`const q = request;\nq.socket;`), ['REQUEST_MEMBER']),
   deny('alias propagation', 'ambient const alias', withServer(`declare const a: typeof server;\nconst b = server;\nb.on('x', () => {});`), ['SERVER_MEMBER']),
   // PR #67 F2: a const alias of an allowed member call result carries the receiver's authority.
-  deny('alias propagation', 'const alias of listen result then escape (PR #67 F2)', withServer(`const leaked = server.listen(1);\nuse(leaked);`), ['SERVER_ESCAPE']),
+  deny('alias propagation', 'const alias of listen result then escape (PR #67 F2)', withServer(`const leaked = server.listen(4317, '127.0.0.1');\nuse(leaked);`), ['SERVER_ESCAPE']),
   deny('alias propagation', 'const alias of setHeader result then escape', inListener(`const r2 = response.setHeader('a', 'b');\nuse(r2);`), ['RESPONSE_ESCAPE']),
   deny('alias propagation', 'const alias of end result then socket', inListener(`const r2 = response.end('x');\nr2.socket;`), ['RESPONSE_MEMBER']),
-  deny('alias propagation', 'alias chain through allowed call results', withServer(`const a = server.listen(1);\nconst b = a.close();\nb.on('x', () => {});`), ['SERVER_MEMBER']),
-  deny('alias propagation', 'PARAM-derived call result alias escapes', withServer(`function setup(s: http.Server) { const t = s.listen(1); use(t); }\nsetup(server);`), ['SERVER_ESCAPE']),
-  deny('alias propagation', 'let binding of listen result', withServer(`let started = server.listen(1);`), ['SERVER_MUTABLE_BINDING']),
-  allow('alias propagation', 'const alias of listen result used within policy', withServer(`const started = server.listen(1);\nstarted.close();`)),
+  deny('alias propagation', 'alias chain through allowed call results', withServer(`const a = server.listen(4317, '127.0.0.1');\nconst b = a.close();\nb.on('x', () => {});`), ['SERVER_MEMBER']),
+  deny('alias propagation', 'PARAM-derived call result alias escapes', withServer(`function setup(s: http.Server) { const t = s.listen(4317, '127.0.0.1'); use(t); }\nsetup(server);`), ['SERVER_ESCAPE']),
+  deny('alias propagation', 'let binding of listen result', withServer(`let started = server.listen(4317, '127.0.0.1');`), ['SERVER_MUTABLE_BINDING']),
+  allow('alias propagation', 'const alias of listen result used within policy', withServer(`const started = server.listen(4317, '127.0.0.1');\nstarted.close();`)),
 ];
 
 // ---------------------------------------------------------------------------
@@ -566,8 +570,8 @@ const LOCAL_PROPAGATION: readonly RegressionRow[] = [
     'parameter with default initializer',
     `${NS}\ndeclare const fallback: http.ServerResponse;\nfunction a(res: http.ServerResponse = fallback) { res.end(); }\nhttp.createServer((request, response) => { a(response); });`,
   ),
-  allow('local function propagation', 'server passed to eligible local setup', withServer(`function setup(s: http.Server) { s.listen(1); }\nsetup(server);`)),
-  allow('local function propagation', 'createServer result passed directly to eligible callee', `${NS}\nfunction setup(s: http.Server) { s.listen(1); }\nsetup(http.createServer(${L}));`),
+  allow('local function propagation', 'server passed to eligible local setup', withServer(`function setup(s: http.Server) { s.listen(4317, '127.0.0.1'); }\nsetup(server);`)),
+  allow('local function propagation', 'createServer result passed directly to eligible callee', `${NS}\nfunction setup(s: http.Server) { s.listen(4317, '127.0.0.1'); }\nsetup(http.createServer(${L}));`),
   allow(
     'local function propagation',
     'mutually recursive propagation converges',
@@ -811,16 +815,16 @@ const OPTIONS: readonly RegressionRow[] = [
 // ---------------------------------------------------------------------------
 
 const FACTORY: readonly RegressionRow[] = [
-  allow('factory confinement', 'real exported factory and const consumer', withFactory(`const server = createCockpitServer();\nserver.listen(1);`)),
-  allow('factory confinement', 'const arrow factory', `${NS}\nconst make = () => http.createServer(${L});\nconst server = make();\nserver.listen(1);`),
-  allow('factory confinement', 'const function-expression factory', `${NS}\nconst make = function () { return http.createServer(${L}); };\nmake().listen(1);`),
-  allow('factory confinement', 'factory returning another factory', withFactory(`function outer() { return createCockpitServer(); }\nouter().listen(1);`)),
+  allow('factory confinement', 'real exported factory and const consumer', withFactory(`const server = createCockpitServer();\nserver.listen(4317, '127.0.0.1');`)),
+  allow('factory confinement', 'const arrow factory', `${NS}\nconst make = () => http.createServer(${L});\nconst server = make();\nserver.listen(4317, '127.0.0.1');`),
+  allow('factory confinement', 'const function-expression factory', `${NS}\nconst make = function () { return http.createServer(${L}); };\nmake().listen(4317, '127.0.0.1');`),
+  allow('factory confinement', 'factory returning another factory', withFactory(`function outer() { return createCockpitServer(); }\nouter().listen(4317, '127.0.0.1');`)),
   allow('factory confinement', 'factory returning a rooted const alias', withServer(`function get() { return server; }\nget().close();`)),
-  allow('factory confinement', 'multiple SERVER returns', `${NS}\nfunction make(x: boolean) { if (x) { return http.createServer(${L}); } return http.createServer(${L}); }\nmake(true).listen(1);`),
-  allow('factory confinement', 'export default function factory', `${NS}\nexport default function make() { return http.createServer(${L}); }\nmake().listen(1);`),
+  allow('factory confinement', 'multiple SERVER returns', `${NS}\nfunction make(x: boolean) { if (x) { return http.createServer(${L}); } return http.createServer(${L}); }\nmake(true).listen(4317, '127.0.0.1');`),
+  allow('factory confinement', 'export default function factory', `${NS}\nexport default function make() { return http.createServer(${L}); }\nmake().listen(4317, '127.0.0.1');`),
   allow('factory confinement', 'factory exported by specifier', `${NS}\nfunction make() { return http.createServer(${L}); }\nexport { make };`),
   allow('factory confinement', 'factory referenced by typeof', `${NS}\nfunction make() { return http.createServer(${L}); }\nconst t = typeof make;\nt;`),
-  allow('factory confinement', 'factory with parameters', `${NS}\nfunction make(port: number) { const s = http.createServer(${L}); s.listen(port); return s; }\nmake(1);`),
+  allow('factory confinement', 'factory with parameters', `${NS}\nfunction make(label: string) { const s = http.createServer(${L}); s.listen(4317, '127.0.0.1'); console.log(label); return s; }\nmake('x');`),
   deny('factory confinement', 'mixed SERVER/non-SERVER returns', `${NS}\nfunction make(x: boolean) { if (x) { return http.createServer(${L}); } return null; }\nmake(true);`, ['SERVER_UNCONFINED_RETURN'], {
     closes: ['F-6'],
   }),
@@ -862,11 +866,11 @@ const RESULT: readonly RegressionRow[] = [
   allow('result confinement', 'expression statement', `${NS}\nhttp.createServer(${L});`),
   allow('result confinement', 'void operand', `${NS}\nvoid http.createServer(${L});`),
   allow('result confinement', 'typeof operand', `${NS}\ntypeof http.createServer(${L});`),
-  allow('result confinement', 'direct listen', `${NS}\nhttp.createServer(${L}).listen(1);`),
+  allow('result confinement', 'direct listen', `${NS}\nhttp.createServer(${L}).listen(4317, '127.0.0.1');`),
   allow('result confinement', 'direct close', `${NS}\nhttp.createServer(${L}).close();`),
   allow('result confinement', 'confined const initializer', `${NS}\nconst server = http.createServer(${L});`),
   allow('result confinement', 'confined factory return', `${NS}\nfunction make() { return http.createServer(${L}); }`),
-  allow('result confinement', 'approved propagation', `${NS}\nfunction setup(s: http.Server) { s.listen(1); }\nsetup(http.createServer(${L}));`),
+  allow('result confinement', 'approved propagation', `${NS}\nfunction setup(s: http.Server) { s.listen(4317, '127.0.0.1'); }\nsetup(http.createServer(${L}));`),
   deny('result confinement', 'let binding', `${NS}\nlet s = http.createServer(${L});`, ['SERVER_MUTABLE_BINDING']),
   deny('result confinement', 'var binding', `${NS}\nvar s = http.createServer(${L});`, ['SERVER_MUTABLE_BINDING']),
   deny('result confinement', 'array element', `${NS}\nconst a = [http.createServer(${L})];`, ['SERVER_ESCAPE']),
@@ -884,20 +888,20 @@ const RESULT: readonly RegressionRow[] = [
   deny('result confinement', 'direct exported const', `${NS}\nexport const s = http.createServer(${L});`, ['SERVER_EXPORT']),
   deny('result confinement', 'non-allowed member on result', `${NS}\nhttp.createServer(${L}).on('x', () => {});`, ['SERVER_MEMBER']),
   deny('result confinement', 'member read without call on result', `${NS}\nconst l = http.createServer(${L}).listen;`, ['SERVER_MEMBER']),
-  deny('result confinement', 'optional-chained member on result', `${NS}\nhttp.createServer(${L})?.listen(1);`, ['SERVER_MEMBER']),
+  deny('result confinement', 'optional-chained member on result', `${NS}\nhttp.createServer(${L})?.listen(4317, '127.0.0.1');`, ['SERVER_MEMBER']),
   deny('result confinement', 'spread of result', `${NS}\nuse(...(http.createServer(${L}) as any));`, ['SERVER_ESCAPE']),
   deny('result confinement', 'result in a nullish expression', `${NS}\nconst s = http.createServer(${L}) ?? null;`, ['SERVER_ESCAPE']),
   deny('result confinement', 'result in an equality test', `${NS}\nif (http.createServer(${L}) === null) {}`, ['SERVER_ESCAPE']),
   deny('result confinement', 'result as heritage expression', `${NS}\nclass Sub extends (http.createServer(${L}) as any) {}`, ['SERVER_ESCAPE']),
   // PR #67 F2: allowed member call results are confined exactly like the values they were called on.
-  deny('result confinement', 'listen result as call argument (PR #67 F2)', withServer(`use(server.listen(1));`), ['SERVER_ESCAPE']),
-  deny('result confinement', 'createServer result listen chain non-allowed member', `${NS}\nhttp.createServer(${L}).listen(1).on('x', () => {});`, ['SERVER_MEMBER']),
-  deny('result confinement', 'listen result in container', withServer(`const a = [server.listen(1)];`), ['SERVER_ESCAPE']),
-  deny('result confinement', 'listen result returned from an unconfined function', withServer(`function start() { return server.listen(1); }`), ['SERVER_UNCONFINED_RETURN']),
+  deny('result confinement', 'listen result as call argument (PR #67 F2)', withServer(`use(server.listen(4317, '127.0.0.1'));`), ['SERVER_ESCAPE']),
+  deny('result confinement', 'createServer result listen chain non-allowed member', `${NS}\nhttp.createServer(${L}).listen(4317, '127.0.0.1').on('x', () => {});`, ['SERVER_MEMBER']),
+  deny('result confinement', 'listen result in container', withServer(`const a = [server.listen(4317, '127.0.0.1')];`), ['SERVER_ESCAPE']),
+  deny('result confinement', 'listen result returned from an unconfined function', withServer(`function start() { return server.listen(4317, '127.0.0.1'); }`), ['SERVER_UNCONFINED_RETURN']),
   deny('result confinement', 'end result returned from an arrow body', inListener(`const send = () => response.end('x');`), ['RESPONSE_UNCONFINED_RETURN']),
-  deny('result confinement', 'listen result assigned', withServer(`let s;\ns = server.listen(1);`), ['SERVER_ESCAPE']),
-  deny('result confinement', 'listen result propagated then misused', withServer(`function setup(s: http.Server) { s.on('x', () => {}); }\nsetup(server.listen(1));`), ['SERVER_MEMBER']),
-  allow('result confinement', 'listen result passed to an eligible local callee', withServer(`function setup(s: http.Server) { s.close(); }\nsetup(server.listen(1));`)),
+  deny('result confinement', 'listen result assigned', withServer(`let s;\ns = server.listen(4317, '127.0.0.1');`), ['SERVER_ESCAPE']),
+  deny('result confinement', 'listen result propagated then misused', withServer(`function setup(s: http.Server) { s.on('x', () => {}); }\nsetup(server.listen(4317, '127.0.0.1'));`), ['SERVER_MEMBER']),
+  allow('result confinement', 'listen result passed to an eligible local callee', withServer(`function setup(s: http.Server) { s.close(); }\nsetup(server.listen(4317, '127.0.0.1'));`)),
   allow('result confinement', 'listen result as expression statement', withServer(`server.listen(4317, '127.0.0.1', () => { console.log('up'); });`)),
 ];
 
@@ -918,8 +922,8 @@ const EXPORT: readonly RegressionRow[] = [
   deny('export confinement', 'exported const alias of server', withServer(`export const alias = server;`), ['SERVER_EXPORT'], { closes: ['F-7'] }),
   // PR #67 F2: exporting an allowed member call result exports the receiver's authority.
   deny('export confinement', 'export const leaked = server.listen(...) (PR #67 F2)', withServer(`export const leaked = server.listen(4317, '127.0.0.1');`), ['SERVER_EXPORT']),
-  deny('export confinement', 'export default server.listen(...)', withServer(`export default server.listen(1);`), ['SERVER_EXPORT']),
-  deny('export confinement', 'export of a const alias of a listen result', withServer(`const leaked = server.listen(1);\nexport { leaked };`), ['SERVER_EXPORT']),
+  deny('export confinement', 'export default server.listen(...)', withServer(`export default server.listen(4317, '127.0.0.1');`), ['SERVER_EXPORT']),
+  deny('export confinement', 'export of a const alias of a listen result', withServer(`const leaked = server.listen(4317, '127.0.0.1');\nexport { leaked };`), ['SERVER_EXPORT']),
   allow('export confinement', 'export function factory', withFactory(``)),
   allow('export confinement', 'export { factory }', `${NS}\nfunction createCockpitServer() { return http.createServer(${L}); }\nexport { createCockpitServer };`),
   allow('export confinement', 'export default function factory', `${NS}\nexport default function createCockpitServer() { return http.createServer(${L}); }`),
@@ -936,9 +940,9 @@ const FIXPOINT: readonly RegressionRow[] = [
   allow('convergence/exhaustion', 'reverse propagation chain converges under the default ceiling', reverseChain(6)),
   deny('convergence/exhaustion', 'reverse propagation chain exhausts a low ceiling', reverseChain(6), ['FIXPOINT_EXHAUSTED'], { options: { fixpointCeiling: 2 } }),
   deny('convergence/exhaustion', 'exhaustion denies even an otherwise-allowed real host shape', REAL_HOST_SHAPE, ['FIXPOINT_EXHAUSTED'], { options: { fixpointCeiling: 1 } }),
-  allow('convergence/exhaustion', 'recursive alias/factory cycle converges', withServer(`function get() { return server; }\nfunction again() { return get(); }\nagain().close();\nget().listen(1);`)),
+  allow('convergence/exhaustion', 'recursive alias/factory cycle converges', withServer(`function get() { return server; }\nfunction again() { return get(); }\nagain().close();\nget().listen(4317, '127.0.0.1');`)),
   allow('convergence/exhaustion', 'empty file converges', ``),
-  allow('convergence/exhaustion', 'alias chain through allowed call results converges', withServer(`const a = server.listen(1);\nconst b = a.close();\nb.close();`)),
+  allow('convergence/exhaustion', 'alias chain through allowed call results converges', withServer(`const a = server.listen(4317, '127.0.0.1');\nconst b = a.close();\nb.close();`)),
 ];
 
 // ---------------------------------------------------------------------------
@@ -984,6 +988,93 @@ const REAL_HOST: readonly RegressionRow[] = [
 ];
 
 // ---------------------------------------------------------------------------
+// 19. loopback listen binding (PR #67 B1)
+// ---------------------------------------------------------------------------
+
+/** The real host replica with its loopback host literal replaced by `host`. */
+const replicaListeningOn = (host: string): string => REAL_HOST_SHAPE.replace(`'127.0.0.1'`, `'${host}'`);
+
+const LISTEN_BINDING: readonly RegressionRow[] = [
+  deny('loopback listen binding', 'wildcard IPv4 host', withServer(`server.listen(4317, '0.0.0.0');`), ['SERVER_LISTEN_BINDING']),
+  deny('loopback listen binding', 'wildcard IPv6 host', withServer(`server.listen(4317, '::');`), ['SERVER_LISTEN_BINDING']),
+  deny('loopback listen binding', 'port only', withServer(`server.listen(4317);`), ['SERVER_LISTEN_BINDING']),
+  deny('loopback listen binding', 'no arguments', withServer(`server.listen();`), ['SERVER_LISTEN_BINDING']),
+  deny('loopback listen binding', 'IPv6 loopback literal is not the bound host', withServer(`server.listen(4317, '::1');`), ['SERVER_LISTEN_BINDING']),
+  deny('loopback listen binding', 'localhost name is not the bound host', withServer(`server.listen(4317, 'localhost');`), ['SERVER_LISTEN_BINDING']),
+  deny('loopback listen binding', 'ambient host binding', withServer(`declare const dynamicHost: string;\nserver.listen(4317, dynamicHost);`), ['SERVER_LISTEN_BINDING']),
+  deny('loopback listen binding', 'mutable host binding', withServer(`let host = '127.0.0.1';\nserver.listen(4317, host);`), ['SERVER_LISTEN_BINDING']),
+  deny('loopback listen binding', 'reassigned const-like host', withServer(`var host = '127.0.0.1';\nhost = '0.0.0.0';\nserver.listen(4317, host);`), ['SERVER_LISTEN_BINDING']),
+  deny('loopback listen binding', 'wildcard host through a const', withServer(`const HOST = '0.0.0.0';\nserver.listen(4317, HOST);`), ['SERVER_LISTEN_BINDING']),
+  deny('loopback listen binding', 'exported wildcard constants', withServer(`export const HOST = '0.0.0.0';\nexport const PORT = 4317;\nserver.listen(PORT, HOST);`), ['SERVER_LISTEN_BINDING']),
+  deny('loopback listen binding', 'host from a runtime expression', withServer(`declare const env: Record<string, string>;\nconst HOST = env['HOST'] ?? '127.0.0.1';\nserver.listen(4317, HOST);`), ['SERVER_LISTEN_BINDING']),
+  deny('loopback listen binding', 'ambient port binding', withServer(`declare const port: number;\nserver.listen(port, '127.0.0.1');`), ['SERVER_LISTEN_BINDING']),
+  deny('loopback listen binding', 'port above range', withServer(`server.listen(65536, '127.0.0.1');`), ['SERVER_LISTEN_BINDING']),
+  deny('loopback listen binding', 'pipe path as port', withServer(`server.listen('/tmp/cockpit.sock', '127.0.0.1');`), ['SERVER_LISTEN_BINDING']),
+  deny('loopback listen binding', 'options object form', withServer(`server.listen({ port: 4317, host: '127.0.0.1' });`), ['SERVER_LISTEN_BINDING']),
+  deny('loopback listen binding', 'spread arguments', withServer(`declare const args: [number, string];\nserver.listen(...args);`), ['SERVER_LISTEN_BINDING']),
+  deny('loopback listen binding', 'spread callback', withServer(`declare const rest: [() => void];\nserver.listen(4317, '127.0.0.1', ...rest);`), ['SERVER_LISTEN_BINDING']),
+  deny('loopback listen binding', 'backlog instead of callback', withServer(`server.listen(4317, '127.0.0.1', 511);`), ['SERVER_LISTEN_BINDING']),
+  deny('loopback listen binding', 'ambient callback', withServer(`declare const onUp: () => void;\nserver.listen(4317, '127.0.0.1', onUp);`), ['SERVER_LISTEN_BINDING']),
+  deny('loopback listen binding', 'fourth argument', withServer(`server.listen(4317, '127.0.0.1', () => {}, 511);`), ['SERVER_LISTEN_BINDING']),
+  deny('loopback listen binding', 'computed listen key without host', withServer(`server['listen'](4317);`), ['SERVER_LISTEN_BINDING']),
+  deny('loopback listen binding', 'listen on a call-result receiver', withServer(`server.close().listen(4317);`), ['SERVER_LISTEN_BINDING']),
+  deny('loopback listen binding', 'listen on the createServer result', `${NS}\nhttp.createServer(${L}).listen(4317);`, ['SERVER_LISTEN_BINDING']),
+  deny('loopback listen binding', 'listen on a PARAM-derived server', withServer(`function setup(s: http.Server) { s.listen(4317); }\nsetup(server);`), ['SERVER_LISTEN_BINDING']),
+  deny('loopback listen binding', 'listen on a confined factory result', withFactory(`createCockpitServer().listen(4317);`), ['SERVER_LISTEN_BINDING']),
+  deny('loopback listen binding', 'listen on a const alias of the server', withServer(`const a = server;\na.listen(4317, '0.0.0.0');`), ['SERVER_LISTEN_BINDING']),
+  deny('loopback listen binding', 'wildcard binding inside the real host shape', replicaListeningOn('0.0.0.0'), ['SERVER_LISTEN_BINDING']),
+  deny('loopback listen binding', 'unspecified IPv6 binding inside the real host shape', replicaListeningOn('::'), ['SERVER_LISTEN_BINDING']),
+  deny('loopback listen binding', 'misbound listen result still carries SERVER authority', withServer(`server.listen(4317).on('x', () => {});`), ['SERVER_LISTEN_BINDING', 'SERVER_MEMBER']),
+  allow('loopback listen binding', 'port and loopback host literals', withServer(`server.listen(4317, '127.0.0.1');`)),
+  allow('loopback listen binding', 'arrow callback', withServer(`server.listen(4317, '127.0.0.1', () => { console.log('up'); });`)),
+  allow('loopback listen binding', 'function-expression callback', withServer(`server.listen(4317, '127.0.0.1', function () { console.log('up'); });`)),
+  allow('loopback listen binding', 'local function-declaration callback', withServer(`function onUp() { console.log('up'); }\nserver.listen(4317, '127.0.0.1', onUp);`)),
+  allow('loopback listen binding', 'const arrow callback', withServer(`const onUp = () => { console.log('up'); };\nserver.listen(4317, '127.0.0.1', onUp);`)),
+  allow('loopback listen binding', 'exported loopback constants (real host)', withServer(`export const HOST = '127.0.0.1';\nexport const PORT = 4317;\nserver.listen(PORT, HOST, () => {});`)),
+  allow('loopback listen binding', 'template literal host', withServer('server.listen(4317, `127.0.0.1`);')),
+  allow('loopback listen binding', 'wrapped arguments', withServer(`server.listen(4317 as number, ('127.0.0.1' as string));`)),
+  allow('loopback listen binding', 'computed listen key with loopback host', withServer(`server['listen'](4317, '127.0.0.1');`)),
+  allow('loopback listen binding', 'decimal-string port is the same numeric port', withServer(`server.listen('4317', '127.0.0.1');`)),
+  allow('loopback listen binding', 'numeric literal forms resolve to their decimal value', withServer(`server.listen(0x10dd, '127.0.0.1');`)),
+  allow('loopback listen binding', 'port zero (ephemeral, still loopback)', withServer(`server.listen(0, '127.0.0.1');`)),
+  allow('loopback listen binding', 'loopback listen on a call-result receiver', withServer(`server.close().listen(4317, '127.0.0.1');`)),
+  allow('loopback listen binding', 'loopback listen on a PARAM-derived server', withServer(`function setup(s: http.Server) { s.listen(4317, '127.0.0.1'); }\nsetup(server);`)),
+  allow('loopback listen binding', 'loopback listen on the real host replica', REAL_HOST_SHAPE),
+];
+
+// ---------------------------------------------------------------------------
+// 20. server instantiation site bound (PR #67 B2)
+// ---------------------------------------------------------------------------
+
+const INSTANTIATION_SITES: readonly RegressionRow[] = [
+  deny('server instantiation site bound', 'two direct createServer sites', `${NS}\nconst a = http.createServer(${L});\nconst b = http.createServer(${L});\na.close();\nb.close();`, ['CREATE_SERVER_MULTIPLE']),
+  deny('server instantiation site bound', 'two direct sites as expression statements', `${NS}\nhttp.createServer(${L});\nhttp.createServer(${L});`, ['CREATE_SERVER_MULTIPLE']),
+  deny('server instantiation site bound', 'two named-import sites', `${NAMED}\nconst a = createServer(${L_PLAIN});\nconst b = createServer(${L_PLAIN});\na.close();\nb.close();`, ['CREATE_SERVER_MULTIPLE']),
+  deny('server instantiation site bound', 'direct site plus confined-factory call', withFactory(`const a = createCockpitServer();\nconst b = http.createServer(${L});\na.close();\nb.close();`), ['CREATE_SERVER_MULTIPLE']),
+  deny('server instantiation site bound', 'two confined-factory call sites', withFactory(`createCockpitServer().close();\ncreateCockpitServer().close();`), ['CREATE_SERVER_MULTIPLE']),
+  deny('server instantiation site bound', 'two const-arrow factory call sites', `${NS}\nconst make = () => http.createServer(${L});\nconst a = make();\nconst b = make();\na.close();\nb.close();`, ['CREATE_SERVER_MULTIPLE']),
+  deny('server instantiation site bound', 'aliased results from two distinct sites', withFactory(`const first = createCockpitServer();\nconst alias = first;\nconst second = createCockpitServer();\nalias.close();\nsecond.close();`), ['CREATE_SERVER_MULTIPLE']),
+  deny('server instantiation site bound', 'spare site in real-host-shaped code', withFactory(`const HOST = '127.0.0.1';\nconst PORT = 4317;\nfunction main() { const server = createCockpitServer(); server.listen(PORT, HOST, () => {}); const spare = createCockpitServer(); spare.close(); }\nmain();`), ['CREATE_SERVER_MULTIPLE']),
+  deny('server instantiation site bound', 'spare direct site appended to the real host replica', `${REAL_HOST_SHAPE}\nhttp.createServer(${L}).close();`, ['CREATE_SERVER_MULTIPLE']),
+  deny('server instantiation site bound', 'sites split across two non-factory functions', `${NS}\nfunction a() { http.createServer(${L}).close(); }\nfunction b() { http.createServer(${L}).close(); }\na();\nb();`, ['CREATE_SERVER_MULTIPLE']),
+  deny('server instantiation site bound', 'nested site inside a factory listener', `${NS}\nfunction make() { return http.createServer((request, response) => { http.createServer(${L}).close(); response.end('x'); }); }\nmake().close();`, ['CREATE_SERVER_MULTIPLE']),
+  deny('server instantiation site bound', 'factory-of-factory called twice', withFactory(`function outer() { return createCockpitServer(); }\nouter().close();\nouter().close();`), ['CREATE_SERVER_MULTIPLE']),
+  deny('server instantiation site bound', 'factory call plus factory-of-factory call', withFactory(`function outer() { return createCockpitServer(); }\nouter().close();\ncreateCockpitServer().close();`), ['CREATE_SERVER_MULTIPLE']),
+  deny('server instantiation site bound', 'three direct sites', `${NS}\nhttp.createServer(${L});\nhttp.createServer(${L});\nhttp.createServer(${L});`, ['CREATE_SERVER_MULTIPLE']),
+  deny('server instantiation site bound', 'exhaustion still fails closed before the site bound', `${NS}\nhttp.createServer(${L});\nhttp.createServer(${L});`, ['FIXPOINT_EXHAUSTED'], { options: { fixpointCeiling: 1 } }),
+  allow('server instantiation site bound', 'one direct site', withServer(`server.close();`)),
+  allow('server instantiation site bound', 'confined factory with one external call site', withFactory(`createCockpitServer().close();`)),
+  allow('server instantiation site bound', 'unused confined factory plus one direct site', withFactory(`http.createServer(${L}).close();`)),
+  allow('server instantiation site bound', 'alias-returning factories add no site', withServer(`function get() { return server; }\nfunction again() { return get(); }\nagain().close();\nget().close();`)),
+  allow('server instantiation site bound', 'factory with multiple internal returns is one site per call', `${NS}\nfunction make(x: boolean) { if (x) { return http.createServer(${L}); } return http.createServer(${L}); }\nmake(true).close();`),
+  allow('server instantiation site bound', 'factory-of-factory called once', withFactory(`function outer() { return createCockpitServer(); }\nouter().close();`)),
+  allow('server instantiation site bound', 'factory instantiating through a const then returning it', `${NS}\nfunction make(label: string) { const s = http.createServer(${L}); s.listen(4317, '127.0.0.1'); console.log(label); return s; }\nmake('x');`),
+  allow('server instantiation site bound', 'real host replica has one site', REAL_HOST_SHAPE),
+  outside('server instantiation site bound', 'runtime call multiplicity of one static site', `${NS}\nfunction boot() { http.createServer(${L}).close(); }\nboot();\nboot();`),
+  outside('server instantiation site bound', 'loop around one static site', `${NS}\nfor (let i = 0; i < 2; i += 1) { http.createServer(${L}).close(); }`),
+];
+
+// ---------------------------------------------------------------------------
 // Outside the declared boundary (documented, terminate-only)
 // ---------------------------------------------------------------------------
 
@@ -1015,6 +1106,8 @@ export const D3_REGRESSION_MATRIX: readonly RegressionRow[] = [
   ...FIXPOINT,
   ...EXTRA_PARAMETERS,
   ...REAL_HOST,
+  ...LISTEN_BINDING,
+  ...INSTANTIATION_SITES,
   ...OUTSIDE_BOUNDARY,
 ];
 

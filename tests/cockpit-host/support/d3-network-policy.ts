@@ -2,10 +2,12 @@
  * Cockpit D3 — network policy for the read-only dashboard host (Stage A).
  *
  * A static, development-time source policy over ONE TypeScript file at a time.
- * It is not a runtime sandbox. The host may create exactly one inbound HTTP
- * server and must not obtain outbound network capability, socket capability,
- * hidden mutable server capability, or privileged request/response authority
- * beyond the explicitly allow-listed operations.
+ * It is not a runtime sandbox. The source may contain one server instantiation
+ * site, loopback-bound, and must not obtain outbound network capability, socket
+ * capability, hidden mutable server capability, or privileged request/response
+ * authority beyond the explicitly allow-listed operations. Nothing about
+ * runtime server cardinality is claimed: the bound is a static source-site
+ * invariant plus a statically proven `127.0.0.1` listen binding.
  *
  * Core structural invariant:
  *
@@ -67,6 +69,8 @@ export type ReasonCode =
   | 'CREATE_SERVER_NEW'
   | 'CREATE_SERVER_NOT_CALLED'
   | 'CREATE_SERVER_ARITY'
+  | 'CREATE_SERVER_MULTIPLE'
+  | 'SERVER_LISTEN_BINDING'
   | 'LISTENER_NOT_FUNCTION'
   | 'LISTENER_PARAMETER_PATTERN'
   | 'LISTENER_THIS_PARAMETER';
@@ -109,7 +113,12 @@ export const HTTP_MODULE_SPECIFIERS: ReadonlySet<string> = new Set(['node:http',
 export const NETWORK_GLOBAL_NAMES: ReadonlySet<string> = new Set(['fetch', 'WebSocket']);
 export const GLOBAL_RECEIVER_NAMES: ReadonlySet<string> = new Set(['globalThis', 'window', 'self', 'global']);
 const CREATE_SERVER = 'createServer';
-export const SERVER_METHODS: ReadonlySet<string> = new Set(['listen', 'close']);
+const SERVER_LISTEN = 'listen';
+export const SERVER_METHODS: ReadonlySet<string> = new Set([SERVER_LISTEN, 'close']);
+/** The only host a proven SERVER target may listen on (positive policy; compared through the static-key resolver). */
+export const LOOPBACK_HOST = '127.0.0.1';
+/** Largest decimal port a proven SERVER target may listen on. */
+export const PORT_MAX = 65535;
 export const REQUEST_READS: ReadonlySet<string> = new Set(['method', 'url']);
 export const RESPONSE_METHODS: ReadonlySet<string> = new Set(['setHeader', 'end']);
 const RESPONSE_STATUS = 'statusCode';
@@ -124,6 +133,7 @@ export const POLICY_KEY_NAMES: readonly string[] = [
   ...REQUEST_READS,
   ...RESPONSE_METHODS,
   RESPONSE_STATUS,
+  LOOPBACK_HOST,
 ];
 
 /** A folded string longer than this can never be a policy key: NOT_CAPABILITY. */
@@ -1001,6 +1011,24 @@ function memberAllowed(ctx: Context, authority: AuthorityClass, access: MemberAc
   }
 }
 
+/**
+ * Loopback listen binding (positive policy, B1): a proven SERVER target may
+ * listen only as `listen(<port>, '127.0.0.1'[, <callback>])` — argument 0 a
+ * static decimal port, argument 1 the loopback host literal, both through THE
+ * static-key resolver; an optional argument 2 that normalizes to a local
+ * function through the listener normalizer; no spread and no further argument.
+ * Every other listen shape is denied. No host or port is named as dangerous.
+ */
+function isLoopbackListen(ctx: Context, call: ts.CallExpression): boolean {
+  const [port, host, callback] = call.arguments;
+  if (call.arguments.length > 3 || port === undefined || host === undefined) return false;
+  if (call.arguments.some((argument) => ts.isSpreadElement(argument))) return false;
+  const portKey = resolveStaticKey(ctx, port);
+  if (portKey.kind !== 'RESOLVED' || !/^\d+$/.test(portKey.value) || Number(portKey.value) > PORT_MAX) return false;
+  if (!isResolvedTo(resolveStaticKey(ctx, host), LOOPBACK_HOST)) return false;
+  return callback === undefined || normalizeListener(ctx, callback) !== null;
+}
+
 /** The binding symbol of the function whose own body contains `node`, if that function is a local binding. */
 function enclosingFunctionSymbol(ctx: Context, node: ts.Node): ts.Symbol | undefined {
   let current: ts.Node = node;
@@ -1050,6 +1078,11 @@ function checkTargetUse(ctx: Context, expression: ts.Expression, classes: Readon
   }
   if (isMemberAccess(parent) && parent.expression === node) {
     if (![...classes].every((authority) => memberAllowed(ctx, authority, parent))) violate('MEMBER');
+    else if (classes.has('SERVER') && isResolvedTo(memberKey(ctx, parent), SERVER_LISTEN)) {
+      // `listen` is allow-listed by `memberAllowed`; its binding is the one further positive check.
+      const call = directCallOf(parent);
+      if (call !== null && !isLoopbackListen(ctx, call)) deny(ctx, 'SERVER_LISTEN_BINDING', call);
+    }
     return;
   }
   if (ts.isExportSpecifier(parent) || ts.isExportAssignment(parent)) {
@@ -1211,6 +1244,40 @@ function checkFreeGlobal(ctx: Context, id: ts.Identifier): void {
   else if (GLOBAL_RECEIVER_NAMES.has(id.text)) checkGlobalReceiverUse(ctx, id);
 }
 
+/**
+ * Server-instantiation site bound (static, evidence-bounded, B2): the source
+ * may contain at most one server-instantiation site outside the own body of a
+ * confined factory — a proven createServer call, or a call of a confined
+ * factory whose own body instantiates a server (directly, or through another
+ * instantiating confined factory). A confined factory's internal createServer
+ * is realized by its call sites and is not a site of its own; an
+ * alias-returning factory adds no site. Runs over the already-collected calls
+ * after the fixpoint; nothing about runtime call multiplicity is claimed.
+ */
+function checkInstantiationSites(ctx: Context): void {
+  const memo = new Map<ts.Symbol, boolean>();
+  const factoryInstantiates = (factory: ts.Symbol): boolean => {
+    const known = memo.get(factory);
+    if (known !== undefined) return known;
+    memo.set(factory, false);
+    const result = ctx.calls.some((call) => enclosingFunctionSymbol(ctx, call) === factory && instantiates(call));
+    memo.set(factory, result);
+    return result;
+  };
+  const instantiates = (call: ts.CallExpression): boolean => {
+    const callee = unwrap(call.expression);
+    if (isProvenCreateServerCall(ctx, call)) return true;
+    if (!isConfinedFactoryCall(ctx, call)) return false;
+    const factory = valueSymbolOf(ctx.checker, callee);
+    return factory !== undefined && factoryInstantiates(factory);
+  };
+  const sites = ctx.calls.filter((call) => {
+    const owner = enclosingFunctionSymbol(ctx, call);
+    return (owner === undefined || !ctx.confinedFactories.has(owner)) && instantiates(call);
+  });
+  for (const site of sites.slice(1)) deny(ctx, 'CREATE_SERVER_MULTIPLE', site);
+}
+
 function classify(ctx: Context): void {
   for (const node of ctx.thisExpressions) deny(ctx, 'THIS_EXPRESSION', node);
   for (const id of ctx.unboundValueReads) checkFreeGlobal(ctx, id);
@@ -1232,6 +1299,7 @@ function classify(ctx: Context): void {
     const classes = classesOf(ctx, call);
     if (classes.size > 0) checkTargetUse(ctx, call, classes);
   }
+  checkInstantiationSites(ctx);
 }
 
 // ---------------------------------------------------------------------------

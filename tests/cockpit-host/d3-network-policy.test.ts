@@ -11,7 +11,9 @@ import {
   inspectNetworkPolicy,
   isValueRead,
   isWriteTarget,
+  LOOPBACK_HOST,
   POLICY_KEY_NAMES,
+  PORT_MAX,
   STATIC_KEY_CEILING,
   type NetworkPolicyResult,
   type ReasonCode,
@@ -429,7 +431,7 @@ describe('D3 network policy factory confinement', () => {
   };
 
   it('confines the real exported factory and roots its const consumer as SERVER', () => {
-    const source = `${NS}\nexport function createCockpitServer(): http.Server { return http.createServer(${L}); }\nconst server = createCockpitServer();\nserver.listen(1);`;
+    const source = `${NS}\nexport function createCockpitServer(): http.Server { return http.createServer(${L}); }\nconst server = createCockpitServer();\nserver.listen(4317, '127.0.0.1');`;
     const { confined, result } = factoryState(source, 'createCockpitServer');
     expect(confined).toBe(true);
     expect(result.verdict, describeFindings(result)).toBe('ALLOW');
@@ -462,7 +464,7 @@ describe('D3 network policy factory confinement', () => {
   });
 
   it('confines factories returning other confined factories or rooted const aliases', () => {
-    const source = `${NS}\nconst server = http.createServer(${L});\nfunction get() { return server; }\nfunction outer() { return get(); }\nouter().listen(1);`;
+    const source = `${NS}\nconst server = http.createServer(${L});\nfunction get() { return server; }\nfunction outer() { return get(); }\nouter().listen(4317, '127.0.0.1');`;
     expect(factoryState(source, 'get').confined).toBe(true);
     expect(factoryState(source, 'outer').confined).toBe(true);
     expect(factoryState(source, 'outer').result.verdict).toBe('ALLOW');
@@ -586,14 +588,14 @@ describe('D3 network policy receiver-call result authority inheritance (PR #67 F
   it('F2: denies every proven-target call-result witness through the existing target policy', () => {
     for (const [source, reason] of [
       [withServer(`export const leaked = server.listen(4317, '127.0.0.1');`), 'SERVER_EXPORT'],
-      [withServer(`server.listen(1).on('connection', (socket) => { socket.write('x'); });`), 'SERVER_MEMBER'],
+      [withServer(`server.listen(4317, '127.0.0.1').on('connection', (socket) => { socket.write('x'); });`), 'SERVER_MEMBER'],
       [withServer(`server.close().on('close', () => {});`), 'SERVER_MEMBER'],
       [inListener(`response.setHeader('a', 'b').socket;`), 'RESPONSE_MEMBER'],
       [inListener(`response.end('x').socket;`), 'RESPONSE_MEMBER'],
       [inListener(`const r2 = response.setHeader('a', 'b');\nuse(r2);`), 'RESPONSE_ESCAPE'],
-      [withServer(`use(server.listen(1));`), 'SERVER_ESCAPE'],
-      [`${NS}\nhttp.createServer(${L}).listen(1).on('x', () => {});`, 'SERVER_MEMBER'],
-      [withServer(`const leaked = server.listen(1);\nuse(leaked);`), 'SERVER_ESCAPE'],
+      [withServer(`use(server.listen(4317, '127.0.0.1'));`), 'SERVER_ESCAPE'],
+      [`${NS}\nhttp.createServer(${L}).listen(4317, '127.0.0.1').on('x', () => {});`, 'SERVER_MEMBER'],
+      [withServer(`const leaked = server.listen(4317, '127.0.0.1');\nuse(leaked);`), 'SERVER_ESCAPE'],
     ] as const) {
       const result = analyzeNetworkPolicy(source);
       expect(result.verdict, source).toBe('DENY');
@@ -649,12 +651,12 @@ describe('D3 network policy receiver-call result authority inheritance (PR #67 F
 
   it('preserves allowed chains, statement-position results and eligible propagation', () => {
     for (const source of [
-      withServer(`server.listen(1).close();`),
+      withServer(`server.listen(4317, '127.0.0.1').close();`),
       inListener(`response.setHeader('a', 'b').end('x');`),
-      withServer(`void server.listen(1);`),
+      withServer(`void server.listen(4317, '127.0.0.1');`),
       withServer(`server.listen(4317, '127.0.0.1', () => { console.log('up'); });`),
-      withServer(`function setup(s: http.Server) { s.close(); }\nsetup(server.listen(1));`),
-      withServer(`const started = server.listen(1);\nstarted.close();`),
+      withServer(`function setup(s: http.Server) { s.close(); }\nsetup(server.listen(4317, '127.0.0.1'));`),
+      withServer(`const started = server.listen(4317, '127.0.0.1');\nstarted.close();`),
       `globalThis.console.log('x');`,
       `globalThis.valueOf();`,
       `globalThis.valueOf().console.log('x');`,
@@ -666,23 +668,23 @@ describe('D3 network policy receiver-call result authority inheritance (PR #67 F
   });
 
   it('establishes SERVER authority on a const alias of a listen result as ALIAS, converging within the derived bound', () => {
-    const rooted = factsOfConst(withServer(`const leaked = server.listen(1);\nleaked.close();`), 'leaked');
+    const rooted = factsOfConst(withServer(`const leaked = server.listen(4317, '127.0.0.1');\nleaked.close();`), 'leaked');
     expect(rooted.facts).toEqual(['SERVER:ALIAS']);
     expect(rooted.result.fixpoint.state).toBe('CONVERGED');
     expect(rooted.result.fixpoint.iterations).toBeLessThanOrEqual(rooted.bound);
     expect(rooted.result.fixpoint.bound).toBe(rooted.bound);
     expect(rooted.result.verdict, describeFindings(rooted.result)).toBe('ALLOW');
 
-    const direct = factsOfConst(`${NS}\nconst leaked = http.createServer(${L}).listen(1);\nleaked.close();`, 'leaked');
+    const direct = factsOfConst(`${NS}\nconst leaked = http.createServer(${L}).listen(4317, '127.0.0.1');\nleaked.close();`, 'leaked');
     expect(direct.facts).toEqual(['SERVER:ALIAS']);
     expect(direct.result.fixpoint.state).toBe('CONVERGED');
 
-    const chained = factsOfConst(withServer(`const a = server.listen(1);\nconst b = a.close();\nb.close();`), 'b');
+    const chained = factsOfConst(withServer(`const a = server.listen(4317, '127.0.0.1');\nconst b = a.close();\nb.close();`), 'b');
     expect(chained.facts).toEqual(['SERVER:ALIAS']);
     expect(chained.result.fixpoint.state).toBe('CONVERGED');
     expect(chained.result.fixpoint.iterations).toBeLessThanOrEqual(chained.bound);
 
-    const viaParam = factsOfConst(withServer(`function setup(s: http.Server) { const t = s.listen(1); t.close(); }\nsetup(server);`), 't');
+    const viaParam = factsOfConst(withServer(`function setup(s: http.Server) { const t = s.listen(4317, '127.0.0.1'); t.close(); }\nsetup(server);`), 't');
     expect(viaParam.facts).toEqual(['SERVER:PARAM']);
     expect(viaParam.result.fixpoint.state).toBe('CONVERGED');
 
@@ -698,7 +700,7 @@ describe('D3 network policy receiver-call result authority inheritance (PR #67 F
     expect(optionalCall.result.reasons).toEqual(['SERVER_MEMBER']);
     for (const [source, reason] of [
       [withServer(`server.listen?.(1).on('x', () => {});`), 'SERVER_MEMBER'],
-      [withServer(`server?.listen(1).on('x', () => {});`), 'SERVER_MEMBER'],
+      [withServer(`server?.listen(4317, '127.0.0.1').on('x', () => {});`), 'SERVER_MEMBER'],
       [inListener(`response.end?.('x').socket;`), 'RESPONSE_MEMBER'],
     ] as const) {
       const result = analyzeNetworkPolicy(source);
@@ -729,7 +731,7 @@ describe('D3 network policy receiver-call result authority inheritance (PR #67 F
       const result = analyzeNetworkPolicy(source);
       expect(result.reasons, `${source}\n${describeFindings(result)}`).toEqual([]);
     }
-    const carried = analyzeNetworkPolicy(withServer(`function setup(s: http.Server) { s.listen(1).on('x', () => {}); }\nsetup(server);`));
+    const carried = analyzeNetworkPolicy(withServer(`function setup(s: http.Server) { s.listen(4317, '127.0.0.1').on('x', () => {}); }\nsetup(server);`));
     expect(carried.reasons).toEqual(['SERVER_MEMBER']);
   });
 
@@ -811,6 +813,181 @@ describe('D3 network policy receiver-call result authority inheritance (PR #67 F
       expect(occurrences(detector, forbidden), forbidden).toBe(0);
     }
     expect(POLICY_KEY_NAMES).not.toContain('valueOf');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Loopback listen binding and server instantiation site bound (PR #67 B1 / B2)
+// ---------------------------------------------------------------------------
+
+describe('D3 network policy loopback listen binding (PR #67 B1)', () => {
+  const withServer = (rest: string): string => `${NS}\nconst server = http.createServer(${L});\n${rest}`;
+  const withFactory = (rest: string): string =>
+    `${NS}\nexport function createCockpitServer(): http.Server {\n  return http.createServer(${L});\n}\n${rest}`;
+
+  it('denies every non-loopback or indeterminate listen shape on a proven SERVER target with one finding', () => {
+    for (const source of [
+      withServer(`server.listen(4317, '0.0.0.0');`),
+      withServer(`server.listen(4317, '::');`),
+      withServer(`server.listen(4317);`),
+      withServer(`server.listen();`),
+      withServer(`server.listen(4317, '::1');`),
+      withServer(`server.listen(4317, 'localhost');`),
+      withServer(`declare const dynamicHost: string;\nserver.listen(4317, dynamicHost);`),
+      withServer(`let host = '127.0.0.1';\nserver.listen(4317, host);`),
+      withServer(`const HOST = '0.0.0.0';\nserver.listen(4317, HOST);`),
+      withServer(`declare const port: number;\nserver.listen(port, '127.0.0.1');`),
+      withServer(`server.listen(${String(PORT_MAX + 1)}, '127.0.0.1');`),
+      withServer(`server.listen('/tmp/cockpit.sock', '127.0.0.1');`),
+      withServer(`server.listen({ port: 4317, host: '127.0.0.1' });`),
+      withServer(`declare const args: [number, string];\nserver.listen(...args);`),
+      withServer(`declare const rest: [() => void];\nserver.listen(4317, '127.0.0.1', ...rest);`),
+      withServer(`server.listen(4317, '127.0.0.1', 511);`),
+      withServer(`declare const onUp: () => void;\nserver.listen(4317, '127.0.0.1', onUp);`),
+      withServer(`server.listen(4317, '127.0.0.1', () => {}, 511);`),
+      withServer(`server['listen'](4317);`),
+      withServer(`server.close().listen(4317);`),
+      `${NS}\nhttp.createServer(${L}).listen(4317);`,
+      withServer(`function setup(s: http.Server) { s.listen(4317); }\nsetup(server);`),
+      withFactory(`createCockpitServer().listen(4317);`),
+      withServer(`const a = server;\na.listen(4317, '0.0.0.0');`),
+      REAL_HOST_REPLICA.replace(`'127.0.0.1'`, `'0.0.0.0'`),
+    ]) {
+      const result = analyzeNetworkPolicy(source);
+      expect(result.verdict, source).toBe('DENY');
+      expect(result.reasons, `${source}\n${describeFindings(result)}`).toEqual(['SERVER_LISTEN_BINDING']);
+      expect(result.findings, `${source}\n${describeFindings(result)}`).toHaveLength(1);
+      expect(result.fixpoint.state, source).toBe('CONVERGED');
+    }
+  });
+
+  it('allows the statically proven loopback shape, including the real host form', () => {
+    for (const source of [
+      withServer(`server.listen(4317, '127.0.0.1');`),
+      withServer(`server.listen(4317, '127.0.0.1', () => { console.log('up'); });`),
+      withServer(`server.listen(4317, '127.0.0.1', function () { console.log('up'); });`),
+      withServer(`function onUp() { console.log('up'); }\nserver.listen(4317, '127.0.0.1', onUp);`),
+      withServer(`const onUp = () => { console.log('up'); };\nserver.listen(4317, '127.0.0.1', onUp);`),
+      withServer(`export const HOST = '127.0.0.1';\nexport const PORT = 4317;\nserver.listen(PORT, HOST, () => {});`),
+      withServer('server.listen(4317, `127.0.0.1`);'),
+      withServer(`server.listen(4317 as number, ('127.0.0.1' as string));`),
+      withServer(`server['listen'](4317, '127.0.0.1');`),
+      withServer(`server.listen('4317', '127.0.0.1');`),
+      withServer(`server.listen(0x10dd, '127.0.0.1');`),
+      withServer(`server.listen(0, '127.0.0.1');`),
+      withServer(`server.listen(${String(PORT_MAX)}, '127.0.0.1');`),
+      withServer(`server.close().listen(4317, '127.0.0.1');`),
+      withServer(`function setup(s: http.Server) { s.listen(4317, '127.0.0.1'); }\nsetup(server);`),
+      REAL_HOST_REPLICA,
+    ]) {
+      const result = analyzeNetworkPolicy(source);
+      expect(result.reasons, `${source}\n${describeFindings(result)}`).toEqual([]);
+      expect(result.verdict, source).toBe('ALLOW');
+      expect(result.fixpoint.state, source).toBe('CONVERGED');
+    }
+  });
+
+  it('is one further positive check after the member policy; a misbound listen result keeps SERVER authority', () => {
+    expect(analyzeNetworkPolicy(withServer(`server.listen?.(4317);`)).reasons).toEqual(['SERVER_MEMBER']);
+    const chained = analyzeNetworkPolicy(withServer(`server.listen(4317).on('x', () => {});`));
+    expect(chained.reasons, describeFindings(chained)).toEqual(['SERVER_LISTEN_BINDING', 'SERVER_MEMBER']);
+    expect(chained.findings).toHaveLength(2);
+    const aliased = inspectNetworkPolicy(withServer(`const started = server.listen(4317);\nstarted.close();`));
+    const declaration = collectNodes(aliased.sourceFile, ts.isVariableDeclaration).find((d) => ts.isIdentifier(d.name) && d.name.text === 'started');
+    const symbol = declaration === undefined ? undefined : aliased.valueSymbolOf(declaration.name);
+    expect(symbol && aliased.factsOf(symbol)).toEqual(['SERVER:ALIAS']);
+    expect(aliased.result.reasons).toEqual(['SERVER_LISTEN_BINDING']);
+    const unprivileged = analyzeNetworkPolicy(`const o = { listen: (port: number) => port };\no.listen(4317);`);
+    expect(unprivileged.reasons).toEqual([]);
+  });
+
+  it('is structural: the loopback host is a positive policy key, not a dangerous-name table', () => {
+    const detector = readFileSync(detectorPath, 'utf8');
+    expect(LOOPBACK_HOST).toBe('127.0.0.1');
+    expect(POLICY_KEY_NAMES).toContain(LOOPBACK_HOST);
+    expect(STATIC_KEY_CEILING).toBe('createServer'.length);
+    expect(occurrences(detector, 'function isLoopbackListen(')).toBe(1);
+    expect(occurrences(detector, "deny(ctx, 'SERVER_LISTEN_BINDING'")).toBe(1);
+    for (const forbidden of [`'0.0.0.0'`, `'::'`, `'::1'`, 'localhost', 'DANGEROUS', 'WILDCARD']) {
+      expect(occurrences(detector, forbidden), forbidden).toBe(0);
+    }
+  });
+});
+
+describe('D3 network policy server instantiation site bound (PR #67 B2)', () => {
+  const withServer = (rest: string): string => `${NS}\nconst server = http.createServer(${L});\n${rest}`;
+  const withFactory = (rest: string): string =>
+    `${NS}\nexport function createCockpitServer(): http.Server {\n  return http.createServer(${L});\n}\n${rest}`;
+
+  it('denies a second server-instantiation site outside a confined factory body, one finding per extra site', () => {
+    for (const [source, extraSites] of [
+      [`${NS}\nconst a = http.createServer(${L});\nconst b = http.createServer(${L});\na.close();\nb.close();`, 1],
+      [`${NS}\nhttp.createServer(${L});\nhttp.createServer(${L});`, 1],
+      [`${NS}\nhttp.createServer(${L});\nhttp.createServer(${L});\nhttp.createServer(${L});`, 2],
+      [withFactory(`const a = createCockpitServer();\nconst b = http.createServer(${L});\na.close();\nb.close();`), 1],
+      [withFactory(`createCockpitServer().close();\ncreateCockpitServer().close();`), 1],
+      [`${NS}\nconst make = () => http.createServer(${L});\nconst a = make();\nconst b = make();\na.close();\nb.close();`, 1],
+      [withFactory(`const first = createCockpitServer();\nconst alias = first;\nconst second = createCockpitServer();\nalias.close();\nsecond.close();`), 1],
+      [withFactory(`const HOST = '127.0.0.1';\nconst PORT = 4317;\nfunction main() { const server = createCockpitServer(); server.listen(PORT, HOST, () => {}); const spare = createCockpitServer(); spare.close(); }\nmain();`), 1],
+      [`${REAL_HOST_REPLICA}\nhttp.createServer(${L}).close();`, 1],
+      [`${NS}\nfunction a() { http.createServer(${L}).close(); }\nfunction b() { http.createServer(${L}).close(); }\na();\nb();`, 1],
+      [`${NS}\nfunction make() { return http.createServer((request, response) => { http.createServer(${L}).close(); response.end('x'); }); }\nmake().close();`, 1],
+      [withFactory(`function outer() { return createCockpitServer(); }\nouter().close();\nouter().close();`), 1],
+      [withFactory(`function outer() { return createCockpitServer(); }\nouter().close();\ncreateCockpitServer().close();`), 1],
+    ] as const) {
+      const result = analyzeNetworkPolicy(source);
+      expect(result.verdict, source).toBe('DENY');
+      expect(result.reasons, `${source}\n${describeFindings(result)}`).toEqual(['CREATE_SERVER_MULTIPLE']);
+      expect(result.findings, `${source}\n${describeFindings(result)}`).toHaveLength(extraSites);
+      expect(result.fixpoint.state, source).toBe('CONVERGED');
+    }
+    // The finding names the later site, in source order.
+    const two = analyzeNetworkPolicy(`${NS}\nconst a = http.createServer(${L});\nconst b = http.createServer(${L});\na.close();\nb.close();`);
+    expect(two.findings[0]?.line).toBe(3);
+    expect(two.findings[0]?.text.startsWith('http.createServer(')).toBe(true);
+  });
+
+  it('allows exactly one site: direct, through a confined factory, or with alias-returning factories', () => {
+    for (const source of [
+      withServer(`server.close();`),
+      withFactory(`createCockpitServer().close();`),
+      withFactory(`http.createServer(${L}).close();`),
+      withServer(`function get() { return server; }\nfunction again() { return get(); }\nagain().close();\nget().close();`),
+      `${NS}\nfunction make(x: boolean) { if (x) { return http.createServer(${L}); } return http.createServer(${L}); }\nmake(true).close();`,
+      withFactory(`function outer() { return createCockpitServer(); }\nouter().close();`),
+      `${NS}\nfunction make(label: string) { const s = http.createServer(${L}); s.listen(4317, '127.0.0.1'); console.log(label); return s; }\nmake('x');`,
+      REAL_HOST_REPLICA,
+    ]) {
+      const result = analyzeNetworkPolicy(source);
+      expect(result.reasons, `${source}\n${describeFindings(result)}`).toEqual([]);
+      expect(result.verdict, source).toBe('ALLOW');
+    }
+  });
+
+  it('is a static source-site bound: runtime call multiplicity of one site is outside the declared boundary', () => {
+    for (const source of [
+      `${NS}\nfunction boot() { http.createServer(${L}).close(); }\nboot();\nboot();`,
+      `${NS}\nfor (let i = 0; i < 2; i += 1) { http.createServer(${L}).close(); }`,
+    ]) {
+      const result = analyzeNetworkPolicy(source);
+      expect(result.fixpoint.state, source).toBe('CONVERGED');
+      expect(result.reasons, source).not.toContain('CREATE_SERVER_MULTIPLE');
+    }
+  });
+
+  it('runs after the fixpoint only: exhaustion still fails closed without a site finding', () => {
+    const result = analyzeNetworkPolicy(`${NS}\nhttp.createServer(${L});\nhttp.createServer(${L});`, { fixpointCeiling: 1 });
+    expect(result.fixpoint.state).toBe('EXHAUSTED');
+    expect(result.reasons).toEqual(['FIXPOINT_EXHAUSTED']);
+  });
+
+  it('is structural: one site count over the collected calls, no new analysis', () => {
+    const detector = readFileSync(detectorPath, 'utf8');
+    expect(occurrences(detector, 'function checkInstantiationSites(')).toBe(1);
+    expect(occurrences(detector, "deny(ctx, 'CREATE_SERVER_MULTIPLE'")).toBe(1);
+    expect(occurrences(detector, 'checkInstantiationSites(ctx)')).toBe(1);
+    expect(occurrences(detector, 'serverFactories')).toBe(0);
+    expect(occurrences(detector, 'serverCount')).toBe(0);
   });
 });
 

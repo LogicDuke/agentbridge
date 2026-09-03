@@ -3371,9 +3371,11 @@ describe('D3 host rejects symlink escapes under the Cockpit boundary (D3-CX-POLI
  * `./support/d3-network-policy.ts` and is exercised mechanism-by-mechanism in
  * `d3-network-policy.test.ts` together with the semantic regression matrix.
  * Here it is applied to the real host tree through the same symlink-checked
- * `hostSources()` reader the other host guards use. The host may create exactly
- * one inbound `node:http` server; it may not obtain outbound network, socket,
- * hidden mutable server, or non-allow-listed request/response authority.
+ * `hostSources()` reader the other host guards use. The host source may contain
+ * one server instantiation site, loopback-bound (a statically proven
+ * `listen(<port>, '127.0.0.1'[, callback])`); it may not obtain outbound
+ * network, socket, hidden mutable server, or non-allow-listed request/response
+ * authority. Nothing about runtime server cardinality is claimed.
  */
 describe('D3 host network policy (D3-NET)', () => {
   it('accepts every real host source under the frozen network policy', () => {
@@ -3415,6 +3417,7 @@ server.listen(4317, '127.0.0.1');
     expect(result.verdict).toBe('DENY');
     expect(result.reasons).toEqual([
       'CREATE_SERVER_ARITY',
+      'CREATE_SERVER_MULTIPLE',
       'FREE_GLOBAL_NETWORK',
       'HTTP_CLIENT_CAPABILITY',
       'REQUEST_DESTRUCTURING',
