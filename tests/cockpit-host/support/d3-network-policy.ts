@@ -1109,11 +1109,10 @@ const directCallOf = (access: ts.Expression): ts.CallExpression | null => {
 const isDirectCallee = (access: ts.Expression): boolean => directCallOf(access) !== null;
 
 /**
- * The call, optional or not, whose callee is `access` (through wrappers), or
- * null. Global-receiver path only: an optional call of a permitted global
- * member yields the same result as the plain call, so both are followed.
+ * The invocation — call (optional or not), construct, or tagged template —
+ * whose callee is `access` (through wrappers), or null. Global-receiver path
+ * only: every such invocation of a permitted global member is denied.
  */
-/** The invocation — call (optional or not), construct, or tagged template — whose callee is `access`, or null. */
 const memberCallOf = (access: ts.Expression): ts.CallExpression | ts.NewExpression | ts.TaggedTemplateExpression | null => {
   const { node, parent } = climb(access);
   if ((ts.isCallExpression(parent) || ts.isNewExpression(parent)) && parent.expression === node) return parent;
