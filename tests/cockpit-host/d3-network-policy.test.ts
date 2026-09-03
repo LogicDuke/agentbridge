@@ -1727,6 +1727,38 @@ get().close();`,
     });
     expect(reasonsOf(ambiguous, 'main.ts')).toEqual(['RESPONSE_END_ARGUMENT']);
   });
+
+  it('counts every server one factory invocation creates, single-file and across files (Codex P1: server cardinality)', () => {
+    // Witness: one confined factory whose single invocation runs two
+    // http.createServer calls sequentially, invoked once — two servers, denied.
+    const sequential = analyzeNetworkPolicy(
+      `${NS}\nfunction make() { http.createServer(${L}); return http.createServer(${L}); }\nmake().listen(4317, '127.0.0.1');`,
+    );
+    expect(sequential.reasons).toEqual(['CREATE_SERVER_MULTIPLE']);
+    // Preserved: multiple internal returns are one server per invocation (exclusive
+    // branches), and a one-server factory invoked once is allowed.
+    const exclusive = analyzeNetworkPolicy(
+      `${NS}\nfunction make(x: boolean) { if (x) { return http.createServer(${L}); } return http.createServer(${L}); }\nmake(true).listen(4317, '127.0.0.1');`,
+    );
+    expect(exclusive.reasons).toEqual([]);
+    const single = analyzeNetworkPolicy(
+      `${NS}\nfunction make() { return http.createServer(${L}); }\nmake().listen(4317, '127.0.0.1');`,
+    );
+    expect(single.reasons).toEqual([]);
+
+    // Cross-file: an imported two-server factory invoked once is denied via the
+    // propagated multi-instantiation fact; a one-server import is allowed.
+    const crossMulti = tree({
+      'factory.ts': `${NS}\nexport function make() { http.createServer(${L}); return http.createServer(${L}); }`,
+      'main.ts': `import { make } from './factory.js';\nmake().listen(4317, '127.0.0.1');`,
+    });
+    expect(reasonsOf(crossMulti, 'main.ts')).toEqual(['CREATE_SERVER_MULTIPLE']);
+    const crossSingle = tree({
+      'factory.ts': `${NS}\nexport function make() { return http.createServer(${L}); }`,
+      'main.ts': `import { make } from './factory.js';\nmake().listen(4317, '127.0.0.1');`,
+    });
+    expect(reasonsOf(crossSingle, 'main.ts')).toEqual([]);
+  });
 });
 
 // ---------------------------------------------------------------------------

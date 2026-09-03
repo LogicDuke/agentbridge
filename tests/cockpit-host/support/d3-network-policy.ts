@@ -110,6 +110,8 @@ export interface HostModuleExports {
   readonly factories: ReadonlySet<string>;
   /** The subset of `factories` whose own body instantiates a server (directly or through another instantiating confined factory), as opposed to returning an alias. */
   readonly instantiatingFactories: ReadonlySet<string>;
+  /** The subset of `instantiatingFactories` whose single invocation instantiates more than one server (the server-count bound, propagated across files). */
+  readonly multiInstantiatingFactories: ReadonlySet<string>;
   /** Export names whose value is a proven string. */
   readonly strings: ReadonlySet<string>;
   /** Export names that are local functions returning only proven strings. */
@@ -231,8 +233,12 @@ interface Context {
   readonly externalFactories: Set<ts.Symbol>;
   /** The subset of `externalFactories` the exporting file proved to instantiate a server. */
   readonly externalInstantiatingFactories: Set<ts.Symbol>;
+  /** The subset of `externalInstantiatingFactories` the exporting file proved to instantiate more than one server per invocation. */
+  readonly externalMultiInstantiatingFactories: Set<ts.Symbol>;
   /** Confined factories (local or seeded) that instantiate a server (recorded by `checkInstantiationSites`). */
   readonly instantiatingFactories: Set<ts.Symbol>;
+  /** The subset of `instantiatingFactories` whose single invocation instantiates more than one server (recorded by `checkInstantiationSites`). */
+  readonly multiInstantiatingFactories: Set<ts.Symbol>;
   /** Import bindings seeded as proven strings / string-returning functions from sibling host files. */
   readonly externalStrings: Set<ts.Symbol>;
   readonly externalStringFunctions: Set<ts.Symbol>;
@@ -777,6 +783,7 @@ function collectHostImports(ctx: Context): void {
           ctx.externalFactories.add(symbol);
         }
         if (source.instantiatingFactories.has(imported)) ctx.externalInstantiatingFactories.add(symbol);
+        if (source.multiInstantiatingFactories.has(imported)) ctx.externalMultiInstantiatingFactories.add(symbol);
         if (source.strings.has(imported)) ctx.externalStrings.add(symbol);
         if (source.stringFunctions.has(imported)) ctx.externalStringFunctions.add(symbol);
       };
@@ -1532,34 +1539,117 @@ function checkFreeGlobal(ctx: Context, id: ts.Identifier): void {
  * after the fixpoint; nothing about runtime call multiplicity is claimed.
  */
 function checkInstantiationSites(ctx: Context): void {
-  const memo = new Map<ts.Symbol, boolean>();
-  const factoryInstantiates = (factory: ts.Symbol): boolean => {
+  const memo = new Map<ts.Symbol, number>();
+  // Servers created when evaluating an expression: every instantiating call that
+  // runs, summed over sequential sub-expressions, with a conditional taking its
+  // busier branch. A function/class body is a value here — it runs only when
+  // called — so it contributes nothing until such a call.
+  const exprServers = (node: ts.Node | undefined): number => {
+    if (node === undefined) return 0;
+    if (ts.isFunctionLike(node) || ts.isClassLike(node)) return 0;
+    if (ts.isConditionalExpression(node)) {
+      return exprServers(node.condition) + Math.max(exprServers(node.whenTrue), exprServers(node.whenFalse));
+    }
+    let total = ts.isCallExpression(node) ? serversOf(node) : 0;
+    node.forEachChild((child) => {
+      total += exprServers(child);
+    });
+    return total;
+  };
+  // Servers on the busiest execution path through one statement: `max` is the path
+  // that instantiates the most (an internal `return`/`throw` ends that path here),
+  // `exits` whether control always leaves the statement, `pass` what runs when it
+  // falls through. Exclusive branches take the max; sequences add — so multiple
+  // `return createServer()` are one per call while two sequential creations are two.
+  const stmtFlow = (stmt: ts.Statement): { readonly max: number; readonly exits: boolean; readonly pass: number } => {
+    if (ts.isReturnStatement(stmt) || ts.isThrowStatement(stmt)) {
+      return { max: exprServers(stmt.expression), exits: true, pass: 0 };
+    }
+    if (ts.isBlock(stmt)) return blockFlow(stmt.statements);
+    if (ts.isIfStatement(stmt)) {
+      const cond = exprServers(stmt.expression);
+      const thenFlow = stmtFlow(stmt.thenStatement);
+      const elseFlow = stmt.elseStatement !== undefined ? stmtFlow(stmt.elseStatement) : { max: 0, exits: false, pass: 0 };
+      return {
+        max: cond + Math.max(thenFlow.max, elseFlow.max),
+        exits: thenFlow.exits && elseFlow.exits,
+        pass: cond + Math.max(thenFlow.exits ? 0 : thenFlow.pass, elseFlow.exits ? 0 : elseFlow.pass),
+      };
+    }
+    // Any other statement (expression / variable / loop / switch / try): every
+    // instantiating call it contains runs and control falls through — an upper
+    // bound for branchy forms, which therefore fail closed toward the bound.
+    const servers = exprServers(stmt);
+    return { max: servers, exits: false, pass: servers };
+  };
+  const blockFlow = (statements: readonly ts.Statement[]): { readonly max: number; readonly exits: boolean; readonly pass: number } => {
+    let straight = 0;
+    let best = 0;
+    for (const stmt of statements) {
+      const flow = stmtFlow(stmt);
+      best = Math.max(best, straight + flow.max);
+      if (flow.exits) return { max: best, exits: true, pass: 0 };
+      straight += flow.pass;
+    }
+    return { max: Math.max(best, straight), exits: false, pass: straight };
+  };
+  // Servers instantiated by one invocation of a confined factory, capped at 2 —
+  // the bound only distinguishes "at most one" from "more than one". A factory in
+  // progress on the current path contributes 0 (cycle-closed, matching the
+  // fixpoint; an alias-returning factory adds none).
+  const factoryServerCount = (factory: ts.Symbol): number => {
     const known = memo.get(factory);
     if (known !== undefined) return known;
-    memo.set(factory, false);
-    const result = ctx.calls.some((call) => enclosingFunctionSymbol(ctx, call) === factory && instantiates(call));
-    memo.set(factory, result);
-    return result;
+    memo.set(factory, 0);
+    const fn = eligibleCallee(ctx, factory);
+    let count = 0;
+    if (fn !== null && fn.body !== undefined) {
+      count = ts.isBlock(fn.body) ? blockFlow(fn.body.statements).max : exprServers(fn.body);
+    }
+    const bounded = Math.min(count, 2);
+    memo.set(factory, bounded);
+    return bounded;
   };
-  const instantiates = (call: ts.CallExpression): boolean => {
+  // Servers one evaluation of a call instantiates: a proven createServer makes
+  // one; a confined-factory call makes as many as one invocation of that factory
+  // does — for a factory seeded from a sibling host file, the exporting file's
+  // proven per-invocation count; any other call makes none.
+  const serversOf = (call: ts.CallExpression): number => {
     const callee = unwrap(call.expression);
-    if (isProvenCreateServerCall(ctx, call)) return true;
-    if (!isConfinedFactoryCall(ctx, call)) return false;
+    if (isProvenCreateServerCall(ctx, call)) return 1;
+    if (!isConfinedFactoryCall(ctx, call)) return 0;
     const factory = valueSymbolOf(ctx.checker, callee);
-    if (factory === undefined) return false;
-    // A factory seeded from a sibling host file instantiates a server only if the exporting file proved so.
-    return ctx.externalInstantiatingFactories.has(factory) || factoryInstantiates(factory);
+    if (factory === undefined) return 0;
+    if (ctx.externalMultiInstantiatingFactories.has(factory)) return 2;
+    if (ctx.externalInstantiatingFactories.has(factory)) return 1;
+    return factoryServerCount(factory);
   };
+  const factoryCount = (factory: ts.Symbol): number =>
+    ctx.externalMultiInstantiatingFactories.has(factory)
+      ? 2
+      : ctx.externalInstantiatingFactories.has(factory)
+        ? 1
+        : factoryServerCount(factory);
   const sites = ctx.calls.filter((call) => {
     const owner = enclosingFunctionSymbol(ctx, call);
-    return (owner === undefined || !ctx.confinedFactories.has(owner)) && instantiates(call);
+    return (owner === undefined || !ctx.confinedFactories.has(owner)) && serversOf(call) > 0;
   });
-  ctx.instantiationSites = sites.length;
   for (const factory of ctx.confinedFactories) {
-    if (ctx.externalInstantiatingFactories.has(factory) || factoryInstantiates(factory)) ctx.instantiatingFactories.add(factory);
+    const count = factoryCount(factory);
+    if (count >= 1) ctx.instantiatingFactories.add(factory);
+    if (count >= 2) ctx.multiInstantiatingFactories.add(factory);
   }
-  // The tree entry counts sites across files: only the first site of the whole host tree is free.
-  for (const site of sites.slice(Math.max(0, 1 - ctx.priorInstantiationSites))) deny(ctx, 'CREATE_SERVER_MULTIPLE', site);
+  // The tree entry counts servers across files: only the first server of the
+  // whole host tree is free. A site is denied once it would create a server
+  // beyond that single free one — whether it is the second external site or one
+  // factory call whose single invocation instantiates two servers.
+  let running = ctx.priorInstantiationSites;
+  for (const site of sites) {
+    const servers = serversOf(site);
+    if (running + servers > 1) deny(ctx, 'CREATE_SERVER_MULTIPLE', site);
+    running += servers;
+  }
+  ctx.instantiationSites = running - ctx.priorInstantiationSites;
 }
 
 function classify(ctx: Context): void {
@@ -1622,7 +1712,9 @@ function createContext(source: string, options: NetworkPolicyOptions): Context {
     priorInstantiationSites: options.priorInstantiationSites ?? 0,
     externalFactories: new Set(),
     externalInstantiatingFactories: new Set(),
+    externalMultiInstantiatingFactories: new Set(),
     instantiatingFactories: new Set(),
+    multiInstantiatingFactories: new Set(),
     externalStrings: new Set(),
     externalStringFunctions: new Set(),
     instantiationSites: 0,
@@ -1724,18 +1816,21 @@ const hasDefaultModifier = (node: ts.Node): boolean =>
 function hostExportsOf(ctx: Context): HostModuleExports {
   const factories = new Set<string>();
   const instantiatingFactories = new Set<string>();
+  const multiInstantiatingFactories = new Set<string>();
   const strings = new Set<string>();
   const stringFunctions = new Set<string>();
   const classifyBinding = (symbol: ts.Symbol | undefined, exportName: string): void => {
     if (symbol === undefined) return;
     if (ctx.confinedFactories.has(symbol)) factories.add(exportName);
     if (ctx.instantiatingFactories.has(symbol)) instantiatingFactories.add(exportName);
+    if (ctx.multiInstantiatingFactories.has(symbol)) multiInstantiatingFactories.add(exportName);
     if (isStringFunction(ctx, symbol, new Set())) stringFunctions.add(exportName);
     else if (isStringValue(ctx, symbol)) strings.add(exportName);
   };
   const copyFrom = (source: HostModuleExports, imported: string, exportName: string): void => {
     if (source.factories.has(imported)) factories.add(exportName);
     if (source.instantiatingFactories.has(imported)) instantiatingFactories.add(exportName);
+    if (source.multiInstantiatingFactories.has(imported)) multiInstantiatingFactories.add(exportName);
     if (source.strings.has(imported)) strings.add(exportName);
     if (source.stringFunctions.has(imported)) stringFunctions.add(exportName);
   };
@@ -1815,7 +1910,7 @@ function hostExportsOf(ctx: Context): HostModuleExports {
     const source = providers[0];
     if (source !== undefined) copyFrom(source, name, name);
   }
-  return { factories, instantiatingFactories, strings, stringFunctions };
+  return { factories, instantiatingFactories, multiInstantiatingFactories, strings, stringFunctions };
 }
 
 /** One host source file for the tree entry; `file` is its native path relative to the host root (win32: either separator; elsewhere a backslash is a literal filename character). */
@@ -1827,6 +1922,7 @@ export interface HostSource {
 const EMPTY_EXPORTS: HostModuleExports = {
   factories: new Set(),
   instantiatingFactories: new Set(),
+  multiInstantiatingFactories: new Set(),
   strings: new Set(),
   stringFunctions: new Set(),
 };
@@ -1838,6 +1934,7 @@ const sameExports = (left: HostModuleExports | undefined, right: HostModuleExpor
   left !== undefined &&
   sameNames(left.factories, right.factories) &&
   sameNames(left.instantiatingFactories, right.instantiatingFactories) &&
+  sameNames(left.multiInstantiatingFactories, right.multiInstantiatingFactories) &&
   sameNames(left.strings, right.strings) &&
   sameNames(left.stringFunctions, right.stringFunctions);
 

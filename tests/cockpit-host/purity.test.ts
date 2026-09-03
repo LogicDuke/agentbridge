@@ -204,7 +204,15 @@ const srcFileUrl = (name: string): URL => new URL(name.split('/').map(encodeURIC
 const closureMemberOf = (importerFileUrl: URL, specifier: string): string => {
   const resolvedUrl = resolveRelativeImport(importerFileUrl, specifier);
   if (resolvedUrl === null) throw new Error(`D3-NET: unresolvable runtime import ${specifier} from ${importerFileUrl.href}`);
-  const sourceUrl = new URL(resolvedUrl.href.replace(/\.js$/, '.ts').replace(/\.mjs$/, '.mts').replace(/\.cjs$/, '.cts'));
+  // Map the NodeNext output extension to its source on the *pathname*, dropping
+  // any URL suffix — a module's source identity is its path, not its `?query` or
+  // `#fragment`. Rewriting the full `href` missed `./x.js?instance`, whose `.js`
+  // is followed by the query, so the walker looked for `x.js` and threw; this
+  // mirrors the tree resolver `resolveHostSpecifier`, which maps on the pathname.
+  const sourceUrl = new URL(resolvedUrl.href);
+  sourceUrl.search = '';
+  sourceUrl.hash = '';
+  sourceUrl.pathname = sourceUrl.pathname.replace(/\.js$/, '.ts').replace(/\.mjs$/, '.mts').replace(/\.cjs$/, '.cts');
   const name = srcRelativeName(sourceUrl);
   if (!existsSync(fileURLToPath(sourceUrl))) {
     throw new Error(`D3-NET: runtime import ${specifier} from ${importerFileUrl.href} has no source file ${name}`);
@@ -276,15 +284,22 @@ const isAllowedNodeBuiltin = (specifier: string): boolean => ALLOWED_NODE_BUILTI
  *   - dynamic `import('S')` / `import('S', { … })` — a call whose callee is the
  *     `import` keyword; its first argument surfaces only as a `StringLiteral` or a
  *     substitution-free `NoSubstitutionTemplateLiteral`, never a substituted
- *     `TemplateExpression` (a computed specifier).
+ *     `TemplateExpression` (a computed specifier);
+ *   - CommonJS `require('S')` — a call whose callee is the bare identifier
+ *     `require`; its first argument surfaces on the same static-string rule as
+ *     dynamic `import`. A `.cts`/`.cjs` closure member loads its dependencies
+ *     through `require`, so this is a genuine runtime module edge — `obj.require(…)`
+ *     (a property call) and `require.resolve(…)` are not.
  *
  * Excluded structurally, with no special-casing: `import.meta` (a meta-property,
- * not a call), `obj.import(…)` (a property call), a plain `require(…)`, and a
- * member/property/class-field named `import` (`{ import: 'S' }`,
- * `class C { import = 'S' }`) — none of which is an import node. Specifiers are
- * returned in source order (a pre-order walk); repeats are kept, since each
- * import site is a distinct occurrence. This is a pure syntactic parse — no
- * binder, type-checker, module resolution, or file-system access.
+ * not a call), `obj.import(…)` (a property call), and a member/property/class-field
+ * named `import` (`{ import: 'S' }`, `class C { import = 'S' }`) — none of which is
+ * an import node. A named import/export clause whose specifiers are all `type` (or
+ * a declaration-level `import type` / `export type`) erases at runtime and is
+ * dropped under `runtimeOnly`. Specifiers are returned in source order (a pre-order
+ * walk); repeats are kept, since each import site is a distinct occurrence. This is
+ * a pure syntactic parse — no binder, type-checker, module resolution, or
+ * file-system access.
  */
 function extractModuleSpecifiers(source: string, options: { readonly runtimeOnly?: boolean } = {}): readonly string[] {
   const sourceFile = ts.createSourceFile(
@@ -303,11 +318,34 @@ function extractModuleSpecifiers(source: string, options: { readonly runtimeOnly
   const stringLiteralText = (node: ts.Node | undefined): string | null =>
     node !== undefined && ts.isStringLiteral(node) ? node.text : null;
 
+  // Whether an import/export declaration is fully erased at runtime — a
+  // declaration-level `import type` / `export type`, OR a named clause that binds
+  // no runtime value (no default/namespace binding and every named specifier is
+  // `type`). `import { type X } from 'S'` and `export { type X } from 'S'` erase
+  // exactly as `import type { X } from 'S'` does. A side-effect `import 'S'`, a
+  // namespace binding (`import * as ns`, `export * as ns`), and a bare
+  // `export * from 'S'` all load at runtime and are never erased.
+  const isErasedRuntimeDeclaration = (node: ts.ImportDeclaration | ts.ExportDeclaration): boolean => {
+    if (ts.isImportDeclaration(node)) {
+      if (node.importClause?.phaseModifier === ts.SyntaxKind.TypeKeyword) return true;
+      const clause = node.importClause;
+      if (clause === undefined || clause.name !== undefined) return false;
+      const named = clause.namedBindings;
+      if (named === undefined || ts.isNamespaceImport(named)) return false;
+      return named.elements.every((element) => element.isTypeOnly);
+    }
+    if (node.isTypeOnly) return true;
+    const clause = node.exportClause;
+    if (clause === undefined || ts.isNamespaceExport(clause)) return false;
+    return clause.elements.every((element) => element.isTypeOnly);
+  };
+
   const visit = (node: ts.Node): void => {
     if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
-      // A clause-level `import type` / `export type` is erased by emit and loads
-      // nothing at runtime; the executable-closure walk skips it on request.
-      const typeOnly = ts.isImportDeclaration(node) ? node.importClause?.phaseModifier === ts.SyntaxKind.TypeKeyword : node.isTypeOnly;
+      // A clause-level `import type` / `export type`, or a named clause whose
+      // specifiers are all `type`, is erased by emit and loads nothing at runtime;
+      // the executable-closure walk skips it on request.
+      const typeOnly = isErasedRuntimeDeclaration(node);
       const specifier = stringLiteralText(node.moduleSpecifier);
       if (specifier !== null && !(options.runtimeOnly === true && typeOnly)) specifiers.push(specifier);
     } else if (ts.isImportEqualsDeclaration(node)) {
@@ -326,6 +364,18 @@ function extractModuleSpecifiers(source: string, options: { readonly runtimeOnly
       // substituted `TemplateExpression` (a computed value). A second options
       // argument is ignored; `import.meta` is a MetaProperty, not a call, so it
       // never reaches this branch.
+      const arg = node.arguments[0];
+      if (arg !== undefined && ts.isStringLiteralLike(arg)) specifiers.push(arg.text);
+    } else if (
+      ts.isCallExpression(node) &&
+      ts.isIdentifier(node.expression) &&
+      node.expression.text === 'require'
+    ) {
+      // CommonJS `require('S')`: a bare-identifier `require` call — the runtime
+      // load form of a `.cts`/`.cjs` closure member. Its first argument surfaces
+      // on the same static-string rule as dynamic `import`. `obj.require(…)` (a
+      // property call) and `require.resolve(…)` have a non-identifier callee and
+      // never reach this branch.
       const arg = node.arguments[0];
       if (arg !== undefined && ts.isStringLiteralLike(arg)) specifiers.push(arg.text);
     }
@@ -3526,6 +3576,52 @@ describe('D3 executable closure outbound-capability discipline (D3-NET single so
     expect(extractModuleSpecifiers(`import Ns = require('./loaded.js');`)).toEqual(['./loaded.js']);
     // A type-only *alias* (`import type A = B.C`) is not an external-module reference and is never surfaced.
     expect(extractModuleSpecifiers(`import type A = Ns.Member;`, { runtimeOnly: true })).toEqual([]);
+  });
+});
+
+describe('D3 executable-closure module-graph correctness (Codex P1/P2)', () => {
+  // The closure walk must enumerate the true runtime module graph and resolve each
+  // edge with the project's TypeScript/Node semantics. These are the three audited
+  // cases; the outbound rule here is the same `relative-or-allow-listed` predicate
+  // the discipline block enforces.
+  const outboundOk = (specifier: string): boolean => isRelativeImportSpecifier(specifier) || isAllowedNodeBuiltin(specifier);
+
+  // (1) CommonJS `require` in a `.cts`/`.cjs` closure member is a runtime edge.
+  it('surfaces a bare require() as a runtime module edge', () => {
+    expect(extractModuleSpecifiers(`const https = require('node:https');\nhttps.get('x');`, { runtimeOnly: true })).toEqual(['node:https']);
+    expect(extractModuleSpecifiers(`const sibling = require('./helper.cjs');`, { runtimeOnly: true })).toEqual(['./helper.cjs']);
+    // A builtin require is refused by the outbound rule; a relative require is followed as a closure edge.
+    expect(outboundOk('node:https')).toBe(false);
+    expect(isRelativeImportSpecifier('./helper.cjs')).toBe(true);
+  });
+  it('does not treat require.resolve or a property/keyed require as a module edge', () => {
+    expect(extractModuleSpecifiers(`const p = require.resolve('node:https');`, { runtimeOnly: true })).toEqual([]);
+    expect(extractModuleSpecifiers(`const x = obj.require('node:https');`, { runtimeOnly: true })).toEqual([]);
+    expect(extractModuleSpecifiers(`const x = { require: 'node:https' };`, { runtimeOnly: true })).toEqual([]);
+  });
+
+  // (2) A named clause whose specifiers are all `type` erases at runtime.
+  it('drops an all-type named import/export under runtimeOnly, keeps a value-bearing clause', () => {
+    expect(extractModuleSpecifiers(`import { type X } from './t.js';`, { runtimeOnly: true })).toEqual([]);
+    expect(extractModuleSpecifiers(`export { type X } from './t.js';`, { runtimeOnly: true })).toEqual([]);
+    // Without runtimeOnly it is still a (type-resolution) dependency.
+    expect(extractModuleSpecifiers(`import { type X } from './t.js';`)).toEqual(['./t.js']);
+    // A value specifier, a default binding, or a namespace binding keeps the runtime edge.
+    expect(extractModuleSpecifiers(`import { value, type X } from './t.js';`, { runtimeOnly: true })).toEqual(['./t.js']);
+    expect(extractModuleSpecifiers(`import def, { type X } from './t.js';`, { runtimeOnly: true })).toEqual(['./t.js']);
+    expect(extractModuleSpecifiers(`import * as ns from './t.js';`, { runtimeOnly: true })).toEqual(['./t.js']);
+    // A side-effect import and a bare `export *` load at runtime and are kept.
+    expect(extractModuleSpecifiers(`import './t.js';`, { runtimeOnly: true })).toEqual(['./t.js']);
+    expect(extractModuleSpecifiers(`export * from './t.js';`, { runtimeOnly: true })).toEqual(['./t.js']);
+  });
+
+  // (3) The output→source extension mapping is on the pathname, preserving suffixes.
+  it('resolves a closure member through a query or fragment suffix', () => {
+    const importer = srcFileUrl('cockpit/index.ts');
+    expect(closureMemberOf(importer, './read-model.js?instance')).toBe('cockpit/read-model.ts');
+    expect(closureMemberOf(importer, './read-model.js#section')).toBe('cockpit/read-model.ts');
+    // The plain specifier resolves identically — the suffix handling is additive.
+    expect(closureMemberOf(importer, './read-model.js')).toBe('cockpit/read-model.ts');
   });
 });
 
