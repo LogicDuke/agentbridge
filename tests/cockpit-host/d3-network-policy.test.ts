@@ -333,7 +333,7 @@ describe('D3 network policy createServer listener boundary', () => {
     for (const source of [
       `${NS}\nhttp.createServer((${L}) as any);`,
       `${NS}\nconst h1 = ${L};\nconst h2 = h1!;\nhttp.createServer(h2);`,
-      `${NS}\nfunction handle(request: http.IncomingMessage, response: http.ServerResponse) { response.end(String(request.url)); }\nhttp.createServer(handle);`,
+      `${NS}\nfunction handle(request: http.IncomingMessage, response: http.ServerResponse) { response.end(\`\${request.url}\`); }\nhttp.createServer(handle);`,
     ]) {
       const result = analyzeNetworkPolicy(source);
       expect(result.verdict, `${source}\n${describeFindings(result)}`).toBe('ALLOW');
@@ -1099,13 +1099,13 @@ ${describeFindings(result)}`).toEqual(['GLOBAL_RECEIVER_WRITE']);
       expect(result.findings, source).toHaveLength(1);
       expect(result.fixpoint.state, source).toBe('CONVERGED');
     }
-    // Codex witness: a replaced `String` would let `isProvenString` trust a callable Proxy handed to response.end.
+    // Codex witness: the write is denied on its own, and `response.end(String(1))` is unproven regardless.
     const witness = analyzeNetworkPolicy(
       `${NS}
 (globalThis.String as any) = () => new Proxy(() => {}, { apply(_target: unknown, res: http.ServerResponse) { res.req.socket.write('x'); } });
 http.createServer((request, response) => { response.end(String(1)); });`,
     );
-    expect(witness.reasons, describeFindings(witness)).toEqual(['GLOBAL_RECEIVER_WRITE']);
+    expect(witness.reasons, describeFindings(witness)).toEqual(['GLOBAL_RECEIVER_WRITE', 'RESPONSE_END_ARGUMENT']);
     for (const source of [
       `String(1);`,
       `globalThis.String.length;`,
@@ -1213,11 +1213,11 @@ ${describeFindings(result)}`).toEqual([]);
       expect(result.findings, source).toHaveLength(1);
       expect(result.fixpoint.state, source).toBe('CONVERGED');
     }
-    // Codex witness: an inherited mutator rebinds `String` without a write target, so `isProvenString` would trust a callable Proxy.
+    // Codex witness: the mutator call is denied on its own, and `response.end(String(1))` is unproven regardless.
     const witness = analyzeNetworkPolicy(
       `${NS}\n(globalThis as any).__defineGetter__('String', () => () => new Proxy(() => {}, { apply(_target: unknown, res: http.ServerResponse) { res.req.socket.write('x'); } }));\nhttp.createServer((request, response) => { response.end(String(1)); });`,
     );
-    expect(witness.reasons, describeFindings(witness)).toEqual(['GLOBAL_RECEIVER_CALL']);
+    expect(witness.reasons, describeFindings(witness)).toEqual(['GLOBAL_RECEIVER_CALL', 'RESPONSE_END_ARGUMENT']);
     // The same family through a free mutator: the receiver forwarded as an argument is already an escape.
     for (const source of [
       `Object.defineProperty(globalThis, 'String', { value: 1 });`,
@@ -1247,6 +1247,67 @@ ${describeFindings(result)}`).toEqual([]);
     for (const forbidden of ['__defineGetter__', '__defineSetter__', 'defineProperty', 'eval']) {
       expect(occurrences(detector, `'${forbidden}'`), forbidden).toBe(0);
     }
+  });
+
+  it('P1 family: an ambient String(...) call proves nothing, so the String mutation routes no longer matter to response.end', () => {
+    const inListener = (body: string): string => `${NS}\nhttp.createServer((request, response) => {\n  ${body}\n});`;
+    // response.end(String(...)) is no longer trusted, whatever the argument and however it is reached.
+    for (const source of [
+      inListener(`response.end(String(1));`),
+      inListener(`response.end(String('x'));`),
+      inListener(`response.end(String(request.url));`),
+      inListener(`const body = String('x');\nresponse.end(body);`),
+      inListener(`function page() { return String('x'); }\nresponse.end(page());`),
+    ]) {
+      const result = analyzeNetworkPolicy(source);
+      expect(result.reasons, `${source}\n${describeFindings(result)}`).toEqual(['RESPONSE_END_ARGUMENT']);
+      expect(result.findings, source).toHaveLength(1);
+    }
+    // Each String mutation route only adds its own finding on top of the same end denial: none of them is load-bearing.
+    for (const [mutation, reason] of [
+      [`(globalThis.String as any) = () => 1;`, 'GLOBAL_RECEIVER_WRITE'],
+      [`(globalThis as any).__defineGetter__('String', () => () => 1);`, 'GLOBAL_RECEIVER_CALL'],
+      [`Object.defineProperty(globalThis, 'String', { value: () => 1 });`, 'GLOBAL_RECEIVER_ESCAPE'],
+    ] as const) {
+      const result = analyzeNetworkPolicy(`${NS}\n${mutation}\nhttp.createServer((request, response) => { response.end(String(1)); });`);
+      expect(result.reasons, `${mutation}\n${describeFindings(result)}`).toEqual([reason, 'RESPONSE_END_ARGUMENT']);
+    }
+    // Every already-proven string path is untouched: literal, template, concat, const, local function.
+    for (const source of [
+      inListener(`response.end('ok');`),
+      inListener('response.end(`<p>${request.url ?? \'\'}</p>`);'),
+      inListener(`response.end('<p>' + request.url + '</p>');`),
+      inListener(`const body = 'x';\nconst page = body;\nresponse.end(page);`),
+      inListener(`function page(title: string) { return \`\${title}\`; }\nresponse.end(page('x'));`),
+      inListener(`const page = () => 'x' + request.url;\nresponse.end(page());`),
+      REAL_HOST_REPLICA,
+    ]) {
+      const result = analyzeNetworkPolicy(source);
+      expect(result.reasons, `${source}\n${describeFindings(result)}`).toEqual([]);
+    }
+    // Sibling-export string paths through the host module graph.
+    const siblings = analyzeNetworkPolicyTree([
+      { file: 'styles.ts', text: 'export const STYLES = `body {}`;' },
+      { file: 'render.ts', text: 'export function render(title: string): string {\n  return `<h1>${title}</h1>`;\n}' },
+      {
+        file: 'server.ts',
+        text: `${NS}\nimport { render } from './render.js';\nimport { STYLES } from './styles.js';\nhttp.createServer((request, response) => {\n  if (request.url === '/styles.css') { response.end(STYLES); return; }\n  response.end(render('x'));\n}).listen(4317, '127.0.0.1');`,
+      },
+    ]);
+    for (const [file, result] of siblings) expect(result.reasons, `${file}: ${describeFindings(result)}`).toEqual([]);
+    // The real host tree stays ALLOW: its bodies are literals, a sibling string constant and a sibling template function.
+    const host = readdirSync(hostDir, { recursive: true })
+      .map((entry) => String(entry))
+      .filter((name) => name.endsWith('.ts'))
+      .map((file) => ({ file, text: readFileSync(join(hostDir, file), 'utf8') }));
+    for (const [file, result] of analyzeNetworkPolicyTree(host)) {
+      expect(result.reasons, `${file}: ${describeFindings(result)}`).toEqual([]);
+      expect(result.verdict, file).toBe('ALLOW');
+    }
+    // Structural: the proof names no global identifier.
+    const detector = readFileSync(detectorPath, 'utf8');
+    expect(occurrences(detector, "'String'")).toBe(0);
+    expect(occurrences(detector, 'function isProvenString(')).toBe(1);
   });
 
   it('is structural: one runtime-shadow predicate, threaded through the single symbol-resolution path', () => {
@@ -1304,6 +1365,8 @@ describe('D3 network policy positive shapes for close and end (PR #67 Codex P1)'
       inListener(`response.end(request.url ?? '');`),
       inListener(`let body = 'x';\nresponse.end(body);`),
       inListener(`const String = (v: unknown) => v;\nresponse.end(String('x'));`),
+      inListener(`response.end(String(request.url));`),
+      inListener(`response.end(String(1));`),
       inListener(`function echo(v: string) { return v; }\nresponse.end(echo('x'));`),
       inListener(`async function page() { return 'x'; }\nresponse.end(page());`),
       inListener(`function* page() { yield 'x'; }\nresponse.end(page());`),
@@ -1322,7 +1385,6 @@ describe('D3 network policy positive shapes for close and end (PR #67 Codex P1)'
       inListener(`response.end('<p>' + request.url + '</p>');`),
       inListener(`const body = 'x';\nconst page = body;\nresponse.end(page);`),
       inListener(`response.end(request.url === '/' ? 'root' : 'other');`),
-      inListener(`response.end(String(request.url));`),
       inListener(`function page(title: string) { return \`<h1>\${title}</h1>\`; }\nresponse.end(page('x'));`),
       inListener(`function page() { return '<html></html>'; }\nconst html = page();\nresponse.end(html);`),
       inListener(`const page = () => 'x';\nresponse.end(page());`),
@@ -1339,6 +1401,7 @@ describe('D3 network policy positive shapes for close and end (PR #67 Codex P1)'
     expect(occurrences(detector, 'function checkAllowedCallShape(')).toBe(1);
     expect(occurrences(detector, 'checkAllowedCallShape(ctx, parent, classes)')).toBe(1);
     expect(occurrences(detector, 'function isProvenString(')).toBe(1);
+    expect(occurrences(detector, "'String'")).toBe(0);
     expect(occurrences(detector, 'function hasOnlyLocalCallback(')).toBe(1);
     expect(occurrences(detector, 'function hasOnlyProvenStringChunk(')).toBe(1);
     expect(occurrences(detector, "deny(ctx, 'SERVER_CLOSE_CALLBACK'")).toBe(1);

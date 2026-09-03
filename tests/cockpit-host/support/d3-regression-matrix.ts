@@ -512,7 +512,10 @@ const SOCKET: readonly RegressionRow[] = [
   allow('socket acquisition through proven target policy', 'end with a concatenated chunk', inListener(`response.end('<p>' + request.url + '</p>');`)),
   allow('socket acquisition through proven target policy', 'end with a const string chain', inListener(`const body = 'x';\nconst page = body;\nresponse.end(page);`)),
   allow('socket acquisition through proven target policy', 'end with a conditional of proven strings', inListener(`response.end(request.url === '/' ? 'root' : 'other');`)),
-  allow('socket acquisition through proven target policy', 'end with String() of anything', inListener(`response.end(String(request.url));`)),
+  allow('socket acquisition through proven target policy', 'end with a template of anything', inListener(`response.end(\`\${request.url}\`);`)),
+  // Codex P1 family: no ambient global call proves a string, so the routes that replace `String` no longer matter here.
+  deny('socket acquisition through proven target policy', 'end with String() of anything is not proven', inListener(`response.end(String(request.url));`), ['RESPONSE_END_ARGUMENT']),
+  deny('socket acquisition through proven target policy', 'end with String() of a literal is not proven', inListener(`response.end(String('x'));`), ['RESPONSE_END_ARGUMENT']),
   allow('socket acquisition through proven target policy', 'end with a local string function result', inListener(`function page(title: string) { return \`<h1>\${title}</h1>\`; }\nresponse.end(page('x'));`)),
   allow('socket acquisition through proven target policy', 'end with a const holding a local string function result', inListener(`function page() { return '<html></html>'; }\nconst html = page();\nresponse.end(html);`)),
   deny('socket acquisition through proven target policy', 'server.on connection', withServer(`server.on('connection', (socket) => { socket.write('x'); });`), ['SERVER_MEMBER']),
@@ -837,14 +840,14 @@ const LISTENER_BOUNDARY: readonly RegressionRow[] = [
   allow('createServer listener boundary', 'async arrow listener', `${NS}\nhttp.createServer(async (request, response) => { response.end(); });`),
   allow('createServer listener boundary', 'anonymous function expression listener', `${NS}\nhttp.createServer(function (request, response) { response.end(); });`),
   allow('createServer listener boundary', 'named function expression listener', `${NS}\nhttp.createServer(function handler(request, response) { response.end(); });`),
-  allow('createServer listener boundary', 'unique FunctionDeclaration listener', `${NS}\nfunction handle(request: http.IncomingMessage, response: http.ServerResponse) { response.end(String(request.url)); }\nhttp.createServer(handle);`),
+  allow('createServer listener boundary', 'unique FunctionDeclaration listener', `${NS}\nfunction handle(request: http.IncomingMessage, response: http.ServerResponse) { response.end(\`\${request.url}\`); }\nhttp.createServer(handle);`),
   allow('createServer listener boundary', 'hoisted FunctionDeclaration listener', `${NS}\nhttp.createServer(handle);\nfunction handle(request: http.IncomingMessage, response: http.ServerResponse) { response.end(); }`),
   allow('createServer listener boundary', 'const listener spine', `${NS}\nconst h1 = ${L};\nconst h2 = h1;\nhttp.createServer(h2);`),
   allow('createServer listener boundary', 'wrapped listener', `${NS}\nhttp.createServer((${L}) as any);`),
   allow('createServer listener boundary', 'wrapped callee', `${NS}\n(http.createServer)(${L});`),
   allow('createServer listener boundary', 'zero-parameter listener', `${NS}\nhttp.createServer(() => {});`),
   allow('createServer listener boundary', 'one-parameter listener', `${NS}\nhttp.createServer((request) => { request.url; });`),
-  allow('createServer listener boundary', 'pattern at parameter 2 is unconstrained', `${NS}\nhttp.createServer((request, response, { extra }: any) => { response.end(String(extra)); });`),
+  allow('createServer listener boundary', 'pattern at parameter 2 is unconstrained', `${NS}\nhttp.createServer((request, response, { extra }: any) => { response.end(\`\${extra}\`); });`),
   allow('createServer listener boundary', 'exported const listener', `${NS}\nexport const handler = ${L};\nhttp.createServer(handler);`),
 ];
 
@@ -1039,7 +1042,7 @@ const REAL_HOST: readonly RegressionRow[] = [
   allow('real host acceptance', 'inline replica of the Stage-A host', REAL_HOST_SHAPE),
   allow('real host acceptance', 'type positions on the namespace', `${NS}\nfunction f(request: http.IncomingMessage, response: http.ServerResponse): http.Server | null { request; response; return null; }`),
   allow('real host acceptance', 'request.method nullish fallback', inListener(`const method = request.method ?? '';\nif (method !== 'GET') { response.statusCode = 405; response.setHeader('Allow', 'GET'); response.end('405'); return; }`)),
-  allow('real host acceptance', 'request.url passed to a pure helper', inListener(`function pathOf(url: string) { return url; }\nconst path = pathOf(request.url ?? '');\nresponse.end(String(path));`)),
+  allow('real host acceptance', 'request.url passed to a pure helper', inListener(`function pathOf(url: string) { return url; }\nconst path = pathOf(request.url ?? '');\nresponse.end(\`\${path}\`);`)),
   allow('real host acceptance', 'listen with host and port constants', withFactory(`const HOST = '127.0.0.1';\nconst PORT = 4317;\nfunction main() { const server = createCockpitServer(); server.listen(PORT, HOST, () => { console.log(HOST); }); }\nmain();`)),
 ];
 

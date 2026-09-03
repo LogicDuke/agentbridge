@@ -1167,11 +1167,12 @@ function isLoopbackListen(ctx: Context, call: ts.CallExpression): boolean {
 /**
  * Proven string (positive policy): an expression that can only evaluate to a
  * primitive string — a string or template literal (any spans), `+` with a
- * proven-string side, a conditional of proven strings, `String(...)` through
- * the unshadowed global, a unique const initialized by one, a call of a local
- * non-async eligible callee whose every own return is one, or a binding seeded
- * from a sibling host file's proven exports. Nothing else is proven, so no
- * callable value (a Proxy, a function) can reach a Node callback position.
+ * proven-string side, a conditional of proven strings, a unique const
+ * initialized by one, a call of a local non-async eligible callee whose every
+ * own return is one, or a binding seeded from a sibling host file's proven
+ * exports. No ambient global call is proven: a global binding can be replaced
+ * through routes this analysis does not track, so nothing else is proven and
+ * no callable value (a Proxy, a function) can reach a Node callback position.
  */
 function isProvenString(ctx: Context, expression: ts.Expression, visiting: Set<ts.Symbol>): boolean {
   const node = unwrap(expression);
@@ -1197,7 +1198,7 @@ function isProvenString(ctx: Context, expression: ts.Expression, visiting: Set<t
     const callee = unwrap(node.expression);
     if (!ts.isIdentifier(callee)) return false;
     const symbol = valueSymbolOf(ctx.checker, callee);
-    if (symbol === undefined) return callee.text === 'String' && node.arguments.length === 1;
+    if (symbol === undefined) return false;
     return isStringFunction(ctx, symbol, visiting);
   }
   return false;
