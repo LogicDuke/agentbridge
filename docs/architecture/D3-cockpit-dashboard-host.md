@@ -46,7 +46,12 @@ itself, or `../cockpit/`.
 D3 has zero authority and no mutation surface of any kind:
 
 - **No repository write** — no filesystem write to the repo, no Git.
-- **No GitHub write** — no adapter imported, no network egress.
+- **No GitHub write** — no adapter imported.
+- **Networking surface (source-bounded)** — the authored D3 executable closure
+  imports no networking capability beyond the single loopback `node:http` server
+  required by the host (bound to `127.0.0.1`, `GET`-only). Behavioral/literal
+  no-egress is *not* proven by this source guard; it belongs to a separate
+  future runtime/process isolation boundary.
 - **No agent invocation, ExecutionPermit, or merge capability** — C1 authority
   and the provider adapters are not imported and are unreachable.
 
