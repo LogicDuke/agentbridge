@@ -206,3 +206,91 @@ describe('D — authored server structure', () => {
     expect(calls[0]?.port).toEqual({ kind: 'number', value: 4317 });
   });
 });
+
+describe('D — listen host resolves in its lexical scope (fail closed on shadow/mutability)', () => {
+  const hostOf = (body: string): unknown => findListenCalls('fixture.ts', body)[0]?.host;
+
+  it('accepts the expected top-level `const HOST = "127.0.0.1"`', () => {
+    const body = ["const HOST = '127.0.0.1';", 'function main() { server.listen(4317, HOST); }'].join('\n');
+    expect(hostOf(body)).toEqual({ kind: 'string', value: '127.0.0.1' });
+  });
+
+  it('resolves a nearer local shadow `HOST = "0.0.0.0"` (so a loopback assertion is rejected)', () => {
+    const body = [
+      "const HOST = '127.0.0.1';",
+      "function main() { const HOST = '0.0.0.0'; server.listen(4317, HOST); }",
+    ].join('\n');
+    expect(hostOf(body)).toEqual({ kind: 'string', value: '0.0.0.0' });
+  });
+
+  it('a sibling-scope shadow does not affect an unrelated top-level use', () => {
+    const body = [
+      "const HOST = '127.0.0.1';",
+      "function other() { const HOST = '0.0.0.0'; server.listen(1, HOST); }",
+      'function main() { server.listen(4317, HOST); }',
+    ].join('\n');
+    const calls = findListenCalls('fixture.ts', body);
+    expect(calls[0]?.host).toEqual({ kind: 'string', value: '0.0.0.0' }); // other()'s local shadow
+    expect(calls[1]?.host).toEqual({ kind: 'string', value: '127.0.0.1' }); // main()'s top-level use
+  });
+
+  it('a mutable `let` binding fails closed', () => {
+    const body = ["let HOST = '127.0.0.1';", 'function main() { server.listen(4317, HOST); }'].join('\n');
+    expect(hostOf(body)).toEqual({ kind: 'unresolved' });
+  });
+
+  it('an indeterminate `const` initializer fails closed', () => {
+    const body = ['const HOST = pickHost();', 'function main() { server.listen(4317, HOST); }'].join('\n');
+    expect(hostOf(body)).toEqual({ kind: 'unresolved' });
+  });
+
+  it('a parameter shadow fails closed', () => {
+    const body = ["const HOST = '127.0.0.1';", 'function main(HOST) { server.listen(4317, HOST); }'].join('\n');
+    expect(hostOf(body)).toEqual({ kind: 'unresolved' });
+  });
+
+  it('a for-loop binding of the same name fails closed (not resolved to the outer const)', () => {
+    const body = [
+      "const HOST = '127.0.0.1';",
+      'for (const HOST of hosts) { server.listen(4317, HOST); }',
+    ].join('\n');
+    expect(hostOf(body)).toEqual({ kind: 'unresolved' });
+  });
+});
+
+describe('D — createServer authored-site recognition normalizes transparent syntax', () => {
+  const sitesFor = (body: string): number =>
+    findHttpCreateServerSites(join(REPO_ROOT, SERVER), `import http from 'node:http';\n${body}`).length;
+
+  it('`http.createServer(...)` is one authored site', () => {
+    expect(sitesFor('http.createServer(() => {});')).toBe(1);
+  });
+
+  it('`(http).createServer(...)` is the same authored-site class', () => {
+    expect(sitesFor('(http).createServer(() => {});')).toBe(1);
+  });
+
+  it("`http['createServer'](...)` is the same authored-site class", () => {
+    expect(sitesFor("http['createServer'](() => {});")).toBe(1);
+  });
+
+  it('a second wrapped site is counted (the exact-one invariant would then reject)', () => {
+    expect(sitesFor("http.createServer(() => {});\n(http)['createServer'](() => {});")).toBe(2);
+  });
+
+  it('unrelated property or index access is not counted', () => {
+    expect(sitesFor("http.get('http://x/');")).toBe(0);
+    expect(sitesFor("http['request']({});")).toBe(0);
+    expect(sitesFor('notHttp.createServer(() => {});')).toBe(0);
+    expect(sitesFor("obj['createServer'](() => {});")).toBe(0);
+  });
+
+  it('a computed (non-static) index is not this authored-site class', () => {
+    expect(sitesFor("const k = 'createServer';\nhttp[k](() => {});")).toBe(0);
+  });
+
+  it('optional-chaining on the http binding is still the same authored-site class', () => {
+    expect(sitesFor('http?.createServer(() => {});')).toBe(1);
+    expect(sitesFor("http?.['createServer'](() => {});")).toBe(1);
+  });
+});

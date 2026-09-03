@@ -301,33 +301,116 @@ export type ResolvedArg =
   | { readonly kind: 'number'; readonly value: number }
   | { readonly kind: 'unresolved' };
 
-/**
- * Resolve one same-file top-level `const <name> = <literal>` to its literal
- * value. Bounded and single-file by construction — the only "resolution" rule D
- * sanctions ("if statically resolvable"). It is not value-flow: no cross-module
- * tracking, no aliasing, no reassignment following, only a lexical `const`
- * whose initializer is a string or numeric literal.
- */
-function resolveConstLiteral(sourceFile: ts.SourceFile, name: string): ResolvedArg {
-  for (const statement of sourceFile.statements) {
-    if (!ts.isVariableStatement(statement)) continue;
-    if ((statement.declarationList.flags & ts.NodeFlags.Const) === 0) continue;
-    for (const declaration of statement.declarationList.declarations) {
-      if (!ts.isIdentifier(declaration.name) || declaration.name.text !== name) continue;
-      const init = declaration.initializer;
-      if (init !== undefined && ts.isStringLiteral(init)) return { kind: 'string', value: init.text };
-      if (init !== undefined && ts.isNumericLiteral(init)) return { kind: 'number', value: Number(init.text) };
-    }
+/** True when a binding name (identifier or destructuring pattern) binds `name`. */
+function bindingBinds(binding: ts.BindingName, name: string): boolean {
+  if (ts.isIdentifier(binding)) return binding.text === name;
+  for (const element of binding.elements) {
+    if (ts.isOmittedExpression(element)) continue;
+    if (bindingBinds(element.name, name)) return true;
   }
-  return { kind: 'unresolved' };
+  return false;
 }
 
-/** Resolve a call argument to a literal (string/number) or a same-file `const` literal. */
-function resolveArg(sourceFile: ts.SourceFile, arg: ts.Expression | undefined): ResolvedArg {
+/** The parameter list of a function-like node, or undefined for anything else. */
+function functionLikeParameters(node: ts.Node): readonly ts.ParameterDeclaration[] | undefined {
+  if (
+    ts.isFunctionDeclaration(node) ||
+    ts.isFunctionExpression(node) ||
+    ts.isArrowFunction(node) ||
+    ts.isMethodDeclaration(node) ||
+    ts.isConstructorDeclaration(node) ||
+    ts.isGetAccessorDeclaration(node) ||
+    ts.isSetAccessorDeclaration(node)
+  ) {
+    return node.parameters;
+  }
+  return undefined;
+}
+
+/** The statement list of a scope-bearing node (source file, block, module block). */
+function scopeStatements(node: ts.Node): readonly ts.Statement[] | undefined {
+  if (ts.isSourceFile(node) || ts.isBlock(node) || ts.isModuleBlock(node)) return node.statements;
+  return undefined;
+}
+
+/** True when a for-loop or catch clause introduces its own (shadowing) binding of `name`. */
+function introducesBinding(node: ts.Node, name: string): boolean {
+  if (ts.isForStatement(node) || ts.isForInStatement(node) || ts.isForOfStatement(node)) {
+    const initializer = node.initializer;
+    return (
+      initializer !== undefined &&
+      ts.isVariableDeclarationList(initializer) &&
+      initializer.declarations.some((declaration) => bindingBinds(declaration.name, name))
+    );
+  }
+  if (ts.isCatchClause(node)) {
+    return node.variableDeclaration !== undefined && bindingBinds(node.variableDeclaration.name, name);
+  }
+  return false;
+}
+
+/**
+ * Classify the nearest declaration of `name` in one scope's statements:
+ * an immutable `const <name> = <string|number literal>` yields that literal;
+ * a `let`/`var`, a `const` with a non-literal or computed initializer, or a
+ * destructured binding is a real shadow that fails closed (`unresolved`);
+ * `undefined` means this scope does not declare `name` (keep looking outward).
+ */
+function classifyInStatements(statements: readonly ts.Statement[], name: string): ResolvedArg | undefined {
+  for (const statement of statements) {
+    if (!ts.isVariableStatement(statement)) continue;
+    const isConst = (statement.declarationList.flags & ts.NodeFlags.Const) !== 0;
+    for (const declaration of statement.declarationList.declarations) {
+      if (ts.isIdentifier(declaration.name)) {
+        if (declaration.name.text !== name) continue;
+        if (!isConst) return { kind: 'unresolved' };
+        const init = declaration.initializer;
+        if (init !== undefined && ts.isStringLiteral(init)) return { kind: 'string', value: init.text };
+        if (init !== undefined && ts.isNumericLiteral(init)) return { kind: 'number', value: Number(init.text) };
+        return { kind: 'unresolved' };
+      }
+      if (bindingBinds(declaration.name, name)) return { kind: 'unresolved' };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Resolve an identifier used as a `listen` argument to the immutable literal
+ * actually visible at its use site (rule D, "if statically resolvable").
+ *
+ * The parse carries parent links, so this walks enclosing scopes innermost-first
+ * — the body block, then any function parameters, then outward to the module —
+ * and returns the FIRST scope that declares the name. A nearer lexical `const`
+ * literal therefore shadows the top-level one; a nearer `let`/`var`, parameter,
+ * destructured, or non-literal `const` binding fails closed. It is not a
+ * data-flow or alias engine: it follows no assignment, no aliasing, and never
+ * leaves this file; it only reads which lexical declaration is in scope.
+ */
+function resolveIdentifierLexically(useSite: ts.Node, name: string): ResolvedArg {
+  let scope: ts.Node = useSite;
+  for (;;) {
+    if (introducesBinding(scope, name)) return { kind: 'unresolved' };
+    const parameters = functionLikeParameters(scope);
+    if (parameters !== undefined && parameters.some((parameter) => bindingBinds(parameter.name, name))) {
+      return { kind: 'unresolved' };
+    }
+    const statements = scopeStatements(scope);
+    if (statements !== undefined) {
+      const found = classifyInStatements(statements, name);
+      if (found !== undefined) return found;
+    }
+    if (ts.isSourceFile(scope)) return { kind: 'unresolved' };
+    scope = scope.parent;
+  }
+}
+
+/** Resolve a call argument to a literal (string/number) or a lexically-visible `const` literal. */
+function resolveArg(arg: ts.Expression | undefined): ResolvedArg {
   if (arg === undefined) return { kind: 'unresolved' };
   if (ts.isStringLiteral(arg)) return { kind: 'string', value: arg.text };
   if (ts.isNumericLiteral(arg)) return { kind: 'number', value: Number(arg.text) };
-  if (ts.isIdentifier(arg)) return resolveConstLiteral(sourceFile, arg.text);
+  if (ts.isIdentifier(arg)) return resolveIdentifierLexically(arg, arg.text);
   return { kind: 'unresolved' };
 }
 
@@ -359,12 +442,54 @@ export interface CreateServerSite {
   readonly line: number; // 1-based
 }
 
+/** Strip transparent parenthesization: `((expr))` -> `expr`. Purely syntactic. */
+function unwrapParens(expression: ts.Expression): ts.Expression {
+  let current = expression;
+  while (ts.isParenthesizedExpression(current)) current = current.expression;
+  return current;
+}
+
+/** True when a receiver expression is (a parenthesized form of) an http-binding identifier. */
+function receiverIsHttpBinding(expression: ts.Expression, httpBindings: ReadonlySet<string>): boolean {
+  const receiver = unwrapParens(expression);
+  return ts.isIdentifier(receiver) && httpBindings.has(receiver.text);
+}
+
+/**
+ * True when a call's callee is a *direct* `createServer` access on the imported
+ * `node:http` binding, recognized up to transparent syntax only:
+ *   `http.createServer`, `(http).createServer`, `http['createServer']`,
+ *   and a bare `createServer` bound from `import { createServer } from 'node:http'`.
+ * The member name / static index string must be exactly `createServer`, and the
+ * receiver must be the http binding identifier. A computed index, or any other
+ * name, is not this authored-site class. No alias, value, receiver, or provenance
+ * is followed — only the written syntax is normalized (rule D).
+ */
+function isHttpCreateServerCallee(
+  callee: ts.Expression,
+  defaultOrNamespace: ReadonlySet<string>,
+  named: ReadonlySet<string>,
+): boolean {
+  const unwrapped = unwrapParens(callee);
+  if (ts.isPropertyAccessExpression(unwrapped) && unwrapped.name.text === 'createServer') {
+    return receiverIsHttpBinding(unwrapped.expression, defaultOrNamespace);
+  }
+  if (
+    ts.isElementAccessExpression(unwrapped) &&
+    ts.isStringLiteralLike(unwrapped.argumentExpression) &&
+    unwrapped.argumentExpression.text === 'createServer'
+  ) {
+    return receiverIsHttpBinding(unwrapped.expression, defaultOrNamespace);
+  }
+  return ts.isIdentifier(unwrapped) && named.has(unwrapped.text);
+}
+
 /**
  * Find direct `createServer(...)` sites that target the `node:http` import in
- * this file: either `<httpDefault>.createServer(...)` or a bare `createServer(...)`
- * bound from `import { createServer } from 'node:http'`. This is a statement
- * about the written source structure only; it does not follow `createServer`
- * through variables, returns, or aliases (rule D).
+ * this file, recognizing the transparent-syntax variants documented on
+ * {@link isHttpCreateServerCallee}. This is a statement about the written source
+ * structure only; it does not follow `createServer` through variables, returns,
+ * factories, callbacks, exports, or aliases (rule D).
  */
 export function findHttpCreateServerSites(fileName: string, text: string): CreateServerSite[] {
   const sourceFile = parse(fileName, text);
@@ -373,18 +498,9 @@ export function findHttpCreateServerSites(fileName: string, text: string): Creat
   const sites: CreateServerSite[] = [];
 
   const visit = (node: ts.Node): void => {
-    if (ts.isCallExpression(node)) {
-      const callee = node.expression;
-      const isMemberSite =
-        ts.isPropertyAccessExpression(callee) &&
-        callee.name.text === 'createServer' &&
-        ts.isIdentifier(callee.expression) &&
-        defaultOrNamespace.has(callee.expression.text);
-      const isNamedSite = ts.isIdentifier(callee) && named.has(callee.text);
-      if (isMemberSite || isNamedSite) {
-        const { line } = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
-        sites.push({ file: relFile, line: line + 1 });
-      }
+    if (ts.isCallExpression(node) && isHttpCreateServerCallee(node.expression, defaultOrNamespace, named)) {
+      const { line } = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
+      sites.push({ file: relFile, line: line + 1 });
     }
     ts.forEachChild(node, visit);
   };
@@ -418,8 +534,8 @@ export function findListenCalls(fileName: string, text: string): ListenCall[] {
       const { line } = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
       calls.push({
         line: line + 1,
-        port: resolveArg(sourceFile, node.arguments[0]),
-        host: resolveArg(sourceFile, node.arguments[1]),
+        port: resolveArg(node.arguments[0]),
+        host: resolveArg(node.arguments[1]),
       });
     }
     ts.forEachChild(node, visit);
