@@ -1373,6 +1373,61 @@ describe('D3 network policy host module graph (PR #67 Codex P1: exported factori
     expect(occurrences(detector, "from 'node:path'")).toBe(0);
   });
 
+  it('resolves specifiers with URL semantics: query, fragment, encoded and dot segments, plain relative paths (Codex P1)', () => {
+    const FACTORY = `${NS}\nexport function make(): http.Server {\n  return http.createServer(${L});\n}`;
+    const consumer = (specifier: string): string => `import { make } from '${specifier}';\nmake().listen(4317, '0.0.0.0');`;
+    // Codex witness: a valid ESM suffix still resolves to the factory source, so the consumer is seeded and the wildcard bind is seen.
+    const witness = tree({ 'factory.ts': FACTORY, 'main.ts': consumer('./factory.js?instance') });
+    expect(reasonsOf(witness, 'main.ts')).toEqual(['SERVER_LISTEN_BINDING']);
+    for (const [importer, specifier] of [
+      ['main.ts', './factory.js?instance'],
+      ['main.ts', './factory.js#fragment'],
+      ['main.ts', './factory.js?a=1&b=2#c'],
+      ['main.ts', './factory.ts?x'],
+      ['main.ts', './factory?x'],
+      ['main.ts', './%66actory.js'],
+      ['main.ts', './sub/%2e%2e/factory.js'],
+      ['main.ts', './sub/%2E%2E/factory.js?x'],
+      ['main.ts', './sub/../factory.js'],
+      ['main.ts', '././factory.js'],
+      ['main.ts', './factory.js'],
+      ['lib/main.ts', '../factory.js?x'],
+      ['lib/deep/main.ts', '../../factory.js#x'],
+      ['lib/deep/main.ts', '.././../factory.js'],
+    ] as const) {
+      const results = tree({ 'factory.ts': FACTORY, [importer]: consumer(specifier) });
+      expect(reasonsOf(results, importer), `${importer} <- ${specifier}`).toEqual(['SERVER_LISTEN_BINDING']);
+    }
+    // Encoded and literal characters inside a segment decode to the same tree name.
+    for (const specifier of ['./my%20dir/factory.js?x', './my dir/factory.js']) {
+      const spaced = tree({ 'my dir/factory.ts': FACTORY, 'main.ts': consumer(specifier) });
+      expect(reasonsOf(spaced, 'main.ts'), specifier).toEqual(['SERVER_LISTEN_BINDING']);
+    }
+    // The POSIX literal-backslash importer stays one root-level segment under URL resolution too.
+    const posix = tree({ 'factory.ts': FACTORY, 'nested\\consumer.ts': consumer('./factory.js?instance') }, { separator: '/' });
+    expect(reasonsOf(posix, 'nested\\consumer.ts')).toEqual(['SERVER_LISTEN_BINDING']);
+    // Outside the boundary: leaving the root, an encoded separator, a malformed escape, a missing file, a non-relative specifier.
+    for (const [importer, specifier] of [
+      ['main.ts', '../factory.js'],
+      ['lib/main.ts', '../../factory.js'],
+      ['main.ts', './sub%2f../factory.js'],
+      ['main.ts', './sub%5C../factory.js'],
+      ['main.ts', './%zzfactory.js'],
+      ['main.ts', './factory.js%'],
+      ['main.ts', './missing.js?x'],
+      ['main.ts', '/abs/factory.js?x'],
+      ['main.ts', 'factory.js?x'],
+    ] as const) {
+      const results = tree({ 'factory.ts': FACTORY, [importer]: consumer(specifier) });
+      expect(reasonsOf(results, importer), `${importer} <- ${specifier}`).toEqual([]);
+    }
+    const detector = readFileSync(detectorPath, 'utf8');
+    expect(occurrences(detector, 'function resolveHostSpecifier(')).toBe(1);
+    expect(occurrences(detector, 'new URL(')).toBe(3);
+    expect(occurrences(detector, "from 'node:url'")).toBe(0);
+    expect(occurrences(detector, "from 'node:path'")).toBe(0);
+  });
+
   it('applies the server-instantiation site bound across the tree', () => {
     const twoFiles = tree({
       'review.ts': `${REVIEW}\nmakeReviewServer().listen(4317, '127.0.0.1');`,

@@ -1804,15 +1804,32 @@ function relativeSpecifiersOf(sourceFile: ts.SourceFile): readonly string[] {
   return [...specifiers];
 }
 
-/** Resolve a relative specifier against its importing file, posix-style, to a file of the tree (`.js` → `.ts` and friends), or undefined. */
+/** Synthetic root the tree's '/'-separated names hang under; a resolution that leaves it is outside the boundary. */
+const TREE_ROOT_URL = new URL('file:///host/');
+
+/** An encoded separator never folds into one (Node rejects `%2f` everywhere and `%5c` on win32): fail closed on both. */
+const ENCODED_SEPARATOR = /%2f|%5c/i;
+
+/**
+ * Resolve a relative specifier against its importing file with URL semantics,
+ * as Node's ESM loader does — `.`/`..` and their `%2e` forms fold, a query or
+ * fragment is dropped, an encoded segment decodes — to a file of the tree
+ * (`.js` → `.ts` and friends), or undefined. A resolution that leaves the root,
+ * carries an encoded separator, or has a malformed escape stays outside the
+ * boundary. Each importer segment is encoded first so a literal backslash in a
+ * POSIX filename stays one segment instead of reading as a separator.
+ */
 function resolveHostSpecifier(fromFile: string, specifier: string, files: ReadonlySet<string>): string | undefined {
-  const segments = fromFile.split('/').slice(0, -1);
-  for (const part of specifier.split('/')) {
-    if (part === '' || part === '.') continue;
-    if (part === '..') segments.pop();
-    else segments.push(part);
+  if (ENCODED_SEPARATOR.test(specifier)) return undefined;
+  let target: string;
+  try {
+    const importer = new URL(fromFile.split('/').map(encodeURIComponent).join('/'), TREE_ROOT_URL);
+    const resolved = new URL(specifier, importer);
+    if (!resolved.pathname.startsWith(TREE_ROOT_URL.pathname)) return undefined;
+    target = resolved.pathname.slice(TREE_ROOT_URL.pathname.length).split('/').map(decodeURIComponent).join('/');
+  } catch {
+    return undefined;
   }
-  const target = segments.join('/');
   const candidates = [
     target,
     target.replace(/\.js$/, '.ts'),
