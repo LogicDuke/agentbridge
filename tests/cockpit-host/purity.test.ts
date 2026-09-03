@@ -311,8 +311,11 @@ function extractModuleSpecifiers(source: string, options: { readonly runtimeOnly
       const specifier = stringLiteralText(node.moduleSpecifier);
       if (specifier !== null && !(options.runtimeOnly === true && typeOnly)) specifiers.push(specifier);
     } else if (ts.isImportEqualsDeclaration(node)) {
-      // `import x = require('S')` — an external-module reference.
-      if (ts.isExternalModuleReference(node.moduleReference)) {
+      // `import x = require('S')` — an external-module reference. A type-only
+      // `import type x = require('S')` is erased by emit and loads nothing at
+      // runtime, exactly like a clause-level `import type … from`; the
+      // executable-closure walk skips it on request (`runtimeOnly`).
+      if (ts.isExternalModuleReference(node.moduleReference) && !(options.runtimeOnly === true && node.isTypeOnly)) {
         const specifier = stringLiteralText(node.moduleReference.expression);
         if (specifier !== null) specifiers.push(specifier);
       }
@@ -2822,10 +2825,13 @@ describe('D3 host purity rejects symlink escapes (D3-CX-POLICY-SYMLINK)', () => 
 // runtime code-generation primitive, so the host must use none.
 // ---------------------------------------------------------------------------
 describe('D3 host forbids runtime code generation (D3-CX-POLICY-RC)', () => {
-  // Enforcement over the real host tree: no production source constructs code at
-  // runtime, so the discipline is satisfied today and stays satisfied.
-  it('accepts every real host source (none uses runtime code generation)', () => {
-    for (const { file, text } of hostSources()) {
+  // Enforcement over the whole executable closure (the single source of truth):
+  // every runtime-executable file — host, Cockpit boundary and domain kernel —
+  // gets the runtime-code-generation guard, not just `src/cockpit-host/**`. No
+  // production source constructs code at runtime, so the discipline is satisfied
+  // today and stays satisfied.
+  it('accepts every real closure source (none uses runtime code generation)', () => {
+    for (const { file, text } of hostExecutableClosure()) {
       expect(usesRuntimeCodeGeneration(text), `${file} uses runtime code generation`).toBe(false);
     }
   });
@@ -2903,10 +2909,12 @@ describe('D3 host forbids runtime code generation (D3-CX-POLICY-RC)', () => {
 // A builtin obtained without an import specifier bypasses the exact allowlist.
 // ---------------------------------------------------------------------------
 describe('D3 host forbids hidden builtin acquisition (D3-CX-POLICY-HA)', () => {
-  // Enforcement over the real host tree: no production source acquires a builtin
-  // through a specifier-less side channel.
-  it('accepts every real host source (none hides a builtin acquisition)', () => {
-    for (const { file, text } of hostSources()) {
+  // Enforcement over the whole executable closure (the single source of truth):
+  // every runtime-executable file — host, Cockpit boundary and domain kernel —
+  // gets the hidden-builtin-acquisition guard. No production source acquires a
+  // builtin through a specifier-less side channel.
+  it('accepts every real closure source (none hides a builtin acquisition)', () => {
+    for (const { file, text } of hostExecutableClosure()) {
       expect(acquiresHiddenBuiltin(text), `${file} hides a builtin acquisition`).toBe(false);
     }
   });
@@ -3427,6 +3435,97 @@ describe('D3 host rejects symlink escapes under the Cockpit boundary (D3-CX-POLI
     // fails closed on a Cockpit-boundary symlink exactly as it does on a host one.
     expect(() => hostSources()).not.toThrow();
     expect(hostSources().length).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// D3-NET single source of truth: the executable-safety guards are enforced over
+// the *whole* executable closure — `hostExecutableClosure()` — not just
+// `src/cockpit-host/**`. The runtime-code-generation guard and the
+// hidden-builtin-acquisition guard are applied to every closure member by the
+// `D3 host forbids …` describes above (retargeted to the closure). This block
+// owns the third guard — the outbound builtin/module allow-list — over the same
+// closure, and pins the real closure. Host-directory confinement and the
+// symlink/topology checks stay scoped to the host, where they encode directory
+// shape rather than executable capability, so a domain member importing a
+// sibling domain file is never judged against the Cockpit-host boundary.
+// ---------------------------------------------------------------------------
+describe('D3 executable closure outbound-capability discipline (D3-NET single source of truth)', () => {
+  // The one outbound-capability rule for a closure member: every module it loads
+  // at runtime is either an in-tree relative import (whose target the closure walk
+  // already confines to `src/`) or one of the exact allow-listed builtins. Every
+  // other builtin — `node:net`, `node:tls`, `node:dgram`, `node:https`,
+  // `node:http2`, `node:fs`, … — and every bare package is outbound-capable and
+  // refused, in any closure member, host or not.
+  const outboundCapabilityViolation = (text: string): string | null => {
+    for (const specifier of extractModuleSpecifiers(text, { runtimeOnly: true })) {
+      if (!(isRelativeImportSpecifier(specifier) || isAllowedNodeBuiltin(specifier))) return specifier;
+    }
+    return null;
+  };
+
+  it('pins the real closure and gives every runtime file the host network-import restriction', () => {
+    const closure = hostExecutableClosure();
+    // The closure stays exactly the pinned 12-file oracle: nothing drops out
+    // (e.g. through the type-only import-equals fix) and nothing is silently added.
+    expect([...closure.map((source) => source.file)].sort()).toEqual([...EXPECTED_HOST_CLOSURE]);
+    for (const { file, text } of closure) {
+      // A computed dynamic `import(...)` cannot be confined, so no closure member may hold one.
+      expect(
+        hasUnverifiableDynamicImport(text),
+        `${file} contains an unverifiable (computed) dynamic import`,
+      ).toBe(false);
+      expect(outboundCapabilityViolation(text), `${file} imports an outbound-capable module`).toBeNull();
+    }
+  });
+
+  // --- Regression: outbound-capable builtins in a Cockpit/domain closure member ---
+  const OUTBOUND_BUILTINS = ['node:net', 'node:tls', 'node:dgram', 'node:https', 'node:http2'] as const;
+  for (const builtin of OUTBOUND_BUILTINS) {
+    it(`rejects a Cockpit closure member importing ${builtin}`, () => {
+      expect(outboundCapabilityViolation(`import handle from '${builtin}';\nexport const x = handle;`)).toBe(builtin);
+    });
+    it(`rejects a domain closure member re-exporting from ${builtin}`, () => {
+      expect(outboundCapabilityViolation(`export { thing } from '${builtin}';`)).toBe(builtin);
+    });
+  }
+  it('still accepts the exact production builtins and in-tree relatives', () => {
+    expect(
+      outboundCapabilityViolation(`import http from 'node:http';\nimport { pathToFileURL } from 'node:url';`),
+    ).toBeNull();
+    expect(
+      outboundCapabilityViolation(`import { renderDashboard } from './render.js';\nexport * from '../cockpit/index.js';`),
+    ).toBeNull();
+  });
+
+  // --- Regression: runtime code generation in a Cockpit/domain closure member ---
+  // The runtime-code-generation guard (`usesRuntimeCodeGeneration`) is the single
+  // policy; these witnesses prove it fires on a non-host closure member exactly as
+  // it does on the host, closing the gap where only `src/cockpit-host/**` was guarded.
+  const CODEGEN_MEMBERS: readonly { readonly form: string; readonly source: string }[] = [
+    { form: 'eval in a Cockpit member', source: `export const run = (): number => eval('1 + 1');` },
+    { form: 'Function in a Cockpit member', source: `export const make = Function('return 1');` },
+    { form: 'new Function in a domain member', source: `export const make = new Function('return 1');` },
+    { form: 'constructor chain in a domain member', source: `export const evil = (() => {}).constructor('return 1');` },
+    { form: 'globalThis.eval alias in a domain member', source: `export const g = globalThis.eval;` },
+  ];
+  for (const { form, source } of CODEGEN_MEMBERS) {
+    it(`rejects ${form}`, () => {
+      expect(usesRuntimeCodeGeneration(source)).toBe(true);
+    });
+  }
+
+  // --- Regression: type-only vs runtime `import x = require(...)` in the closure walk ---
+  it('keeps a type-only ImportEqualsDeclaration out of the runtime closure', () => {
+    expect(extractModuleSpecifiers(`import type Ns = require('./erased.js');`, { runtimeOnly: true })).toEqual([]);
+    // It is still a real (type-resolution) dependency when runtime filtering is off.
+    expect(extractModuleSpecifiers(`import type Ns = require('./erased.js');`)).toEqual(['./erased.js']);
+  });
+  it('keeps a runtime ImportEqualsDeclaration in the runtime closure', () => {
+    expect(extractModuleSpecifiers(`import Ns = require('./loaded.js');`, { runtimeOnly: true })).toEqual(['./loaded.js']);
+    expect(extractModuleSpecifiers(`import Ns = require('./loaded.js');`)).toEqual(['./loaded.js']);
+    // A type-only *alias* (`import type A = B.C`) is not an external-module reference and is never surfaced.
+    expect(extractModuleSpecifiers(`import type A = Ns.Member;`, { runtimeOnly: true })).toEqual([]);
   });
 });
 
