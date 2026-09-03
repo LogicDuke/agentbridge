@@ -15,7 +15,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import ts from 'typescript';
 import { afterAll, describe, expect, it } from 'vitest';
 
-import { analyzeNetworkPolicy } from './support/d3-network-policy.js';
+import { analyzeNetworkPolicy, analyzeNetworkPolicyTree } from './support/d3-network-policy.js';
 
 /**
  * Cockpit D3 host purity, bounded to `src/cockpit-host/`.
@@ -3371,7 +3371,9 @@ describe('D3 host rejects symlink escapes under the Cockpit boundary (D3-CX-POLI
  * `./support/d3-network-policy.ts` and is exercised mechanism-by-mechanism in
  * `d3-network-policy.test.ts` together with the semantic regression matrix.
  * Here it is applied to the real host tree through the same symlink-checked
- * `hostSources()` reader the other host guards use. The host source may contain
+ * `hostSources()` reader the other host guards use, as one host module graph:
+ * a server factory exported by one host file stays a proven factory in the
+ * files that import it. The host source may contain
  * one server instantiation site, loopback-bound (a statically proven
  * `listen(<port>, '127.0.0.1'[, callback])`); it may not obtain outbound
  * network, socket, hidden mutable server, or non-allow-listed request/response
@@ -3379,8 +3381,13 @@ describe('D3 host rejects symlink escapes under the Cockpit boundary (D3-CX-POLI
  */
 describe('D3 host network policy (D3-NET)', () => {
   it('accepts every real host source under the frozen network policy', () => {
-    for (const { file, text } of hostSources()) {
-      const result = analyzeNetworkPolicy(text);
+    // The tree entry seeds each file with the proven exports of the sibling host
+    // files it imports (server factories, string constants, string functions) and
+    // applies the server-instantiation site bound across the whole host tree.
+    const sources = hostSources();
+    const results = analyzeNetworkPolicyTree(sources);
+    expect(results.size).toBe(sources.length);
+    for (const [file, result] of results) {
       const detail = result.findings
         .map((finding) => `${finding.reason}@${String(finding.line)}:${String(finding.column)} ${finding.text}`)
         .join('; ');

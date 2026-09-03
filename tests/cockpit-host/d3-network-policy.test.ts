@@ -7,6 +7,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   analyzeNetworkPolicy,
+  analyzeNetworkPolicyTree,
   DEFAULT_FIXPOINT_CEILING,
   inspectNetworkPolicy,
   isValueRead,
@@ -331,7 +332,7 @@ describe('D3 network policy createServer listener boundary', () => {
     for (const source of [
       `${NS}\nhttp.createServer((${L}) as any);`,
       `${NS}\nconst h1 = ${L};\nconst h2 = h1!;\nhttp.createServer(h2);`,
-      `${NS}\nfunction handle(request: http.IncomingMessage, response: http.ServerResponse) { response.end(request.url); }\nhttp.createServer(handle);`,
+      `${NS}\nfunction handle(request: http.IncomingMessage, response: http.ServerResponse) { response.end(String(request.url)); }\nhttp.createServer(handle);`,
     ]) {
       const result = analyzeNetworkPolicy(source);
       expect(result.verdict, `${source}\n${describeFindings(result)}`).toBe('ALLOW');
@@ -1080,20 +1081,268 @@ describe('D3 network policy closes the open Codex findings on PR #67', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Codex review closure: implicit-receiver callbacks and the host module graph (PR #67)
+// ---------------------------------------------------------------------------
+
+describe('D3 network policy positive shapes for close and end (PR #67 Codex P1)', () => {
+  const withServer = (rest: string): string => `${NS}\nconst server = http.createServer(${L});\n${rest}`;
+  const inListener = (body: string): string => `${NS}\nhttp.createServer((request, response) => {\n  ${body}\n});`;
+  const serverProxy = `const proxy = new Proxy(() => {}, { apply(_target: unknown, receiver: http.Server) { receiver.listen(4318, '0.0.0.0'); } });`;
+  const responseProxy = `const proxy = new Proxy(() => {}, { apply(_target: unknown, res: http.ServerResponse) { res.req.socket.write('x'); } });`;
+
+  it('denies every close call whose callback is not a local function literal, with one finding', () => {
+    for (const source of [
+      withServer(`${serverProxy}\nserver.close(proxy);`),
+      withServer(`declare const onClosed: () => void;\nserver.close(onClosed);`),
+      withServer(`server.close(1);`),
+      withServer(`server.close(() => {}, 1);`),
+      withServer(`declare const args: [() => void];\nserver.close(...args);`),
+      withServer(`server.listen(4317, '127.0.0.1').close(new Proxy(() => {}, {}));`),
+      withServer(`function setup(s: http.Server) { s.close(new Proxy(() => {}, {})); }\nsetup(server);`),
+    ]) {
+      const result = analyzeNetworkPolicy(source);
+      expect(result.reasons, `${source}\n${describeFindings(result)}`).toEqual(['SERVER_CLOSE_CALLBACK']);
+      expect(result.findings, source).toHaveLength(1);
+    }
+    for (const source of [
+      withServer(`server.close();`),
+      withServer(`server.close(() => { console.log('closed'); });`),
+      withServer(`server.close(function () { console.log('closed'); });`),
+      withServer(`function onClosed() { console.log('closed'); }\nserver.close(onClosed);`),
+      withServer(`const onClosed = () => {};\nserver.close(onClosed);`),
+    ]) {
+      expect(analyzeNetworkPolicy(source).reasons, source).toEqual([]);
+    }
+  });
+
+  it('denies every end call whose chunk is not a proven string, with one finding', () => {
+    for (const source of [
+      inListener(`${responseProxy}\nresponse.end('ok', proxy);`),
+      inListener(`${responseProxy}\nresponse.end(proxy);`),
+      inListener(`declare const body: string;\nresponse.end(body);`),
+      inListener(`response.end('x', 'utf8');`),
+      inListener(`response.end(() => {});`),
+      inListener(`response.end(request.url ?? '');`),
+      inListener(`let body = 'x';\nresponse.end(body);`),
+      inListener(`const String = (v: unknown) => v;\nresponse.end(String('x'));`),
+      inListener(`function echo(v: string) { return v; }\nresponse.end(echo('x'));`),
+      inListener(`async function page() { return 'x'; }\nresponse.end(page());`),
+      inListener(`function* page() { yield 'x'; }\nresponse.end(page());`),
+      inListener(`declare const parts: string[];\nresponse.end(parts.join(''));`),
+      inListener(`response.setHeader('a', 'b').end(1);`),
+      `${NS}\nfunction send(r: http.ServerResponse, body: string) { r.end(body); }\nhttp.createServer((request, response) => { send(response, 'x'); });`,
+    ]) {
+      const result = analyzeNetworkPolicy(source);
+      expect(result.reasons, `${source}\n${describeFindings(result)}`).toEqual(['RESPONSE_END_ARGUMENT']);
+      expect(result.findings, source).toHaveLength(1);
+    }
+    for (const source of [
+      inListener(`response.end();`),
+      inListener(`response.end('ok');`),
+      inListener('response.end(`<p>${request.url ?? \'\'}</p>`);'),
+      inListener(`response.end('<p>' + request.url + '</p>');`),
+      inListener(`const body = 'x';\nconst page = body;\nresponse.end(page);`),
+      inListener(`response.end(request.url === '/' ? 'root' : 'other');`),
+      inListener(`response.end(String(request.url));`),
+      inListener(`function page(title: string) { return \`<h1>\${title}</h1>\`; }\nresponse.end(page('x'));`),
+      inListener(`function page() { return '<html></html>'; }\nconst html = page();\nresponse.end(html);`),
+      inListener(`const page = () => 'x';\nresponse.end(page());`),
+      inListener(`response.setHeader('a', 'b').end('x');`),
+      REAL_HOST_REPLICA,
+    ]) {
+      const result = analyzeNetworkPolicy(source);
+      expect(result.reasons, `${source}\n${describeFindings(result)}`).toEqual([]);
+    }
+  });
+
+  it('is structural: one call-shape check after the member policy, three positive predicates', () => {
+    const detector = readFileSync(detectorPath, 'utf8');
+    expect(occurrences(detector, 'function checkAllowedCallShape(')).toBe(1);
+    expect(occurrences(detector, 'checkAllowedCallShape(ctx, parent, classes)')).toBe(1);
+    expect(occurrences(detector, 'function isProvenString(')).toBe(1);
+    expect(occurrences(detector, 'function hasOnlyLocalCallback(')).toBe(1);
+    expect(occurrences(detector, 'function hasOnlyProvenStringChunk(')).toBe(1);
+    expect(occurrences(detector, "deny(ctx, 'SERVER_CLOSE_CALLBACK'")).toBe(1);
+    expect(occurrences(detector, "deny(ctx, 'RESPONSE_END_ARGUMENT'")).toBe(1);
+    expect(occurrences(detector, 'Proxy')).toBe(1);
+  });
+});
+
+describe('D3 network policy host module graph (PR #67 Codex P1: exported factories across files)', () => {
+  const tree = (files: Record<string, string>): ReadonlyMap<string, NetworkPolicyResult> =>
+    analyzeNetworkPolicyTree(Object.entries(files).map(([file, text]) => ({ file, text })));
+  const reasonsOf = (results: ReadonlyMap<string, NetworkPolicyResult>, file: string): readonly string[] => {
+    const result = results.get(file);
+    if (result === undefined) throw new Error(`no result for ${file}`);
+    return result.reasons;
+  };
+  const REVIEW = `${NS}\nexport function makeReviewServer(): http.Server {\n  return http.createServer(${L});\n}`;
+
+  it('Codex witness: a consumer of an exported factory is held to the loopback binding', () => {
+    const wildcard = tree({
+      'review.ts': REVIEW,
+      'main.ts': `import { makeReviewServer } from './review.js';\nmakeReviewServer().listen(45678, '0.0.0.0');`,
+    });
+    expect(reasonsOf(wildcard, 'review.ts')).toEqual([]);
+    expect(reasonsOf(wildcard, 'main.ts')).toEqual(['SERVER_LISTEN_BINDING']);
+    const loopback = tree({
+      'review.ts': REVIEW,
+      'main.ts': `import { makeReviewServer } from './review.js';\nmakeReviewServer().listen(45678, '127.0.0.1');`,
+    });
+    expect(reasonsOf(loopback, 'review.ts')).toEqual([]);
+    expect(reasonsOf(loopback, 'main.ts')).toEqual([]);
+    const standalone = analyzeNetworkPolicy(`import { makeReviewServer } from './review.js';\nmakeReviewServer().listen(45678, '0.0.0.0');`);
+    expect(standalone.reasons, 'a lone file cannot know the import is a factory').toEqual([]);
+  });
+
+  it('propagates factories through default exports, aliases, re-export chains and the consumer\'s own factories', () => {
+    const viaDefault = tree({
+      'x.ts': `${NS}\nexport default function make() { return http.createServer(${L}); }`,
+      'main.ts': `import make from './x.js';\nmake().listen(1, '0.0.0.0');`,
+    });
+    expect(reasonsOf(viaDefault, 'main.ts')).toEqual(['SERVER_LISTEN_BINDING']);
+    const viaAlias = tree({
+      'x.ts': `${NS}\nfunction make() { return http.createServer(${L}); }\nexport { make as build };`,
+      'main.ts': `import { build as b } from './x.js';\nb().listen(1, '0.0.0.0');`,
+    });
+    expect(reasonsOf(viaAlias, 'main.ts')).toEqual(['SERVER_LISTEN_BINDING']);
+    const viaChain = tree({
+      'review.ts': REVIEW,
+      'mid.ts': `export { makeReviewServer } from './review.js';`,
+      'star.ts': `export * from './mid.js';`,
+      'main.ts': `import { makeReviewServer } from './star.js';\nmakeReviewServer().listen(1, '0.0.0.0');`,
+    });
+    expect(reasonsOf(viaChain, 'main.ts')).toEqual(['SERVER_LISTEN_BINDING']);
+    const viaWrapper = tree({
+      'review.ts': REVIEW,
+      'wrap.ts': `import { makeReviewServer } from './review.js';\nexport function boot() { return makeReviewServer(); }`,
+      'main.ts': `import { boot } from './wrap.js';\nboot().listen(1, '0.0.0.0');`,
+    });
+    expect(reasonsOf(viaWrapper, 'wrap.ts')).toEqual([]);
+    expect(reasonsOf(viaWrapper, 'main.ts')).toEqual(['SERVER_LISTEN_BINDING']);
+    const nested = tree({
+      'lib/review.ts': REVIEW,
+      'main.ts': `import { makeReviewServer } from './lib/review.js';\nmakeReviewServer().listen(1, '0.0.0.0');`,
+      'lib\\deep\\entry.ts': `import { makeReviewServer } from '../review.js';\nmakeReviewServer().listen(1, '0.0.0.0');`,
+    });
+    expect(reasonsOf(nested, 'main.ts')).toEqual(['SERVER_LISTEN_BINDING']);
+    expect(reasonsOf(nested, 'lib/deep/entry.ts')).toEqual(['CREATE_SERVER_MULTIPLE', 'SERVER_LISTEN_BINDING']);
+  });
+
+  it('applies the server-instantiation site bound across the tree', () => {
+    const twoFiles = tree({
+      'review.ts': `${REVIEW}\nmakeReviewServer().listen(4317, '127.0.0.1');`,
+      'main.ts': `import { makeReviewServer } from './review.js';\nmakeReviewServer().listen(4318, '127.0.0.1');`,
+    });
+    expect(reasonsOf(twoFiles, 'review.ts')).toEqual([]);
+    expect(reasonsOf(twoFiles, 'main.ts')).toEqual(['CREATE_SERVER_MULTIPLE']);
+    const directPlusImported = tree({
+      'review.ts': REVIEW,
+      'main.ts': `${NS}\nimport { makeReviewServer } from './review.js';\nhttp.createServer(${L}).listen(4317, '127.0.0.1');\nmakeReviewServer().close();`,
+    });
+    expect(reasonsOf(directPlusImported, 'main.ts')).toEqual(['CREATE_SERVER_MULTIPLE']);
+  });
+
+  it('denies every import form through which a factory could leave the graph unseen', () => {
+    for (const [consumer, reason] of [
+      [`import * as review from './review.js';\nreview.makeReviewServer().listen(1, '0.0.0.0');`, 'SERVER_FACTORY_ESCAPE'],
+      [`export * as review from './review.js';`, 'SERVER_FACTORY_ESCAPE'],
+      [`import review = require('./review.js');\nreview.makeReviewServer();`, 'SERVER_FACTORY_ESCAPE'],
+      [`void import('./review.js');`, 'SERVER_FACTORY_ESCAPE'],
+      [`import { makeReviewServer } from './review.js';\nuse(makeReviewServer);`, 'SERVER_FACTORY_ESCAPE'],
+      [`import { makeReviewServer } from './review.js';\nconst fns = [makeReviewServer];`, 'SERVER_FACTORY_ESCAPE'],
+      [`import { makeReviewServer } from './review.js';\nmakeReviewServer.call(null);`, 'SERVER_FACTORY_ESCAPE'],
+      [`import { makeReviewServer } from './review.js';\nmakeReviewServer?.();`, 'SERVER_FACTORY_ESCAPE'],
+    ] as const) {
+      const results = tree({ 'review.ts': REVIEW, 'main.ts': consumer });
+      expect(reasonsOf(results, 'main.ts'), consumer).toContain(reason);
+    }
+    for (const consumer of [
+      `import { makeReviewServer } from './review.js';\nmakeReviewServer().close();`,
+      `import { makeReviewServer } from './review.js';\nconst t = typeof makeReviewServer;\nt;`,
+      `import { makeReviewServer } from './review.js';\nexport { makeReviewServer };`,
+      `import type { makeReviewServer } from './review.js';\nlet x: typeof makeReviewServer | null = null;\nx;`,
+      `import * as other from './other.js';\nother.x;`,
+    ]) {
+      const results = tree({ 'review.ts': REVIEW, 'other.ts': `export const x = 1;`, 'main.ts': consumer });
+      expect(reasonsOf(results, 'main.ts'), consumer).toEqual([]);
+    }
+  });
+
+  it('carries proven strings and string functions across files for response.end', () => {
+    const files = {
+      'styles.ts': 'export const STYLES = `body {}`;',
+      'render.ts': 'export function renderDashboard(title: string): string {\n  return `<h1>${title}</h1>`;\n}',
+      'server.ts': `${NS}\nimport { renderDashboard } from './render.js';\nimport { STYLES } from './styles.js';\nexport function buildDashboardHtml(): string { return renderDashboard('x'); }\nexport function createCockpitServer(): http.Server {\n  const page = buildDashboardHtml();\n  return http.createServer((request, response) => {\n    if (request.url === '/styles.css') { response.end(STYLES); return; }\n    response.end(page);\n  });\n}\ncreateCockpitServer().listen(4317, '127.0.0.1');`,
+    };
+    const results = tree(files);
+    for (const file of Object.keys(files)) expect(reasonsOf(results, file), file).toEqual([]);
+    const standalone = analyzeNetworkPolicy(files['server.ts']);
+    expect(standalone.reasons).toEqual(['RESPONSE_END_ARGUMENT']);
+    expect(standalone.findings).toHaveLength(2);
+    const unproven = tree({
+      ...files,
+      'render.ts': `export function renderDashboard(parts: string[]): string {\n  return parts.join('');\n}`,
+    });
+    expect(reasonsOf(unproven, 'server.ts')).toEqual(['RESPONSE_END_ARGUMENT']);
+    const exported = inspectNetworkPolicy(files['server.ts']);
+    expect([...exported.hostExports.factories]).toEqual(['createCockpitServer']);
+    expect([...exported.hostExports.stringFunctions]).toEqual([]);
+  });
+
+  it('is bounded: exports converge within one round per file, and an unresolvable specifier stays outside the boundary', () => {
+    const cycle = tree({
+      'a.ts': `export { make } from './b.js';`,
+      'b.ts': `export { make } from './a.js';`,
+      'main.ts': `import { make } from './a.js';\nmake();`,
+    });
+    expect(reasonsOf(cycle, 'main.ts')).toEqual([]);
+    const outside = tree({
+      'review.ts': REVIEW,
+      'main.ts': `import { makeReviewServer } from '/abs/review.js';\nimport { other } from './missing.js';\nmakeReviewServer().listen(1, '0.0.0.0');\nother();`,
+    });
+    expect(reasonsOf(outside, 'main.ts')).toEqual([]);
+    const detector = readFileSync(detectorPath, 'utf8');
+    expect(occurrences(detector, 'function analyzeNetworkPolicyTree(')).toBe(1);
+    expect(occurrences(detector, 'function collectHostImports(')).toBe(1);
+    expect(occurrences(detector, 'function hostExportsOf(')).toBe(1);
+    expect(occurrences(detector, "from 'node:path'")).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Real host
 // ---------------------------------------------------------------------------
 
 describe('D3 network policy accepts the real Stage-A host', () => {
-  it('allows every real host source file', () => {
-    const files = readdirSync(hostDir, { recursive: true })
+  const realHostSources = (): { file: string; text: string }[] =>
+    readdirSync(hostDir, { recursive: true })
       .map((entry) => String(entry))
-      .filter((name) => name.endsWith('.ts'));
-    expect(files).toContain('server.ts');
-    for (const file of files) {
-      const result = analyzeNetworkPolicy(readFileSync(join(hostDir, file), 'utf8'));
+      .filter((name) => name.endsWith('.ts'))
+      .map((file) => ({ file, text: readFileSync(join(hostDir, file), 'utf8') }));
+
+  it('allows every real host source file through the host module graph', () => {
+    const sources = realHostSources();
+    expect(sources.map((source) => source.file)).toContain('server.ts');
+    const results = analyzeNetworkPolicyTree(sources);
+    expect(results.size).toBe(sources.length);
+    for (const [file, result] of results) {
       expect(result.fixpoint.state, file).toBe('CONVERGED');
-      expect(result.verdict, `${file}: ${describeFindings(result)}`).toBe('ALLOW');
+      expect(result.reasons, `${file}: ${describeFindings(result)}`).toEqual([]);
+      expect(result.verdict, file).toBe('ALLOW');
     }
+  });
+
+  it('fails closed on the real server.ts alone: its response bodies are proven only through sibling exports', () => {
+    const standalone = analyzeNetworkPolicy(readFileSync(join(hostDir, 'server.ts'), 'utf8'));
+    expect(standalone.reasons, describeFindings(standalone)).toEqual(['RESPONSE_END_ARGUMENT']);
+    const inspection = inspectNetworkPolicy(readFileSync(join(hostDir, 'render.ts'), 'utf8'));
+    expect([...inspection.hostExports.stringFunctions]).toContain('renderDashboard');
+    const styles = inspectNetworkPolicy(readFileSync(join(hostDir, 'styles.ts'), 'utf8'));
+    expect([...styles.hostExports.strings]).toEqual(['STYLES']);
+    const server = inspectNetworkPolicy(readFileSync(join(hostDir, 'server.ts'), 'utf8'));
+    expect([...server.hostExports.factories]).toEqual(['createCockpitServer']);
+    expect(server.instantiationSites).toBe(1);
   });
 
   it('proves the real server.ts through the intended mechanisms', () => {

@@ -19,6 +19,9 @@
  *   - unique `const` bindings and unique bodied local `FunctionDeclaration`s
  *   - finite local propagation through a bounded monotone fixpoint
  *   - finite static-key folding
+ *   - the host module graph, only through `analyzeNetworkPolicyTree`: proven
+ *     exports of sibling host files (server factories, string constants and
+ *     string-returning functions) seeded into their importers
  *
  * One concept, one implementation: `valueSymbolOf` is the only symbol
  * resolution path; `resolveStaticKey` is the only key resolver;
@@ -71,6 +74,9 @@ export type ReasonCode =
   | 'CREATE_SERVER_ARITY'
   | 'CREATE_SERVER_MULTIPLE'
   | 'SERVER_LISTEN_BINDING'
+  | 'SERVER_CLOSE_CALLBACK'
+  | 'RESPONSE_END_ARGUMENT'
+  | 'SERVER_FACTORY_ESCAPE'
   | 'LISTENER_NOT_FUNCTION'
   | 'LISTENER_PARAMETER_PATTERN'
   | 'LISTENER_THIS_PARAMETER';
@@ -95,9 +101,23 @@ export interface NetworkPolicyResult {
   readonly fixpoint: FixpointReport;
 }
 
+/** Proven exports of one sibling host file, as seen by an importer (host module graph, tree entry). */
+export interface HostModuleExports {
+  /** Export names that are confined server factories in the exporting file. */
+  readonly factories: ReadonlySet<string>;
+  /** Export names whose value is a proven string. */
+  readonly strings: ReadonlySet<string>;
+  /** Export names that are local functions returning only proven strings. */
+  readonly stringFunctions: ReadonlySet<string>;
+}
+
 export interface NetworkPolicyOptions {
   /** Absolute safety ceiling on fixpoint iterations (test hook; default `DEFAULT_FIXPOINT_CEILING`). */
   readonly fixpointCeiling?: number;
+  /** Proven exports of sibling host files, keyed by the exact module specifier text used in this file (set by `analyzeNetworkPolicyTree`). */
+  readonly hostImports?: ReadonlyMap<string, HostModuleExports>;
+  /** Server-instantiation sites already counted in earlier files of the same host tree (set by `analyzeNetworkPolicyTree`). */
+  readonly priorInstantiationSites?: number;
 }
 
 export type StaticKey =
@@ -115,13 +135,15 @@ export const NETWORK_GLOBAL_NAMES: ReadonlySet<string> = new Set(['fetch', 'WebS
 export const GLOBAL_RECEIVER_NAMES: ReadonlySet<string> = new Set(['globalThis', 'window', 'self', 'global']);
 const CREATE_SERVER = 'createServer';
 const SERVER_LISTEN = 'listen';
-export const SERVER_METHODS: ReadonlySet<string> = new Set([SERVER_LISTEN, 'close']);
+const SERVER_CLOSE = 'close';
+export const SERVER_METHODS: ReadonlySet<string> = new Set([SERVER_LISTEN, SERVER_CLOSE]);
 /** The only host a proven SERVER target may listen on (positive policy; compared through the static-key resolver). */
 export const LOOPBACK_HOST = '127.0.0.1';
 /** Largest decimal port a proven SERVER target may listen on. */
 export const PORT_MAX = 65535;
 export const REQUEST_READS: ReadonlySet<string> = new Set(['method', 'url']);
-export const RESPONSE_METHODS: ReadonlySet<string> = new Set(['setHeader', 'end']);
+const RESPONSE_END = 'end';
+export const RESPONSE_METHODS: ReadonlySet<string> = new Set(['setHeader', RESPONSE_END]);
 const RESPONSE_STATUS = 'statusCode';
 
 /** Every key the policy ever compares a static string against. */
@@ -185,6 +207,17 @@ interface Context {
   /** Number of `expressionFacts` evaluations (complexity witness for the inspection API). */
   expressionFactsEvaluations: number;
   readonly fixpointCeiling: number;
+  /** Proven exports of sibling host files by specifier text (tree entry; empty for a standalone file). */
+  readonly hostImports: ReadonlyMap<string, HostModuleExports>;
+  /** Server-instantiation sites counted in earlier files of the same tree. */
+  readonly priorInstantiationSites: number;
+  /** Import bindings seeded as confined server factories from sibling host files. */
+  readonly externalFactories: Set<ts.Symbol>;
+  /** Import bindings seeded as proven strings / string-returning functions from sibling host files. */
+  readonly externalStrings: Set<ts.Symbol>;
+  readonly externalStringFunctions: Set<ts.Symbol>;
+  /** Server-instantiation sites found in this file (recorded by `checkInstantiationSites`). */
+  instantiationSites: number;
 }
 
 const FILE_NAME = 'host.ts';
@@ -700,6 +733,66 @@ function collectHttpImports(ctx: Context): void {
   }
 }
 
+/**
+ * Host module graph (tree entry only): seed bindings imported from sibling host
+ * files with the authority proven there — a confined server factory stays a
+ * confined factory in its importer, a proven string stays a proven string —
+ * and deny every import form through which a factory could leave the graph
+ * unseen (namespace import/re-export, `require`, dynamic import).
+ */
+function collectHostImports(ctx: Context): void {
+  if (ctx.hostImports.size === 0) return;
+  const exportsOf = (specifier: ts.Expression | undefined): HostModuleExports | undefined =>
+    specifier !== undefined && ts.isStringLiteralLike(specifier) ? ctx.hostImports.get(specifier.text) : undefined;
+  for (const statement of ctx.sourceFile.statements) {
+    if (ts.isImportDeclaration(statement)) {
+      const source = exportsOf(statement.moduleSpecifier);
+      const clause = statement.importClause;
+      if (source === undefined || clause === undefined || isTypeOnlyImportClause(clause)) continue;
+      const seed = (name: ts.Identifier, imported: string): void => {
+        const symbol = valueSymbolOf(ctx.checker, name);
+        if (symbol === undefined) return;
+        if (source.factories.has(imported)) {
+          ctx.confinedFactories.add(symbol);
+          ctx.externalFactories.add(symbol);
+        }
+        if (source.strings.has(imported)) ctx.externalStrings.add(symbol);
+        if (source.stringFunctions.has(imported)) ctx.externalStringFunctions.add(symbol);
+      };
+      if (clause.name !== undefined) seed(clause.name, 'default');
+      const bindings = clause.namedBindings;
+      if (bindings === undefined) continue;
+      if (ts.isNamespaceImport(bindings)) {
+        if (source.factories.size > 0) deny(ctx, 'SERVER_FACTORY_ESCAPE', bindings);
+        continue;
+      }
+      for (const element of bindings.elements) {
+        if (!element.isTypeOnly) seed(element.name, (element.propertyName ?? element.name).text);
+      }
+    }
+    if (ts.isExportDeclaration(statement) && !statement.isTypeOnly) {
+      const source = exportsOf(statement.moduleSpecifier);
+      const clause = statement.exportClause;
+      if (source !== undefined && source.factories.size > 0 && clause !== undefined && ts.isNamespaceExport(clause)) {
+        deny(ctx, 'SERVER_FACTORY_ESCAPE', clause);
+      }
+    }
+    if (ts.isImportEqualsDeclaration(statement) && !statement.isTypeOnly && ts.isExternalModuleReference(statement.moduleReference)) {
+      const source = exportsOf(statement.moduleReference.expression);
+      if (source !== undefined && source.factories.size > 0) deny(ctx, 'SERVER_FACTORY_ESCAPE', statement);
+    }
+  }
+  for (const call of ctx.calls) {
+    if (call.expression.kind !== ts.SyntaxKind.ImportKeyword) continue;
+    const [specifier] = call.arguments;
+    if (specifier === undefined) continue;
+    const literal = unwrap(specifier);
+    const key = resolveStaticKey(ctx, specifier);
+    const text = ts.isStringLiteralLike(literal) ? literal.text : key.kind === 'RESOLVED' ? key.value : undefined;
+    if (text !== undefined && (ctx.hostImports.get(text)?.factories.size ?? 0) > 0) deny(ctx, 'SERVER_FACTORY_ESCAPE', call);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // createServer recognition and listener normalization
 // ---------------------------------------------------------------------------
@@ -1049,6 +1142,101 @@ function isLoopbackListen(ctx: Context, call: ts.CallExpression): boolean {
   return callback === undefined || normalizeListener(ctx, callback) !== null;
 }
 
+/**
+ * Proven string (positive policy): an expression that can only evaluate to a
+ * primitive string — a string or template literal (any spans), `+` with a
+ * proven-string side, a conditional of proven strings, `String(...)` through
+ * the unshadowed global, a unique const initialized by one, a call of a local
+ * non-async eligible callee whose every own return is one, or a binding seeded
+ * from a sibling host file's proven exports. Nothing else is proven, so no
+ * callable value (a Proxy, a function) can reach a Node callback position.
+ */
+function isProvenString(ctx: Context, expression: ts.Expression, visiting: Set<ts.Symbol>): boolean {
+  const node = unwrap(expression);
+  if (ts.isStringLiteralLike(node) || ts.isTemplateExpression(node)) return true;
+  if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+    return isProvenString(ctx, node.left, visiting) || isProvenString(ctx, node.right, visiting);
+  }
+  if (ts.isConditionalExpression(node)) {
+    return isProvenString(ctx, node.whenTrue, visiting) && isProvenString(ctx, node.whenFalse, visiting);
+  }
+  if (ts.isIdentifier(node)) {
+    const symbol = valueSymbolOf(ctx.checker, node);
+    if (symbol === undefined || visiting.has(symbol)) return false;
+    if (ctx.externalStrings.has(symbol)) return true;
+    const declaration = uniqueConstDeclaration(ctx, symbol);
+    if (declaration?.initializer === undefined) return false;
+    visiting.add(symbol);
+    const proven = isProvenString(ctx, declaration.initializer, visiting);
+    visiting.delete(symbol);
+    return proven;
+  }
+  if (ts.isCallExpression(node) && node.questionDotToken === undefined && !node.arguments.some((argument) => ts.isSpreadElement(argument))) {
+    const callee = unwrap(node.expression);
+    if (!ts.isIdentifier(callee)) return false;
+    const symbol = valueSymbolOf(ctx.checker, callee);
+    if (symbol === undefined) return callee.text === 'String' && node.arguments.length === 1;
+    return isStringFunction(ctx, symbol, visiting);
+  }
+  return false;
+}
+
+/** A local non-async, non-generator eligible callee whose every own return is a proven string, or a seeded string function. */
+function isStringFunction(ctx: Context, symbol: ts.Symbol, visiting: Set<ts.Symbol>): boolean {
+  if (ctx.externalStringFunctions.has(symbol)) return true;
+  if (visiting.has(symbol)) return false;
+  const fn = eligibleCallee(ctx, symbol);
+  if (fn === null || fn.asteriskToken !== undefined) return false;
+  if ((ts.getCombinedModifierFlags(fn) & ts.ModifierFlags.Async) !== 0) return false;
+  const returns = ownReturnExpressions(fn);
+  if (returns.length === 0) return false;
+  visiting.add(symbol);
+  const proven = returns.every((returned) => returned !== null && isProvenString(ctx, returned, visiting));
+  visiting.delete(symbol);
+  return proven;
+}
+
+/** A binding whose value is a proven string: seeded, or a unique const with a proven-string initializer. */
+function isStringValue(ctx: Context, symbol: ts.Symbol): boolean {
+  if (ctx.externalStrings.has(symbol)) return true;
+  const declaration = uniqueConstDeclaration(ctx, symbol);
+  return declaration?.initializer !== undefined && isProvenString(ctx, declaration.initializer, new Set([symbol]));
+}
+
+/** `close()` or `close(<local function>)`: Node calls the callback with the server as `this`, which only a local function literal (whose `this` is already denied) may receive. */
+function hasOnlyLocalCallback(ctx: Context, call: ts.CallExpression): boolean {
+  const [callback] = call.arguments;
+  if (callback === undefined) return call.arguments.length === 0;
+  return call.arguments.length === 1 && normalizeListener(ctx, callback) !== null;
+}
+
+/** `end()` or `end(<proven string>)`: any callable chunk or explicit callback would run with the response as `this`. */
+function hasOnlyProvenStringChunk(ctx: Context, call: ts.CallExpression): boolean {
+  const [chunk] = call.arguments;
+  if (chunk === undefined) return call.arguments.length === 0;
+  return call.arguments.length === 1 && !ts.isSpreadElement(chunk) && isProvenString(ctx, chunk, new Set());
+}
+
+/**
+ * The further positive checks on an allow-listed direct call of a proven
+ * target: `listen` must be loopback-bound, `close` may carry only a local
+ * function callback, `end` may carry only a proven string. Each of these calls
+ * hands its receiver to a callback as an implicit `this`, so nothing but a
+ * local function literal or a proven primitive may reach them.
+ */
+function checkAllowedCallShape(ctx: Context, access: MemberAccess, classes: ReadonlySet<AuthorityClass>): void {
+  const call = directCallOf(access);
+  if (call === null) return;
+  const key = memberKey(ctx, access);
+  if (classes.has('SERVER')) {
+    if (isResolvedTo(key, SERVER_LISTEN) && !isLoopbackListen(ctx, call)) deny(ctx, 'SERVER_LISTEN_BINDING', call);
+    if (isResolvedTo(key, SERVER_CLOSE) && !hasOnlyLocalCallback(ctx, call)) deny(ctx, 'SERVER_CLOSE_CALLBACK', call);
+  }
+  if (classes.has('RESPONSE') && isResolvedTo(key, RESPONSE_END) && !hasOnlyProvenStringChunk(ctx, call)) {
+    deny(ctx, 'RESPONSE_END_ARGUMENT', call);
+  }
+}
+
 /** The binding symbol of the function whose own body contains `node`, if that function is a local binding. */
 function enclosingFunctionSymbol(ctx: Context, node: ts.Node): ts.Symbol | undefined {
   let current: ts.Node = node;
@@ -1098,11 +1286,7 @@ function checkTargetUse(ctx: Context, expression: ts.Expression, classes: Readon
   }
   if (isMemberAccess(parent) && parent.expression === node) {
     if (![...classes].every((authority) => memberAllowed(ctx, authority, parent))) violate('MEMBER');
-    else if (classes.has('SERVER') && isResolvedTo(memberKey(ctx, parent), SERVER_LISTEN)) {
-      // `listen` is allow-listed by `memberAllowed`; its binding is the one further positive check.
-      const call = directCallOf(parent);
-      if (call !== null && !isLoopbackListen(ctx, call)) deny(ctx, 'SERVER_LISTEN_BINDING', call);
-    }
+    else checkAllowedCallShape(ctx, parent, classes);
     return;
   }
   if (ts.isExportSpecifier(parent) || ts.isExportAssignment(parent)) {
@@ -1289,13 +1473,17 @@ function checkInstantiationSites(ctx: Context): void {
     if (isProvenCreateServerCall(ctx, call)) return true;
     if (!isConfinedFactoryCall(ctx, call)) return false;
     const factory = valueSymbolOf(ctx.checker, callee);
-    return factory !== undefined && factoryInstantiates(factory);
+    if (factory === undefined) return false;
+    // A factory seeded from a sibling host file instantiated a server there.
+    return ctx.externalFactories.has(factory) || factoryInstantiates(factory);
   };
   const sites = ctx.calls.filter((call) => {
     const owner = enclosingFunctionSymbol(ctx, call);
     return (owner === undefined || !ctx.confinedFactories.has(owner)) && instantiates(call);
   });
-  for (const site of sites.slice(1)) deny(ctx, 'CREATE_SERVER_MULTIPLE', site);
+  ctx.instantiationSites = sites.length;
+  // The tree entry counts sites across files: only the first site of the whole host tree is free.
+  for (const site of sites.slice(Math.max(0, 1 - ctx.priorInstantiationSites))) deny(ctx, 'CREATE_SERVER_MULTIPLE', site);
 }
 
 function classify(ctx: Context): void {
@@ -1318,6 +1506,12 @@ function classify(ctx: Context): void {
     // Confined factory results and receiver-call results carry authority into their use site.
     const classes = classesOf(ctx, call);
     if (classes.size > 0) checkTargetUse(ctx, call, classes);
+  }
+  // A factory seeded from a sibling host file is confined here exactly like a local one: direct call, typeof, or re-export only.
+  for (const factory of ctx.externalFactories) {
+    for (const id of ctx.valueReads.get(factory) ?? []) {
+      if (!isConfinedReference(id)) deny(ctx, 'SERVER_FACTORY_ESCAPE', id);
+    }
   }
   checkInstantiationSites(ctx);
 }
@@ -1348,6 +1542,12 @@ function createContext(source: string, options: NetworkPolicyOptions): Context {
     keyWork: 0,
     expressionFactsEvaluations: 0,
     fixpointCeiling: options.fixpointCeiling ?? DEFAULT_FIXPOINT_CEILING,
+    hostImports: options.hostImports ?? new Map(),
+    priorInstantiationSites: options.priorInstantiationSites ?? 0,
+    externalFactories: new Set(),
+    externalStrings: new Set(),
+    externalStringFunctions: new Set(),
+    instantiationSites: 0,
   };
 }
 
@@ -1370,6 +1570,10 @@ export interface NetworkPolicyInspection {
   readonly fixpointBound: number;
   /** Total `expressionFacts` evaluations performed by the analysis (deterministic complexity witness). */
   readonly expressionFactsEvaluations: number;
+  /** Server-instantiation sites found in this file. */
+  readonly instantiationSites: number;
+  /** What this file proves about its own exports, as a sibling host file would see them. */
+  readonly hostExports: HostModuleExports;
 }
 
 function analyze(source: string, options: NetworkPolicyOptions): { ctx: Context; result: NetworkPolicyResult } {
@@ -1377,6 +1581,7 @@ function analyze(source: string, options: NetworkPolicyOptions): { ctx: Context;
   collect(ctx, ctx.sourceFile);
   buildWriteInventory(ctx);
   collectHttpImports(ctx);
+  collectHostImports(ctx);
   const fixpoint = runFixpoint(ctx);
   if (fixpoint.state === 'EXHAUSTED') {
     deny(ctx, 'FIXPOINT_EXHAUSTED', ctx.sourceFile);
@@ -1405,5 +1610,175 @@ export function inspectNetworkPolicy(source: string, options: NetworkPolicyOptio
     declaredSymbolCount: ctx.declaredSymbols.size,
     fixpointBound: fixpointBound(ctx),
     expressionFactsEvaluations: ctx.expressionFactsEvaluations,
+    instantiationSites: ctx.instantiationSites,
+    hostExports: hostExportsOf(ctx),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Host module graph (tree entry)
+// ---------------------------------------------------------------------------
+
+const hasExportModifier = (node: ts.Node): boolean =>
+  ts.canHaveModifiers(node) && (ts.getModifiers(node) ?? []).some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword);
+
+const hasDefaultModifier = (node: ts.Node): boolean =>
+  ts.canHaveModifiers(node) && (ts.getModifiers(node) ?? []).some((modifier) => modifier.kind === ts.SyntaxKind.DefaultKeyword);
+
+/** What a file proves about its own exports: confined factories, proven strings and string functions, including re-exports of proven sibling exports. */
+function hostExportsOf(ctx: Context): HostModuleExports {
+  const factories = new Set<string>();
+  const strings = new Set<string>();
+  const stringFunctions = new Set<string>();
+  const classifyBinding = (symbol: ts.Symbol | undefined, exportName: string): void => {
+    if (symbol === undefined) return;
+    if (ctx.confinedFactories.has(symbol)) factories.add(exportName);
+    if (isStringFunction(ctx, symbol, new Set())) stringFunctions.add(exportName);
+    else if (isStringValue(ctx, symbol)) strings.add(exportName);
+  };
+  const copyFrom = (source: HostModuleExports, imported: string, exportName: string): void => {
+    if (source.factories.has(imported)) factories.add(exportName);
+    if (source.strings.has(imported)) strings.add(exportName);
+    if (source.stringFunctions.has(imported)) stringFunctions.add(exportName);
+  };
+  for (const statement of ctx.sourceFile.statements) {
+    if (isAmbient(statement)) continue;
+    if (ts.isFunctionDeclaration(statement) && statement.name !== undefined && hasExportModifier(statement)) {
+      classifyBinding(valueSymbolOf(ctx.checker, statement.name), hasDefaultModifier(statement) ? 'default' : statement.name.text);
+    }
+    if (ts.isVariableStatement(statement) && hasExportModifier(statement)) {
+      for (const declaration of statement.declarationList.declarations) {
+        if (ts.isIdentifier(declaration.name)) classifyBinding(valueSymbolOf(ctx.checker, declaration.name), declaration.name.text);
+      }
+    }
+    if (ts.isExportAssignment(statement) && !statement.isExportEquals) {
+      const exported = unwrap(statement.expression);
+      if (ts.isIdentifier(exported)) classifyBinding(valueSymbolOf(ctx.checker, exported), 'default');
+    }
+    if (ts.isExportDeclaration(statement) && !statement.isTypeOnly) {
+      const clause = statement.exportClause;
+      const specifier = statement.moduleSpecifier;
+      if (specifier !== undefined) {
+        const source = ts.isStringLiteralLike(specifier) ? ctx.hostImports.get(specifier.text) : undefined;
+        if (source === undefined) continue;
+        if (clause === undefined) {
+          for (const name of source.factories) factories.add(name);
+          for (const name of source.strings) strings.add(name);
+          for (const name of source.stringFunctions) stringFunctions.add(name);
+        } else if (ts.isNamedExports(clause)) {
+          for (const element of clause.elements) {
+            if (!element.isTypeOnly) copyFrom(source, (element.propertyName ?? element.name).text, element.name.text);
+          }
+        }
+      } else if (clause !== undefined && ts.isNamedExports(clause)) {
+        for (const element of clause.elements) {
+          if (!element.isTypeOnly) classifyBinding(valueSymbolOf(ctx.checker, element), element.name.text);
+        }
+      }
+    }
+  }
+  return { factories, strings, stringFunctions };
+}
+
+/** One host source file for the tree entry; `file` is its path relative to the host root (either separator). */
+export interface HostSource {
+  readonly file: string;
+  readonly text: string;
+}
+
+const EMPTY_EXPORTS: HostModuleExports = { factories: new Set(), strings: new Set(), stringFunctions: new Set() };
+
+const sameNames = (left: ReadonlySet<string>, right: ReadonlySet<string>): boolean =>
+  left.size === right.size && [...left].every((name) => right.has(name));
+
+const sameExports = (left: HostModuleExports | undefined, right: HostModuleExports): boolean =>
+  left !== undefined &&
+  sameNames(left.factories, right.factories) &&
+  sameNames(left.strings, right.strings) &&
+  sameNames(left.stringFunctions, right.stringFunctions);
+
+const isRelativeSpecifier = (specifier: string): boolean => specifier.startsWith('./') || specifier.startsWith('../');
+
+/** Every relative string-literal module specifier a file uses, in import, export, `require` and dynamic-import positions. */
+function relativeSpecifiersOf(sourceFile: ts.SourceFile): readonly string[] {
+  const specifiers = new Set<string>();
+  const consider = (expression: ts.Expression | undefined): void => {
+    if (expression === undefined) return;
+    const literal = unwrap(expression);
+    if (ts.isStringLiteralLike(literal) && isRelativeSpecifier(literal.text)) specifiers.add(literal.text);
+  };
+  const visit = (node: ts.Node): void => {
+    if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) consider(node.moduleSpecifier);
+    if (ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference)) consider(node.moduleReference.expression);
+    if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) consider(node.arguments[0]);
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return [...specifiers];
+}
+
+/** Resolve a relative specifier against its importing file, posix-style, to a file of the tree (`.js` → `.ts` and friends), or undefined. */
+function resolveHostSpecifier(fromFile: string, specifier: string, files: ReadonlySet<string>): string | undefined {
+  const segments = fromFile.split('/').slice(0, -1);
+  for (const part of specifier.split('/')) {
+    if (part === '' || part === '.') continue;
+    if (part === '..') segments.pop();
+    else segments.push(part);
+  }
+  const target = segments.join('/');
+  const candidates = [
+    target,
+    target.replace(/\.js$/, '.ts'),
+    target.replace(/\.mjs$/, '.mts'),
+    target.replace(/\.cjs$/, '.cts'),
+    `${target}.ts`,
+    `${target}/index.ts`,
+  ];
+  return candidates.find((candidate) => files.has(candidate));
+}
+
+/**
+ * Analyze a whole host tree: each file under the frozen single-file policy,
+ * with the proven exports of the sibling files it imports seeded in (server
+ * factories, proven strings, string functions), and the server-instantiation
+ * site bound applied across the tree. Exports are computed to a fixpoint over
+ * the import graph (bounded by the number of files) before the final pass.
+ */
+export function analyzeNetworkPolicyTree(
+  sources: readonly HostSource[],
+  options: NetworkPolicyOptions = {},
+): ReadonlyMap<string, NetworkPolicyResult> {
+  const files = sources.map((source) => ({ file: source.file.replace(/\\/g, '/'), text: source.text }));
+  const names = new Set(files.map((entry) => entry.file));
+  const specifiers = new Map(
+    files.map((entry) => [
+      entry.file,
+      relativeSpecifiersOf(ts.createSourceFile(entry.file, entry.text, ts.ScriptTarget.ESNext, true, ts.ScriptKind.TS)),
+    ]),
+  );
+  let exports = new Map<string, HostModuleExports>();
+  const importsFor = (file: string): ReadonlyMap<string, HostModuleExports> => {
+    const imports = new Map<string, HostModuleExports>();
+    for (const specifier of specifiers.get(file) ?? []) {
+      const target = resolveHostSpecifier(file, specifier, names);
+      if (target !== undefined) imports.set(specifier, exports.get(target) ?? EMPTY_EXPORTS);
+    }
+    return imports;
+  };
+  for (let round = 0; round <= files.length; round += 1) {
+    const next = new Map(
+      files.map((entry) => [entry.file, hostExportsOf(analyze(entry.text, { ...options, hostImports: importsFor(entry.file) }).ctx)]),
+    );
+    const changed = files.some((entry) => !sameExports(exports.get(entry.file), next.get(entry.file) ?? EMPTY_EXPORTS));
+    exports = next;
+    if (!changed) break;
+  }
+  const results = new Map<string, NetworkPolicyResult>();
+  let priorInstantiationSites = 0;
+  for (const entry of files) {
+    const { ctx, result } = analyze(entry.text, { ...options, hostImports: importsFor(entry.file), priorInstantiationSites });
+    priorInstantiationSites += ctx.instantiationSites;
+    results.set(entry.file, result);
+  }
+  return results;
 }
