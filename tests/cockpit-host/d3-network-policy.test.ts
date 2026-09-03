@@ -1070,6 +1070,49 @@ describe('D3 network policy closes the open Codex findings on PR #67', () => {
     expect(twice.reasons, describeFindings(twice)).toEqual(['CREATE_SERVER_MULTIPLE', 'SERVER_LISTEN_BINDING']);
   });
 
+  it('P1: writes to permitted global members are denied, reads of them stay allowed', () => {
+    for (const source of [
+      `(globalThis.String as any) = (value: unknown) => value;`,
+      `globalThis.String = String;`,
+      `(globalThis as any).String = 1;`,
+      `window.String = String;`,
+      `globalThis.globalThis.String = String;`,
+      `delete (globalThis as any).String;`,
+      `(globalThis as any).String += 1;`,
+      `(globalThis as any).String++;`,
+      `[(globalThis as any).String] = [1];`,
+      `({ x: (globalThis as any).String } = { x: 1 });`,
+      `for ((globalThis as any).String of [1]) {}`,
+    ]) {
+      const result = analyzeNetworkPolicy(source);
+      expect(result.reasons, `${source}
+${describeFindings(result)}`).toEqual(['GLOBAL_RECEIVER_WRITE']);
+      expect(result.findings, source).toHaveLength(1);
+      expect(result.fixpoint.state, source).toBe('CONVERGED');
+    }
+    // Codex witness: a replaced `String` would let `isProvenString` trust a callable Proxy handed to response.end.
+    const witness = analyzeNetworkPolicy(
+      `${NS}
+(globalThis.String as any) = () => new Proxy(() => {}, { apply(_target: unknown, res: http.ServerResponse) { res.req.socket.write('x'); } });
+http.createServer((request, response) => { response.end(String(1)); });`,
+    );
+    expect(witness.reasons, describeFindings(witness)).toEqual(['GLOBAL_RECEIVER_WRITE']);
+    for (const source of [
+      `globalThis.String(1);`,
+      `String(1);`,
+      `globalThis.String.length;`,
+      `typeof globalThis.String;`,
+      `const n = globalThis.String.length;
+n;`,
+    ]) {
+      const result = analyzeNetworkPolicy(source);
+      expect(result.reasons, `${source}
+${describeFindings(result)}`).toEqual([]);
+    }
+    const detector = readFileSync(detectorPath, 'utf8');
+    expect(occurrences(detector, "deny(ctx, 'GLOBAL_RECEIVER_WRITE'")).toBe(1);
+  });
+
   it('is structural: one runtime-shadow predicate, threaded through the single symbol-resolution path', () => {
     const detector = readFileSync(detectorPath, 'utf8');
     expect(occurrences(detector, 'function isRuntimeShadowed(')).toBe(1);
@@ -1241,6 +1284,49 @@ describe('D3 network policy host module graph (PR #67 Codex P1: exported factori
       'main.ts': `${NS}\nimport { makeReviewServer } from './review.js';\nhttp.createServer(${L}).listen(4317, '127.0.0.1');\nmakeReviewServer().close();`,
     });
     expect(reasonsOf(directPlusImported, 'main.ts')).toEqual(['CREATE_SERVER_MULTIPLE']);
+  });
+
+  it('preserves whether an imported factory instantiates a server: alias-returning getters add no site (Codex P2)', () => {
+    const GETTER = `${NS}
+const server = http.createServer(${L});
+export function get(): http.Server {
+  return server;
+}`;
+    const getter = tree({
+      'x.ts': GETTER,
+      'main.ts': `import { get } from './x.js';
+get().listen(4317, '127.0.0.1');
+get().close();`,
+    });
+    expect(reasonsOf(getter, 'x.ts')).toEqual([]);
+    expect(reasonsOf(getter, 'main.ts')).toEqual([]);
+    const viaChain = tree({
+      'x.ts': GETTER,
+      'mid.ts': `export { get } from './x.js';`,
+      'star.ts': `export * from './mid.js';`,
+      'wrap.ts': `import { get } from './star.js';
+export function boot() { return get(); }`,
+      'main.ts': `import { boot } from './wrap.js';
+boot().listen(4317, '127.0.0.1');`,
+    });
+    for (const file of ['x.ts', 'mid.ts', 'star.ts', 'wrap.ts', 'main.ts']) expect(reasonsOf(viaChain, file), file).toEqual([]);
+    // The getter is still a confined factory: its result carries SERVER authority, and the exporter's own site still counts.
+    const wildcard = tree({ 'x.ts': GETTER, 'main.ts': `import { get } from './x.js';
+get().listen(4317, '0.0.0.0');` });
+    expect(reasonsOf(wildcard, 'main.ts')).toEqual(['SERVER_LISTEN_BINDING']);
+    const extraSite = tree({
+      'x.ts': GETTER,
+      'main.ts': `${NS}
+import { get } from './x.js';
+http.createServer(${L}).close();
+get().close();`,
+    });
+    expect(reasonsOf(extraSite, 'main.ts')).toEqual(['CREATE_SERVER_MULTIPLE']);
+    const exported = inspectNetworkPolicy(GETTER);
+    expect([...exported.hostExports.factories]).toEqual(['get']);
+    expect([...exported.hostExports.instantiatingFactories]).toEqual([]);
+    const instantiating = inspectNetworkPolicy(REVIEW);
+    expect([...instantiating.hostExports.instantiatingFactories]).toEqual(['makeReviewServer']);
   });
 
   it('denies every import form through which a factory could leave the graph unseen', () => {

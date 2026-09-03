@@ -62,6 +62,7 @@ export type ReasonCode =
   | 'GLOBAL_RECEIVER_RUNTIME_KEY'
   | 'GLOBAL_RECEIVER_ESCAPE'
   | 'GLOBAL_RECEIVER_DESTRUCTURING'
+  | 'GLOBAL_RECEIVER_WRITE'
   | 'HTTP_CLIENT_CAPABILITY'
   | 'HTTP_IMPORT_EQUALS'
   | 'HTTP_DYNAMIC_IMPORT'
@@ -105,6 +106,8 @@ export interface NetworkPolicyResult {
 export interface HostModuleExports {
   /** Export names that are confined server factories in the exporting file. */
   readonly factories: ReadonlySet<string>;
+  /** The subset of `factories` whose own body instantiates a server (directly or through another instantiating confined factory), as opposed to returning an alias. */
+  readonly instantiatingFactories: ReadonlySet<string>;
   /** Export names whose value is a proven string. */
   readonly strings: ReadonlySet<string>;
   /** Export names that are local functions returning only proven strings. */
@@ -213,6 +216,10 @@ interface Context {
   readonly priorInstantiationSites: number;
   /** Import bindings seeded as confined server factories from sibling host files. */
   readonly externalFactories: Set<ts.Symbol>;
+  /** The subset of `externalFactories` the exporting file proved to instantiate a server. */
+  readonly externalInstantiatingFactories: Set<ts.Symbol>;
+  /** Confined factories (local or seeded) that instantiate a server (recorded by `checkInstantiationSites`). */
+  readonly instantiatingFactories: Set<ts.Symbol>;
   /** Import bindings seeded as proven strings / string-returning functions from sibling host files. */
   readonly externalStrings: Set<ts.Symbol>;
   readonly externalStringFunctions: Set<ts.Symbol>;
@@ -756,6 +763,7 @@ function collectHostImports(ctx: Context): void {
           ctx.confinedFactories.add(symbol);
           ctx.externalFactories.add(symbol);
         }
+        if (source.instantiatingFactories.has(imported)) ctx.externalInstantiatingFactories.add(symbol);
         if (source.strings.has(imported)) ctx.externalStrings.add(symbol);
         if (source.stringFunctions.has(imported)) ctx.externalStringFunctions.add(symbol);
       };
@@ -1413,7 +1421,7 @@ function checkGlobalAssignmentPattern(ctx: Context, target: ts.Expression): void
   }
 }
 
-/** A free global receiver root (or a static self-hop from one) may only be read through static, non-network keys. */
+/** A free global receiver root (or a static self-hop from one) may only be read through static, non-network keys; no member is ever written. */
 function checkGlobalReceiverUse(ctx: Context, expression: ts.Expression): void {
   const { node, parent } = climb(expression);
   if (ts.isExpressionStatement(parent) || ts.isVoidExpression(parent) || ts.isTypeOfExpression(parent)) return;
@@ -1421,6 +1429,12 @@ function checkGlobalReceiverUse(ctx: Context, expression: ts.Expression): void {
     const permitted = checkGlobalKey(ctx, memberKey(ctx, parent), parent, () => {
       checkGlobalReceiverUse(ctx, parent);
     });
+    // A permitted static member is read-only: writing it mutates the global
+    // (e.g. replacing `String`, which `isProvenString` trusts as intrinsic).
+    if (permitted && isWriteTarget(parent)) {
+      deny(ctx, 'GLOBAL_RECEIVER_WRITE', parent);
+      return;
+    }
     // Receiver-call result authority inheritance: the result of a call of a
     // permitted static member, optional or not, conservatively retains
     // global-root authority and is checked as such.
@@ -1474,14 +1488,17 @@ function checkInstantiationSites(ctx: Context): void {
     if (!isConfinedFactoryCall(ctx, call)) return false;
     const factory = valueSymbolOf(ctx.checker, callee);
     if (factory === undefined) return false;
-    // A factory seeded from a sibling host file instantiated a server there.
-    return ctx.externalFactories.has(factory) || factoryInstantiates(factory);
+    // A factory seeded from a sibling host file instantiates a server only if the exporting file proved so.
+    return ctx.externalInstantiatingFactories.has(factory) || factoryInstantiates(factory);
   };
   const sites = ctx.calls.filter((call) => {
     const owner = enclosingFunctionSymbol(ctx, call);
     return (owner === undefined || !ctx.confinedFactories.has(owner)) && instantiates(call);
   });
   ctx.instantiationSites = sites.length;
+  for (const factory of ctx.confinedFactories) {
+    if (ctx.externalInstantiatingFactories.has(factory) || factoryInstantiates(factory)) ctx.instantiatingFactories.add(factory);
+  }
   // The tree entry counts sites across files: only the first site of the whole host tree is free.
   for (const site of sites.slice(Math.max(0, 1 - ctx.priorInstantiationSites))) deny(ctx, 'CREATE_SERVER_MULTIPLE', site);
 }
@@ -1545,6 +1562,8 @@ function createContext(source: string, options: NetworkPolicyOptions): Context {
     hostImports: options.hostImports ?? new Map(),
     priorInstantiationSites: options.priorInstantiationSites ?? 0,
     externalFactories: new Set(),
+    externalInstantiatingFactories: new Set(),
+    instantiatingFactories: new Set(),
     externalStrings: new Set(),
     externalStringFunctions: new Set(),
     instantiationSites: 0,
@@ -1628,16 +1647,19 @@ const hasDefaultModifier = (node: ts.Node): boolean =>
 /** What a file proves about its own exports: confined factories, proven strings and string functions, including re-exports of proven sibling exports. */
 function hostExportsOf(ctx: Context): HostModuleExports {
   const factories = new Set<string>();
+  const instantiatingFactories = new Set<string>();
   const strings = new Set<string>();
   const stringFunctions = new Set<string>();
   const classifyBinding = (symbol: ts.Symbol | undefined, exportName: string): void => {
     if (symbol === undefined) return;
     if (ctx.confinedFactories.has(symbol)) factories.add(exportName);
+    if (ctx.instantiatingFactories.has(symbol)) instantiatingFactories.add(exportName);
     if (isStringFunction(ctx, symbol, new Set())) stringFunctions.add(exportName);
     else if (isStringValue(ctx, symbol)) strings.add(exportName);
   };
   const copyFrom = (source: HostModuleExports, imported: string, exportName: string): void => {
     if (source.factories.has(imported)) factories.add(exportName);
+    if (source.instantiatingFactories.has(imported)) instantiatingFactories.add(exportName);
     if (source.strings.has(imported)) strings.add(exportName);
     if (source.stringFunctions.has(imported)) stringFunctions.add(exportName);
   };
@@ -1663,6 +1685,7 @@ function hostExportsOf(ctx: Context): HostModuleExports {
         if (source === undefined) continue;
         if (clause === undefined) {
           for (const name of source.factories) factories.add(name);
+          for (const name of source.instantiatingFactories) instantiatingFactories.add(name);
           for (const name of source.strings) strings.add(name);
           for (const name of source.stringFunctions) stringFunctions.add(name);
         } else if (ts.isNamedExports(clause)) {
@@ -1677,7 +1700,7 @@ function hostExportsOf(ctx: Context): HostModuleExports {
       }
     }
   }
-  return { factories, strings, stringFunctions };
+  return { factories, instantiatingFactories, strings, stringFunctions };
 }
 
 /** One host source file for the tree entry; `file` is its path relative to the host root (either separator). */
@@ -1686,7 +1709,12 @@ export interface HostSource {
   readonly text: string;
 }
 
-const EMPTY_EXPORTS: HostModuleExports = { factories: new Set(), strings: new Set(), stringFunctions: new Set() };
+const EMPTY_EXPORTS: HostModuleExports = {
+  factories: new Set(),
+  instantiatingFactories: new Set(),
+  strings: new Set(),
+  stringFunctions: new Set(),
+};
 
 const sameNames = (left: ReadonlySet<string>, right: ReadonlySet<string>): boolean =>
   left.size === right.size && [...left].every((name) => right.has(name));
@@ -1694,6 +1722,7 @@ const sameNames = (left: ReadonlySet<string>, right: ReadonlySet<string>): boole
 const sameExports = (left: HostModuleExports | undefined, right: HostModuleExports): boolean =>
   left !== undefined &&
   sameNames(left.factories, right.factories) &&
+  sameNames(left.instantiatingFactories, right.instantiatingFactories) &&
   sameNames(left.strings, right.strings) &&
   sameNames(left.stringFunctions, right.stringFunctions);
 
