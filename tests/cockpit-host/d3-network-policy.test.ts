@@ -17,6 +17,7 @@ import {
   POLICY_KEY_NAMES,
   PORT_MAX,
   STATIC_KEY_CEILING,
+  type NetworkPolicyOptions,
   type NetworkPolicyResult,
   type ReasonCode,
 } from './support/d3-network-policy.js';
@@ -1113,6 +1114,74 @@ ${describeFindings(result)}`).toEqual([]);
     expect(occurrences(detector, "deny(ctx, 'GLOBAL_RECEIVER_WRITE'")).toBe(1);
   });
 
+  it('P1: the process global has one permitted runtime use, process.argv[<index>]; every other use is denied', () => {
+    const withServer = (rest: string): string => `${NS}\nconst server = http.createServer(${L});\n${rest}`;
+    for (const source of [
+      // Codex witness: handle introspection recovers the listening server and rebinds it off loopback.
+      withServer(
+        `server.listen(4317, '127.0.0.1', () => {\n  const [handle] = (process as any)._getActiveHandles();\n  handle.close(() => handle.listen(4318, '0.0.0.0'));\n});`,
+      ),
+      `(process as any)._getActiveHandles();`,
+      `process.getBuiltinModule('http');`,
+      `(process as any).binding('http');`,
+      `process.cwd();`,
+      `process.env.HOME;`,
+      `process.exit(1);`,
+      `process.on('exit', () => {});`,
+      `process.argv;`,
+      `process.argv.length;`,
+      `process.argv.slice(2);`,
+      `const args = process.argv;\nargs;`,
+      `const [, entry] = process.argv;\nentry;`,
+      `const { argv } = process;\nargv;`,
+      `process.argv[1] = 'x';`,
+      `process.argv = [];`,
+      `declare const i: number;\nprocess.argv[i];`,
+      `use(process);`,
+      `const p = process;\np.argv[1];`,
+      `[process].length;`,
+      `globalThis.process._getActiveHandles();`,
+      `globalThis.process.cwd();`,
+      `(globalThis as any)['process'].binding('http');`,
+      `window.process.argv;`,
+      `const { process: p } = globalThis;\np.argv[1];`,
+      `let p: unknown;\n({ process: p } = globalThis);\np;`,
+      `const { process } = globalThis;\nprocess.argv[1];`,
+    ]) {
+      const result = analyzeNetworkPolicy(source);
+      expect(result.reasons, `${source}\n${describeFindings(result)}`).toEqual(['PROCESS_GLOBAL_USE']);
+      expect(result.fixpoint.state, source).toBe('CONVERGED');
+    }
+    for (const source of [
+      `process.argv[1];`,
+      `const entryArgument = process.argv[1];\nentryArgument;`,
+      `(process as any).argv[1];`,
+      `process['argv'][1];`,
+      `process.argv['1'];`,
+      `process['arg' + 'v'][1];`,
+      `globalThis.process.argv[1];`,
+      `typeof process;`,
+      `process;`,
+      `void process;`,
+      `function main(process: { cwd(): string }) { return process.cwd(); }\nmain;`,
+      `const process = { argv: ['x'] };\nprocess.argv.slice(0);`,
+      REAL_HOST_REPLICA,
+    ]) {
+      const result = analyzeNetworkPolicy(source);
+      expect(result.reasons, `${source}\n${describeFindings(result)}`).toEqual([]);
+      expect(result.fixpoint.state, source).toBe('CONVERGED');
+    }
+    // One positive shape check, no per-method table: the detector never names a process method.
+    expect(POLICY_KEY_NAMES).toContain('process');
+    expect(POLICY_KEY_NAMES).toContain('argv');
+    const detector = readFileSync(detectorPath, 'utf8');
+    expect(occurrences(detector, 'function checkProcessUse(')).toBe(1);
+    expect(occurrences(detector, 'checkProcessUse(ctx, ')).toBe(2);
+    for (const forbidden of ['_getActiveHandles', 'getBuiltinModule', 'binding', 'cwd', 'env']) {
+      expect(occurrences(detector, `'${forbidden}'`), forbidden).toBe(0);
+    }
+  });
+
   it('is structural: one runtime-shadow predicate, threaded through the single symbol-resolution path', () => {
     const detector = readFileSync(detectorPath, 'utf8');
     expect(occurrences(detector, 'function isRuntimeShadowed(')).toBe(1);
@@ -1212,8 +1281,11 @@ describe('D3 network policy positive shapes for close and end (PR #67 Codex P1)'
 });
 
 describe('D3 network policy host module graph (PR #67 Codex P1: exported factories across files)', () => {
-  const tree = (files: Record<string, string>): ReadonlyMap<string, NetworkPolicyResult> =>
-    analyzeNetworkPolicyTree(Object.entries(files).map(([file, text]) => ({ file, text })));
+  const tree = (files: Record<string, string>, options: NetworkPolicyOptions = {}): ReadonlyMap<string, NetworkPolicyResult> =>
+    analyzeNetworkPolicyTree(
+      Object.entries(files).map(([file, text]) => ({ file, text })),
+      options,
+    );
   const reasonsOf = (results: ReadonlyMap<string, NetworkPolicyResult>, file: string): readonly string[] => {
     const result = results.get(file);
     if (result === undefined) throw new Error(`no result for ${file}`);
@@ -1263,13 +1335,42 @@ describe('D3 network policy host module graph (PR #67 Codex P1: exported factori
     });
     expect(reasonsOf(viaWrapper, 'wrap.ts')).toEqual([]);
     expect(reasonsOf(viaWrapper, 'main.ts')).toEqual(['SERVER_LISTEN_BINDING']);
-    const nested = tree({
-      'lib/review.ts': REVIEW,
-      'main.ts': `import { makeReviewServer } from './lib/review.js';\nmakeReviewServer().listen(1, '0.0.0.0');`,
-      'lib\\deep\\entry.ts': `import { makeReviewServer } from '../review.js';\nmakeReviewServer().listen(1, '0.0.0.0');`,
-    });
+    const nested = tree(
+      {
+        'lib/review.ts': REVIEW,
+        'main.ts': `import { makeReviewServer } from './lib/review.js';\nmakeReviewServer().listen(1, '0.0.0.0');`,
+        'lib\\deep\\entry.ts': `import { makeReviewServer } from '../review.js';\nmakeReviewServer().listen(1, '0.0.0.0');`,
+      },
+      { separator: '\\' },
+    );
     expect(reasonsOf(nested, 'main.ts')).toEqual(['SERVER_LISTEN_BINDING']);
     expect(reasonsOf(nested, 'lib/deep/entry.ts')).toEqual(['CREATE_SERVER_MULTIPLE', 'SERVER_LISTEN_BINDING']);
+  });
+
+  it('resolves HostSource names by the platform separator: a POSIX filename keeps its literal backslashes (Codex P1)', () => {
+    const FACTORY = `${NS}\nexport function make(): http.Server {\n  return http.createServer(${L});\n}`;
+    const consumer = `import { make } from './factory.js';\nmake().listen(4567, '0.0.0.0');`;
+    const files = { 'factory.ts': FACTORY, 'nested\\consumer.ts': consumer };
+    // POSIX: `nested\\consumer.ts` is a root-level file, so `./factory.js` is the root factory and the wildcard bind is seen.
+    const posix = tree(files, { separator: '/' });
+    expect([...posix.keys()]).toEqual(['factory.ts', 'nested\\consumer.ts']);
+    expect(reasonsOf(posix, 'nested\\consumer.ts')).toEqual(['SERVER_LISTEN_BINDING']);
+    // win32: the same name is `nested/consumer.ts`, whose `./factory.js` is a missing `nested/factory.ts` (outside the boundary).
+    const windows = tree(files, { separator: '\\' });
+    expect([...windows.keys()]).toEqual(['factory.ts', 'nested/consumer.ts']);
+    expect(reasonsOf(windows, 'nested/consumer.ts')).toEqual([]);
+    // A forward slash is a separator on both platforms.
+    for (const separator of ['/', '\\'] as const) {
+      const slashed = tree({ 'factory.ts': FACTORY, 'lib/consumer.ts': `import { make } from '../factory.js';\nmake().listen(4567, '0.0.0.0');` }, { separator });
+      expect(reasonsOf(slashed, 'lib/consumer.ts'), separator).toEqual(['SERVER_LISTEN_BINDING']);
+    }
+    // The default is the running platform's separator: exactly what `readdirSync` hands the real-host readers.
+    const native = tree(files);
+    expect([...native.keys()]).toEqual([...(process.platform === 'win32' ? windows : posix).keys()]);
+    const detector = readFileSync(detectorPath, 'utf8');
+    expect(occurrences(detector, 'const nativeSeparator = ')).toBe(1);
+    expect(occurrences(detector, "process.platform === 'win32'")).toBe(1);
+    expect(occurrences(detector, "from 'node:path'")).toBe(0);
   });
 
   it('applies the server-instantiation site bound across the tree', () => {

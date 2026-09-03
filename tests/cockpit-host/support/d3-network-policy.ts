@@ -63,6 +63,7 @@ export type ReasonCode =
   | 'GLOBAL_RECEIVER_ESCAPE'
   | 'GLOBAL_RECEIVER_DESTRUCTURING'
   | 'GLOBAL_RECEIVER_WRITE'
+  | 'PROCESS_GLOBAL_USE'
   | 'HTTP_CLIENT_CAPABILITY'
   | 'HTTP_IMPORT_EQUALS'
   | 'HTTP_DYNAMIC_IMPORT'
@@ -121,6 +122,8 @@ export interface NetworkPolicyOptions {
   readonly hostImports?: ReadonlyMap<string, HostModuleExports>;
   /** Server-instantiation sites already counted in earlier files of the same host tree (set by `analyzeNetworkPolicyTree`). */
   readonly priorInstantiationSites?: number;
+  /** Directory separator the `HostSource.file` names use (test hook; default: the running platform's, as `readdirSync` emits it). */
+  readonly separator?: '/' | '\\';
 }
 
 export type StaticKey =
@@ -136,6 +139,13 @@ export const HTTP_MODULE_SPECIFIERS: ReadonlySet<string> = new Set(['node:http',
 /** Global outbound-network capabilities of the supported Node runtime: HTTP, WebSocket and server-sent events. */
 export const NETWORK_GLOBAL_NAMES: ReadonlySet<string> = new Set(['fetch', 'WebSocket', 'EventSource']);
 export const GLOBAL_RECEIVER_NAMES: ReadonlySet<string> = new Set(['globalThis', 'window', 'self', 'global']);
+/**
+ * The free `process` global is a Node authority object (handle introspection,
+ * builtin acquisition, environment, signals, exit). Its one permitted runtime
+ * use is the real host's entry guard, reading `process.argv[<index>]`.
+ */
+export const PROCESS_GLOBAL = 'process';
+export const PROCESS_ARGV = 'argv';
 const CREATE_SERVER = 'createServer';
 const SERVER_LISTEN = 'listen';
 const SERVER_CLOSE = 'close';
@@ -154,6 +164,8 @@ export const POLICY_KEY_NAMES: readonly string[] = [
   ...HTTP_MODULE_SPECIFIERS,
   ...NETWORK_GLOBAL_NAMES,
   ...GLOBAL_RECEIVER_NAMES,
+  PROCESS_GLOBAL,
+  PROCESS_ARGV,
   CREATE_SERVER,
   ...SERVER_METHODS,
   ...REQUEST_READS,
@@ -1369,12 +1381,14 @@ function checkCreateServerBindingUse(ctx: Context, id: ts.Identifier): void {
 
 /**
  * Shared verdict for a key read off a global receiver; `onSelfHop` handles a
- * resolved global-root key. Returns whether the key is a permitted static member.
+ * resolved global-root key and `onProcess` the `process` key (the same object
+ * as the free global). Returns whether the key is a permitted static member.
  */
-function checkGlobalKey(ctx: Context, key: StaticKey, at: ts.Node, onSelfHop: () => void): boolean {
+function checkGlobalKey(ctx: Context, key: StaticKey, at: ts.Node, onSelfHop: () => void, onProcess: () => void): boolean {
   if (key.kind === 'INDETERMINATE') deny(ctx, 'GLOBAL_RECEIVER_RUNTIME_KEY', at);
   else if (isResolvedTo(key, NETWORK_GLOBAL_NAMES)) deny(ctx, 'GLOBAL_RECEIVER_NETWORK_MEMBER', at);
   else if (isResolvedTo(key, GLOBAL_RECEIVER_NAMES)) onSelfHop();
+  else if (isResolvedTo(key, PROCESS_GLOBAL)) onProcess();
   else return true;
   return false;
 }
@@ -1392,10 +1406,16 @@ function checkGlobalBindingPattern(ctx: Context, pattern: ts.BindingPattern): vo
     let key: StaticKey = INDETERMINATE;
     if (element.propertyName !== undefined) key = resolvePropertyName(ctx, element.propertyName);
     else if (ts.isIdentifier(element.name)) key = foldKey(element.name.text);
-    checkGlobalKey(ctx, key, element, () => {
-      if (isBindingPattern(element.name)) checkGlobalBindingPattern(ctx, element.name);
-      else deny(ctx, 'GLOBAL_RECEIVER_ESCAPE', element);
-    });
+    checkGlobalKey(
+      ctx,
+      key,
+      element,
+      () => {
+        if (isBindingPattern(element.name)) checkGlobalBindingPattern(ctx, element.name);
+        else deny(ctx, 'GLOBAL_RECEIVER_ESCAPE', element);
+      },
+      () => { deny(ctx, 'PROCESS_GLOBAL_USE', element); },
+    );
   }
 }
 
@@ -1407,16 +1427,26 @@ function checkGlobalAssignmentPattern(ctx: Context, target: ts.Expression): void
   }
   for (const property of literal.properties) {
     if (ts.isShorthandPropertyAssignment(property)) {
-      checkGlobalKey(ctx, foldKey(property.name.text), property, () => {
-        deny(ctx, 'GLOBAL_RECEIVER_ESCAPE', property);
-      });
+      checkGlobalKey(
+        ctx,
+        foldKey(property.name.text),
+        property,
+        () => { deny(ctx, 'GLOBAL_RECEIVER_ESCAPE', property); },
+        () => { deny(ctx, 'PROCESS_GLOBAL_USE', property); },
+      );
     } else if (ts.isPropertyAssignment(property)) {
-      checkGlobalKey(ctx, resolvePropertyName(ctx, property.name), property, () => {
-        const nested = unwrap(property.initializer);
-        if (ts.isObjectLiteralExpression(nested) || ts.isArrayLiteralExpression(nested)) {
-          checkGlobalAssignmentPattern(ctx, nested);
-        } else deny(ctx, 'GLOBAL_RECEIVER_ESCAPE', property);
-      });
+      checkGlobalKey(
+        ctx,
+        resolvePropertyName(ctx, property.name),
+        property,
+        () => {
+          const nested = unwrap(property.initializer);
+          if (ts.isObjectLiteralExpression(nested) || ts.isArrayLiteralExpression(nested)) {
+            checkGlobalAssignmentPattern(ctx, nested);
+          } else deny(ctx, 'GLOBAL_RECEIVER_ESCAPE', property);
+        },
+        () => { deny(ctx, 'PROCESS_GLOBAL_USE', property); },
+      );
     } else deny(ctx, 'GLOBAL_RECEIVER_DESTRUCTURING', property);
   }
 }
@@ -1426,9 +1456,13 @@ function checkGlobalReceiverUse(ctx: Context, expression: ts.Expression): void {
   const { node, parent } = climb(expression);
   if (ts.isExpressionStatement(parent) || ts.isVoidExpression(parent) || ts.isTypeOfExpression(parent)) return;
   if (isMemberAccess(parent) && parent.expression === node) {
-    const permitted = checkGlobalKey(ctx, memberKey(ctx, parent), parent, () => {
-      checkGlobalReceiverUse(ctx, parent);
-    });
+    const permitted = checkGlobalKey(
+      ctx,
+      memberKey(ctx, parent),
+      parent,
+      () => { checkGlobalReceiverUse(ctx, parent); },
+      () => { checkProcessUse(ctx, parent); },
+    );
     // A permitted static member is read-only: writing it mutates the global
     // (e.g. replacing `String`, which `isProvenString` trusts as intrinsic).
     if (permitted && isWriteTarget(parent)) {
@@ -1456,10 +1490,31 @@ function checkGlobalReceiverUse(ctx: Context, expression: ts.Expression): void {
   deny(ctx, 'GLOBAL_RECEIVER_ESCAPE', node);
 }
 
+/**
+ * Positive policy for the `process` global, whether reached as the free
+ * identifier or as `<global receiver>.process`: the only permitted runtime use
+ * is an element read `process.argv[<static index>]` (the entry guard). Every
+ * other operation — any other member, forwarding the object, writing `argv`,
+ * or reading it whole — is denied; no per-method table is kept.
+ */
+function checkProcessUse(ctx: Context, expression: ts.Expression): void {
+  const { node, parent } = climb(expression);
+  if (ts.isExpressionStatement(parent) || ts.isVoidExpression(parent) || ts.isTypeOfExpression(parent)) return;
+  if (isMemberAccess(parent) && parent.expression === node && isResolvedTo(memberKey(ctx, parent), PROCESS_ARGV) && !isWriteTarget(parent)) {
+    const argv = climb(parent);
+    if (ts.isElementAccessExpression(argv.parent) && argv.parent.expression === argv.node && !isWriteTarget(argv.parent)) {
+      const index = memberKey(ctx, argv.parent);
+      if (index.kind === 'RESOLVED' && /^\d+$/.test(index.value)) return;
+    }
+  }
+  deny(ctx, 'PROCESS_GLOBAL_USE', node);
+}
+
 function checkFreeGlobal(ctx: Context, id: ts.Identifier): void {
   if (id.text === 'arguments') deny(ctx, 'ARGUMENTS_USE', id);
   else if (NETWORK_GLOBAL_NAMES.has(id.text)) deny(ctx, 'FREE_GLOBAL_NETWORK', id);
   else if (GLOBAL_RECEIVER_NAMES.has(id.text)) checkGlobalReceiverUse(ctx, id);
+  else if (id.text === PROCESS_GLOBAL) checkProcessUse(ctx, id);
 }
 
 /**
@@ -1703,7 +1758,7 @@ function hostExportsOf(ctx: Context): HostModuleExports {
   return { factories, instantiatingFactories, strings, stringFunctions };
 }
 
-/** One host source file for the tree entry; `file` is its path relative to the host root (either separator). */
+/** One host source file for the tree entry; `file` is its native path relative to the host root (win32: either separator; elsewhere a backslash is a literal filename character). */
 export interface HostSource {
   readonly file: string;
   readonly text: string;
@@ -1727,6 +1782,9 @@ const sameExports = (left: HostModuleExports | undefined, right: HostModuleExpor
   sameNames(left.stringFunctions, right.stringFunctions);
 
 const isRelativeSpecifier = (specifier: string): boolean => specifier.startsWith('./') || specifier.startsWith('../');
+
+/** The directory separator of the platform the `HostSource.file` names come from. */
+const nativeSeparator = (): '/' | '\\' => (process.platform === 'win32' ? '\\' : '/');
 
 /** Every relative string-literal module specifier a file uses, in import, export, `require` and dynamic-import positions. */
 function relativeSpecifiersOf(sourceFile: ts.SourceFile): readonly string[] {
@@ -1777,7 +1835,10 @@ export function analyzeNetworkPolicyTree(
   sources: readonly HostSource[],
   options: NetworkPolicyOptions = {},
 ): ReadonlyMap<string, NetworkPolicyResult> {
-  const files = sources.map((source) => ({ file: source.file.replace(/\\/g, '/'), text: source.text }));
+  // Tree paths are '/'-separated: a win32 name folds its backslashes; a POSIX name keeps them, they are part of the filename.
+  const separator = options.separator ?? nativeSeparator();
+  const treePath = (file: string): string => (separator === '\\' ? file.replace(/\\/g, '/') : file);
+  const files = sources.map((source) => ({ file: treePath(source.file), text: source.text }));
   const names = new Set(files.map((entry) => entry.file));
   const specifiers = new Map(
     files.map((entry) => [
