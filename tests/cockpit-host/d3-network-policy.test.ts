@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -28,6 +28,7 @@ import {
   reversePropagationChain,
   type RegressionRow,
 } from './support/d3-regression-matrix.js';
+import { EXPECTED_HOST_CLOSURE, readHostClosure } from './support/host-closure.js';
 
 /**
  * Cockpit D3 network policy — mechanism tests and the semantic regression matrix.
@@ -1296,11 +1297,7 @@ ${describeFindings(result)}`).toEqual([]);
     ]);
     for (const [file, result] of siblings) expect(result.reasons, `${file}: ${describeFindings(result)}`).toEqual([]);
     // The real host tree stays ALLOW: its bodies are literals, a sibling string constant and a sibling template function.
-    const host = readdirSync(hostDir, { recursive: true })
-      .map((entry) => String(entry))
-      .filter((name) => name.endsWith('.ts'))
-      .map((file) => ({ file, text: readFileSync(join(hostDir, file), 'utf8') }));
-    for (const [file, result] of analyzeNetworkPolicyTree(host)) {
+    for (const [file, result] of analyzeNetworkPolicyTree(readHostClosure())) {
       expect(result.reasons, `${file}: ${describeFindings(result)}`).toEqual([]);
       expect(result.verdict, file).toBe('ALLOW');
     }
@@ -1687,15 +1684,12 @@ get().close();`,
 // ---------------------------------------------------------------------------
 
 describe('D3 network policy accepts the real Stage-A host', () => {
-  const realHostSources = (): { file: string; text: string }[] =>
-    readdirSync(hostDir, { recursive: true })
-      .map((entry) => String(entry))
-      .filter((name) => name.endsWith('.ts'))
-      .map((file) => ({ file, text: readFileSync(join(hostDir, file), 'utf8') }));
-
-  it('allows every real host source file through the host module graph', () => {
-    const sources = realHostSources();
-    expect(sources.map((source) => source.file)).toContain('server.ts');
+  it('allows the real executable closure — host, Cockpit boundary and domain kernel — through the host module graph', () => {
+    // The purity suite proves this pinned list is the host's real executable closure; here the detector accepts it as one tree.
+    const sources = readHostClosure();
+    expect(sources.map((source) => source.file)).toEqual([...EXPECTED_HOST_CLOSURE]);
+    expect(sources).toHaveLength(12);
+    expect(sources.map((source) => source.file)).toContain('cockpit-host/server.ts');
     const results = analyzeNetworkPolicyTree(sources);
     expect(results.size).toBe(sources.length);
     for (const [file, result] of results) {
