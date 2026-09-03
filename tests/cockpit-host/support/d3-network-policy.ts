@@ -1703,7 +1703,24 @@ const hasExportModifier = (node: ts.Node): boolean =>
 const hasDefaultModifier = (node: ts.Node): boolean =>
   ts.canHaveModifiers(node) && (ts.getModifiers(node) ?? []).some((modifier) => modifier.kind === ts.SyntaxKind.DefaultKeyword);
 
-/** What a file proves about its own exports: confined factories, proven strings and string functions, including re-exports of proven sibling exports. */
+/**
+ * What a file proves about its own exports: confined factories, proven strings
+ * and string functions, including re-exports of proven sibling exports.
+ *
+ * Computed from the module's *effective* exports under ECMAScript semantics, not
+ * the raw union of every re-export clause. An explicit export — a local
+ * declaration, an `export default`, or an explicit `export { … }` /
+ * `export { … } from` — shadows a same-name `export * from` star export, and
+ * `export *` never re-exports the `default` binding. A name exported by two
+ * different stars is ambiguous (absent from the namespace unless an explicit
+ * export shadows it), so it too propagates no fact. Explicit exports are
+ * therefore classified first — recording the names they bind — and only then do
+ * star exports fill in the names no explicit export, and no competing star,
+ * already claims. Without this, `export * from './safe.js'` beside an explicit
+ * `export const chunk = …` of the same name would keep `safe`'s proven-string
+ * fact for `chunk`, and a callable value shadowing it (typed `string`) would be
+ * wrongly accepted as a `response.end` argument.
+ */
 function hostExportsOf(ctx: Context): HostModuleExports {
   const factories = new Set<string>();
   const instantiatingFactories = new Set<string>();
@@ -1722,42 +1739,81 @@ function hostExportsOf(ctx: Context): HostModuleExports {
     if (source.strings.has(imported)) strings.add(exportName);
     if (source.stringFunctions.has(imported)) stringFunctions.add(exportName);
   };
+  // Every name this module exports explicitly. A star export of the same name is
+  // shadowed by it and contributes no fact.
+  const explicitNames = new Set<string>();
+  const starStatements: ts.ExportDeclaration[] = [];
   for (const statement of ctx.sourceFile.statements) {
     if (isAmbient(statement)) continue;
     if (ts.isFunctionDeclaration(statement) && statement.name !== undefined && hasExportModifier(statement)) {
-      classifyBinding(valueSymbolOf(ctx.checker, statement.name), hasDefaultModifier(statement) ? 'default' : statement.name.text);
+      const exportName = hasDefaultModifier(statement) ? 'default' : statement.name.text;
+      explicitNames.add(exportName);
+      classifyBinding(valueSymbolOf(ctx.checker, statement.name), exportName);
     }
     if (ts.isVariableStatement(statement) && hasExportModifier(statement)) {
       for (const declaration of statement.declarationList.declarations) {
-        if (ts.isIdentifier(declaration.name)) classifyBinding(valueSymbolOf(ctx.checker, declaration.name), declaration.name.text);
+        if (ts.isIdentifier(declaration.name)) {
+          explicitNames.add(declaration.name.text);
+          classifyBinding(valueSymbolOf(ctx.checker, declaration.name), declaration.name.text);
+        }
       }
     }
     if (ts.isExportAssignment(statement) && !statement.isExportEquals) {
+      explicitNames.add('default');
       const exported = unwrap(statement.expression);
       if (ts.isIdentifier(exported)) classifyBinding(valueSymbolOf(ctx.checker, exported), 'default');
     }
     if (ts.isExportDeclaration(statement) && !statement.isTypeOnly) {
       const clause = statement.exportClause;
       const specifier = statement.moduleSpecifier;
-      if (specifier !== undefined) {
+      if (clause === undefined && specifier !== undefined) {
+        // `export * from 'S'` — an effective-export computation deferred below.
+        starStatements.push(statement);
+      } else if (specifier !== undefined && clause !== undefined && ts.isNamedExports(clause)) {
+        // `export { a, b as c } from 'S'` — explicit named re-exports.
         const source = ts.isStringLiteralLike(specifier) ? ctx.hostImports.get(specifier.text) : undefined;
-        if (source === undefined) continue;
-        if (clause === undefined) {
-          for (const name of source.factories) factories.add(name);
-          for (const name of source.instantiatingFactories) instantiatingFactories.add(name);
-          for (const name of source.strings) strings.add(name);
-          for (const name of source.stringFunctions) stringFunctions.add(name);
-        } else if (ts.isNamedExports(clause)) {
-          for (const element of clause.elements) {
-            if (!element.isTypeOnly) copyFrom(source, (element.propertyName ?? element.name).text, element.name.text);
-          }
-        }
-      } else if (clause !== undefined && ts.isNamedExports(clause)) {
         for (const element of clause.elements) {
-          if (!element.isTypeOnly) classifyBinding(valueSymbolOf(ctx.checker, element), element.name.text);
+          if (element.isTypeOnly) continue;
+          explicitNames.add(element.name.text);
+          if (source !== undefined) copyFrom(source, (element.propertyName ?? element.name).text, element.name.text);
+        }
+      } else if (specifier === undefined && clause !== undefined && ts.isNamedExports(clause)) {
+        // Local `export { a, b }`.
+        for (const element of clause.elements) {
+          if (element.isTypeOnly) continue;
+          explicitNames.add(element.name.text);
+          classifyBinding(valueSymbolOf(ctx.checker, element), element.name.text);
         }
       }
     }
+  }
+  // Star pass: a name is effectively star-exported only when no explicit export
+  // shadows it, it is not `default` (which `export *` excludes), and exactly one
+  // star source provides it (otherwise it is ambiguous). Its fact comes from
+  // that single source.
+  const starProviders = new Map<string, HostModuleExports[]>();
+  for (const statement of starStatements) {
+    const specifier = statement.moduleSpecifier;
+    const source = specifier !== undefined && ts.isStringLiteralLike(specifier) ? ctx.hostImports.get(specifier.text) : undefined;
+    if (source === undefined) continue;
+    const provided = new Set<string>([
+      ...source.factories,
+      ...source.instantiatingFactories,
+      ...source.strings,
+      ...source.stringFunctions,
+    ]);
+    for (const name of provided) {
+      if (name === 'default') continue; // `export *` never re-exports the default binding
+      const providers = starProviders.get(name) ?? [];
+      providers.push(source);
+      starProviders.set(name, providers);
+    }
+  }
+  for (const [name, providers] of starProviders) {
+    if (explicitNames.has(name)) continue; // an explicit export shadows the star
+    if (providers.length !== 1) continue; // ambiguous across stars → not exported
+    const source = providers[0];
+    if (source !== undefined) copyFrom(source, name, name);
   }
   return { factories, instantiatingFactories, strings, stringFunctions };
 }

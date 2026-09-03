@@ -1677,6 +1677,56 @@ get().close();`,
     expect(occurrences(detector, 'function hostExportsOf(')).toBe(1);
     expect(occurrences(detector, "from 'node:path'")).toBe(0);
   });
+
+  it('respects ECMAScript effective-export semantics when propagating star-export facts (Codex P1)', () => {
+    // A legitimate, non-shadowed `export *` keeps carrying the proven-string fact:
+    // `response.end(chunk)` is accepted because `chunk` really is a proven string.
+    const nonShadowed = tree({
+      'safe.ts': `export const chunk = 'safe-body';`,
+      'barrel.ts': `export * from './safe.js';`,
+      'server.ts': `${NS}\nimport { chunk } from './barrel.js';\nhttp.createServer((request, response) => { response.end(chunk); });`,
+    });
+    expect(reasonsOf(nonShadowed, 'server.ts')).toEqual([]);
+
+    // The Codex witness: the barrel also explicitly exports `chunk`, which is not a
+    // proven string. ECMAScript gives that explicit export precedence, so the
+    // star's proven-string fact must not survive — `response.end(chunk)` is denied.
+    const shadowed = tree({
+      'safe.ts': `export const chunk = 'safe-body';`,
+      'barrel.ts': `export * from './safe.js';\nexport function chunk(): void {}`,
+      'server.ts': `${NS}\nimport { chunk } from './barrel.js';\nhttp.createServer((request, response) => { response.end(chunk); });`,
+    });
+    expect(reasonsOf(shadowed, 'barrel.ts')).toEqual([]);
+    expect(reasonsOf(shadowed, 'server.ts')).toEqual(['RESPONSE_END_ARGUMENT']);
+
+    // `export *` never re-exports `default`: the star does not carry the source's
+    // default factory, so the barrel's default import is unproven.
+    const noDefault = tree({
+      'src.ts': `${NS}\nexport default function make(): http.Server { return http.createServer(${L}); }`,
+      'barrel.ts': `export * from './src.js';`,
+      'main.ts': `import make from './barrel.js';\nmake().listen(1, '0.0.0.0');`,
+    });
+    expect(reasonsOf(noDefault, 'main.ts')).toEqual([]);
+    // An explicit `export { default as make }` DOES re-export the default factory,
+    // so the same consumer is again held to the loopback binding.
+    const explicitDefault = tree({
+      'src.ts': `${NS}\nexport default function make(): http.Server { return http.createServer(${L}); }`,
+      'barrel.ts': `export { default as make } from './src.js';`,
+      'main.ts': `import { make } from './barrel.js';\nmake().listen(1, '0.0.0.0');`,
+    });
+    expect(reasonsOf(explicitDefault, 'main.ts')).toEqual(['SERVER_LISTEN_BINDING']);
+
+    // A name provided by two different stars is ambiguous under ECMAScript
+    // (absent from the namespace), so neither the factory nor the string fact
+    // propagates: the factory does not leak and the string is not proven.
+    const ambiguous = tree({
+      'a.ts': `${NS}\nexport function dup(): http.Server { return http.createServer(${L}); }`,
+      'b.ts': `export const dup = 'body';`,
+      'barrel.ts': `export * from './a.js';\nexport * from './b.js';`,
+      'main.ts': `${NS}\nimport { dup } from './barrel.js';\nhttp.createServer((request, response) => { response.end(dup); });`,
+    });
+    expect(reasonsOf(ambiguous, 'main.ts')).toEqual(['RESPONSE_END_ARGUMENT']);
+  });
 });
 
 // ---------------------------------------------------------------------------
