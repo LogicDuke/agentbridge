@@ -18,6 +18,7 @@
  */
 
 import type {
+  CockpitAutoflowProjection,
   CockpitEvidenceFreshnessProjection,
   CockpitEvidenceReadModel,
   CockpitFindingReadModel,
@@ -75,16 +76,92 @@ function gapSection(): string {
   </section>`;
 }
 
-function autoflowSection(): string {
+/** Render a number, or an inert placeholder for an absent count. */
+function optionalNum(value: number | null): string {
+  return value === null ? '<span class="empty">—</span>' : String(value);
+}
+
+/**
+ * The honest absence state: no `WorkflowState` projection was supplied to this
+ * render, so nothing is shown. No value is ever invented to fill the panel.
+ */
+function autoflowAbsent(): string {
   return `
   <section>
     <h2>Autoflow <span class="section-cat cat cat-orchestration">orchestration state</span></h2>
     <p class="empty">Not projected yet.</p>
     <p>
-      Real Autoflow workflow state requires a future pure Cockpit D4 projection.
-      This panel deliberately shows no status, revision, sequence, invocation,
-      or human-gate value: those would be manufactured, not observed.
+      Real Autoflow workflow state requires a pure Cockpit D4 projection of an
+      observed <span class="mono">WorkflowState</span>; none was supplied for this
+      render. This panel deliberately shows no status, revision, sequence,
+      invocation, or human-gate value unless one is projected: those would be
+      manufactured, not observed.
     </p>
+  </section>`;
+}
+
+/** Render the invocations table for a supplied projection, or an empty state. */
+function autoflowInvocations(autoflow: CockpitAutoflowProjection): string {
+  if (autoflow.invocations.length === 0) {
+    return `<p class="empty">No tracked invocations in this workflow.</p>`;
+  }
+  const rows = autoflow.invocations
+    .map(
+      (invocation) => `
+      <tr>
+        <td class="mono">${text(invocation.invocationId)}</td>
+        <td><span class="tag">${text(invocation.state)}</span></td>
+        <td class="mono">${text(invocation.targetCommitSha)}</td>
+        <td>${text(invocation.purpose)}</td>
+        <td>${text(invocation.providerId)}</td>
+        <td class="mono">${text(invocation.agentId)}</td>
+        <td>${optional(invocation.reportedStatus)}</td>
+        <td class="mono">${num(invocation.requestedAtRevision)}/${num(invocation.requestedAtSequence)}</td>
+        <td class="mono">${optionalNum(invocation.reportedAtRevision)}/${optionalNum(invocation.reportedAtSequence)}</td>
+      </tr>`,
+    )
+    .join('');
+  return `
+    <table>
+      <thead><tr><th>Invocation</th><th>State</th><th>Target SHA</th><th>Purpose</th><th>Provider</th><th>Agent</th><th>Reported status</th><th>Requested rev/seq</th><th>Reported rev/seq</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+/**
+ * Render the Autoflow panel from a supplied D4 projection, or the honest absence
+ * state when none is available. Every value is echoed verbatim from the
+ * projection and escaped; nothing is derived into a verdict, and no `humanGateOpen`
+ * boolean is invented — `status` plus `humanGateOpenedAtRevision` are the facts.
+ */
+function autoflowSection(autoflow: CockpitAutoflowProjection | null): string {
+  if (autoflow === null) {
+    return autoflowAbsent();
+  }
+  const counts = autoflow.counts;
+  return `
+  <section>
+    <h2>Autoflow <span class="section-cat cat cat-orchestration">orchestration state</span></h2>
+    <p class="empty">Projected verbatim from one observed <span class="mono">WorkflowState</span>. Orchestration state only — never authority, readiness, or a next action.</p>
+    <dl class="kv">
+      <dt>Workflow</dt><dd class="mono">${text(autoflow.workflowId)}</dd>
+      <dt>Repository</dt><dd class="mono">${text(autoflow.repositoryId)}</dd>
+      <dt>Pull request</dt><dd class="mono">${optional(autoflow.pullRequestId)}</dd>
+      <dt>Bound commit SHA</dt><dd class="mono">${text(autoflow.boundCommitSha)}</dd>
+      <dt>Revision</dt><dd class="mono">${num(autoflow.revision)}</dd>
+      <dt>Sequence</dt><dd class="mono">${num(autoflow.sequence)}</dd>
+      <dt>Status</dt><dd><span class="tag">${text(autoflow.status)}</span></dd>
+      <dt>Closure reason</dt><dd class="mono">${optional(autoflow.closureReason)}</dd>
+      <dt>Human gate opened at revision</dt><dd class="mono">${optionalNum(autoflow.humanGateOpenedAtRevision)}</dd>
+    </dl>
+    <div class="counts">
+      <div class="count"><b>${num(counts.invocationsTotal)}</b><span>invocations</span></div>
+      <div class="count"><b>${num(counts.requested)}</b><span>requested</span></div>
+      <div class="count"><b>${num(counts.reported)}</b><span>reported</span></div>
+      <div class="count"><b>${num(counts.evidenceAdmissions)}</b><span>evidence admissions</span></div>
+      <div class="count"><b>${num(counts.reviewAdmissions)}</b><span>review admissions</span></div>
+    </div>
+    ${autoflowInvocations(autoflow)}
   </section>`;
 }
 
@@ -274,10 +351,16 @@ function legendSection(): string {
 /**
  * Build the complete dashboard HTML document from a validated snapshot and its
  * D2 freshness projection.
+ *
+ * `autoflow` is an optional D4 projection of one observed `WorkflowState`. When
+ * supplied, the Autoflow panel renders its verbatim orchestration facts; when
+ * omitted (the default), the panel shows an honest absence state and invents no
+ * value. The Stage-A host supplies no workflow, so the panel is absent there.
  */
 export function renderDashboard(
   snapshot: CockpitSnapshot,
   projection: CockpitEvidenceFreshnessProjection,
+  autoflow: CockpitAutoflowProjection | null = null,
 ): string {
   return `<!doctype html>
 <html lang="en">
@@ -305,7 +388,7 @@ export function renderDashboard(
   ${evidenceSection(snapshot.evidence, projection)}
   ${findingsSection(snapshot.findings)}
   ${repairJobsSection(snapshot.repairJobs)}
-  ${autoflowSection()}
+  ${autoflowSection(autoflow)}
   ${legendSection()}
   <footer>
     AgentBridge Cockpit D3 · Stage A fixture data · not live · read-only ·
