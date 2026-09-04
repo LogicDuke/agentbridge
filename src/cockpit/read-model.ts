@@ -791,6 +791,19 @@ export function readCockpitSnapshot(value: unknown): CockpitSnapshotReadResult {
   // trusted, detached, deeply-frozen state. Absent, inherited, unreadable, and
   // malformed are each distinct from a present `null`, and each rejects the whole
   // snapshot rather than silently folding to a legitimate empty observation.
+  //
+  // Cross-field envelope invariant: one snapshot represents exactly one
+  // repository, so a reconstructed workflow is accepted only when its own
+  // `repositoryId` equals this snapshot's already-read, trusted repository
+  // identity. `readWorkflowState` validates a `WorkflowState`'s *internal*
+  // consistency; it neither knows nor should know which Cockpit envelope owns
+  // that state, so the ownership check belongs here, not there. The comparison
+  // uses the `repositoryId` primitive already captured above from the envelope's
+  // `repository.repositoryId` — never a re-read of the raw input — and reads the
+  // workflow's id from the detached, frozen reconstruction, so no hostile getter
+  // can shift either side after capture and no second source of truth is
+  // introduced. On mismatch the workflow is discarded and the whole snapshot
+  // rejects with `autoflow` in `invalidFields`; neither identity is rewritten.
   const rawAutoflow = readOwnOptionalProperty(record, 'autoflow');
   let autoflow: WorkflowState | null = null;
   let autoflowValid = false;
@@ -798,7 +811,10 @@ export function readCockpitSnapshot(value: unknown): CockpitSnapshotReadResult {
     autoflowValid = true;
   } else if (rawAutoflow !== undefined && rawAutoflow !== UNREADABLE_PROPERTY) {
     autoflow = readWorkflowState(rawAutoflow);
-    autoflowValid = autoflow !== null;
+    autoflowValid = autoflow !== null && autoflow.repositoryId === repositoryId;
+    if (!autoflowValid) {
+      autoflow = null;
+    }
   }
 
   const invalidFields: string[] = [];
