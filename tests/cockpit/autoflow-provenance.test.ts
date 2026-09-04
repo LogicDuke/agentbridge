@@ -9,7 +9,7 @@
  * conditions and are never folded together.
  */
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 
 import { projectCockpitAutoflow } from '../../src/cockpit/autoflow-projection.js';
 import {
@@ -178,5 +178,51 @@ describe('D1 autoflow determinism and round trip', () => {
     const second = readCockpitSnapshot(revived);
     expect(second.invalidFields).toEqual([]);
     expect(second.snapshot).toEqual(first as CockpitSnapshot);
+  });
+});
+
+describe('D1 snapshot serialization is safe with a non-null autoflow (PR74-F1)', () => {
+  const objectToJSON = Object.getOwnPropertyDescriptor(Object.prototype, 'toJSON');
+
+  afterEach(() => {
+    if (objectToJSON !== undefined) {
+      Object.defineProperty(Object.prototype, 'toJSON', objectToJSON);
+    } else {
+      delete (Object.prototype as unknown as Record<string, unknown>).toJSON;
+    }
+  });
+
+  /** A valid autoflow whose `workflowId` getter installs `Object.prototype.toJSON` mid-read. */
+  function autoflowPoisoningDuringRead(): Record<string, unknown> {
+    const base = validAutoflow();
+    let installed = false;
+    Object.defineProperty(base, 'workflowId', {
+      get(): string {
+        if (!installed) {
+          installed = true;
+          (Object.prototype as unknown as Record<string, unknown>).toJSON = () => ({
+            HIJACKED: true,
+          });
+        }
+        return 'wf-1';
+      },
+      enumerable: true,
+      configurable: true,
+    });
+    return base;
+  }
+
+  it('serializing a snapshot whose autoflow was ingested under a poisoned toJSON is safe', () => {
+    const read = readCockpitSnapshot(raw(2, { value: autoflowPoisoningDuringRead() }));
+    expect(read.snapshot).not.toBeNull();
+    expect(read.snapshot?.autoflow).not.toBeNull();
+    // The poison is live; serializing the D1 snapshot must not execute it.
+    let json = '';
+    expect(() => {
+      json = JSON.stringify(read.snapshot);
+    }).not.toThrow();
+    expect(json).not.toContain('HIJACKED');
+    const parsed = JSON.parse(json) as { autoflow: { workflowId: string } | null };
+    expect(parsed.autoflow?.workflowId).toBe('wf-1');
   });
 });
