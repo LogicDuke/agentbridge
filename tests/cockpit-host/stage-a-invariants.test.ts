@@ -30,15 +30,17 @@ const SOURCES = HOST_FILES.map((file) => ({
 
 /**
  * Trivial specifier extraction: the quoted module string in a static
- * `… from '…'` or a `import('…')`. This is a direct regex over frozen text, not
- * a parser or resolver — it does no module resolution and models no scope.
+ * `… from '…'`, a bare side-effect `import '…'`, or a `import('…')`. This is a
+ * direct regex over frozen text, not a parser or resolver — it does no module
+ * resolution and models no scope.
  */
 function specifiersOf(text: string): string[] {
   const out: string[] = [];
-  const re = /\bfrom\s*['"]([^'"]+)['"]|\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
+  const re =
+    /\bfrom\s*['"]([^'"]+)['"]|\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)|\bimport\s+['"]([^'"]+)['"]/g;
   let match: RegExpExecArray | null;
   while ((match = re.exec(text)) !== null) {
-    out.push((match[1] ?? match[2]) as string);
+    out.push((match[1] ?? match[2] ?? match[3]) as string);
   }
   return out;
 }
@@ -104,5 +106,22 @@ describe('Cockpit D3 Stage-A source invariants (frozen-source pin, not an analyz
     expect(text.includes("'127.0.0.1'")).toBe(true);
     expect(text.includes("'0.0.0.0'")).toBe(false);
     expect(text.includes("'::'")).toBe(false);
+  });
+});
+
+describe('specifier extraction — literal ESM forms (regression)', () => {
+  it('extracts bare static side-effect imports', () => {
+    expect(specifiersOf('import "node:fs";')).toEqual(['node:fs']);
+    expect(specifiersOf("import 'node:https';")).toEqual(['node:https']);
+  });
+
+  it('still extracts static named/default imports (single match, no double count)', () => {
+    expect(specifiersOf("import x from '../cockpit/index.js';")).toEqual(['../cockpit/index.js']);
+    expect(specifiersOf('import { a, b } from "node:http";')).toEqual(['node:http']);
+    expect(specifiersOf("import y from 'node:url';")).toEqual(['node:url']);
+  });
+
+  it('still extracts dynamic imports', () => {
+    expect(specifiersOf("const m = import('./render.js');")).toEqual(['./render.js']);
   });
 });
