@@ -58,7 +58,20 @@ function repositorySection(snapshot: CockpitSnapshot): string {
   </section>`;
 }
 
-function gapSection(): string {
+function gapSection(autoflow: CockpitAutoflowProjection | null): string {
+  // The Autoflow gap notice is truthful only while no projection is supplied.
+  // When one is, the populated Autoflow panel is the source of truth, so the
+  // "not projected yet" notice would contradict it and is omitted. Every
+  // unrelated capability gap (e.g. Tree SHA) is always shown.
+  const autoflowNotice =
+    autoflow === null
+      ? `
+    <div class="notice">
+      <b>Autoflow — not projected yet.</b> Real Autoflow workflow state (status,
+      revision, sequence, invocations, human gate) requires a pure Cockpit D4
+      projection of an observed WorkflowState; none was supplied for this render.
+    </div>`
+      : '';
   return `
   <section>
     <h2>Capability notices</h2>
@@ -66,13 +79,7 @@ function gapSection(): string {
       <b>Tree SHA — not projected.</b> The current D1 read model carries the
       observed HEAD only. No tree SHA field exists, so none is shown. A value is
       never invented from the implementation base.
-    </div>
-    <div class="notice">
-      <b>Autoflow — not projected yet.</b> Real Autoflow workflow state (status,
-      revision, sequence, invocations, human gate) requires a future pure
-      Cockpit D4 projection. Stage A shows no Autoflow values because none are
-      projected through the D1/D2 boundary.
-    </div>
+    </div>${autoflowNotice}
   </section>`;
 }
 
@@ -383,7 +390,7 @@ export function renderDashboard(
     </div>
   </div>
   ${repositorySection(snapshot)}
-  ${gapSection()}
+  ${gapSection(autoflow)}
   ${pullRequestsSection(snapshot.pullRequests)}
   ${evidenceSection(snapshot.evidence, projection)}
   ${findingsSection(snapshot.findings)}

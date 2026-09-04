@@ -149,6 +149,53 @@ describe('Cockpit D4 Autoflow panel', () => {
   });
 });
 
+describe('Cockpit D4 gap-notice / panel consistency (PR72-F1)', () => {
+  function validSnapshot(): CockpitSnapshot {
+    const read = readCockpitSnapshot(STAGE_A_FIXTURE);
+    expect(read.snapshot).not.toBeNull();
+    return read.snapshot as CockpitSnapshot;
+  }
+
+  const snapshot = validSnapshot();
+  const freshness = projectCockpitEvidenceFreshness(snapshot);
+
+  // The distinctive capability-notice strings (the <b>…</b> labels in the
+  // "Capability notices" section), separate from the Autoflow panel's own copy.
+  const AUTOFLOW_GAP_NOTICE = '<b>Autoflow — not projected yet.</b>';
+  const TREE_SHA_GAP_NOTICE = '<b>Tree SHA — not projected.</b>';
+
+  function projectionHtml(): string {
+    let state = openedWorkflow();
+    state = applyOrThrow(state, requestInvocation(buildInvocation({ invocationId: 'inv-1' })));
+    return renderDashboard(snapshot, freshness, projectCockpitAutoflow(state));
+  }
+
+  it('1. keeps the Autoflow gap notice when no projection is supplied', () => {
+    const html = renderDashboard(snapshot, freshness);
+    expect(html).toContain(AUTOFLOW_GAP_NOTICE);
+  });
+
+  it('2. renders the populated Autoflow panel when a projection is supplied', () => {
+    expect(projectionHtml()).toContain('Bound commit SHA');
+  });
+
+  it('3. omits the obsolete Autoflow gap notice when a projection is supplied', () => {
+    // The core PR72-F1 contradiction: the populated panel and the "not projected
+    // yet" gap notice must never appear together.
+    expect(projectionHtml()).not.toContain(AUTOFLOW_GAP_NOTICE);
+  });
+
+  it('4. keeps unrelated capability-gap notices (Tree SHA) in both states', () => {
+    expect(renderDashboard(snapshot, freshness)).toContain(TREE_SHA_GAP_NOTICE);
+    expect(projectionHtml()).toContain(TREE_SHA_GAP_NOTICE);
+  });
+
+  it('5. never emits raw script markup in either state', () => {
+    expect(renderDashboard(snapshot, freshness)).not.toContain('<script');
+    expect(projectionHtml()).not.toContain('<script');
+  });
+});
+
 describe('Cockpit D3 finding binding (D3-CODEX-F1)', () => {
   const html = buildDashboardHtml();
 
