@@ -119,6 +119,7 @@ describe('single-read discipline', () => {
       'evidence',
       'findings',
       'repairJobs',
+      'autoflow',
     ]);
     const result = readCockpitSnapshot(hostile);
 

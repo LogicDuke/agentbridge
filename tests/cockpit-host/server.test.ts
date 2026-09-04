@@ -53,7 +53,11 @@ describe('Cockpit D3 routes', () => {
     const body = await response.text();
     expect(body).toContain('READ ONLY');
     expect(body).toContain('STAGE A');
-    expect(body).toContain('Not projected yet');
+    // Stage B: the fixture carries a serialized WorkflowState, so the served
+    // page shows the populated Autoflow panel rather than the absence copy.
+    expect(body).toContain('Autoflow');
+    expect(body).not.toContain('Not projected yet');
+    expect(body).toContain('wf-stage-a-0001');
     expect(body).toContain('Tree SHA');
   });
 

@@ -25,6 +25,7 @@
 import http from 'node:http';
 import { pathToFileURL } from 'node:url';
 
+import { projectCockpitAutoflow } from '../cockpit/autoflow-projection.js';
 import { projectCockpitEvidenceFreshness, readCockpitSnapshot } from '../cockpit/index.js';
 import { STAGE_A_FIXTURE } from './fixtures/stage-a.js';
 import { renderDashboard } from './render.js';
@@ -49,9 +50,13 @@ function applySecurityHeaders(response: http.ServerResponse): void {
 }
 
 /**
- * Validate the Stage-A fixture through D1, project freshness through D2, and
- * render the page. Throws (fail closed) if the fixture does not pass D1, so a
- * malformed fixture can never be served as raw data.
+ * Validate the Stage-A fixture through D1, project freshness through D2 and
+ * Autoflow through D4, and render the page. Throws (fail closed) if the fixture
+ * does not pass D1, so a malformed fixture can never be served as raw data.
+ *
+ * The Autoflow projection is derived from the snapshot's already-validated,
+ * trusted `autoflow` state (a read-only observation); the host executes no
+ * workflow transition and imports neither `openWorkflow` nor `applyWorkflowEvent`.
  */
 export function buildDashboardHtml(): string {
   const read = readCockpitSnapshot(STAGE_A_FIXTURE);
@@ -61,7 +66,9 @@ export function buildDashboardHtml(): string {
     );
   }
   const projection = projectCockpitEvidenceFreshness(read.snapshot);
-  return renderDashboard(read.snapshot, projection);
+  const autoflow =
+    read.snapshot.autoflow === null ? null : projectCockpitAutoflow(read.snapshot.autoflow);
+  return renderDashboard(read.snapshot, projection, autoflow);
 }
 
 /** Strip any query string, returning just the request path. */
