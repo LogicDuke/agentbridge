@@ -1,9 +1,20 @@
 import { describe, expect, it } from 'vitest';
 
-import { readCockpitSnapshot } from '../../src/cockpit/index.js';
+import { projectCockpitEvidenceFreshness, readCockpitSnapshot } from '../../src/cockpit/index.js';
+import { projectCockpitAutoflow } from '../../src/cockpit/autoflow-projection.js';
 import { STAGE_A_FIXTURE } from '../../src/cockpit-host/fixtures/stage-a.js';
 import { escapeHtml } from '../../src/cockpit-host/escape.js';
+import { renderDashboard } from '../../src/cockpit-host/render.js';
 import { buildDashboardHtml } from '../../src/cockpit-host/server.js';
+import type { CockpitSnapshot } from '../../src/cockpit/index.js';
+import {
+  applyOrThrow,
+  buildInvocation,
+  buildReport,
+  openedWorkflow,
+  reportInvocation,
+  requestInvocation,
+} from '../domain/workflow-fixtures.js';
 
 describe('Cockpit D3 escaping', () => {
   it('escapes the five HTML-significant characters', () => {
@@ -84,6 +95,104 @@ describe('Cockpit D3 rendered page', () => {
   it('shows the D2 freshness states projected from the fixture', () => {
     expect(html).toContain('state-CURRENT');
     expect(html).toContain('state-STALE');
+  });
+});
+
+describe('Cockpit D4 Autoflow panel', () => {
+  function validSnapshot(): CockpitSnapshot {
+    const read = readCockpitSnapshot(STAGE_A_FIXTURE);
+    expect(read.snapshot).not.toBeNull();
+    return read.snapshot as CockpitSnapshot;
+  }
+
+  const snapshot = validSnapshot();
+  const freshness = projectCockpitEvidenceFreshness(snapshot);
+
+  it('shows an honest absence state when no workflow projection is supplied (24)', () => {
+    const html = renderDashboard(snapshot, freshness);
+    expect(html).toContain('Autoflow');
+    expect(html).toContain('Not projected yet');
+    expect(html).toContain('Cockpit D4 projection');
+    // No fabricated workflow values in the absence state.
+    expect(html).not.toContain('Bound commit SHA');
+  });
+
+  it('renders projected workflow facts when a projection is supplied', () => {
+    let state = openedWorkflow();
+    state = applyOrThrow(
+      state,
+      requestInvocation(
+        buildInvocation({ invocationId: 'inv-1', providerId: 'a&b', agentId: 'c<d>' }),
+      ),
+    );
+    state = applyOrThrow(state, reportInvocation(buildReport({ invocationId: 'inv-1' })));
+    state = applyOrThrow(state, requestInvocation(buildInvocation({ invocationId: 'inv-2' })));
+
+    const html = renderDashboard(snapshot, freshness, projectCockpitAutoflow(state));
+
+    // The absence copy is replaced once a projection is actually supplied.
+    expect(html).not.toContain('Not projected yet');
+    // Verbatim facts are shown.
+    expect(html).toContain(state.workflowId);
+    expect(html).toContain('Bound commit SHA');
+    expect(html).toContain('REQUESTED');
+    expect(html).toContain('REPORTED');
+    // Inert echoed identifiers are rendered as inert escaped text.
+    expect(html).toContain('a&amp;b');
+    expect(html).toContain('c&lt;d&gt;');
+    expect(html).not.toContain('c<d>');
+    // No interactive authority surface is introduced by the panel.
+    expect(html).not.toContain('<button');
+    expect(html).not.toContain('<form');
+    expect(html).not.toContain('onclick');
+    expect(html).not.toContain('<script');
+  });
+});
+
+describe('Cockpit D4 gap-notice / panel consistency (PR72-F1)', () => {
+  function validSnapshot(): CockpitSnapshot {
+    const read = readCockpitSnapshot(STAGE_A_FIXTURE);
+    expect(read.snapshot).not.toBeNull();
+    return read.snapshot as CockpitSnapshot;
+  }
+
+  const snapshot = validSnapshot();
+  const freshness = projectCockpitEvidenceFreshness(snapshot);
+
+  // The distinctive capability-notice strings (the <b>…</b> labels in the
+  // "Capability notices" section), separate from the Autoflow panel's own copy.
+  const AUTOFLOW_GAP_NOTICE = '<b>Autoflow — not projected yet.</b>';
+  const TREE_SHA_GAP_NOTICE = '<b>Tree SHA — not projected.</b>';
+
+  function projectionHtml(): string {
+    let state = openedWorkflow();
+    state = applyOrThrow(state, requestInvocation(buildInvocation({ invocationId: 'inv-1' })));
+    return renderDashboard(snapshot, freshness, projectCockpitAutoflow(state));
+  }
+
+  it('1. keeps the Autoflow gap notice when no projection is supplied', () => {
+    const html = renderDashboard(snapshot, freshness);
+    expect(html).toContain(AUTOFLOW_GAP_NOTICE);
+  });
+
+  it('2. renders the populated Autoflow panel when a projection is supplied', () => {
+    expect(projectionHtml()).toContain('Bound commit SHA');
+  });
+
+  it('3. omits the obsolete Autoflow gap notice when a projection is supplied', () => {
+    // The core PR72-F1 contradiction: the populated panel and the "not projected
+    // yet" gap notice must never appear together.
+    expect(projectionHtml()).not.toContain(AUTOFLOW_GAP_NOTICE);
+  });
+
+  it('4. keeps unrelated capability-gap notices (Tree SHA) in both states', () => {
+    expect(renderDashboard(snapshot, freshness)).toContain(TREE_SHA_GAP_NOTICE);
+    expect(projectionHtml()).toContain(TREE_SHA_GAP_NOTICE);
+  });
+
+  it('5. never emits raw script markup in either state', () => {
+    expect(renderDashboard(snapshot, freshness)).not.toContain('<script');
+    expect(projectionHtml()).not.toContain('<script');
   });
 });
 
