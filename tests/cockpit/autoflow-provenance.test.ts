@@ -18,15 +18,28 @@ import {
   readCockpitSnapshot,
   type CockpitSnapshot,
 } from '../../src/cockpit/index.js';
-import { buildSnapshot } from './read-model-fixtures.js';
+import { REPO_A, buildRepository, buildSnapshot } from './read-model-fixtures.js';
 
 const HEAD = 'c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00';
 
-/** A fresh, valid serialized WorkflowState (OPEN, one REQUESTED invocation). */
-function validAutoflow(): Record<string, unknown> {
+/**
+ * A repository identity distinct from the envelope's {@link REPO_A}, used to
+ * forge an internally valid workflow that belongs to a *different* repository.
+ */
+const REPO_B = 'github.com/other/repository';
+
+/**
+ * A fresh, valid serialized WorkflowState (OPEN, one REQUESTED invocation).
+ *
+ * `repositoryId` defaults to the envelope's own {@link REPO_A} so a plain
+ * `validAutoflow()` describes a workflow that legitimately belongs to the
+ * snapshot built by {@link buildSnapshot}; pass a different id to forge a
+ * cross-repository state.
+ */
+function validAutoflow(repositoryId: string = REPO_A): Record<string, unknown> {
   return {
     workflowId: 'wf-1',
-    repositoryId: 'owner/repo',
+    repositoryId,
     pullRequestId: 'pr-1',
     boundCommitSha: HEAD,
     revision: 0,
@@ -224,5 +237,102 @@ describe('D1 snapshot serialization is safe with a non-null autoflow (PR74-F1)',
     expect(json).not.toContain('HIJACKED');
     const parsed = JSON.parse(json) as { autoflow: { workflowId: string } | null };
     expect(parsed.autoflow?.workflowId).toBe('wf-1');
+  });
+});
+
+describe('D1 autoflow repository-binding invariant (PR74-F2)', () => {
+  // Envelope contract: one CockpitSnapshot represents exactly one repository. A
+  // serialized WorkflowState may be internally valid yet describe a *different*
+  // repository; readWorkflowState cannot see the envelope, so readCockpitSnapshot
+  // owns the cross-field check `snapshot.repository.repositoryId ==
+  // snapshot.autoflow.repositoryId`. The trusted side of that comparison is the
+  // envelope identity already captured while reading `repository.repositoryId`.
+
+  it('1. repository=A + autoflow.repositoryId=B → whole snapshot REJECT', () => {
+    const r = readCockpitSnapshot(raw(2, { value: validAutoflow(REPO_B) }));
+    expect(r.snapshot).toBeNull();
+  });
+
+  it('2. the mismatch flags exactly `autoflow`, leaving the valid envelope repository untouched', () => {
+    const r = readCockpitSnapshot(raw(2, { value: validAutoflow(REPO_B) }));
+    expect(r.invalidFields).toContain('autoflow');
+    // The envelope's own repository identity is valid: the cross-field check adds
+    // no second repository source of truth and does not corrupt envelope reads.
+    expect(r.invalidFields).not.toContain('repository.repositoryId');
+    expect(r.invalidFields).not.toContain('schemaVersion');
+  });
+
+  it('3. repository=A + autoflow.repositoryId=A → ACCEPT (matching binds)', () => {
+    const r = readCockpitSnapshot(raw(2, { value: validAutoflow(REPO_A) }));
+    expect(r.invalidFields).toEqual([]);
+    expect(r.snapshot).not.toBeNull();
+    expect(r.snapshot?.repository.repositoryId).toBe(REPO_A);
+    expect(r.snapshot?.autoflow?.repositoryId).toBe(REPO_A);
+  });
+
+  it('4. null autoflow still ACCEPTs under the binding check (null semantics unchanged)', () => {
+    const r = readCockpitSnapshot(raw(2, { value: null }));
+    expect(r.invalidFields).toEqual([]);
+    expect(r.snapshot).not.toBeNull();
+    expect(r.snapshot?.autoflow).toBeNull();
+  });
+
+  it('5. malformed autoflow still REJECTs as `autoflow` (malformed semantics unchanged)', () => {
+    const r = readCockpitSnapshot(raw(2, { value: malformedAutoflow() }));
+    expect(r.snapshot).toBeNull();
+    expect(r.invalidFields).toContain('autoflow');
+  });
+
+  it('6. a matching-autoflow snapshot survives a plain-JSON round trip unchanged', () => {
+    const first = readCockpitSnapshot(raw(2, { value: validAutoflow(REPO_A) })).snapshot;
+    expect(first).not.toBeNull();
+    const revived: unknown = JSON.parse(JSON.stringify(first));
+    const second = readCockpitSnapshot(revived);
+    expect(second.invalidFields).toEqual([]);
+    expect(second.snapshot).toEqual(first as CockpitSnapshot);
+  });
+
+  it('7. neither the workflow nor the envelope repositoryId is mutated or coerced', () => {
+    // Mismatch: the foreign input keeps its own id; nothing is rewritten to A.
+    const foreign = validAutoflow(REPO_B);
+    readCockpitSnapshot(raw(2, { value: foreign }));
+    expect(foreign.repositoryId).toBe(REPO_B);
+
+    // Match: the reconstructed state reports A because the input already said A,
+    // not because the envelope id was injected over some other value.
+    const owned = validAutoflow(REPO_A);
+    const r = readCockpitSnapshot(raw(2, { value: owned }));
+    expect(owned.repositoryId).toBe(REPO_A);
+    expect(r.snapshot?.autoflow?.repositoryId).toBe(REPO_A);
+    expect(r.snapshot?.repository.repositoryId).toBe(REPO_A);
+  });
+
+  it('8. a repository.repositoryId that flips after capture cannot rebind a foreign workflow (TOCTOU)', () => {
+    const base = buildRepository();
+    const hostileRepository: Record<string, unknown> = {
+      observedHeadSha: base.observedHeadSha,
+      defaultBranchRef: base.defaultBranchRef,
+    };
+    let reads = 0;
+    Object.defineProperty(hostileRepository, 'repositoryId', {
+      get(): string {
+        reads += 1;
+        // Trusted A on the first (capturing) read; a *repeated* untrusted read
+        // would see B and wrongly "match" the forged workflow below.
+        return reads === 1 ? REPO_A : REPO_B;
+      },
+      enumerable: true,
+      configurable: true,
+    });
+    const snapshot = buildSnapshot() as unknown as Record<string, unknown>;
+    snapshot.schemaVersion = COCKPIT_SNAPSHOT_SCHEMA_VERSION;
+    snapshot.repository = hostileRepository;
+    snapshot.autoflow = validAutoflow(REPO_B);
+
+    const r = readCockpitSnapshot(snapshot);
+    expect(r.snapshot).toBeNull();
+    expect(r.invalidFields).toContain('autoflow');
+    // The identity captured as A stays valid and is never re-read as B.
+    expect(r.invalidFields).not.toContain('repository.repositoryId');
   });
 });
