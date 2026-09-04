@@ -45,14 +45,26 @@ function specifiersOf(text: string): string[] {
   return out;
 }
 
-/** The only specifiers the read-only host is allowed to import. */
-function isAllowedSpecifier(specifier: string): boolean {
-  return (
-    specifier === 'node:http' ||
-    specifier === 'node:url' ||
-    specifier.startsWith('./') ||
-    specifier.startsWith('../cockpit/')
-  );
+/**
+ * The exact, frozen set of literal runtime import specifiers the five Stage-A
+ * host source files use — derived from the current real source, NOT a prefix
+ * rule. Any specifier outside this set (e.g. `./network.js`, `../cockpit/other.js`,
+ * `node:fs`) fails the pin until this frozen Stage-A invariant is deliberately
+ * updated here. This is exact literal set membership — no closure walking, no
+ * file resolution, no AST.
+ */
+const FROZEN_SPECIFIERS: ReadonlySet<string> = new Set([
+  'node:http',
+  'node:url',
+  '../cockpit/index.js',
+  './escape.js',
+  './fixtures/stage-a.js',
+  './render.js',
+  './styles.js',
+]);
+
+function isFrozenSpecifier(specifier: string): boolean {
+  return FROZEN_SPECIFIERS.has(specifier);
 }
 
 describe('Cockpit D3 Stage-A source invariants (frozen-source pin, not an analyzer)', () => {
@@ -71,12 +83,14 @@ describe('Cockpit D3 Stage-A source invariants (frozen-source pin, not an analyz
     }
   });
 
-  it('imports only node:http, node:url, itself, or ../cockpit/ (no GitHub/agent/permit authority)', () => {
-    for (const { file, text } of SOURCES) {
+  it('imports exactly the frozen Stage-A specifier set (no broad prefix acceptance)', () => {
+    const actual = new Set<string>();
+    for (const { text } of SOURCES) {
       for (const specifier of specifiersOf(text)) {
-        expect(isAllowedSpecifier(specifier), `${file} imports disallowed specifier ${specifier}`).toBe(true);
+        actual.add(specifier);
       }
     }
+    expect([...actual].sort()).toEqual([...FROZEN_SPECIFIERS].sort());
   });
 
   it('limits Node builtin imports to exactly {node:http, node:url}', () => {
@@ -123,5 +137,33 @@ describe('specifier extraction — literal ESM forms (regression)', () => {
 
   it('still extracts dynamic imports', () => {
     expect(specifiersOf("const m = import('./render.js');")).toEqual(['./render.js']);
+  });
+});
+
+describe('frozen specifier set — exact membership (regression)', () => {
+  it('accepts every current real Stage-A specifier', () => {
+    for (const specifier of [
+      'node:http',
+      'node:url',
+      '../cockpit/index.js',
+      './escape.js',
+      './fixtures/stage-a.js',
+      './render.js',
+      './styles.js',
+    ]) {
+      expect(isFrozenSpecifier(specifier), `${specifier} should be frozen-accepted`).toBe(true);
+    }
+  });
+
+  it('rejects a specifier outside the frozen set, extracted from any literal ESM form', () => {
+    const cases: readonly [string, string][] = [
+      ["import './network.js';", './network.js'],
+      ["import x from '../cockpit/other.js';", '../cockpit/other.js'],
+      ["import 'node:fs';", 'node:fs'],
+    ];
+    for (const [source, expected] of cases) {
+      expect(specifiersOf(source)).toEqual([expected]);
+      expect(isFrozenSpecifier(expected), `${expected} must not be frozen-accepted`).toBe(false);
+    }
   });
 });
