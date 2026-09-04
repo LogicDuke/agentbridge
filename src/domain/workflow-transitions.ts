@@ -1207,6 +1207,150 @@ function readMutableList(value: unknown, limit: number): readonly unknown[] | nu
 }
 
 /**
+ * Prototype-hook insulation for the serialized-observation graph (PR74-F1).
+ *
+ * The transition path's `freezeState` returns a **standard** domain
+ * `WorkflowState` — ordinary-prototype records and arrays — which is correct for
+ * an in-process value that is never JSON-serialized across a poisoned realm. The
+ * serialized-observation value is different: a hostile getter may have installed
+ * `Object.prototype.toJSON` (hijacking or throwing) *during* ingestion, and that
+ * poisoned hook persists. If the accepted observation graph inherited it, a later
+ * `JSON.stringify(snapshot)` at the D1 boundary would execute attacker code.
+ *
+ * These helpers — used **only** by `readWorkflowState`, never by the transition
+ * path — rebuild the returned graph so no inherited `toJSON` can reach it:
+ *
+ * - records are detached from `Object.prototype` (a `null` prototype removes the
+ *   inherited chain entirely), so no inherited `toJSON` exists to call;
+ * - lists stay real arrays (consumers index and read `length`), so the inherited
+ *   chain is instead neutralised by an **own, non-enumerable, non-callable**
+ *   `toJSON`: `JSON.stringify` finds it, skips it, and serialises the array
+ *   itself, never reaching a poisoned `Object.prototype.toJSON`. Non-enumerable,
+ *   so it never appears in the JSON output and changes no structural equality;
+ * - every node is deeply frozen.
+ *
+ * Only module-load-captured intrinsics are used, so a poisoned `Object.prototype`
+ * accessor cannot intercept the construction. This mirrors the D1 snapshot reader
+ * and the D4 projector, whose accepted graphs are insulated the same way.
+ */
+function observationDataDescriptor(value: unknown, enumerable: boolean): PropertyDescriptor {
+  // A hostile getter installed earlier may have poisoned `Object.prototype`; a
+  // plain `{...}` descriptor would inherit any planted accessor keys and
+  // `ToPropertyDescriptor` (which walks the chain) would then reject the mixed
+  // descriptor. A `null` prototype removes the inherited chain entirely.
+  const descriptor: PropertyDescriptor = {
+    value,
+    writable: false,
+    enumerable,
+    configurable: false,
+  };
+  objectSetPrototypeOf(descriptor, null);
+  return descriptor;
+}
+
+/** Append by defining an own element: no `push`, no inherited index setter. */
+function observationAppend<T>(list: T[], value: T): void {
+  objectDefineProperty(list, list.length, observationDataDescriptor(value, true));
+}
+
+/** Detach a returned record node from `Object.prototype` and freeze it. */
+function observationRecord<T extends object>(record: T): Readonly<T> {
+  objectSetPrototypeOf(record, null);
+  return objectFreeze(record);
+}
+
+/** Freeze a returned list node, shadowing any inherited `toJSON` with an own non-callable. */
+function observationList<T>(list: T[]): readonly T[] {
+  objectDefineProperty(list, 'toJSON', observationDataDescriptor(undefined, false));
+  return objectFreeze(list);
+}
+
+/**
+ * Rebuild the validated snapshot into a deeply-frozen, prototype-insulated
+ * observation `WorkflowState` (PR74-F1).
+ *
+ * Every field is copied verbatim from the already-validated snapshot, so value
+ * semantics are identical to what `freezeState` would have returned; only the
+ * prototype exposure of the returned graph differs. No hostile input reference
+ * survives — every record is a fresh node built from validated primitives.
+ */
+function hardenObservation(snapshot: WorkflowSnapshot): WorkflowState {
+  const invocations: TrackedInvocation[] = [];
+  for (let index = 0; index < snapshot.invocations.length; index += 1) {
+    const source = snapshot.invocations[index];
+    if (source === undefined) {
+      continue;
+    }
+    observationAppend(
+      invocations,
+      observationRecord({
+        invocationId: source.invocationId,
+        targetCommitSha: source.targetCommitSha,
+        purpose: source.purpose,
+        providerId: source.providerId,
+        agentId: source.agentId,
+        requestedAtRevision: source.requestedAtRevision,
+        requestedAtSequence: source.requestedAtSequence,
+        state: source.state,
+        reportedStatus: source.reportedStatus,
+        reportedAtRevision: source.reportedAtRevision,
+        reportedAtSequence: source.reportedAtSequence,
+      }),
+    );
+  }
+
+  const evidence: AdmittedEvidence[] = [];
+  for (let index = 0; index < snapshot.evidence.length; index += 1) {
+    const source = snapshot.evidence[index];
+    if (source === undefined) {
+      continue;
+    }
+    observationAppend(
+      evidence,
+      observationRecord({
+        evidenceId: source.evidenceId,
+        kind: source.kind,
+        admittedAtCommitSha: source.admittedAtCommitSha,
+        admittedAtRevision: source.admittedAtRevision,
+        admittedAtSequence: source.admittedAtSequence,
+      }),
+    );
+  }
+
+  const reviews: AdmittedReview[] = [];
+  for (let index = 0; index < snapshot.reviews.length; index += 1) {
+    const source = snapshot.reviews[index];
+    if (source === undefined) {
+      continue;
+    }
+    observationAppend(
+      reviews,
+      observationRecord({
+        reviewId: source.reviewId,
+        admittedAtCommitSha: source.admittedAtCommitSha,
+        admittedAtRevision: source.admittedAtRevision,
+        admittedAtSequence: source.admittedAtSequence,
+      }),
+    );
+  }
+
+  return observationRecord({
+    workflowId: snapshot.workflowId,
+    repositoryId: snapshot.repositoryId,
+    pullRequestId: snapshot.pullRequestId,
+    boundCommitSha: snapshot.boundCommitSha,
+    revision: snapshot.revision,
+    sequence: snapshot.sequence,
+    status: snapshot.status,
+    closureReason: snapshot.closureReason,
+    humanGateOpenedAtRevision: snapshot.humanGateOpenedAtRevision,
+    invocations: observationList(invocations),
+    evidence: observationList(evidence),
+    reviews: observationList(reviews),
+  });
+}
+
+/**
  * Reconstruct a trusted {@link WorkflowState} from an untrusted, possibly-mutable
  * serialized representation, or reject it.
  *
@@ -1223,9 +1367,10 @@ function readMutableList(value: unknown, limit: number): readonly unknown[] | nu
  * the assembled candidate is null-prototyped so no inherited hook reaches the
  * validator; and the candidate is handed to the **unchanged** {@link
  * snapshotWorkflow}, which re-checks every scalar, per-record, and cross-record
- * invariant and rebuilds fresh frozen records. {@link freezeState} then returns a
- * deeply-frozen state fully detached from the hostile input. Nothing here relaxes
- * the frozen-input requirement the transition path relies on.
+ * invariant and rebuilds fresh frozen records. {@link hardenObservation} then
+ * returns a deeply-frozen, prototype-insulated state fully detached from the
+ * hostile input (PR74-F1). Nothing here relaxes the frozen-input requirement the
+ * transition path relies on.
  */
 export function readWorkflowState(value: unknown): WorkflowState | null {
   const record = asRecord(value);
@@ -1275,7 +1420,12 @@ export function readWorkflowState(value: unknown): WorkflowState | null {
   if (snapshot === null) {
     return null;
   }
-  return freezeState(snapshot);
+  // The observation graph is prototype-insulated (PR74-F1) rather than returned
+  // through `freezeState`: a hostile `Object.prototype.toJSON` installed during
+  // ingestion must not be reachable by a later `JSON.stringify` of this value at
+  // the D1 boundary. Value semantics are identical; only prototype exposure
+  // differs. `freezeState` and the transition path are untouched.
+  return hardenObservation(snapshot);
 }
 
 /** Copy a list and append one element, without prototype methods or spread. */

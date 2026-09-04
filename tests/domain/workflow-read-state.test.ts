@@ -11,7 +11,7 @@
  * every structural or invariant violation.
  */
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 
 import { readWorkflowState } from '../../src/domain/index.js';
 import { WORKFLOW_BOUNDS } from '../../src/domain/workflow.js';
@@ -318,5 +318,126 @@ describe('readWorkflowState — ambient-realm robustness', () => {
     const state = readWorkflowState(input);
     expect(state).toBeNull(); // typeof check rejects without coercion
     expect(coerced).toBe(false);
+  });
+});
+
+describe('readWorkflowState — PR74-F1 prototype-hook insulation of the observation graph', () => {
+  const objectToJSON = Object.getOwnPropertyDescriptor(Object.prototype, 'toJSON');
+  const arrayToJSON = Object.getOwnPropertyDescriptor(Array.prototype, 'toJSON');
+
+  // Always restore, even if a test threw, so no poisoned global leaks to others.
+  afterEach(() => {
+    if (objectToJSON !== undefined) {
+      Object.defineProperty(Object.prototype, 'toJSON', objectToJSON);
+    } else {
+      delete (Object.prototype as unknown as Record<string, unknown>).toJSON;
+    }
+    if (arrayToJSON !== undefined) {
+      Object.defineProperty(Array.prototype, 'toJSON', arrayToJSON);
+    } else {
+      delete (Array.prototype as unknown as Record<string, unknown>).toJSON;
+    }
+  });
+
+  /**
+   * A valid serialized state whose own `workflowId` getter runs `install` the
+   * first time it is read — i.e. **during** `readWorkflowState`, before the
+   * observation graph is built — so the poison is genuinely live at construction
+   * time, not merely installed afterwards.
+   */
+  function inputPoisoningDuringRead(install: () => void): Record<string, unknown> {
+    const base = validSerialized();
+    let installed = false;
+    Object.defineProperty(base, 'workflowId', {
+      get(): string {
+        if (!installed) {
+          installed = true;
+          install();
+        }
+        return 'wf-1';
+      },
+      enumerable: true,
+      configurable: true,
+    });
+    return base;
+  }
+
+  it('A. a hijacking Object.prototype.toJSON installed during the read cannot hijack serialization', () => {
+    const input = inputPoisoningDuringRead(() => {
+      (Object.prototype as unknown as Record<string, unknown>).toJSON = () => ({ HIJACKED: true });
+    });
+    const state = readWorkflowState(input);
+    expect(state).not.toBeNull();
+    // The poison is live now; serialize the accepted graph.
+    const json = JSON.stringify(state);
+    expect(json).not.toContain('HIJACKED');
+    const parsed = JSON.parse(json) as { workflowId: string; invocations: { invocationId: string }[] };
+    expect(parsed.workflowId).toBe('wf-1');
+    expect(parsed.invocations[0]?.invocationId).toBe('inv-1');
+  });
+
+  it('B. a throwing Object.prototype.toJSON installed during the read cannot make serialization throw', () => {
+    const input = inputPoisoningDuringRead(() => {
+      (Object.prototype as unknown as Record<string, unknown>).toJSON = () => {
+        throw new Error('hostile toJSON');
+      };
+    });
+    const state = readWorkflowState(input);
+    expect(state).not.toBeNull();
+    expect(() => JSON.stringify(state)).not.toThrow();
+    const parsed = JSON.parse(JSON.stringify(state)) as { workflowId: string };
+    expect(parsed.workflowId).toBe('wf-1');
+  });
+
+  it('C. a hostile Array.prototype.toJSON is not executed by the returned lists', () => {
+    const state = readWorkflowState(validSerialized());
+    expect(state).not.toBeNull();
+    let called = false;
+    (Array.prototype as unknown as Record<string, unknown>).toJSON = (): string => {
+      called = true;
+      return 'HOSTILE_ARRAY';
+    };
+    const json = JSON.stringify(state);
+    expect(called).toBe(false);
+    expect(json).not.toContain('HOSTILE_ARRAY');
+    // Lists still serialize as real JSON arrays.
+    const parsed = JSON.parse(json) as { invocations: unknown };
+    expect(Array.isArray(parsed.invocations)).toBe(true);
+  });
+
+  it('D. nested records do not execute an inherited Object.prototype.toJSON', () => {
+    const state = readWorkflowState(validSerialized());
+    expect(state).not.toBeNull();
+    (Object.prototype as unknown as Record<string, unknown>).toJSON = () => ({ HIJACKED: true });
+    const parsed = JSON.parse(JSON.stringify(state)) as {
+      invocations: { invocationId?: string; HIJACKED?: boolean }[];
+    };
+    expect(parsed.invocations[0]?.invocationId).toBe('inv-1');
+    expect(parsed.invocations[0]?.HIJACKED).toBeUndefined();
+  });
+
+  it('E. the protective list toJSON shadow is non-enumerable and absent from JSON output', () => {
+    const state = readWorkflowState(validSerialized());
+    expect(state).not.toBeNull();
+    const list = state?.invocations ?? [];
+    expect(Object.hasOwn(list, 'toJSON')).toBe(true);
+    expect(Object.getOwnPropertyDescriptor(list, 'toJSON')?.enumerable).toBe(false);
+    expect(JSON.stringify(state)).not.toContain('toJSON');
+  });
+
+  it('F. the returned observation graph is deeply frozen and prototype-detached', () => {
+    const state = readWorkflowState(validSerialized());
+    expect(state).not.toBeNull();
+    expect(state !== null && everyFrozen(state)).toBe(true);
+    // Records are detached from Object.prototype; no inherited toJSON to reach.
+    expect(Object.getPrototypeOf(state)).toBeNull();
+    expect(Object.getPrototypeOf(state?.invocations[0])).toBeNull();
+  });
+
+  it('G. value semantics are unchanged from a normal read (round trip is faithful)', () => {
+    const state = readWorkflowState(validSerialized());
+    expect(state).not.toBeNull();
+    const revived: unknown = JSON.parse(JSON.stringify(state));
+    expect(readWorkflowState(revived)).toEqual(state);
   });
 });
