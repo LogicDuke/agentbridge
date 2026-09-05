@@ -11,6 +11,7 @@ as a read-only browser page.
     Stage-A fixture (unknown)
       -> readCockpitSnapshot()          (D1: hostile-input validation)
       -> projectCockpitEvidenceFreshness()  (D2: freshness projection)
+      -> projectCockpitAutoflow()           (D4: Autoflow observation projection)
       -> server-side HTML (every value escaped)
       -> 127.0.0.1 GET-only browser view
 
@@ -68,12 +69,14 @@ The dashboard shows only what the current read models project:
 
 - **Tree SHA — not projected.** D1 carries the observed HEAD only; there is no
   tree SHA field. The host renders a capability notice, never an invented value.
-- **Autoflow — not projected yet.** `WorkflowState` (status, revision, sequence,
-  invocations, human gate) has no Cockpit projection. Rendering a fixture
-  `WorkflowState` would manufacture orchestration state, so the Autoflow panel
-  shows an honest "not projected yet" notice. A real Autoflow view requires a
-  future **pure Cockpit D4 projection**; D3 does not import `WorkflowState`,
-  `workflow-transitions`, or `applyWorkflowEvent`.
+- **Autoflow — projected (D4).** The snapshot's D1-validated `autoflow`
+  observation (a reconstructed PR 007 `WorkflowState`, or `null`) is projected by
+  the pure Cockpit **D4** `projectCockpitAutoflow`. The host renders a populated
+  Autoflow panel (status, revision, sequence, invocations, human gate) when the
+  observation is non-null, and an honest absence panel when it is `null`. The
+  panel is a read-only projection of an already-validated observation: D3 runs no
+  workflow transition and imports neither `workflow-transitions` nor
+  `applyWorkflowEvent`.
 
 ## HTTP security boundary
 
@@ -131,7 +134,8 @@ The user opens it manually; the host starts no browser and holds no shell.
 ## Tests
 
 `tests/cockpit-host/` covers fixture-passes-D1, fail-closed on malformed input,
-adversarial escaping of hostile prose, read-only self-identification, honest
-Autoflow/tree-SHA notices, GET/405/404 routing, loopback binding, security
-headers, and the absence of any mutation route. These are **behaviour tests**
+adversarial escaping of hostile prose, read-only self-identification, the
+Autoflow panel (populated projection and honest absence) and the tree-SHA
+capability notice, GET/405/404 routing, loopback binding, security headers, and
+the absence of any mutation route. These are **behaviour tests**
 over the running host — there is no source-scanning purity analyzer.

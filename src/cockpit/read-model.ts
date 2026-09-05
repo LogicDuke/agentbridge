@@ -78,6 +78,8 @@ import {
   type ReviewFindingStatus,
   type ReviewSeverity,
 } from '../domain/review.js';
+import type { WorkflowState } from '../domain/workflow.js';
+import { readWorkflowState } from '../domain/workflow-transitions.js';
 
 /**
  * Intrinsics captured at module load, before any untrusted property access is
@@ -187,8 +189,15 @@ export const COCKPIT_BOUNDS = objectFreeze({
 /**
  * The one schema version D1 defines. A snapshot carrying any other value is
  * rejected whole: a reader must never guess at a future shape.
+ *
+ * Version 2 adds the required `autoflow` field (a serialized PR 007
+ * `WorkflowState`, or `null`). The reader accepts version 2 **only**: no durable
+ * version-1 snapshot exists to migrate — the sole version-1 producer was fixture
+ * code — so a second accepted shape would guard nothing, and every non-2 value
+ * (including 1) is rejected whole, as this boundary already rejected every value
+ * but its one supported version.
  */
-export const COCKPIT_SNAPSHOT_SCHEMA_VERSION = 1;
+export const COCKPIT_SNAPSHOT_SCHEMA_VERSION = 2;
 
 export type CockpitSnapshotSchemaVersion = typeof COCKPIT_SNAPSHOT_SCHEMA_VERSION;
 
@@ -383,11 +392,18 @@ export interface CockpitRepairJobReadModel {
 
 /**
  * The serializable snapshot envelope: one repository, one observed HEAD, one
- * collector, one externally supplied timestamp, and the derived read models.
+ * collector, one externally supplied timestamp, the derived read models, and one
+ * serialized Autoflow observation.
  *
  * Every field of an accepted snapshot is a primitive, `null`, or a frozen array
  * of frozen records, so `JSON.parse(JSON.stringify(snapshot))` re-reads to an
  * equal snapshot.
+ *
+ * `autoflow` is a **serialized-observation echo** of one PR 007 `WorkflowState`,
+ * reconstructed through the domain's own hostile reader into a trusted, detached,
+ * deeply-frozen state, or `null` when no workflow was observed. It is display
+ * input only: authority over a workflow stays entirely in the Autoflow engine,
+ * and nothing reads this field back into a transition.
  */
 export interface CockpitSnapshot {
   readonly schemaVersion: CockpitSnapshotSchemaVersion;
@@ -397,6 +413,7 @@ export interface CockpitSnapshot {
   readonly evidence: readonly CockpitEvidenceReadModel[];
   readonly findings: readonly CockpitFindingReadModel[];
   readonly repairJobs: readonly CockpitRepairJobReadModel[];
+  readonly autoflow: WorkflowState | null;
 }
 
 /**
@@ -414,6 +431,7 @@ export const COCKPIT_SNAPSHOT_FIELD_ORDER: readonly string[] = objectFreeze([
   'evidence',
   'findings',
   'repairJobs',
+  'autoflow',
 ]);
 
 /** The outcome of reading a snapshot exactly once. */
@@ -767,6 +785,38 @@ export function readCockpitSnapshot(value: unknown): CockpitSnapshotReadResult {
     readRepairJobReadModel,
   );
 
+  // Autoflow (schema v2): the property MUST be present. An own `null` means "no
+  // workflow observed"; any other own value is a serialized PR 007
+  // `WorkflowState`, reconstructed through the domain's own hostile reader into a
+  // trusted, detached, deeply-frozen state. Absent, inherited, unreadable, and
+  // malformed are each distinct from a present `null`, and each rejects the whole
+  // snapshot rather than silently folding to a legitimate empty observation.
+  //
+  // Cross-field envelope invariant: one snapshot represents exactly one
+  // repository, so a reconstructed workflow is accepted only when its own
+  // `repositoryId` equals this snapshot's already-read, trusted repository
+  // identity. `readWorkflowState` validates a `WorkflowState`'s *internal*
+  // consistency; it neither knows nor should know which Cockpit envelope owns
+  // that state, so the ownership check belongs here, not there. The comparison
+  // uses the `repositoryId` primitive already captured above from the envelope's
+  // `repository.repositoryId` — never a re-read of the raw input — and reads the
+  // workflow's id from the detached, frozen reconstruction, so no hostile getter
+  // can shift either side after capture and no second source of truth is
+  // introduced. On mismatch the workflow is discarded and the whole snapshot
+  // rejects with `autoflow` in `invalidFields`; neither identity is rewritten.
+  const rawAutoflow = readOwnOptionalProperty(record, 'autoflow');
+  let autoflow: WorkflowState | null = null;
+  let autoflowValid = false;
+  if (rawAutoflow === null) {
+    autoflowValid = true;
+  } else if (rawAutoflow !== undefined && rawAutoflow !== UNREADABLE_PROPERTY) {
+    autoflow = readWorkflowState(rawAutoflow);
+    autoflowValid = autoflow !== null && autoflow.repositoryId === repositoryId;
+    if (!autoflowValid) {
+      autoflow = null;
+    }
+  }
+
   const invalidFields: string[] = [];
   if (!schemaVersionValid) {
     append(invalidFields, 'schemaVersion');
@@ -797,6 +847,9 @@ export function readCockpitSnapshot(value: unknown): CockpitSnapshotReadResult {
   }
   if (repairJobs === null) {
     append(invalidFields, 'repairJobs');
+  }
+  if (!autoflowValid) {
+    append(invalidFields, 'autoflow');
   }
 
   if (invalidFields.length > 0) {
@@ -831,6 +884,7 @@ export function readCockpitSnapshot(value: unknown): CockpitSnapshotReadResult {
       evidence,
       findings,
       repairJobs,
+      autoflow,
     }),
     invalidFields: objectFreeze([] as string[]),
   });

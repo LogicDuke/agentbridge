@@ -1,6 +1,7 @@
 # Cockpit Snapshot / Read-Model Contract (Cockpit D1)
 
-Status: V1 defaults. Superseded only by an explicit architecture decision.
+Status: schema version 2 (Stage B — Autoflow observation). Superseded only by
+an explicit architecture decision.
 
 ## Scope
 
@@ -10,9 +11,11 @@ D1 adds the pure TypeScript contract for future read-only Cockpit data:
 
 **Contract only. Nothing is collected, persisted, served, or executed.** D1
 contains no filesystem access, no Evidence Store implementation, no collectors,
-no Git or GitHub access, no subprocess, no HTTP/REST/WebSocket/SSE, no
-frontend, and no Autoflow integration. Every value in a snapshot — including
-the observation timestamp — is caller-supplied data.
+no Git or GitHub access, no subprocess, no HTTP/REST/WebSocket/SSE, and no
+frontend. A snapshot embeds one serialized Autoflow observation (schema v2), but
+D1 drives no Autoflow engine and executes no workflow transition. Every value in
+a snapshot — including the observation timestamp and that Autoflow observation —
+is caller-supplied data.
 
 ## Authority model
 
@@ -42,15 +45,54 @@ Domain/evidence truth and the Cockpit view model are distinct by construction:
 
 One `CockpitSnapshot` describes exactly one repository at one observed HEAD:
 
+- `schemaVersion` — the accepted contract version, `2`. Required, matched by
+  exact equality (see *Schema version and Autoflow*).
 - `repository` — repository identity, observed HEAD SHA, optional canonical
   default-branch ref (C1's `refs/heads/<name>` spelling).
 - `provenance` — collector/source identity and the externally supplied
   observation timestamp. Audit metadata, inert as authority.
 - `pullRequests`, `evidence`, `findings`, `repairJobs` — bounded, all-or-nothing
   lists of frozen read models.
+- `autoflow` — a required field carrying one serialized Autoflow observation (a
+  PR 007 `WorkflowState`) or `null` (see *Schema version and Autoflow*).
 
-Every accepted field is a primitive, `null`, or a frozen array of frozen
-records, so a snapshot survives a plain-JSON round trip unchanged.
+Every accepted field is a primitive, `null`, a frozen record, or a frozen array
+of frozen records, so a snapshot survives a plain-JSON round trip unchanged:
+`JSON.parse(JSON.stringify(snapshot))` re-reads to an equal accepted snapshot.
+
+## Schema version and Autoflow
+
+`schemaVersion` is required and accepts version `2` only. Version 1, an absent
+`schemaVersion`, and any unsupported or future version are each rejected whole;
+the reader never guesses at another shape. No durable version-1 snapshot exists
+to migrate — the sole version-1 producer was fixture code — so a second accepted
+durable shape would guard nothing, and version 1 is not accepted.
+
+`autoflow` is a **required** envelope field under schema v2, and is
+observation/display data only. It is a serialized echo of one workflow, read
+through the domain's own hostile `readWorkflowState` into a detached,
+deeply-frozen state; it grants no authority. It cannot execute a transition,
+alter a Policy Engine decision, invoke a provider, authorize a repair, set
+Ready, authorize a merge, or stand up a second workflow source of truth —
+authority over a workflow stays entirely in the Autoflow engine.
+
+The field has four distinct states:
+
+- **absent property** — an invalid snapshot; a missing `autoflow` never folds to
+  an empty observation.
+- **`null`** — valid; means no workflow was observed.
+- **a valid `WorkflowState`** — accepted only when it is internally valid *and*
+  repository-bound (see below).
+- **a malformed `WorkflowState`** — an invalid snapshot.
+
+Repository binding: an accepted `autoflow` must satisfy
+
+    snapshot.autoflow.repositoryId === snapshot.repository.repositoryId
+
+The reader compares the reconstructed workflow's own `repositoryId` against the
+snapshot's already-read `repository.repositoryId`. A mismatch invalidates
+`autoflow` and rejects the whole snapshot; neither identity is rewritten or
+coerced. One snapshot represents exactly one repository.
 
 ## Reused domain vocabulary (never duplicated)
 

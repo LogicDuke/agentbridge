@@ -98,7 +98,9 @@ describe('malformed input is rejected deterministically', () => {
   });
 
   it('rejects any schema version other than the one this reader defines', () => {
-    for (const schemaVersion of [0, 2, '1', 1.5, null, undefined, {}]) {
+    // Version 2 is now the sole supported version; 1 is a superseded shape and,
+    // like every other non-2 value, is rejected whole.
+    for (const schemaVersion of [0, 1, 3, '2', 1.5, null, undefined, {}]) {
       const result = readCockpitSnapshot(
         buildSnapshot({ schemaVersion: schemaVersion as never }),
       );

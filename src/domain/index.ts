@@ -253,4 +253,4 @@ export {
   type WorkflowStatus,
 } from './workflow.js';
 
-export { applyWorkflowEvent, openWorkflow } from './workflow-transitions.js';
+export { applyWorkflowEvent, openWorkflow, readWorkflowState } from './workflow-transitions.js';

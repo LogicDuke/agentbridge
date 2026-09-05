@@ -50,10 +50,16 @@ describe('Cockpit D3 rendered page', () => {
     expect(html).toContain('FIXTURE DATA');
   });
 
-  it('honestly labels Autoflow as not projected', () => {
+  it('renders the populated Autoflow panel projected from the fixture workflow', () => {
+    // Stage B: the fixture now carries a serialized WorkflowState, so the host
+    // projects it through D4 and the honest absence copy is replaced by the
+    // projected orchestration facts. (The absence branch itself is still covered
+    // directly against the renderer in the "Cockpit D4 Autoflow panel" suite.)
     expect(html).toContain('Autoflow');
-    expect(html).toContain('Not projected yet');
-    expect(html).toContain('Cockpit D4 projection');
+    expect(html).not.toContain('Not projected yet');
+    expect(html).toContain('Projected verbatim from one observed');
+    expect(html).toContain('wf-stage-a-0001');
+    expect(html).toContain('inv-review-0001');
   });
 
   it('honestly labels tree SHA as not projected', () => {

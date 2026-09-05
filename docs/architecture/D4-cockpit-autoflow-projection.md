@@ -1,6 +1,9 @@
 # Cockpit Autoflow Projection (D4, Stage A)
 
-Status: V1, Stage A. Superseded only by an explicit architecture decision.
+Status: V1. The D4 projection is Stage A (in-process `WorkflowState` → display);
+Stage B has since landed the serialized Autoflow ingestion in the D1 snapshot
+reader (see *Frozen Stage-A design decision*). Superseded only by an explicit
+architecture decision.
 
 ## Purpose
 
@@ -27,17 +30,27 @@ returned by `openWorkflow` / `applyWorkflowEvent`). It does **not**:
 - add next-action / current-gate policy;
 - add authority.
 
-The future serialized/collector provenance boundary — re-reading a workflow
-state from hostile JSON — is **explicitly deferred**. When it lands it belongs to
-the D1 snapshot reader, not to D4.
+The serialized/collector provenance boundary — re-reading a workflow state from
+hostile JSON — has since **landed in the D1 Cockpit snapshot reader**, exactly
+where this Stage-A note anticipated it belongs, not in D4. Under Cockpit snapshot
+**schema version 2** the D1 envelope carries a **required** `autoflow` field: a
+non-null Autoflow observation is a serialized `WorkflowState` that D1 (not D4)
+reconstructs and validates through the domain's own hostile `readWorkflowState`
+reader, and binds to the snapshot's `repositoryId`, before any consumer sees it.
+D4 still consumes only that already-validated, in-process value: the D4
+projection does not own or run the D1 envelope reader, does not mutate the
+`CockpitSnapshot` envelope, adds no hostile reader of its own, executes no
+workflow transition, and gains no authority.
 
 ## Trust boundary (D2 "Option A")
 
-The input is a `WorkflowState` produced by the PR 007 state machine, which
-returns only deeply-frozen, self-consistent, JSON-round-trippable values. D4
-mirrors D2: it consumes an already-validated domain value, accepts no `unknown`,
-adds no `invalidFields` envelope, and re-validates nothing. It is not a second
-reader.
+The input is an already-validated `WorkflowState` — either one produced directly
+by the PR 007 state machine (`openWorkflow` / `applyWorkflowEvent`), or the
+deeply-frozen observation the D1 snapshot reader reconstructs from a serialized
+snapshot; both are deeply-frozen, self-consistent, JSON-round-trippable values.
+D4 mirrors D2: it consumes that already-validated domain value, accepts no
+`unknown`, adds no `invalidFields` envelope, and re-validates nothing. It is not
+a second reader.
 
 For realm robustness (the JavaScript realm may be mutated between the domain
 transition and the projection) D4 captures its intrinsics at load, avoids every
@@ -103,15 +116,20 @@ authority value has nowhere to land. Cockpit remains presentation only.
 `renderDashboard` gains an optional `autoflow` projection argument (default
 `null`). When supplied, the Autoflow panel renders the projected facts; when
 omitted, it shows an honest absence state and invents nothing. The Stage-A host
-supplies no workflow — it must not execute Autoflow transitions merely to
-manufacture display state — so the panel is absent there. Tests build a real
-`WorkflowState` through the domain transitions and pass its projection to the
-renderer to exercise the populated panel.
+supplies a fixture Autoflow observation *through D1*: `readCockpitSnapshot`
+rebuilds the fixture's `autoflow` into a validated `WorkflowState`, the host
+projects it with `projectCockpitAutoflow`, and renders the populated panel —
+never by executing an Autoflow transition. Unit tests also build a real
+`WorkflowState` through the domain transitions and project it to exercise the
+populated panel; the host path exercises the fixture -> D1 -> D4 projection
+route, and a `null` observation renders the honest absence panel.
 
 ## Recommended next gate
 
-A WF2 mechanism-design gate deciding the D4 input-provenance/serialization
-contract — how a real `WorkflowState` crosses into Cockpit beyond an in-process
-value (D1-envelope extension with a `schemaVersion` policy, or an Evidence-Store
-source). Escalation (WF1/WF2/WF3), finding-family, and reviewer-budget
-projection remain deferred until the domain state they describe exists.
+The D4 input-provenance/serialization boundary — how a real `WorkflowState`
+crosses into Cockpit beyond an in-process value — has landed as the **D1-envelope
+extension with a `schemaVersion` policy** (Cockpit snapshot schema version 2's
+required `autoflow` field); an Evidence-Store-backed source remains a possible
+later provenance, not a prerequisite. Still deferred until the domain state they
+describe exists: escalation (WF1/WF2/WF3), finding-family, and reviewer-budget
+projection.

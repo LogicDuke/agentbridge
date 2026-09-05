@@ -1126,6 +1126,308 @@ function freezeState(next: WorkflowSnapshot): WorkflowState {
   });
 }
 
+/**
+ * Materialise one hostile, possibly-mutable collection into a trusted **frozen**
+ * copy — the serialized-observation counterpart to {@link readList}.
+ *
+ * {@link readList} guards the *authoritative transition path*: it demands the
+ * caller's collection be **already frozen**, because that state is about to
+ * re-enter the durable ledger, where a live or merely-sealed Proxy could later
+ * substitute or drop an element and free its identity for reuse. That protection
+ * is deliberately **left unchanged**. A serialized state reconstructed for
+ * read-only Cockpit observation never re-enters the ledger, so the frozen-input
+ * demand — which would reject ordinary `JSON.parse` output — is not imposed
+ * here. Instead the hostile collection is proved structurally and copied once,
+ * exactly as D1's snapshot list reader treats collector JSON:
+ *
+ * - `Array.isArray` guarded (a revoked Proxy throws and fails closed);
+ * - `length` read once and bounded by `limit`;
+ * - own-key cardinality pinned to exactly `length` indices plus `length`, so a
+ *   surplus, symbol, or hidden own key rejects the whole collection;
+ * - every index proved **own** (a sparse hole or an inherited element is
+ *   absence, never a value) and read exactly once;
+ * - the fresh copy is frozen, so {@link readList} — re-run by
+ *   {@link snapshotWorkflow} over this copy — sees a genuinely frozen collection
+ *   and the transition path's guarantee is never relaxed to reach it.
+ *
+ * Elements are copied by reference; their fields are validated and rebuilt into
+ * fresh frozen records by the per-record readers, so no hostile object survives
+ * in the returned state.
+ */
+function readMutableList(value: unknown, limit: number): readonly unknown[] | null {
+  let elements: readonly unknown[] | null;
+  try {
+    elements = arrayIsArray(value) ? (value as readonly unknown[]) : null;
+  } catch {
+    return null;
+  }
+  if (elements === null) {
+    return null;
+  }
+
+  let rawLength: unknown;
+  try {
+    rawLength = elements.length;
+  } catch {
+    return null;
+  }
+  const length = readCount(rawLength, limit);
+  if (length === null) {
+    return null;
+  }
+
+  // A genuine array of `n` elements has exactly `n + 1` own keys: one per index
+  // plus `length`. Any surplus key — a hidden element past the claimed range, a
+  // stray property, a symbol — breaks the equality, and any missing index is
+  // caught by the per-index ownership check below.
+  let keys: readonly (string | symbol)[];
+  try {
+    keys = reflectOwnKeys(elements);
+  } catch {
+    return null;
+  }
+  if (keys.length !== length + 1) {
+    return null;
+  }
+
+  const materialised: unknown[] = [];
+  for (let index = 0; index < length; index += 1) {
+    let element: unknown;
+    try {
+      if (!objectHasOwn(elements, index)) {
+        return null;
+      }
+      element = elements[index];
+    } catch {
+      return null;
+    }
+    append(materialised, element);
+  }
+  return objectFreeze(materialised);
+}
+
+/**
+ * Prototype-hook insulation for the serialized-observation graph (PR74-F1).
+ *
+ * The transition path's `freezeState` returns a **standard** domain
+ * `WorkflowState` — ordinary-prototype records and arrays — which is correct for
+ * an in-process value that is never JSON-serialized across a poisoned realm. The
+ * serialized-observation value is different: a hostile getter may have installed
+ * `Object.prototype.toJSON` (hijacking or throwing) *during* ingestion, and that
+ * poisoned hook persists. If the accepted observation graph inherited it, a later
+ * `JSON.stringify(snapshot)` at the D1 boundary would execute attacker code.
+ *
+ * These helpers — used **only** by `readWorkflowState`, never by the transition
+ * path — rebuild the returned graph so no inherited `toJSON` can reach it:
+ *
+ * - records are detached from `Object.prototype` (a `null` prototype removes the
+ *   inherited chain entirely), so no inherited `toJSON` exists to call;
+ * - lists stay real arrays (consumers index and read `length`), so the inherited
+ *   chain is instead neutralised by an **own, non-enumerable, non-callable**
+ *   `toJSON`: `JSON.stringify` finds it, skips it, and serialises the array
+ *   itself, never reaching a poisoned `Object.prototype.toJSON`. Non-enumerable,
+ *   so it never appears in the JSON output and changes no structural equality;
+ * - every node is deeply frozen.
+ *
+ * Only module-load-captured intrinsics are used, so a poisoned `Object.prototype`
+ * accessor cannot intercept the construction. This mirrors the D1 snapshot reader
+ * and the D4 projector, whose accepted graphs are insulated the same way.
+ */
+function observationDataDescriptor(value: unknown, enumerable: boolean): PropertyDescriptor {
+  // A hostile getter installed earlier may have poisoned `Object.prototype`; a
+  // plain `{...}` descriptor would inherit any planted accessor keys and
+  // `ToPropertyDescriptor` (which walks the chain) would then reject the mixed
+  // descriptor. A `null` prototype removes the inherited chain entirely.
+  const descriptor: PropertyDescriptor = {
+    value,
+    writable: false,
+    enumerable,
+    configurable: false,
+  };
+  objectSetPrototypeOf(descriptor, null);
+  return descriptor;
+}
+
+/** Append by defining an own element: no `push`, no inherited index setter. */
+function observationAppend<T>(list: T[], value: T): void {
+  objectDefineProperty(list, list.length, observationDataDescriptor(value, true));
+}
+
+/** Detach a returned record node from `Object.prototype` and freeze it. */
+function observationRecord<T extends object>(record: T): Readonly<T> {
+  objectSetPrototypeOf(record, null);
+  return objectFreeze(record);
+}
+
+/** Freeze a returned list node, shadowing any inherited `toJSON` with an own non-callable. */
+function observationList<T>(list: T[]): readonly T[] {
+  objectDefineProperty(list, 'toJSON', observationDataDescriptor(undefined, false));
+  return objectFreeze(list);
+}
+
+/**
+ * Rebuild the validated snapshot into a deeply-frozen, prototype-insulated
+ * observation `WorkflowState` (PR74-F1).
+ *
+ * Every field is copied verbatim from the already-validated snapshot, so value
+ * semantics are identical to what `freezeState` would have returned; only the
+ * prototype exposure of the returned graph differs. No hostile input reference
+ * survives — every record is a fresh node built from validated primitives.
+ */
+function hardenObservation(snapshot: WorkflowSnapshot): WorkflowState {
+  const invocations: TrackedInvocation[] = [];
+  for (let index = 0; index < snapshot.invocations.length; index += 1) {
+    const source = snapshot.invocations[index];
+    if (source === undefined) {
+      continue;
+    }
+    observationAppend(
+      invocations,
+      observationRecord({
+        invocationId: source.invocationId,
+        targetCommitSha: source.targetCommitSha,
+        purpose: source.purpose,
+        providerId: source.providerId,
+        agentId: source.agentId,
+        requestedAtRevision: source.requestedAtRevision,
+        requestedAtSequence: source.requestedAtSequence,
+        state: source.state,
+        reportedStatus: source.reportedStatus,
+        reportedAtRevision: source.reportedAtRevision,
+        reportedAtSequence: source.reportedAtSequence,
+      }),
+    );
+  }
+
+  const evidence: AdmittedEvidence[] = [];
+  for (let index = 0; index < snapshot.evidence.length; index += 1) {
+    const source = snapshot.evidence[index];
+    if (source === undefined) {
+      continue;
+    }
+    observationAppend(
+      evidence,
+      observationRecord({
+        evidenceId: source.evidenceId,
+        kind: source.kind,
+        admittedAtCommitSha: source.admittedAtCommitSha,
+        admittedAtRevision: source.admittedAtRevision,
+        admittedAtSequence: source.admittedAtSequence,
+      }),
+    );
+  }
+
+  const reviews: AdmittedReview[] = [];
+  for (let index = 0; index < snapshot.reviews.length; index += 1) {
+    const source = snapshot.reviews[index];
+    if (source === undefined) {
+      continue;
+    }
+    observationAppend(
+      reviews,
+      observationRecord({
+        reviewId: source.reviewId,
+        admittedAtCommitSha: source.admittedAtCommitSha,
+        admittedAtRevision: source.admittedAtRevision,
+        admittedAtSequence: source.admittedAtSequence,
+      }),
+    );
+  }
+
+  return observationRecord({
+    workflowId: snapshot.workflowId,
+    repositoryId: snapshot.repositoryId,
+    pullRequestId: snapshot.pullRequestId,
+    boundCommitSha: snapshot.boundCommitSha,
+    revision: snapshot.revision,
+    sequence: snapshot.sequence,
+    status: snapshot.status,
+    closureReason: snapshot.closureReason,
+    humanGateOpenedAtRevision: snapshot.humanGateOpenedAtRevision,
+    invocations: observationList(invocations),
+    evidence: observationList(evidence),
+    reviews: observationList(reviews),
+  });
+}
+
+/**
+ * Reconstruct a trusted {@link WorkflowState} from an untrusted, possibly-mutable
+ * serialized representation, or reject it.
+ *
+ * This is the **serialized-observation** entry point, distinct by trust purpose
+ * from the authoritative transition path (`openWorkflow` / `applyWorkflowEvent`
+ * / {@link snapshotWorkflow}). The transition path accepts only an already-frozen
+ * in-process state and re-admits it to the durable ledger. This reader accepts
+ * ordinary `JSON.parse` output — mutable and `Object.prototype`-bearing — and
+ * produces a detached observation that is **never** fed back into a transition,
+ * a policy engine, a provider, or a merge.
+ *
+ * Every hostile field is read **exactly once** into an inert local; the three
+ * collections are copied into frozen trusted arrays via {@link readMutableList};
+ * the assembled candidate is null-prototyped so no inherited hook reaches the
+ * validator; and the candidate is handed to the **unchanged** {@link
+ * snapshotWorkflow}, which re-checks every scalar, per-record, and cross-record
+ * invariant and rebuilds fresh frozen records. {@link hardenObservation} then
+ * returns a deeply-frozen, prototype-insulated state fully detached from the
+ * hostile input (PR74-F1). Nothing here relaxes the frozen-input requirement the
+ * transition path relies on.
+ */
+export function readWorkflowState(value: unknown): WorkflowState | null {
+  const record = asRecord(value);
+  if (record === null) {
+    return null;
+  }
+
+  const invocations = readMutableList(
+    readOwnProperty(record, 'invocations'),
+    WORKFLOW_BOUNDS.MAX_TRACKED_INVOCATIONS,
+  );
+  const evidence = readMutableList(
+    readOwnProperty(record, 'evidence'),
+    WORKFLOW_BOUNDS.MAX_ADMITTED_EVIDENCE,
+  );
+  const reviews = readMutableList(
+    readOwnProperty(record, 'reviews'),
+    WORKFLOW_BOUNDS.MAX_ADMITTED_REVIEWS,
+  );
+  if (invocations === null || evidence === null || reviews === null) {
+    return null;
+  }
+
+  // A trusted, inert candidate: every hostile scalar read exactly once into an
+  // own data property, the three collections replaced by the frozen trusted
+  // copies above, and a null prototype so no inherited hook reaches the
+  // authoritative validator. The candidate is transient — never returned — so
+  // its null prototype does not alter the shape of the state `freezeState`
+  // rebuilds, which stays a standard domain `WorkflowState`.
+  const draft: Record<string, unknown> = {
+    workflowId: readOwnProperty(record, 'workflowId'),
+    repositoryId: readOwnProperty(record, 'repositoryId'),
+    pullRequestId: readOwnProperty(record, 'pullRequestId'),
+    boundCommitSha: readOwnProperty(record, 'boundCommitSha'),
+    revision: readOwnProperty(record, 'revision'),
+    sequence: readOwnProperty(record, 'sequence'),
+    status: readOwnProperty(record, 'status'),
+    closureReason: readOwnProperty(record, 'closureReason'),
+    humanGateOpenedAtRevision: readOwnProperty(record, 'humanGateOpenedAtRevision'),
+    invocations,
+    evidence,
+    reviews,
+  };
+  objectSetPrototypeOf(draft, null);
+
+  const snapshot = snapshotWorkflow(draft as unknown as WorkflowState);
+  if (snapshot === null) {
+    return null;
+  }
+  // The observation graph is prototype-insulated (PR74-F1) rather than returned
+  // through `freezeState`: a hostile `Object.prototype.toJSON` installed during
+  // ingestion must not be reachable by a later `JSON.stringify` of this value at
+  // the D1 boundary. Value semantics are identical; only prototype exposure
+  // differs. `freezeState` and the transition path are untouched.
+  return hardenObservation(snapshot);
+}
+
 /** Copy a list and append one element, without prototype methods or spread. */
 function appendTo<T>(list: readonly T[], value: T): readonly T[] {
   const next: T[] = [];

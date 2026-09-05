@@ -57,6 +57,11 @@ const FROZEN_SPECIFIERS: ReadonlySet<string> = new Set([
   'node:http',
   'node:url',
   '../cockpit/index.js',
+  // D4 Stage B: the host projects the snapshot's trusted `autoflow` state through
+  // the pure D4 projector (imported directly, as the barrel deliberately does not
+  // re-export the projection function). Still a `../cockpit/` sibling — no new
+  // capability, no orchestration execution.
+  '../cockpit/autoflow-projection.js',
   './escape.js',
   './fixtures/stage-a.js',
   './render.js',
