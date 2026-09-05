@@ -74,6 +74,29 @@ describe('readStartupWorkflowConfig', () => {
     ).toThrow();
   });
 
+  it('fails closed on an optional-only request: pullRequestId only (never silently null)', () => {
+    const call = (): unknown =>
+      readStartupWorkflowConfig(env({ [WORKFLOW_OPEN_ENV.PULL_REQUEST_ID]: '82' }), REPO);
+    expect(call).toThrow();
+  });
+
+  it('fails closed on an optional-only request: workflow repository id only', () => {
+    const call = (): unknown =>
+      readStartupWorkflowConfig(env({ [WORKFLOW_OPEN_ENV.REPOSITORY_ID]: REPO }), REPO);
+    expect(call).toThrow();
+  });
+
+  it('optional-only with a mismatched repository id cannot silently become null', () => {
+    // A workflow-open var is present, so this is a request; it is incomplete, so
+    // it must throw — never silently return null (the old bypass).
+    expect(() =>
+      readStartupWorkflowConfig(
+        env({ [WORKFLOW_OPEN_ENV.REPOSITORY_ID]: 'someone-else/other' }),
+        REPO,
+      ),
+    ).toThrow();
+  });
+
   it('fails closed on repository identity mismatch', () => {
     expect(() =>
       readStartupWorkflowConfig(

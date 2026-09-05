@@ -21,11 +21,14 @@
  *
  * ## Fail-closed behavior
  *
- * - No workflow-open variables present → no startup workflow (`null`); the
- *   runtime starts honestly with `current() === null`.
+ * - **No** workflow-open variable present (required or optional) → no startup
+ *   workflow (`null`); the runtime starts honestly with `current() === null`.
  * - A complete, consistent request → exactly one {@link WorkflowBinding}.
- * - A **partial** request (one required variable present, the other absent) →
- *   throws; startup fails closed. No partially-minted binding is returned.
+ * - A **partial** request — any workflow-open variable present while the
+ *   required set (`workflowId` + `boundCommitSha`) is incomplete, including an
+ *   optional-only request (just `pullRequestId`, or just the workflow
+ *   repository identity) → throws; startup fails closed. No partially-minted
+ *   binding is returned.
  * - A repository-identity **mismatch** → throws; startup fails closed.
  *
  * Field-*content* validity (non-empty, length bounds, exact-identifier shape) is
@@ -71,10 +74,17 @@ export function readStartupWorkflowConfig(
   const pullRequestId = env[WORKFLOW_OPEN_ENV.PULL_REQUEST_ID];
   const workflowRepositoryId = env[WORKFLOW_OPEN_ENV.REPOSITORY_ID];
 
-  // A startup open is "requested" if any workflow-specific required variable is
-  // present. Presence is `!== undefined`: an empty string is present-but-
-  // malformed and must fail closed at the domain, never be read as absence.
-  const requested = workflowId !== undefined || boundCommitSha !== undefined;
+  // A startup open is "requested" if **any** workflow-open variable is present —
+  // required or optional. An optional-only request (e.g. only the pull-request
+  // id, or only the workflow repository identity) is a *partial* request and
+  // must fail closed below, never be read as "no startup workflow". Presence is
+  // `!== undefined`: an empty string is present-but-malformed and reaches the
+  // domain's rejection, never absence.
+  const requested =
+    workflowId !== undefined ||
+    boundCommitSha !== undefined ||
+    pullRequestId !== undefined ||
+    workflowRepositoryId !== undefined;
   if (!requested) {
     return null;
   }

@@ -172,3 +172,58 @@ describe('AutoflowRuntime single-active-workflow open guard', () => {
     expect(runtime.current()?.workflowId).toBe('wf-live-0001');
   });
 });
+
+describe('reader() capability containment — writer is unrecoverable via prototype swap', () => {
+  it('reader.current() does not dispatch through AutoflowRuntime.prototype.current', () => {
+    const runtime = new AutoflowRuntime();
+    runtime.open(BINDING);
+    const reader = runtime.reader();
+    const expected = runtime.current(); // live OPEN state, captured before the patch
+
+    // Save/restore via descriptor (avoids taking an unbound-method reference).
+    const originalDesc = Object.getOwnPropertyDescriptor(AutoflowRuntime.prototype, 'current');
+    const receivers: unknown[] = [];
+    try {
+      // Adversarial: a downstream same-process actor replaces the (publicly
+      // importable, mutable) prototype method to observe its receiver.
+      (AutoflowRuntime.prototype as unknown as { current: () => unknown }).current =
+        function (this: unknown): unknown {
+          receivers.push(this);
+          return null;
+        };
+
+      // The repaired reader reads the private state cell directly, so it routes
+      // through NO prototype method: the patch is never invoked, no runtime
+      // receiver is captured, and the live state is still returned unaffected.
+      const value = reader.current();
+      expect(receivers).toHaveLength(0);
+      expect(value).toBe(expected);
+
+      // Control: the patch itself IS effective — calling the prototype method on
+      // a runtime receiver DOES capture it. The reader simply never routes there.
+      (runtime as unknown as { current: () => unknown }).current();
+      expect(receivers).toHaveLength(1);
+      expect(receivers[0]).toBe(runtime);
+    } finally {
+      if (originalDesc !== undefined) {
+        Object.defineProperty(AutoflowRuntime.prototype, 'current', originalDesc);
+      }
+    }
+
+    // After restore, the reader remains live across a subsequent transition.
+    runtime.apply(HEAD_OBSERVED_B);
+    expect(reader.current()).toBe(runtime.current());
+    expect(reader.current()?.boundCommitSha).toBe(SHA_B);
+  });
+
+  it('reader exposes current() only; open/apply remain absent/unrecoverable', () => {
+    const reader = new AutoflowRuntime().reader();
+    const asRecord = reader as unknown as Record<string, unknown>;
+    expect('current' in reader).toBe(true);
+    expect('open' in reader).toBe(false);
+    expect('apply' in reader).toBe(false);
+    expect(asRecord['open']).toBeUndefined();
+    expect(asRecord['apply']).toBeUndefined();
+    expect(Object.isFrozen(reader)).toBe(true);
+  });
+});
