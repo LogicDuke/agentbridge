@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   AUTOFLOW_APPLY_NO_WORKFLOW,
+  AUTOFLOW_OPEN_ALREADY_ACTIVE,
   AutoflowRuntime,
   type AutoflowStateReader,
 } from '../../src/autoflow/runtime.js';
@@ -117,5 +118,57 @@ describe('AutoflowRuntime', () => {
     runtime.open(BINDING);
     expect(reader.current()).toBe(runtime.current());
     expect(reader.current()?.status).toBe('OPEN');
+  });
+});
+
+const BINDING_2: WorkflowBinding = {
+  workflowId: 'wf-live-0002',
+  repositoryId: REPO,
+  boundCommitSha: SHA_B,
+};
+const HUMAN_GATE_A: WorkflowEvent = { kind: 'HUMAN_GATE_OPENED', atCommitSha: SHA_A };
+const CLOSE: WorkflowEvent = { kind: 'CLOSE_REQUESTED', closureReason: 'CALLER_CLOSED' };
+
+describe('AutoflowRuntime single-active-workflow open guard', () => {
+  it('rejects a second open while OPEN with WORKFLOW_ALREADY_ACTIVE, unchanged reference', () => {
+    const runtime = new AutoflowRuntime();
+    runtime.open(BINDING);
+    const before = runtime.current();
+    const result = runtime.open(BINDING_2);
+    expect(result.outcome).toBe(AUTOFLOW_OPEN_ALREADY_ACTIVE);
+    expect(result.state).toBeNull();
+    // The active workflow is not clobbered: exact prior reference retained.
+    expect(runtime.current()).toBe(before);
+    expect(runtime.current()?.workflowId).toBe('wf-live-0001');
+  });
+
+  it('rejects a second open while AWAITING_HUMAN_DECISION with WORKFLOW_ALREADY_ACTIVE', () => {
+    const runtime = new AutoflowRuntime();
+    runtime.open(BINDING);
+    runtime.apply(HUMAN_GATE_A);
+    expect(runtime.current()?.status).toBe('AWAITING_HUMAN_DECISION');
+    const before = runtime.current();
+    const result = runtime.open(BINDING_2);
+    expect(result.outcome).toBe(AUTOFLOW_OPEN_ALREADY_ACTIVE);
+    expect(runtime.current()).toBe(before);
+  });
+
+  it('permits a new open after the current workflow is CLOSED', () => {
+    const runtime = new AutoflowRuntime();
+    runtime.open(BINDING);
+    runtime.apply(CLOSE);
+    expect(runtime.current()?.status).toBe('CLOSED');
+    const result = runtime.open(BINDING_2);
+    expect(result.outcome).toBe(TRANSITION_OUTCOME.APPLIED);
+    // The new workflow replaces the closed prior; no history is retained.
+    expect(runtime.current()?.workflowId).toBe('wf-live-0002');
+    expect(runtime.current()?.status).toBe('OPEN');
+  });
+
+  it('permits an open from null (no prior workflow)', () => {
+    const runtime = new AutoflowRuntime();
+    const result = runtime.open(BINDING);
+    expect(result.outcome).toBe(TRANSITION_OUTCOME.APPLIED);
+    expect(runtime.current()?.workflowId).toBe('wf-live-0001');
   });
 });

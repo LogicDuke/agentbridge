@@ -32,6 +32,7 @@ import {
   applyWorkflowEvent,
   openWorkflow,
   TRANSITION_OUTCOME,
+  WORKFLOW_STATUS,
   type TransitionResult,
   type WorkflowBinding,
   type WorkflowEvent,
@@ -81,6 +82,40 @@ const NO_WORKFLOW_RESULT: AutoflowNoWorkflowResult = Object.freeze({
 });
 
 /**
+ * The bounded, truthful result of {@link AutoflowRuntime.open} when it is
+ * refused because a **non-terminal** workflow is already active
+ * (`current()` is `OPEN` or `AWAITING_HUMAN_DECISION`).
+ *
+ * "At most one active workflow" is a **state-owner invariant**: the runtime owns
+ * the single `#current` reference, so it — not any downstream caller — refuses a
+ * replacement. The pure domain `openWorkflow` stays stateless and knows nothing
+ * of a prior workflow, so the guard lives here, around it. The refusal never
+ * clobbers the active workflow, mints no {@link WorkflowState}, and is a provable
+ * no-op. Its shape mirrors {@link WorkflowOpenResult} — `state: null`,
+ * `rejection: null`, empty `invalidFields` — so a consumer can switch on
+ * `outcome` uniformly.
+ */
+export const AUTOFLOW_OPEN_ALREADY_ACTIVE = 'WORKFLOW_ALREADY_ACTIVE';
+
+/** @see AUTOFLOW_OPEN_ALREADY_ACTIVE */
+export interface AutoflowAlreadyActiveResult {
+  readonly outcome: typeof AUTOFLOW_OPEN_ALREADY_ACTIVE;
+  readonly state: null;
+  readonly rejection: null;
+  readonly invalidFields: readonly string[];
+}
+
+/** Every result {@link AutoflowRuntime.open} can return. */
+export type AutoflowOpenResult = WorkflowOpenResult | AutoflowAlreadyActiveResult;
+
+const ALREADY_ACTIVE_RESULT: AutoflowAlreadyActiveResult = Object.freeze({
+  outcome: AUTOFLOW_OPEN_ALREADY_ACTIVE,
+  state: null,
+  rejection: null,
+  invalidFields: Object.freeze([]),
+});
+
+/**
  * Sole runtime owner of the current authoritative {@link WorkflowState}.
  *
  * Not autonomous: `open`/`apply` are driven by an external caller (a real
@@ -96,12 +131,27 @@ export class AutoflowRuntime implements AutoflowStateReader {
   }
 
   /**
-   * Open a workflow through the real domain `openWorkflow`. On `APPLIED` the
-   * single reference is replaced with the returned deeply-frozen state; a
-   * `REJECTED` result leaves the reference unchanged. The domain result is
-   * returned verbatim.
+   * Open a workflow through the real domain `openWorkflow`, enforcing the
+   * **at-most-one-active-workflow** state-owner invariant.
+   *
+   * - `current()` is `null` → open permitted.
+   * - `current()` is `CLOSED` (terminal) → a **new** workflow may be opened; on
+   *   `APPLIED` the reference is replaced and the closed prior workflow is no
+   *   longer retained (the runtime keeps no workflow history — an explicit
+   *   in-memory limitation, not durable orchestration).
+   * - `current()` is `OPEN` or `AWAITING_HUMAN_DECISION` (non-terminal) → the
+   *   open is **refused** with {@link AUTOFLOW_OPEN_ALREADY_ACTIVE}; the exact
+   *   current reference is left unchanged and `openWorkflow` is never called, so
+   *   the active workflow can never be clobbered.
+   *
+   * On a permitted open the pure domain result is returned verbatim; `#current`
+   * advances only on `APPLIED`.
    */
-  open(binding: WorkflowBinding): WorkflowOpenResult {
+  open(binding: WorkflowBinding): AutoflowOpenResult {
+    const current = this.#current;
+    if (current !== null && current.status !== WORKFLOW_STATUS.CLOSED) {
+      return ALREADY_ACTIVE_RESULT;
+    }
     const result = openWorkflow(binding);
     if (result.outcome === TRANSITION_OUTCOME.APPLIED && result.state !== null) {
       this.#current = result.state;
