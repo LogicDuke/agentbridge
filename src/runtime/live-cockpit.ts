@@ -56,10 +56,17 @@ export interface LiveCockpitConfig {
   readonly clock: () => Date;
 }
 
-/** Options for {@link startLiveCockpit}. Host/port default to the loopback pin. */
+/**
+ * Options for {@link startLiveCockpit}.
+ *
+ * There is deliberately **no host option**: the supported live runtime is pinned
+ * to the loopback {@link HOST} (`127.0.0.1`) and no caller may widen the bind
+ * address to `0.0.0.0`, `::`, a LAN, or any routable interface. `port` is
+ * optional only so tests can bind an ephemeral port (`0`) on the same loopback
+ * address; it never affects which interface is bound.
+ */
 export interface StartLiveCockpitOptions {
   readonly config: LiveCockpitConfig;
-  readonly host?: string;
   readonly port?: number;
 }
 
@@ -133,7 +140,10 @@ export function startLiveCockpit(options: StartLiveCockpitOptions): http.Server 
   buildDashboardHtml(source);
 
   const server = createCockpitServerFromProvider((): string => buildDashboardHtml(source));
-  server.listen(options.port ?? PORT, options.host ?? HOST);
+  // Loopback pin: the bind address is always HOST (127.0.0.1); it is never
+  // caller-controlled, so the live path cannot gain remote-listen authority.
+  // Only the port may vary (ephemeral `0` for tests), never the interface.
+  server.listen(options.port ?? PORT, HOST);
   return server;
 }
 

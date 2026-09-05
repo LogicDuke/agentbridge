@@ -8,6 +8,7 @@ import {
   createLiveObservation,
   startLiveCockpit,
   type LiveCockpitConfig,
+  type StartLiveCockpitOptions,
 } from '../../src/runtime/live-cockpit.js';
 import {
   createCockpitServer,
@@ -414,5 +415,27 @@ describe('runtime smoke', () => {
       second.listen(port, '127.0.0.1');
     });
     expect(error.code).toBe('EADDRINUSE');
+  });
+});
+
+describe('loopback pin (Codex P2 repair)', () => {
+  it('binds the production live host only to 127.0.0.1', async () => {
+    const server = track(startLiveCockpit({ config: baseConfig(), port: 0 }));
+    const port = await waitListening(server);
+    const address = server.address();
+    if (address === null || typeof address === 'string') throw new Error('no address');
+    expect(address.address).toBe('127.0.0.1');
+    expect(address.port).toBe(port);
+    // Served on loopback.
+    expect((await request(port, 'GET', '/')).status).toBe(200);
+  });
+
+  it('exposes no public host option — the bind interface is not caller-controlled', () => {
+    // Type-surface proof: StartLiveCockpitOptions has no `host`, so no supported
+    // public call can bind 0.0.0.0, ::, a LAN, or any non-loopback interface.
+    // @ts-expect-error host is not part of the public options; the live host is loopback-pinned.
+    const attempted: StartLiveCockpitOptions = { config: baseConfig(), host: '0.0.0.0', port: 0 };
+    // Only the loopback-safe options survive on the typed value.
+    expect(attempted.port).toBe(0);
   });
 });
