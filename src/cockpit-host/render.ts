@@ -356,25 +356,72 @@ function legendSection(): string {
 }
 
 /**
+ * Which observation source produced the snapshot being rendered, for provenance
+ * labeling only. Structurally identical to the host's `CockpitSourceMode`, so
+ * the two are assignable without a cross-import (the D3 frozen-source pin fixes
+ * this module's import set). It grants no authority; it selects only the copy the
+ * page uses to announce its own provenance.
+ */
+export type CockpitProvenanceMode = 'fixture' | 'live';
+
+/** Provenance-derived page copy. No `fixture`/`Stage A`/`not live` text ever labels a `live` page, and vice versa. */
+interface ProvenanceCopy {
+  readonly title: string;
+  readonly modeBadge: string;
+  readonly dataBadge: string;
+  readonly footerNote: string;
+}
+
+/**
+ * Resolve the provenance-derived copy. `live` and `fixture` are mutually
+ * exclusive: a `live` page never carries the `STAGE A` / `FIXTURE DATA` /
+ * `not live` labels, and a `fixture` page never claims to be a live observation.
+ */
+function provenanceCopy(mode: CockpitProvenanceMode): ProvenanceCopy {
+  if (mode === 'live') {
+    return {
+      title: 'AgentBridge Cockpit — Live (Read Only)',
+      modeBadge: 'LIVE',
+      dataBadge: 'LIVE OBSERVATION',
+      footerNote: 'live observation',
+    };
+  }
+  return {
+    title: 'AgentBridge Cockpit — Stage A (Read Only)',
+    modeBadge: 'STAGE A',
+    dataBadge: 'FIXTURE DATA',
+    footerNote: 'Stage A fixture data · not live',
+  };
+}
+
+/**
  * Build the complete dashboard HTML document from a validated snapshot and its
  * D2 freshness projection.
  *
  * `autoflow` is an optional D4 projection of one observed `WorkflowState`. When
  * supplied, the Autoflow panel renders its verbatim orchestration facts; when
  * omitted (the default), the panel shows an honest absence state and invents no
- * value. The Stage-A host supplies no workflow, so the panel is absent there.
+ * value.
+ *
+ * `provenance` selects the source-derived labeling (title, badges, footer). It
+ * defaults to `fixture`, preserving the historical Stage-A page byte-for-byte;
+ * a `live` page is mechanically distinguished — it carries no `FIXTURE DATA` /
+ * `STAGE A` / `not live` text at all, so a live snapshot can never be falsely
+ * described as fixture, nor a fixture as live.
  */
 export function renderDashboard(
   snapshot: CockpitSnapshot,
   projection: CockpitEvidenceFreshnessProjection,
   autoflow: CockpitAutoflowProjection | null = null,
+  provenance: CockpitProvenanceMode = 'fixture',
 ): string {
+  const copy = provenanceCopy(provenance);
   return `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AgentBridge Cockpit — Stage A (Read Only)</title>
+<title>${text(copy.title)}</title>
 <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
@@ -384,8 +431,8 @@ export function renderDashboard(
     <div>Observability surface — presentation only, no authority.</div>
     <div class="badges">
       <span class="badge readonly">READ ONLY</span>
-      <span class="badge stage">STAGE A</span>
-      <span class="badge fixture">FIXTURE DATA</span>
+      <span class="badge stage">${text(copy.modeBadge)}</span>
+      <span class="badge fixture">${text(copy.dataBadge)}</span>
       <span class="badge">GET-only · loopback</span>
     </div>
   </div>
@@ -398,7 +445,7 @@ export function renderDashboard(
   ${autoflowSection(autoflow)}
   ${legendSection()}
   <footer>
-    AgentBridge Cockpit D3 · Stage A fixture data · not live · read-only ·
+    AgentBridge Cockpit D3 · ${text(copy.footerNote)} · read-only ·
     human merge authority remains external.
   </footer>
 </div>
