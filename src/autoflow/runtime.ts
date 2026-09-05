@@ -32,6 +32,7 @@ import {
   applyWorkflowEvent,
   openWorkflow,
   TRANSITION_OUTCOME,
+  WORKFLOW_STATUS,
   type TransitionResult,
   type WorkflowBinding,
   type WorkflowEvent,
@@ -81,6 +82,51 @@ const NO_WORKFLOW_RESULT: AutoflowNoWorkflowResult = Object.freeze({
 });
 
 /**
+ * The bounded, truthful result of {@link AutoflowRuntime.open} when it is
+ * refused because a **non-terminal** workflow is already active
+ * (`current()` is `OPEN` or `AWAITING_HUMAN_DECISION`).
+ *
+ * "At most one active workflow" is a **state-owner invariant**: the runtime owns
+ * the single `#current` reference, so it — not any downstream caller — refuses a
+ * replacement. The pure domain `openWorkflow` stays stateless and knows nothing
+ * of a prior workflow, so the guard lives here, around it. The refusal never
+ * clobbers the active workflow, mints no {@link WorkflowState}, and is a provable
+ * no-op. Its shape mirrors {@link WorkflowOpenResult} — `state: null`,
+ * `rejection: null`, empty `invalidFields` — so a consumer can switch on
+ * `outcome` uniformly.
+ */
+export const AUTOFLOW_OPEN_ALREADY_ACTIVE = 'WORKFLOW_ALREADY_ACTIVE';
+
+/** @see AUTOFLOW_OPEN_ALREADY_ACTIVE */
+export interface AutoflowAlreadyActiveResult {
+  readonly outcome: typeof AUTOFLOW_OPEN_ALREADY_ACTIVE;
+  readonly state: null;
+  readonly rejection: null;
+  readonly invalidFields: readonly string[];
+}
+
+/** Every result {@link AutoflowRuntime.open} can return. */
+export type AutoflowOpenResult = WorkflowOpenResult | AutoflowAlreadyActiveResult;
+
+const ALREADY_ACTIVE_RESULT: AutoflowAlreadyActiveResult = Object.freeze({
+  outcome: AUTOFLOW_OPEN_ALREADY_ACTIVE,
+  state: null,
+  rejection: null,
+  invalidFields: Object.freeze([]),
+});
+
+/**
+ * The single mutable holder of the current {@link WorkflowState}. Internal to
+ * this module: the {@link AutoflowRuntime} privately owns exactly one, the
+ * writer verbs update its `current`, and {@link AutoflowRuntime.reader} closes
+ * over this cell (and nothing else), so the outward reader stays live without
+ * capturing the write-capable runtime.
+ */
+interface AutoflowStateCell {
+  current: WorkflowState | null;
+}
+
+/**
  * Sole runtime owner of the current authoritative {@link WorkflowState}.
  *
  * Not autonomous: `open`/`apply` are driven by an external caller (a real
@@ -88,23 +134,45 @@ const NO_WORKFLOW_RESULT: AutoflowNoWorkflowResult = Object.freeze({
  * `null` — the honest "no workflow observed" starting point).
  */
 export class AutoflowRuntime implements AutoflowStateReader {
-  #current: WorkflowState | null = null;
+  /**
+   * The single authoritative state location. The writer verbs and the outward
+   * reader read/write **this same cell**, so there is exactly one source of
+   * truth and the reader is live; the reader closes over the cell alone — never
+   * over `this` — so no outward closure can recover this runtime (see
+   * {@link reader}).
+   */
+  readonly #cell: AutoflowStateCell = { current: null };
 
   /** The one current immutable state, or `null` when no workflow is open. */
   current(): WorkflowState | null {
-    return this.#current;
+    return this.#cell.current;
   }
 
   /**
-   * Open a workflow through the real domain `openWorkflow`. On `APPLIED` the
-   * single reference is replaced with the returned deeply-frozen state; a
-   * `REJECTED` result leaves the reference unchanged. The domain result is
-   * returned verbatim.
+   * Open a workflow through the real domain `openWorkflow`, enforcing the
+   * **at-most-one-active-workflow** state-owner invariant.
+   *
+   * - `current()` is `null` → open permitted.
+   * - `current()` is `CLOSED` (terminal) → a **new** workflow may be opened; on
+   *   `APPLIED` the reference is replaced and the closed prior workflow is no
+   *   longer retained (the runtime keeps no workflow history — an explicit
+   *   in-memory limitation, not durable orchestration).
+   * - `current()` is `OPEN` or `AWAITING_HUMAN_DECISION` (non-terminal) → the
+   *   open is **refused** with {@link AUTOFLOW_OPEN_ALREADY_ACTIVE}; the exact
+   *   current reference is left unchanged and `openWorkflow` is never called, so
+   *   the active workflow can never be clobbered.
+   *
+   * On a permitted open the pure domain result is returned verbatim; the cell
+   * advances only on `APPLIED`.
    */
-  open(binding: WorkflowBinding): WorkflowOpenResult {
+  open(binding: WorkflowBinding): AutoflowOpenResult {
+    const current = this.#cell.current;
+    if (current !== null && current.status !== WORKFLOW_STATUS.CLOSED) {
+      return ALREADY_ACTIVE_RESULT;
+    }
     const result = openWorkflow(binding);
     if (result.outcome === TRANSITION_OUTCOME.APPLIED && result.state !== null) {
-      this.#current = result.state;
+      this.#cell.current = result.state;
     }
     return result;
   }
@@ -116,13 +184,13 @@ export class AutoflowRuntime implements AutoflowStateReader {
    * `REJECTED` result leaves it unchanged. The domain result is returned verbatim.
    */
   apply(event: WorkflowEvent): AutoflowApplyResult {
-    const current = this.#current;
+    const current = this.#cell.current;
     if (current === null) {
       return NO_WORKFLOW_RESULT;
     }
     const result = applyWorkflowEvent(current, event);
     if (result.outcome === TRANSITION_OUTCOME.APPLIED) {
-      this.#current = result.state;
+      this.#cell.current = result.state;
     }
     return result;
   }
@@ -132,10 +200,20 @@ export class AutoflowRuntime implements AutoflowStateReader {
    * (`open`/`apply`) are absent from the returned object at runtime, so nothing
    * downstream of this capability can transition workflow state. Pass this — not
    * the runtime instance — into the Cockpit observation path.
+   *
+   * Capability containment (Decision 060): the returned closure captures the
+   * state **cell** only — never `this` — and reads a plain data property, so it
+   * dispatches through **no** method on this runtime's (publicly importable,
+   * mutable) prototype. Replacing `AutoflowRuntime.prototype.current` downstream
+   * therefore cannot observe a runtime receiver through this reader, so the
+   * write-capable runtime is unrecoverable from it. The cell never escapes:
+   * `current()` returns only its value (a deeply-frozen {@link WorkflowState} or
+   * `null`), which carries no writer.
    */
   reader(): AutoflowStateReader {
+    const cell = this.#cell;
     return Object.freeze<AutoflowStateReader>({
-      current: (): WorkflowState | null => this.current(),
+      current: (): WorkflowState | null => cell.current,
     });
   }
 }

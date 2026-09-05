@@ -37,10 +37,13 @@ import {
   type CockpitSource,
 } from '../cockpit-host/server.js';
 import { AutoflowRuntime, type AutoflowStateReader } from '../autoflow/runtime.js';
+import { AutoflowOrchestrator } from '../autoflow/orchestrator.js';
+import { TRANSITION_OUTCOME } from '../domain/index.js';
 import {
   createConfiguredRepositoryObserver,
   type RepositoryObserver,
 } from './repository-observer.js';
+import { readStartupWorkflowConfig } from './orchestration-input.js';
 
 /**
  * Everything the live observation builder needs. `reader` is the narrowed
@@ -161,24 +164,49 @@ function requireEnv(name: string): string {
  * signal handling, and error propagation.
  *
  * Repository observation values are runtime-supplied (environment) — not "live
- * Git observation." The AutoflowRuntime starts owning no workflow (`current()`
- * is `null`), which renders the honest LIVE no-workflow page; this milestone
- * establishes the production write path (`open`/`apply`) but deliberately runs no
- * autonomous event source. Any startup fault exits non-zero (fail closed).
+ * Git observation." A single {@link AutoflowRuntime} is owned for writing only by
+ * the {@link AutoflowOrchestrator}; the Cockpit is handed the runtime's read-only
+ * reader, never the writer. This milestone's sole production write action is a
+ * bounded **startup workflow open** (from {@link readStartupWorkflowConfig}): with
+ * no such config the runtime starts owning no workflow (`current()` is `null`),
+ * rendering the honest LIVE no-workflow page. It runs **no autonomous event
+ * source** — nothing originates a {@link WorkflowEvent} after startup. Any startup
+ * fault, including a rejected startup open, exits non-zero (fail closed).
  */
 function main(): void {
   let server: http.Server;
   try {
     const runtime = new AutoflowRuntime();
+    const orchestrator = new AutoflowOrchestrator(runtime);
+    const repositoryId = requireEnv('AGENTBRIDGE_REPOSITORY_ID');
     const observer = createConfiguredRepositoryObserver({
-      repositoryId: requireEnv('AGENTBRIDGE_REPOSITORY_ID'),
+      repositoryId,
       observedHeadSha: requireEnv('AGENTBRIDGE_OBSERVED_HEAD_SHA'),
       defaultBranchRef: process.env['AGENTBRIDGE_DEFAULT_BRANCH_REF'] ?? null,
     });
     const collectorId = process.env['AGENTBRIDGE_COLLECTOR_ID'] ?? 'agentbridge-live-runtime';
 
+    // Bounded startup-open: the only production write action this milestone.
+    // Absent config → no workflow (current() stays null). Partial/mismatched
+    // config throws from readStartupWorkflowConfig; a malformed binding is
+    // rejected by the domain open below — both exit non-zero (fail closed).
+    const startupBinding = readStartupWorkflowConfig(process.env, repositoryId);
+    if (startupBinding !== null) {
+      const opened = orchestrator.open(startupBinding);
+      if (opened.outcome !== TRANSITION_OUTCOME.APPLIED) {
+        throw new Error(
+          `Live Cockpit runtime: startup workflow open failed (${opened.outcome}).`,
+        );
+      }
+    }
+
     server = startLiveCockpit({
-      config: { reader: runtime.reader(), observer, collectorId, clock: (): Date => new Date() },
+      config: {
+        reader: orchestrator.reader(),
+        observer,
+        collectorId,
+        clock: (): Date => new Date(),
+      },
     });
   } catch (error) {
     console.error('AgentBridge Cockpit (live): startup failed.', error);

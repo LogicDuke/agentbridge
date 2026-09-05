@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   AUTOFLOW_APPLY_NO_WORKFLOW,
+  AUTOFLOW_OPEN_ALREADY_ACTIVE,
   AutoflowRuntime,
   type AutoflowStateReader,
 } from '../../src/autoflow/runtime.js';
@@ -117,5 +118,112 @@ describe('AutoflowRuntime', () => {
     runtime.open(BINDING);
     expect(reader.current()).toBe(runtime.current());
     expect(reader.current()?.status).toBe('OPEN');
+  });
+});
+
+const BINDING_2: WorkflowBinding = {
+  workflowId: 'wf-live-0002',
+  repositoryId: REPO,
+  boundCommitSha: SHA_B,
+};
+const HUMAN_GATE_A: WorkflowEvent = { kind: 'HUMAN_GATE_OPENED', atCommitSha: SHA_A };
+const CLOSE: WorkflowEvent = { kind: 'CLOSE_REQUESTED', closureReason: 'CALLER_CLOSED' };
+
+describe('AutoflowRuntime single-active-workflow open guard', () => {
+  it('rejects a second open while OPEN with WORKFLOW_ALREADY_ACTIVE, unchanged reference', () => {
+    const runtime = new AutoflowRuntime();
+    runtime.open(BINDING);
+    const before = runtime.current();
+    const result = runtime.open(BINDING_2);
+    expect(result.outcome).toBe(AUTOFLOW_OPEN_ALREADY_ACTIVE);
+    expect(result.state).toBeNull();
+    // The active workflow is not clobbered: exact prior reference retained.
+    expect(runtime.current()).toBe(before);
+    expect(runtime.current()?.workflowId).toBe('wf-live-0001');
+  });
+
+  it('rejects a second open while AWAITING_HUMAN_DECISION with WORKFLOW_ALREADY_ACTIVE', () => {
+    const runtime = new AutoflowRuntime();
+    runtime.open(BINDING);
+    runtime.apply(HUMAN_GATE_A);
+    expect(runtime.current()?.status).toBe('AWAITING_HUMAN_DECISION');
+    const before = runtime.current();
+    const result = runtime.open(BINDING_2);
+    expect(result.outcome).toBe(AUTOFLOW_OPEN_ALREADY_ACTIVE);
+    expect(runtime.current()).toBe(before);
+  });
+
+  it('permits a new open after the current workflow is CLOSED', () => {
+    const runtime = new AutoflowRuntime();
+    runtime.open(BINDING);
+    runtime.apply(CLOSE);
+    expect(runtime.current()?.status).toBe('CLOSED');
+    const result = runtime.open(BINDING_2);
+    expect(result.outcome).toBe(TRANSITION_OUTCOME.APPLIED);
+    // The new workflow replaces the closed prior; no history is retained.
+    expect(runtime.current()?.workflowId).toBe('wf-live-0002');
+    expect(runtime.current()?.status).toBe('OPEN');
+  });
+
+  it('permits an open from null (no prior workflow)', () => {
+    const runtime = new AutoflowRuntime();
+    const result = runtime.open(BINDING);
+    expect(result.outcome).toBe(TRANSITION_OUTCOME.APPLIED);
+    expect(runtime.current()?.workflowId).toBe('wf-live-0001');
+  });
+});
+
+describe('reader() capability containment — writer is unrecoverable via prototype swap', () => {
+  it('reader.current() does not dispatch through AutoflowRuntime.prototype.current', () => {
+    const runtime = new AutoflowRuntime();
+    runtime.open(BINDING);
+    const reader = runtime.reader();
+    const expected = runtime.current(); // live OPEN state, captured before the patch
+
+    // Save/restore via descriptor (avoids taking an unbound-method reference).
+    const originalDesc = Object.getOwnPropertyDescriptor(AutoflowRuntime.prototype, 'current');
+    const receivers: unknown[] = [];
+    try {
+      // Adversarial: a downstream same-process actor replaces the (publicly
+      // importable, mutable) prototype method to observe its receiver.
+      (AutoflowRuntime.prototype as unknown as { current: () => unknown }).current =
+        function (this: unknown): unknown {
+          receivers.push(this);
+          return null;
+        };
+
+      // The repaired reader reads the private state cell directly, so it routes
+      // through NO prototype method: the patch is never invoked, no runtime
+      // receiver is captured, and the live state is still returned unaffected.
+      const value = reader.current();
+      expect(receivers).toHaveLength(0);
+      expect(value).toBe(expected);
+
+      // Control: the patch itself IS effective — calling the prototype method on
+      // a runtime receiver DOES capture it. The reader simply never routes there.
+      (runtime as unknown as { current: () => unknown }).current();
+      expect(receivers).toHaveLength(1);
+      expect(receivers[0]).toBe(runtime);
+    } finally {
+      if (originalDesc !== undefined) {
+        Object.defineProperty(AutoflowRuntime.prototype, 'current', originalDesc);
+      }
+    }
+
+    // After restore, the reader remains live across a subsequent transition.
+    runtime.apply(HEAD_OBSERVED_B);
+    expect(reader.current()).toBe(runtime.current());
+    expect(reader.current()?.boundCommitSha).toBe(SHA_B);
+  });
+
+  it('reader exposes current() only; open/apply remain absent/unrecoverable', () => {
+    const reader = new AutoflowRuntime().reader();
+    const asRecord = reader as unknown as Record<string, unknown>;
+    expect('current' in reader).toBe(true);
+    expect('open' in reader).toBe(false);
+    expect('apply' in reader).toBe(false);
+    expect(asRecord['open']).toBeUndefined();
+    expect(asRecord['apply']).toBeUndefined();
+    expect(Object.isFrozen(reader)).toBe(true);
   });
 });
