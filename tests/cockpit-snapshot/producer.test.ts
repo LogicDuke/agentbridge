@@ -169,4 +169,58 @@ describe('producer grants no authority and owns no validation', () => {
       expect(producerText.includes(token), `producer must not reference ${token}`).toBe(false);
     }
   });
+
+  it('P2. never nullish-defaults an optional list (only `=== undefined` defaults)', () => {
+    // The regressing pattern was `observation.<list> ?? []`, which also swallows
+    // an explicit `null`. Pin that no list field uses that nullish default any
+    // more. (The regex targets the code shape, so the doc comment that names the
+    // old pattern in prose does not trip it.)
+    expect(/observation\.\w+\s*\?\?\s*\[\]/.test(producerText)).toBe(false);
+    expect(/defaultOptionalList\s*\(/.test(producerText)).toBe(true);
+  });
+});
+
+describe('P2 — optional lists default only on undefined; null survives to D1', () => {
+  // Every optional read-model list the producer serializes.
+  const LIST_FIELDS = ['pullRequests', 'evidence', 'findings', 'repairJobs'] as const;
+
+  it('1. an absent (undefined) optional list defaults to [] and is accepted by D1', () => {
+    // observation() sets none of the four lists, so each arrives as `undefined`.
+    const raw = produceCockpitSnapshot(observation()) as Record<string, unknown>;
+    for (const field of LIST_FIELDS) {
+      expect(Array.isArray(raw[field]), `${field} should default to []`).toBe(true);
+      expect((raw[field] as readonly unknown[]).length).toBe(0);
+    }
+    const read = readCockpitSnapshot(raw);
+    expect(read.invalidFields).toEqual([]);
+    expect(read.snapshot).not.toBeNull();
+  });
+
+  it.each(LIST_FIELDS)(
+    '2+3. explicit null for %s is not normalized to [] and D1 rejects the whole snapshot',
+    (field) => {
+      const raw = produceCockpitSnapshot(
+        observation({ [field]: null } as unknown as Partial<CockpitObservation>),
+      ) as Record<string, unknown>;
+      // 2. the explicit null survived the producer — it was NOT sanitized to [].
+      expect(raw[field]).toBeNull();
+      expect(Array.isArray(raw[field])).toBe(false);
+      // 3. it reaches D1, which rejects the whole snapshot on that field.
+      const read = readCockpitSnapshot(raw);
+      expect(read.snapshot).toBeNull();
+      expect(read.invalidFields).toContain(field);
+    },
+  );
+
+  it('4. a valid array is preserved unchanged and accepted', () => {
+    const pullRequests: CockpitPullRequestObservation[] = [
+      { pullRequestId: 'pr-1', headSha: SHA_A, baseRef: 'refs/heads/main', state: 'open', title: 'A' },
+    ];
+    const raw = produceCockpitSnapshot(observation({ pullRequests })) as Record<string, unknown>;
+    expect(raw.pullRequests).toEqual(pullRequests);
+    const read = readCockpitSnapshot(raw);
+    expect(read.invalidFields).toEqual([]);
+    expect(read.snapshot?.pullRequests.length).toBe(1);
+    expect(read.snapshot?.pullRequests[0]?.pullRequestId).toBe('pr-1');
+  });
 });

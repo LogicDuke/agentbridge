@@ -81,6 +81,24 @@ export interface CockpitObservation {
 }
 
 /**
+ * Default an optional read-model list **only when it is absent** (`undefined`).
+ *
+ * A nullish default (`value ?? []`) would collapse an explicit `null` — an
+ * invalid runtime value — into a valid empty list *before* D1, so D1 could never
+ * reject it. Defaulting solely on `undefined` lets `null` (and any other
+ * malformed runtime value) survive the serialization boundary and reach
+ * `readCockpitSnapshot`, which rejects the whole snapshot.
+ *
+ * This removes a sanitization; it adds **no** producer-side validation — D1
+ * remains the sole hostile-input validator. The `readonly T[]` return type
+ * reflects the absent-or-array contract; a malformed runtime value (e.g. `null`
+ * arriving through a cast) passes through unchanged for D1 to reject.
+ */
+function defaultOptionalList<T>(value: readonly T[] | undefined): readonly T[] {
+  return value === undefined ? [] : value;
+}
+
+/**
  * Produce a serialized, JSON-shaped schema-v2 Cockpit snapshot from one
  * authoritative observation.
  *
@@ -99,16 +117,19 @@ export function produceCockpitSnapshot(observation: CockpitObservation): unknown
     repository: {
       repositoryId: observation.repositoryId,
       observedHeadSha: observation.observedHeadSha,
+      // `defaultBranchRef` is *not* a list: `null` is a legitimate D1-accepted
+      // "not observed" value, so a nullish default does not sanitize a malformed
+      // value here (undefined and null both map to the same valid `null`).
       defaultBranchRef: observation.defaultBranchRef ?? null,
     },
     provenance: {
       collectorId: observation.collectorId,
       observedAt: observation.observedAt,
     },
-    pullRequests: observation.pullRequests ?? [],
-    evidence: observation.evidence ?? [],
-    findings: observation.findings ?? [],
-    repairJobs: observation.repairJobs ?? [],
+    pullRequests: defaultOptionalList(observation.pullRequests),
+    evidence: defaultOptionalList(observation.evidence),
+    findings: defaultOptionalList(observation.findings),
+    repairJobs: defaultOptionalList(observation.repairJobs),
     autoflow: observation.autoflow,
   };
 
