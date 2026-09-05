@@ -126,12 +126,25 @@ function pathOf(url: string): string {
 }
 
 /**
- * Build the configured (but not yet listening) HTTP server. The page is
- * rendered once here; every request serves the same immutable bytes.
+ * Supplies the `GET /` page body. A pure `() => string` seam that carries **no**
+ * Autoflow, source, or observation knowledge: the host only ever asks for a
+ * page. The fixture path binds a precomputed string (render-once); a live path
+ * binds a per-request callback that rebuilds the page from its live source. The
+ * provider is invoked **only** for `GET /` — never for `/styles.css`, an unknown
+ * path, or a non-GET method.
  */
-export function createCockpitServer(source: CockpitSource = FIXTURE_SOURCE): http.Server {
-  const page = buildDashboardHtml(source);
+export type CockpitPageProvider = () => string;
 
+/**
+ * Build the configured (but not yet listening) HTTP server from a page provider.
+ *
+ * `GET /` invokes `pageProvider()` exactly once per request. If the provider
+ * throws — a live source or its D1 validation failing — the host **fails closed
+ * for that request** with `500`, never serving fixture data or a stale page. All
+ * other routes (`/styles.css`, 404, non-GET 405) never invoke the provider, so a
+ * live source is read at most once per `GET /` and zero times otherwise.
+ */
+export function createCockpitServerFromProvider(pageProvider: CockpitPageProvider): http.Server {
   return http.createServer((request: http.IncomingMessage, response: http.ServerResponse): void => {
     applySecurityHeaders(response);
 
@@ -146,6 +159,17 @@ export function createCockpitServer(source: CockpitSource = FIXTURE_SOURCE): htt
 
     const path = pathOf(request.url ?? '');
     if (path === '/') {
+      let page: string;
+      try {
+        page = pageProvider();
+      } catch {
+        // Per-request fail-closed: never fall back to fixture, never serve a
+        // stale page. The failure is contained to this request; the host stays up.
+        response.statusCode = 500;
+        response.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        response.end('500 Internal Server Error');
+        return;
+      }
       response.statusCode = 200;
       response.setHeader('Content-Type', 'text/html; charset=utf-8');
       response.end(page);
@@ -162,6 +186,17 @@ export function createCockpitServer(source: CockpitSource = FIXTURE_SOURCE): htt
     response.setHeader('Content-Type', 'text/plain; charset=utf-8');
     response.end('404 Not Found');
   });
+}
+
+/**
+ * Build the configured (but not yet listening) HTTP server for a fixed source.
+ * The page is rendered once here; every request serves the same immutable bytes.
+ * Preserves the historical fixture behavior exactly — a failed source still fails
+ * closed at construction — by binding a constant page provider.
+ */
+export function createCockpitServer(source: CockpitSource = FIXTURE_SOURCE): http.Server {
+  const page = buildDashboardHtml(source);
+  return createCockpitServerFromProvider((): string => page);
 }
 
 /** Start the server on the loopback address and print the exact URL. */
