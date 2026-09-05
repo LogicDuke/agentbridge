@@ -25,7 +25,7 @@ const HEAD_SHA = 'c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00';
 const OLD_SHA = 'dead0000dead0000dead0000dead0000dead0000';
 
 export const STAGE_A_FIXTURE: unknown = {
-  schemaVersion: 1,
+  schemaVersion: 2,
   repository: {
     repositoryId: 'LogicDuke/agentbridge',
     observedHeadSha: HEAD_SHA,
@@ -176,4 +176,38 @@ export const STAGE_A_FIXTURE: unknown = {
       independentValidatorId: 'codex-independent-validator',
     },
   ],
+  // Serialized Autoflow observation (schema v2). Shaped like the JSON a future
+  // collector would emit — an OPEN workflow bound to the observed HEAD with one
+  // outstanding (REQUESTED) review invocation. It is hand-authored, NOT produced
+  // by executing a transition, and reaches the renderer only after D1 rebuilds it
+  // through the domain's `readWorkflowState` hostile reader. A `null` here would
+  // instead show the honest "no workflow observed" absence panel.
+  autoflow: {
+    workflowId: 'wf-stage-a-0001',
+    repositoryId: 'LogicDuke/agentbridge',
+    pullRequestId: 'pr-42',
+    boundCommitSha: HEAD_SHA,
+    revision: 0,
+    sequence: 1,
+    status: 'OPEN',
+    closureReason: null,
+    humanGateOpenedAtRevision: null,
+    invocations: [
+      {
+        invocationId: 'inv-review-0001',
+        targetCommitSha: HEAD_SHA,
+        purpose: 'review',
+        providerId: 'claude',
+        agentId: 'claude-review-bot',
+        requestedAtRevision: 0,
+        requestedAtSequence: 1,
+        state: 'REQUESTED',
+        reportedStatus: null,
+        reportedAtRevision: null,
+        reportedAtSequence: null,
+      },
+    ],
+    evidence: [],
+    reviews: [],
+  },
 };
