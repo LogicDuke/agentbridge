@@ -27,9 +27,17 @@ returned by `openWorkflow` / `applyWorkflowEvent`). It does **not**:
 - add next-action / current-gate policy;
 - add authority.
 
-The future serialized/collector provenance boundary — re-reading a workflow
-state from hostile JSON — is **explicitly deferred**. When it lands it belongs to
-the D1 snapshot reader, not to D4.
+The serialized/collector provenance boundary — re-reading a workflow state from
+hostile JSON — has since **landed in the D1 Cockpit snapshot reader**, exactly
+where this Stage-A note anticipated it belongs, not in D4. Under Cockpit snapshot
+**schema version 2** the D1 envelope carries a **required** `autoflow` field: a
+non-null Autoflow observation is a serialized `WorkflowState` that D1 (not D4)
+reconstructs and validates through the domain's own hostile `readWorkflowState`
+reader, and binds to the snapshot's `repositoryId`, before any consumer sees it.
+D4 still consumes only that already-validated, in-process value: the D4
+projection does not own or run the D1 envelope reader, does not mutate the
+`CockpitSnapshot` envelope, adds no hostile reader of its own, executes no
+workflow transition, and gains no authority.
 
 ## Trust boundary (D2 "Option A")
 
