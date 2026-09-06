@@ -49,6 +49,10 @@ import {
   STARTUP_HUMAN_GATE_ENV,
   type StartupEnv,
 } from './orchestration-input.js';
+import {
+  startControlChannel,
+  type ControlChannelHandle,
+} from '../control/control-runtime.js';
 
 /**
  * Everything the live observation builder needs. `reader` is the narrowed
@@ -240,6 +244,7 @@ export function runStartupProgression(
  */
 function main(): void {
   let server: http.Server;
+  let controlChannel: ControlChannelHandle | null = null;
   try {
     const runtime = new AutoflowRuntime();
     const orchestrator = new AutoflowOrchestrator(runtime);
@@ -265,6 +270,24 @@ function main(): void {
         clock: (): Date => new Date(),
       },
     });
+
+    // Decision 062: start the post-start operator control channel only AFTER the
+    // read-only Cockpit host is available (§17). It fails **closed** on any
+    // fault — an unverified control anchor, a descriptor write failure, or a pipe
+    // collision disables the channel and returns null; the Cockpit stays up and
+    // read-only, and the writer is never exposed to it. No await here: the
+    // Cockpit is already serving and must not be blocked on the control channel.
+    void startControlChannel({ orchestrator })
+      .then((handle): void => {
+        controlChannel = handle;
+        if (handle !== null) {
+          console.log('AgentBridge control channel: listening (OPEN_HUMAN_GATE).');
+        }
+      })
+      .catch((): void => {
+        // Fail closed; the Cockpit remains available.
+        console.error('AgentBridge control channel: disabled (startup error).');
+      });
   } catch (error) {
     console.error('AgentBridge Cockpit (live): startup failed.', error);
     process.exit(1);
@@ -280,9 +303,18 @@ function main(): void {
   });
 
   const shutdown = (): void => {
-    server.close((): void => {
-      process.exit(0);
-    });
+    const closeServer = (): void => {
+      server.close((): void => {
+        process.exit(0);
+      });
+    };
+    // Best-effort orderly control-channel shutdown (removes its descriptor),
+    // then close the Cockpit host.
+    if (controlChannel !== null) {
+      void controlChannel.close().then(closeServer, closeServer);
+    } else {
+      closeServer();
+    }
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
