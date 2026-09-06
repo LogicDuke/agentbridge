@@ -52,6 +52,53 @@ export const WORKFLOW_OPEN_ENV = Object.freeze({
 } as const);
 
 /**
+ * The startup human-gate trigger variable (Decision 061 — Startup-Scripted
+ * Human-Gate Progression).
+ *
+ * This is a **presence-and-exact-value** trigger only. It carries no workflow
+ * identity, no commit, and no repository — it can never manufacture or open a
+ * workflow. It merely requests that, *after* a separately-configured startup
+ * workflow-open has succeeded, exactly one `HUMAN_GATE_OPENED` event be
+ * submitted at boot. Requesting the gate without a valid startup-open is a
+ * misconfiguration that the composition treats as startup-fatal.
+ */
+export const STARTUP_HUMAN_GATE_ENV = 'AGENTBRIDGE_STARTUP_OPEN_HUMAN_GATE';
+
+/**
+ * Read the startup human-gate trigger with **exact-value** semantics
+ * (Decision 061).
+ *
+ * The variable is read **exactly once** into an inert local and never consulted
+ * again:
+ *
+ * - absent (`undefined`) → not requested (`false`);
+ * - the exact byte string `"1"` → requested (`true`);
+ * - any other present value → **invalid configuration**; throws so startup fails
+ *   closed before serving.
+ *
+ * There is deliberately **no** trimming, case-folding, `Boolean(value)`,
+ * `Number(value)`, or truthy/loose parsing: `"0"`, `"false"`, `"true"`, `"yes"`,
+ * `"no"`, `" "`, `"01"`, and every other value but `"1"` are rejected. An empty
+ * string is a present-but-invalid value and is rejected too.
+ *
+ * @param env The process-scoped environment (typically `process.env`).
+ * @returns `true` when the gate is requested, `false` when absent.
+ * @throws Error when the variable is present with any value other than `"1"`.
+ */
+export function readStartupHumanGateConfig(env: StartupEnv): boolean {
+  const raw = env[STARTUP_HUMAN_GATE_ENV];
+  if (raw === undefined) {
+    return false;
+  }
+  if (raw === '1') {
+    return true;
+  }
+  throw new Error(
+    `Startup human-gate config invalid: ${STARTUP_HUMAN_GATE_ENV} must be exactly "1" when set.`,
+  );
+}
+
+/**
  * Read the bounded startup-open configuration and mint at most one
  * {@link WorkflowBinding}.
  *

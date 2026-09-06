@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  readStartupHumanGateConfig,
   readStartupWorkflowConfig,
+  STARTUP_HUMAN_GATE_ENV,
   WORKFLOW_OPEN_ENV,
   type StartupEnv,
 } from '../../src/runtime/orchestration-input.js';
@@ -123,5 +125,51 @@ describe('readStartupWorkflowConfig', () => {
     );
     expect(binding).not.toBeNull();
     expect(binding?.workflowId).toBe('');
+  });
+});
+
+describe('readStartupHumanGateConfig (Decision 061 — strict "1" semantics)', () => {
+  it('absent → false (no startup human gate requested)', () => {
+    expect(readStartupHumanGateConfig(env({}))).toBe(false);
+    // An unrelated var present does not request the gate.
+    expect(readStartupHumanGateConfig(env({ AGENTBRIDGE_REPOSITORY_ID: REPO }))).toBe(false);
+  });
+
+  it('exact string "1" → true', () => {
+    expect(readStartupHumanGateConfig(env({ [STARTUP_HUMAN_GATE_ENV]: '1' }))).toBe(true);
+  });
+
+  it.each(['0', 'false', 'true', 'yes', 'no', ' ', '01', '', '1 ', ' 1', 'TRUE', '2', '1.0'])(
+    'any other present value is invalid configuration and fails closed: %o',
+    (value) => {
+      expect(() => readStartupHumanGateConfig(env({ [STARTUP_HUMAN_GATE_ENV]: value }))).toThrow();
+    },
+  );
+
+  it('no trimming, no case-folding, no numeric/boolean coercion', () => {
+    // If any coercion were applied, at least one of these would pass as truthy.
+    expect(() => readStartupHumanGateConfig(env({ [STARTUP_HUMAN_GATE_ENV]: ' 1 ' }))).toThrow();
+    expect(() => readStartupHumanGateConfig(env({ [STARTUP_HUMAN_GATE_ENV]: 'true' }))).toThrow();
+    expect(() => readStartupHumanGateConfig(env({ [STARTUP_HUMAN_GATE_ENV]: 'yes' }))).toThrow();
+  });
+
+  it('reads the variable exactly once and consults nothing else (single-read snapshot)', () => {
+    // A hostile env whose accessor counts reads and mutates on each access:
+    // a single read yields the decision; a re-read would flip/observe the change.
+    let reads = 0;
+    const hostile: StartupEnv = new Proxy(
+      {},
+      {
+        get(_target, key): string | undefined {
+          if (key === STARTUP_HUMAN_GATE_ENV) {
+            reads += 1;
+            return reads === 1 ? '1' : 'poisoned-second-read';
+          }
+          return undefined;
+        },
+      },
+    );
+    expect(readStartupHumanGateConfig(hostile)).toBe(true);
+    expect(reads).toBe(1);
   });
 });

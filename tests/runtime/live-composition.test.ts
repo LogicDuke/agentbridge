@@ -15,9 +15,14 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { AutoflowRuntime } from '../../src/autoflow/runtime.js';
 import { AutoflowOrchestrator } from '../../src/autoflow/orchestrator.js';
-import { readStartupWorkflowConfig, WORKFLOW_OPEN_ENV } from '../../src/runtime/orchestration-input.js';
+import {
+  readStartupWorkflowConfig,
+  STARTUP_HUMAN_GATE_ENV,
+  WORKFLOW_OPEN_ENV,
+} from '../../src/runtime/orchestration-input.js';
 import {
   createLiveCockpitSource,
+  runStartupProgression,
   startLiveCockpit,
   type LiveCockpitConfig,
 } from '../../src/runtime/live-cockpit.js';
@@ -163,5 +168,62 @@ describe('live composition — startup-open flows through one runtime to the Coc
       [WORKFLOW_OPEN_ENV.BOUND_COMMIT_SHA]: SHA_A,
     });
     expect(openedOutcome).toBe(TRANSITION_OUTCOME.REJECTED);
+  });
+});
+
+describe('runStartupProgression — Decision 061 startup-scripted human-gate boot flow', () => {
+  // Exercise the exact production boot progression directly (no process.exit).
+  function progress(startupEnv: Record<string, string | undefined>): LiveCockpitConfig['reader'] {
+    const orchestrator = new AutoflowOrchestrator(new AutoflowRuntime());
+    runStartupProgression(orchestrator, startupEnv, REPO);
+    return orchestrator.reader();
+  }
+
+  it('valid startup-open + gate absent → OPEN', () => {
+    const reader = progress(openConfig);
+    expect(reader.current()?.status).toBe('OPEN');
+    expect(reader.current()?.sequence).toBe(0);
+  });
+
+  it('valid startup-open + gate "1" → AWAITING_HUMAN_DECISION at sequence 1, gate revision 0', () => {
+    const reader = progress({ ...openConfig, [STARTUP_HUMAN_GATE_ENV]: '1' });
+    expect(reader.current()?.status).toBe('AWAITING_HUMAN_DECISION');
+    expect(reader.current()?.sequence).toBe(1);
+    expect(reader.current()?.humanGateOpenedAtRevision).toBe(0);
+  });
+
+  it('neither configured → no workflow (current() stays null)', () => {
+    const reader = progress({});
+    expect(reader.current()).toBeNull();
+  });
+
+  it('gate "1" WITHOUT a valid startup-open → startup-fatal (throws before serving)', () => {
+    expect(() => progress({ [STARTUP_HUMAN_GATE_ENV]: '1' })).toThrow();
+    // Partial open + gate is likewise fatal (partial open throws first).
+    expect(() =>
+      progress({ [WORKFLOW_OPEN_ENV.WORKFLOW_ID]: 'wf-x', [STARTUP_HUMAN_GATE_ENV]: '1' }),
+    ).toThrow();
+  });
+
+  it('invalid gate value → startup-fatal before any open or serving', () => {
+    expect(() => progress({ ...openConfig, [STARTUP_HUMAN_GATE_ENV]: 'true' })).toThrow();
+    expect(() => progress({ ...openConfig, [STARTUP_HUMAN_GATE_ENV]: '0' })).toThrow();
+  });
+
+  it('non-APPLIED startup open → startup-fatal (throws), gate never reached', () => {
+    // Present-but-empty workflowId → domain open REJECTED → progression throws.
+    expect(() =>
+      progress({
+        [WORKFLOW_OPEN_ENV.WORKFLOW_ID]: '',
+        [WORKFLOW_OPEN_ENV.BOUND_COMMIT_SHA]: SHA_A,
+        [STARTUP_HUMAN_GATE_ENV]: '1',
+      }),
+    ).toThrow();
+  });
+
+  it('gate progression is reflected LIVE through the reader → D1 snapshot as AWAITING_HUMAN_DECISION', () => {
+    const reader = progress({ ...openConfig, [STARTUP_HUMAN_GATE_ENV]: '1' });
+    const read = readCockpitSnapshot(createLiveCockpitSource(configFrom(reader)).read());
+    expect(read.snapshot?.autoflow?.status).toBe('AWAITING_HUMAN_DECISION');
   });
 });

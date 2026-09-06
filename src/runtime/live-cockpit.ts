@@ -43,7 +43,12 @@ import {
   createConfiguredRepositoryObserver,
   type RepositoryObserver,
 } from './repository-observer.js';
-import { readStartupWorkflowConfig } from './orchestration-input.js';
+import {
+  readStartupHumanGateConfig,
+  readStartupWorkflowConfig,
+  STARTUP_HUMAN_GATE_ENV,
+  type StartupEnv,
+} from './orchestration-input.js';
 
 /**
  * Everything the live observation builder needs. `reader` is the narrowed
@@ -160,18 +165,78 @@ function requireEnv(name: string): string {
 }
 
 /**
+ * Run the whole bounded, synchronous **startup progression** through the one
+ * production writer, exactly once at boot (Decision 061 — Startup-Scripted
+ * Human-Gate Progression). This is the **single production call site** capable of
+ * invoking {@link AutoflowOrchestrator.openHumanGate}: there is no loop, timer,
+ * poll, callback, or post-start path anywhere.
+ *
+ * The authorized boot flow, and the only one:
+ *
+ * 1. read the bounded startup workflow-open config (existing authorized path);
+ * 2. read the startup human-gate trigger **exactly once** (strict `"1"`);
+ * 3. gate requested **without** a valid startup-open binding → fail closed (the
+ *    trigger carries no identity and may never manufacture a workflow);
+ * 4. with a binding, `open` it — a non-`APPLIED` result is startup-fatal;
+ * 5. if the gate is requested, submit exactly one `HUMAN_GATE_OPENED` via
+ *    {@link AutoflowOrchestrator.openHumanGate} — a non-`APPLIED` result is
+ *    startup-fatal.
+ *
+ * On any misconfiguration or non-`APPLIED` transition this throws, and the caller
+ * (`main`) exits non-zero before serving. It is factored out of `main` only so it
+ * can be exercised directly without `process.exit`; production reaches it through
+ * `main` alone.
+ */
+export function runStartupProgression(
+  orchestrator: AutoflowOrchestrator,
+  env: StartupEnv,
+  repositoryId: string,
+): void {
+  const startupBinding = readStartupWorkflowConfig(env, repositoryId);
+  // Read the human-gate trigger exactly once; strict "1" or throw.
+  const humanGateRequested = readStartupHumanGateConfig(env);
+
+  // The gate trigger cannot open a workflow. Requesting it without a valid
+  // startup-open is a misconfiguration — fail closed before serving.
+  if (humanGateRequested && startupBinding === null) {
+    throw new Error(
+      `Live Cockpit runtime: ${STARTUP_HUMAN_GATE_ENV}=1 requires a valid startup ` +
+        `workflow-open configuration; the human-gate trigger cannot open a workflow.`,
+    );
+  }
+
+  if (startupBinding !== null) {
+    const opened = orchestrator.open(startupBinding);
+    if (opened.outcome !== TRANSITION_OUTCOME.APPLIED) {
+      throw new Error(`Live Cockpit runtime: startup workflow open failed (${opened.outcome}).`);
+    }
+  }
+
+  // The sole production HUMAN_GATE_OPENED submission — one synchronous call, no
+  // external event object, bound internally to the workflow's own commit.
+  if (humanGateRequested) {
+    const gated = orchestrator.openHumanGate();
+    if (gated.outcome !== TRANSITION_OUTCOME.APPLIED) {
+      throw new Error(`Live Cockpit runtime: startup human-gate open failed (${gated.outcome}).`);
+    }
+  }
+}
+
+/**
  * Production entrypoint (`npm run cockpit:live`). Owns configuration, start,
  * signal handling, and error propagation.
  *
  * Repository observation values are runtime-supplied (environment) — not "live
  * Git observation." A single {@link AutoflowRuntime} is owned for writing only by
  * the {@link AutoflowOrchestrator}; the Cockpit is handed the runtime's read-only
- * reader, never the writer. This milestone's sole production write action is a
- * bounded **startup workflow open** (from {@link readStartupWorkflowConfig}): with
- * no such config the runtime starts owning no workflow (`current()` is `null`),
- * rendering the honest LIVE no-workflow page. It runs **no autonomous event
- * source** — nothing originates a {@link WorkflowEvent} after startup. Any startup
- * fault, including a rejected startup open, exits non-zero (fail closed).
+ * reader, never the writer. This milestone's production write actions are a
+ * bounded **startup workflow open** (from {@link readStartupWorkflowConfig}) and,
+ * under Decision 061, an optional bounded **startup human-gate** — both performed
+ * once at boot by {@link runStartupProgression}. With no such config the runtime
+ * starts owning no workflow (`current()` is `null`), rendering the honest LIVE
+ * no-workflow page. It runs **no autonomous event source** — nothing originates a
+ * {@link WorkflowEvent} after startup. Any startup fault, including a rejected
+ * startup open or human-gate, exits non-zero (fail closed).
  */
 function main(): void {
   let server: http.Server;
@@ -186,19 +251,11 @@ function main(): void {
     });
     const collectorId = process.env['AGENTBRIDGE_COLLECTOR_ID'] ?? 'agentbridge-live-runtime';
 
-    // Bounded startup-open: the only production write action this milestone.
-    // Absent config → no workflow (current() stays null). Partial/mismatched
-    // config throws from readStartupWorkflowConfig; a malformed binding is
-    // rejected by the domain open below — both exit non-zero (fail closed).
-    const startupBinding = readStartupWorkflowConfig(process.env, repositoryId);
-    if (startupBinding !== null) {
-      const opened = orchestrator.open(startupBinding);
-      if (opened.outcome !== TRANSITION_OUTCOME.APPLIED) {
-        throw new Error(
-          `Live Cockpit runtime: startup workflow open failed (${opened.outcome}).`,
-        );
-      }
-    }
+    // Bounded startup progression: the only production write actions this
+    // milestone, performed exactly once at boot through the one writer. Any
+    // misconfiguration or non-APPLIED transition throws and exits non-zero
+    // (fail closed) before serving. No post-start event source exists.
+    runStartupProgression(orchestrator, process.env, repositoryId);
 
     server = startLiveCockpit({
       config: {
