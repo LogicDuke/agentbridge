@@ -66,12 +66,49 @@ describe.skipIf(!ready)('D062 owner helper — real Windows binary integration',
     expect(match?.[1]).toBe(actual);
   });
 
-  it('accepts a real operator-owned directory (owner SID == operator SID)', async () => {
+  it('accepts an operator-owned temp dir; fails closed when the runner elevates ownership', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'abctl-own-'));
+
+    // A freshly created temp directory is NOT unconditionally operator-owned: in a
+    // non-elevated context the operator really owns what it just created, but on an
+    // elevated GitHub Actions Windows runner a new directory is owned by the
+    // Administrators group (or SYSTEM), i.e. a non-operator SID. So first read the
+    // directory's ACTUAL owner SID through the same real, build-provenanced helper
+    // binary the production gate uses — test #1 above asserts these exact bytes
+    // match the generated provenance hash — then assert the corresponding
+    // deterministic gate behaviour. This keeps the case meaningful in both
+    // contexts rather than assuming ownership.
+    const owned = await runner(exePath, [dir]);
+    if (!owned.ok) {
+      throw new Error('owner helper failed to report the temp directory owner SID');
+    }
+    const actualOwnerSid = store.parseOwnerHelperSid(owned.stdout);
+    if (actualOwnerSid === null) {
+      throw new Error('owner helper returned a non-canonical owner SID');
+    }
+
     const result = await store.verifyAnchorOwner(operator, dir, runner);
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.ownerSid).toBe(operator.sid);
+
+    if (actualOwnerSid === operator.sid) {
+      // Owner == operator → the gate MUST accept and echo that exact SID.
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.ownerSid).toBe(operator.sid);
+      }
+    } else {
+      // Owner != operator (Administrators/SYSTEM on an elevated runner) → the gate
+      // MUST fail closed; a foreign owner can never be treated as success. SYSTEM
+      // ownership is rejected as OWNER_IS_SYSTEM (production checks it first); any
+      // other foreign owner as OWNER_MISMATCH.
+      const SYSTEM_SID = 's-1-5-18';
+      const expectedReason =
+        actualOwnerSid === SYSTEM_SID
+          ? store.CONTROL_ANCHOR_REJECTION.OWNER_IS_SYSTEM
+          : store.CONTROL_ANCHOR_REJECTION.OWNER_MISMATCH;
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.reason).toBe(expectedReason);
+      }
     }
   });
 
