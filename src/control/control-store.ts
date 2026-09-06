@@ -12,6 +12,13 @@
  * - the anchor ACL is read (read-only) and its principals must be **exactly** the
  *   runtime operator plus SYSTEM — an inherited entry or any foreign principal
  *   fails closed;
+ * - the anchor **OWNER SID** must equal the exact runtime operator SID (Decision
+ *   062 Amendment A). SYSTEM is an allowed DACL principal but **never** an allowed
+ *   owner, because an owner can rewrite the DACL. The owner SID is read by a
+ *   single build-provenanced native helper whose bytes are SHA-256-verified
+ *   against generated build metadata before it is ever run; any mismatch, absence,
+ *   query failure, or non-canonical result fails closed. A display name can never
+ *   satisfy the SID comparison, and DACL membership can never satisfy ownership;
  * - the current operator identity comes from `whoami /user`.
  *
  * This gate is **implementation only**: it never mutates ACLs and never
@@ -33,9 +40,10 @@
  */
 
 import { execFile } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { lstatSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { decodeBase64UrlExact, encodeBase64Url } from './control-codec.js';
 
@@ -205,6 +213,15 @@ export const CONTROL_ANCHOR_REJECTION = Object.freeze({
   INHERITED_PRINCIPAL: 'INHERITED_PRINCIPAL',
   FOREIGN_PRINCIPAL: 'FOREIGN_PRINCIPAL',
   RUNTIME_PRINCIPAL_ABSENT: 'RUNTIME_PRINCIPAL_ABSENT',
+  // Owner-SID gate (F1, Decision 062 Amendment A): the anchor's OWNER must be
+  // the exact runtime operator SID, proven by the build-provenanced owner helper.
+  HELPER_PROVENANCE_MISSING: 'HELPER_PROVENANCE_MISSING',
+  HELPER_MISSING: 'HELPER_MISSING',
+  HELPER_HASH_MISMATCH: 'HELPER_HASH_MISMATCH',
+  OWNER_QUERY_FAILED: 'OWNER_QUERY_FAILED',
+  OWNER_SID_MALFORMED: 'OWNER_SID_MALFORMED',
+  OWNER_IS_SYSTEM: 'OWNER_IS_SYSTEM',
+  OWNER_MISMATCH: 'OWNER_MISMATCH',
 } as const);
 
 export type ControlAnchorRejection =
@@ -447,12 +464,179 @@ function icaclsPath(systemRoot: string): string {
   return join(systemRoot, 'System32', 'icacls.exe');
 }
 
+/* ------------------------------------------------------------------ *
+ * Owner-SID gate — the third, build-provenanced read-only executable
+ * ------------------------------------------------------------------ *
+ *
+ * The ACL scan above proves who may *access* the anchor; it does not prove who
+ * *owns* it, and an owner can rewrite the DACL at will. Decision 062 Amendment A
+ * closes that gap: the anchor OWNER SID must equal the exact runtime operator SID
+ * (SYSTEM is an allowed DACL principal but never an allowed owner).
+ *
+ * The owner SID is read by a single, minimal, source-in-repo native helper built
+ * from reviewed C by the trusted Windows build (`tools/control-owner/`). Its
+ * identity and integrity are rooted in GENERATED BUILD METADATA — the helper's
+ * filename and the SHA-256 of the exact compiled binary — emitted as a built JS
+ * module beside the binary and loaded module-relative here. There is no committed
+ * hash literal, no `.sha256` sidecar, and no env/argv/registry/network authority.
+ * Before the helper is ever executed its bytes are hashed and compared to that
+ * expected hash; any absence, mismatch, query failure, or non-canonical result
+ * fails closed. This adds a third executable (whoami, icacls, owner helper) and
+ * no more.
+ */
+
+/** The build-generated provenance of the owner helper (its trust root). */
+export interface OwnerHelperProvenance {
+  readonly filename: string;
+  readonly sha256: string;
+}
+
+/** Injection seams for the owner gate; production defaults use the real build output. */
+export interface OwnerVerifierDeps {
+  readonly loadProvenance?: () => Promise<OwnerHelperProvenance | null>;
+  readonly resolveHelperPath?: (filename: string) => string;
+  readonly readHelperBytes?: (helperPath: string) => Buffer | null;
+  readonly hashBytes?: (bytes: Buffer) => string;
+}
+
+export type OwnerVerification =
+  | { readonly ok: true; readonly ownerSid: string }
+  | { readonly ok: false; readonly reason: ControlAnchorRejection };
+
+/** A lowercase 64-hex SHA-256 digest. */
+const HELPER_SHA256_PATTERN = /^[0-9a-f]{64}$/;
+/** A safe helper basename: no path separators, drive letters, or traversal. */
+const HELPER_FILENAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+/** A single canonical SID and nothing else. */
+const CANONICAL_SID_PATTERN = /^S-1-\d+(?:-\d+)+$/;
+
+/** SHA-256 of bytes as lowercase hex. */
+function sha256Hex(bytes: Buffer): string {
+  return createHash('sha256').update(bytes).digest('hex');
+}
+
+/** Constant-time equality of two same-form lowercase hex digests. */
+function digestsEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) {
+    return false;
+  }
+  try {
+    return timingSafeEqual(Buffer.from(a, 'hex'), Buffer.from(b, 'hex'));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Load the generated owner-helper provenance module that the trusted build wrote
+ * beside the binary (module-relative to this compiled runtime). Any failure or
+ * shape violation yields `null`, which the caller treats as fail-closed.
+ */
+async function defaultLoadProvenance(): Promise<OwnerHelperProvenance | null> {
+  try {
+    const href = new URL('./native/owner-helper-provenance.js', import.meta.url).href;
+    const loaded = (await import(href)) as unknown;
+    if (typeof loaded !== 'object' || loaded === null) {
+      return null;
+    }
+    const provenance = (loaded as { OWNER_HELPER_PROVENANCE?: unknown }).OWNER_HELPER_PROVENANCE;
+    if (typeof provenance !== 'object' || provenance === null) {
+      return null;
+    }
+    const record = provenance as { filename?: unknown; sha256?: unknown };
+    if (typeof record.filename !== 'string' || typeof record.sha256 !== 'string') {
+      return null;
+    }
+    return { filename: record.filename, sha256: record.sha256 };
+  } catch {
+    return null;
+  }
+}
+
+/** Resolve the helper's absolute path from the trusted runtime module location. */
+function defaultResolveHelperPath(filename: string): string {
+  return fileURLToPath(new URL(`./native/${filename}`, import.meta.url));
+}
+
+/** Read the helper's exact bytes, or `null` if it is absent/unreadable. */
+function defaultReadHelperBytes(helperPath: string): Buffer | null {
+  try {
+    return readFileSync(helperPath);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Parse the helper's stdout as exactly one canonical SID, normalized. Any extra
+ * output, extra lines, or non-canonical text fails closed (`null`).
+ */
+export function parseOwnerHelperSid(stdout: string): string | null {
+  const trimmed = stdout.replace(/\r?\n$/, '');
+  if (!CANONICAL_SID_PATTERN.test(trimmed)) {
+    return null;
+  }
+  return normalizePrincipal(trimmed);
+}
+
+/**
+ * Verify the anchor OWNER SID equals the runtime operator SID, fail-closed. The
+ * helper is resolved module-relative, hash-verified against generated provenance,
+ * then run read-only via the supplied bounded runner with exactly one absolute
+ * anchor-path argument. SYSTEM ownership is rejected even though SYSTEM is an
+ * allowed DACL principal; a display name can never satisfy the SID comparison.
+ */
+export async function verifyAnchorOwner(
+  operator: OperatorIdentity,
+  anchorPath: string,
+  runProcess: ProcessRunner,
+  deps: OwnerVerifierDeps = {},
+): Promise<OwnerVerification> {
+  const provenance = await (deps.loadProvenance ?? defaultLoadProvenance)();
+  if (
+    provenance === null ||
+    !HELPER_SHA256_PATTERN.test(provenance.sha256) ||
+    !HELPER_FILENAME_PATTERN.test(provenance.filename)
+  ) {
+    return { ok: false, reason: CONTROL_ANCHOR_REJECTION.HELPER_PROVENANCE_MISSING };
+  }
+
+  const helperPath = (deps.resolveHelperPath ?? defaultResolveHelperPath)(provenance.filename);
+  const bytes = (deps.readHelperBytes ?? defaultReadHelperBytes)(helperPath);
+  if (bytes === null) {
+    return { ok: false, reason: CONTROL_ANCHOR_REJECTION.HELPER_MISSING };
+  }
+
+  const actualHash = (deps.hashBytes ?? sha256Hex)(bytes);
+  if (!digestsEqual(actualHash, provenance.sha256)) {
+    return { ok: false, reason: CONTROL_ANCHOR_REJECTION.HELPER_HASH_MISMATCH };
+  }
+
+  const query = await runProcess(helperPath, [anchorPath]);
+  if (!query.ok) {
+    return { ok: false, reason: CONTROL_ANCHOR_REJECTION.OWNER_QUERY_FAILED };
+  }
+
+  const ownerSid = parseOwnerHelperSid(query.stdout);
+  if (ownerSid === null) {
+    return { ok: false, reason: CONTROL_ANCHOR_REJECTION.OWNER_SID_MALFORMED };
+  }
+  if (SYSTEM_IDENTITIES.includes(ownerSid)) {
+    return { ok: false, reason: CONTROL_ANCHOR_REJECTION.OWNER_IS_SYSTEM };
+  }
+  if (ownerSid !== operator.sid) {
+    return { ok: false, reason: CONTROL_ANCHOR_REJECTION.OWNER_MISMATCH };
+  }
+  return { ok: true, ownerSid };
+}
+
 export interface VerifyControlAnchorDeps {
   readonly env?: NodeJS.ProcessEnv;
   readonly anchorPath?: string;
   readonly systemRoot?: string;
   readonly runProcess?: ProcessRunner;
   readonly lstat?: LstatProbe;
+  readonly owner?: OwnerVerifierDeps;
 }
 
 export type ControlAnchorVerification =
@@ -461,8 +645,9 @@ export type ControlAnchorVerification =
 
 /**
  * Verify the control anchor end to end, read-only and fail-closed. Never mutates
- * ACLs and never creates the directory. Uses only the two authorized read-only
- * subprocesses and `lstat`.
+ * ACLs and never creates the directory. Uses only the three authorized read-only
+ * subprocesses (whoami, icacls, and the build-provenanced owner helper) and
+ * `lstat`.
  */
 export async function verifyControlAnchor(
   deps: VerifyControlAnchorDeps = {},
@@ -506,6 +691,14 @@ export async function verifyControlAnchor(
   const acl = evaluateAnchorAcl(operator, entries);
   if (!acl.ok) {
     return { ok: false, reason: acl.reason };
+  }
+
+  // 5. Owner SID must be the exact runtime operator SID (SYSTEM owner rejected).
+  //    Uses the same bounded runner and the build-provenanced owner helper — the
+  //    third and only other read-only executable.
+  const owner = await verifyAnchorOwner(operator, anchorPath, runProcess, deps.owner);
+  if (!owner.ok) {
+    return { ok: false, reason: owner.reason };
   }
 
   return { ok: true, anchorPath };

@@ -8,7 +8,10 @@ import { describe, expect, it } from 'vitest';
  * D062 authority-boundary source scans over `src/control/` (and the one wiring
  * edit in `src/runtime/live-cockpit.ts`). These pin the frozen product boundary:
  * exactly one command, no generic event surface, no Git/GitHub/provider/Policy,
- * no shell, exactly two read-only subprocesses, and strict token discipline.
+ * no shell, and strict token discipline. Decision 062 Amendment A (PR #84 F1)
+ * adds exactly one further read-only executable — the build-provenanced owner-SID
+ * helper — making three (whoami, icacls, owner helper) and no more; its identity
+ * lives in generated build metadata, never as a hardcoded source `.exe` literal.
  */
 
 const controlDir = fileURLToPath(new URL('../../src/control/', import.meta.url));
@@ -88,7 +91,7 @@ describe('D062 authority boundary — no Git/GitHub/provider/Policy/network', ()
   });
 });
 
-describe('D062 authority boundary — no shell, exactly two read-only subprocesses', () => {
+describe('D062 authority boundary — no shell, three read-only executables', () => {
   const forbiddenShell: readonly RegExp[] = [
     /powershell/i,
     /\bpwsh\b/,
@@ -110,19 +113,49 @@ describe('D062 authority boundary — no shell, exactly two read-only subprocess
     }
   });
 
-  it('the only executables are whoami.exe and icacls.exe under System32, shell:false', () => {
+  it('the only hardcoded executables are whoami.exe and icacls.exe under System32, shell:false', () => {
     const store = textOf('control-store.ts');
     expect(store).toMatch(/whoami\.exe/);
     expect(store).toMatch(/icacls\.exe/);
     expect(store).toMatch(/System32/);
     expect(store).toMatch(/shell:\s*false/);
-    // No other .exe is referenced anywhere in the control layer.
+    // No other .exe literal is referenced anywhere in the control layer. The
+    // owner helper is deliberately NOT hardcoded: its filename is read from
+    // generated build metadata, so it never appears as a source literal here.
     for (const { file, text } of controlSources()) {
       const exeMatches = text.match(/[A-Za-z0-9]+\.exe(?![A-Za-z0-9])/g) ?? [];
       for (const match of exeMatches) {
         expect(['whoami.exe', 'icacls.exe'], `${file} references ${match}`).toContain(match);
       }
     }
+  });
+});
+
+describe('D062 authority boundary — owner-SID gate is provenance-rooted and hash-verified', () => {
+  it('reads the owner helper identity from generated build metadata, not env or a sidecar', () => {
+    const store = textOf('control-store.ts');
+    // Trust root is the generated provenance JS module (a built artifact).
+    expect(store).toMatch(/owner-helper-provenance/);
+    // The expected hash is never a mutable .sha256 sidecar nor an env/argv value.
+    expect(store).not.toMatch(/['"][^'"]*\.sha256['"]/);
+    expect(store).not.toMatch(/process\.env\[[^\]]*(?:SHA|HASH|HELPER)/i);
+    expect(store).not.toMatch(/process\.env\.\w*(?:SHA|HASH|HELPER)/i);
+  });
+
+  it('hash-verifies the helper bytes before it can be executed', () => {
+    const store = textOf('control-store.ts');
+    expect(store).toMatch(/createHash\(\s*['"]sha256['"]\s*\)/);
+    expect(store).toMatch(/timingSafeEqual/);
+    expect(store).toMatch(/HELPER_HASH_MISMATCH/);
+    expect(store).toMatch(/HELPER_MISSING/);
+    expect(store).toMatch(/HELPER_PROVENANCE_MISSING/);
+  });
+
+  it('requires the anchor OWNER SID to equal the operator SID and rejects SYSTEM ownership', () => {
+    const store = textOf('control-store.ts');
+    expect(store).toMatch(/verifyAnchorOwner/);
+    expect(store).toMatch(/OWNER_IS_SYSTEM/);
+    expect(store).toMatch(/OWNER_MISMATCH/);
   });
 });
 

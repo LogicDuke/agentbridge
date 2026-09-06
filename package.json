@@ -16,6 +16,7 @@
     "cockpit": "npm run build && node dist/cockpit-host/server.js",
     "cockpit:live": "npm run build && node dist/runtime/live-cockpit.js",
     "control": "npm run build && node dist/control/cli.js",
+    "helper:build": "node tools/control-owner/build.mjs",
     "verify": "npm run typecheck && npm run lint && npm test && npm run build"
   },
   "devDependencies": {
