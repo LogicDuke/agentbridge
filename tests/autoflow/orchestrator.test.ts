@@ -2,10 +2,16 @@ import { describe, expect, it } from 'vitest';
 
 import { AutoflowOrchestrator } from '../../src/autoflow/orchestrator.js';
 import {
+  AUTOFLOW_APPLY_NO_WORKFLOW,
   AUTOFLOW_OPEN_ALREADY_ACTIVE,
   AutoflowRuntime,
 } from '../../src/autoflow/runtime.js';
-import { TRANSITION_OUTCOME, type WorkflowBinding } from '../../src/domain/index.js';
+import {
+  TRANSITION_OUTCOME,
+  TRANSITION_REJECTION,
+  WORKFLOW_STATUS,
+  type WorkflowBinding,
+} from '../../src/domain/index.js';
 
 const REPO = 'repo-agentbridge';
 const SHA_A = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678';
@@ -66,9 +72,74 @@ describe('AutoflowOrchestrator single-writer boundary', () => {
     expect(reader['apply']).toBeUndefined();
   });
 
-  it('the orchestrator public method surface carries exactly open and reader', () => {
+  it('the orchestrator public method surface carries exactly open, openHumanGate and reader', () => {
     const proto = Object.getPrototypeOf(new AutoflowOrchestrator(new AutoflowRuntime())) as object;
     const methods = Object.getOwnPropertyNames(proto).filter((n) => n !== 'constructor');
-    expect(methods.sort()).toEqual(['open', 'reader']);
+    // Structurally narrow: a startup human-gate verb, but NO generic apply(event).
+    expect(methods.sort()).toEqual(['open', 'openHumanGate', 'reader']);
+    expect(methods).not.toContain('apply');
+  });
+});
+
+describe('AutoflowOrchestrator.openHumanGate (Decision 061 — startup-scripted human-gate)', () => {
+  it('OPEN → APPLIED, AWAITING_HUMAN_DECISION at sequence 1, gate at revision 0', () => {
+    const runtime = new AutoflowRuntime();
+    const orchestrator = new AutoflowOrchestrator(runtime);
+    orchestrator.open(BINDING);
+    expect(runtime.current()?.status).toBe(WORKFLOW_STATUS.OPEN);
+    expect(runtime.current()?.sequence).toBe(0);
+
+    const result = orchestrator.openHumanGate();
+    expect(result.outcome).toBe(TRANSITION_OUTCOME.APPLIED);
+    expect(runtime.current()?.status).toBe(WORKFLOW_STATUS.AWAITING_HUMAN_DECISION);
+    expect(runtime.current()?.sequence).toBe(1);
+    expect(runtime.current()?.humanGateOpenedAtRevision).toBe(0);
+  });
+
+  it('binds the event to the workflow\'s own authoritative boundCommitSha (no external SHA)', () => {
+    const runtime = new AutoflowRuntime();
+    const orchestrator = new AutoflowOrchestrator(runtime);
+    orchestrator.open(BINDING); // boundCommitSha === SHA_A
+    const result = orchestrator.openHumanGate();
+    // APPLIED proves the internally-minted atCommitSha matched boundCommitSha;
+    // a mismatched SHA would have produced BINDING_MISMATCH.
+    expect(result.outcome).toBe(TRANSITION_OUTCOME.APPLIED);
+    expect(runtime.current()?.boundCommitSha).toBe(SHA_A);
+  });
+
+  it('with no workflow open, does not manufacture one — returns NO_WORKFLOW, state stays null', () => {
+    const runtime = new AutoflowRuntime();
+    const orchestrator = new AutoflowOrchestrator(runtime);
+    expect(runtime.current()).toBeNull();
+    const result = orchestrator.openHumanGate();
+    expect(result.outcome).toBe(AUTOFLOW_APPLY_NO_WORKFLOW);
+    expect(result.state).toBeNull();
+    expect(runtime.current()).toBeNull();
+  });
+
+  it('a second call rejects HUMAN_GATE_ALREADY_OPEN and preserves the exact state', () => {
+    const runtime = new AutoflowRuntime();
+    const orchestrator = new AutoflowOrchestrator(runtime);
+    orchestrator.open(BINDING);
+    orchestrator.openHumanGate();
+    const gatedState = runtime.current();
+
+    const second = orchestrator.openHumanGate();
+    expect(second.outcome).toBe(TRANSITION_OUTCOME.REJECTED);
+    if (second.outcome === TRANSITION_OUTCOME.REJECTED) {
+      expect(second.rejection).toBe(TRANSITION_REJECTION.HUMAN_GATE_ALREADY_OPEN);
+    }
+    // Provable no-op: same frozen reference, unchanged sequence.
+    expect(runtime.current()).toBe(gatedState);
+    expect(runtime.current()?.sequence).toBe(1);
+  });
+
+  it('does not expose a generic apply(event) surface', () => {
+    const orchestrator = new AutoflowOrchestrator(new AutoflowRuntime()) as unknown as Record<
+      string,
+      unknown
+    >;
+    expect(orchestrator['apply']).toBeUndefined();
+    expect('apply' in orchestrator).toBe(false);
   });
 });
