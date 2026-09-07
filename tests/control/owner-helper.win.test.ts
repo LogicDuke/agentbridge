@@ -1,12 +1,17 @@
 /**
- * Real Windows integration for the Decision 062 / PR #84 F1 owner-SID gate.
+ * Real Windows integration for the Decision 062 control-anchor helper.
  *
  * Unlike the pure/injected tests in control-store.test.ts, this exercises the
  * ACTUAL compiled helper binary through the production code path: it imports the
- * built `dist/control/control-store.js` and calls `verifyAnchorOwner` with no
+ * built `dist/control/control-store.js` and calls `verifyAnchorSnapshot` with no
  * injected deps, so the default provenance load (the generated JS metadata beside
  * the binary), the SHA-256 hash gate, and the real bounded `execFile` transport
  * all run for real against `dist/control/native/agentbridge-win-owner.exe`.
+ *
+ * It proves both helper modes on the real binary: the F1 owner-only mode
+ * (backward compatible) and the Amendment B `--acl` canonical OWNER + DACL
+ * snapshot — whose SIDs are canonical and therefore locale-independent (SYSTEM
+ * appears as S-1-5-18, never the localized "NT AUTHORITY\SYSTEM").
  *
  * It is gated to win32 with a built dist + helper. On Linux CI, or before
  * `npm run build && npm run helper:build`, the whole suite is skipped — its
@@ -39,7 +44,10 @@ const ready =
 
 type StoreModule = typeof import('../../src/control/control-store.js');
 
-describe.skipIf(!ready)('D062 owner helper — real Windows binary integration', () => {
+const CANONICAL_SID = /^s-1-\d+(?:-\d+)+$/;
+const SYSTEM_SID = 's-1-5-18';
+
+describe.skipIf(!ready)('D062 control helper — real Windows binary integration', () => {
   const systemRoot = process.env['SystemRoot'] ?? 'C:\\Windows';
   let store!: StoreModule;
   let operator!: OperatorIdentity;
@@ -66,65 +74,97 @@ describe.skipIf(!ready)('D062 owner helper — real Windows binary integration',
     expect(match?.[1]).toBe(actual);
   });
 
-  it('accepts an operator-owned temp dir; fails closed when the runner elevates ownership', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'abctl-own-'));
-
-    // A freshly created temp directory is NOT unconditionally operator-owned: in a
-    // non-elevated context the operator really owns what it just created, but on an
-    // elevated GitHub Actions Windows runner a new directory is owned by the
-    // Administrators group (or SYSTEM), i.e. a non-operator SID. So first read the
-    // directory's ACTUAL owner SID through the same real, build-provenanced helper
-    // binary the production gate uses — test #1 above asserts these exact bytes
-    // match the generated provenance hash — then assert the corresponding
-    // deterministic gate behaviour. This keeps the case meaningful in both
-    // contexts rather than assuming ownership.
+  it('F1 owner-only mode still returns exactly one canonical owner SID', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'abctl-owner-'));
     const owned = await runner(exePath, [dir]);
-    if (!owned.ok) {
-      throw new Error('owner helper failed to report the temp directory owner SID');
-    }
-    const actualOwnerSid = store.parseOwnerHelperSid(owned.stdout);
-    if (actualOwnerSid === null) {
-      throw new Error('owner helper returned a non-canonical owner SID');
-    }
-
-    const result = await store.verifyAnchorOwner(operator, dir, runner);
-
-    if (actualOwnerSid === operator.sid) {
-      // Owner == operator → the gate MUST accept and echo that exact SID.
-      expect(result.ok).toBe(true);
-      if (result.ok) {
-        expect(result.ownerSid).toBe(operator.sid);
-      }
-    } else {
-      // Owner != operator (Administrators/SYSTEM on an elevated runner) → the gate
-      // MUST fail closed; a foreign owner can never be treated as success. SYSTEM
-      // ownership is rejected as OWNER_IS_SYSTEM (production checks it first); any
-      // other foreign owner as OWNER_MISMATCH.
-      const SYSTEM_SID = 's-1-5-18';
-      const expectedReason =
-        actualOwnerSid === SYSTEM_SID
-          ? store.CONTROL_ANCHOR_REJECTION.OWNER_IS_SYSTEM
-          : store.CONTROL_ANCHOR_REJECTION.OWNER_MISMATCH;
-      expect(result.ok).toBe(false);
-      if (!result.ok) {
-        expect(result.reason).toBe(expectedReason);
-      }
+    expect(owned.ok).toBe(true);
+    if (owned.ok) {
+      const sid = store.parseOwnerHelperSid(owned.stdout);
+      expect(sid).not.toBeNull();
+      expect(sid).toMatch(CANONICAL_SID);
     }
   });
 
-  it('rejects when the expected operator SID differs from the real owner', async () => {
+  it('--acl mode returns a canonical OWNER + DACL snapshot (locale-independent)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'abctl-acl-'));
+
+    // Both modes read the same object; cross-check that the --acl owner equals the
+    // owner-only mode's SID (one security truth source, two views agree).
+    const ownerOnly = await runner(exePath, [dir]);
+    expect(ownerOnly.ok).toBe(true);
+    const ownerOnlySid = ownerOnly.ok ? store.parseOwnerHelperSid(ownerOnly.stdout) : null;
+
+    const acl = await runner(exePath, ['--acl', dir]);
+    expect(acl.ok).toBe(true);
+    if (!acl.ok) {
+      return;
+    }
+    const snapshot = store.parseAclSnapshot(acl.stdout);
+    expect(snapshot).not.toBeNull();
+    if (snapshot === null) {
+      return;
+    }
+
+    // Owner: canonical, and identical to the owner-only mode.
+    expect(snapshot.ownerSid).toMatch(CANONICAL_SID);
+    expect(snapshot.ownerSid).toBe(ownerOnlySid);
+
+    // A real temp directory has a present, non-empty DACL.
+    expect(snapshot.daclPresent).toBe(true);
+    expect(snapshot.aces.length).toBeGreaterThanOrEqual(1);
+
+    for (const ace of snapshot.aces) {
+      // F3 core property: EVERY principal is a canonical SID — never a localized
+      // account name — so authorization is identical on any Windows locale.
+      expect(ace.sid).toMatch(CANONICAL_SID);
+      // Structure preserved: representable type, boolean inheritance, and a
+      // 32-bit access mask.
+      expect(['ALLOW', 'DENY']).toContain(ace.type);
+      expect(typeof ace.inherited).toBe('boolean');
+      expect(Number.isInteger(ace.mask)).toBe(true);
+      expect(ace.mask).toBeGreaterThanOrEqual(0);
+      expect(ace.mask).toBeLessThanOrEqual(0xffffffff);
+    }
+
+    // SYSTEM is present on an inherited %TEMP% ACL and MUST appear as its canonical
+    // SID S-1-5-18 — the exact locale-independence the parser-only fix could not
+    // achieve (default icacls shows only the localized "NT AUTHORITY\\SYSTEM").
+    const systemAce = snapshot.aces.find((ace) => ace.sid === SYSTEM_SID);
+    expect(systemAce, 'temp DACL should carry SYSTEM as canonical S-1-5-18').toBeDefined();
+    // The inherited flag is preserved for real inherited ACEs.
+    expect(snapshot.aces.some((ace) => ace.inherited)).toBe(true);
+  });
+
+  it('--acl rejects malformed args, relative paths, and extra argv (fail closed)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'abctl-args-'));
+    // Relative path in either mode.
+    expect((await runner(exePath, ['relative\\path'])).ok).toBe(false);
+    expect((await runner(exePath, ['--acl', 'relative\\path'])).ok).toBe(false);
+    // Extra trailing argv in either mode.
+    expect((await runner(exePath, [dir, 'extra'])).ok).toBe(false);
+    expect((await runner(exePath, ['--acl', dir, 'extra'])).ok).toBe(false);
+    // Unknown flag.
+    expect((await runner(exePath, ['--nope', dir])).ok).toBe(false);
+  });
+
+  it('verifyAnchorSnapshot fails closed when the expected operator SID differs from the real owner', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'abctl-mismatch-'));
     const foreign: OperatorIdentity = { name: operator.name, sid: 's-1-5-21-0-0-0-4242' };
-    const result = await store.verifyAnchorOwner(foreign, dir, runner);
+    const result = await store.verifyAnchorSnapshot(foreign, dir, runner);
     expect(result.ok).toBe(false);
     if (!result.ok) {
-      expect(result.reason).toBe(store.CONTROL_ANCHOR_REJECTION.OWNER_MISMATCH);
+      // Real owner is never the fabricated foreign SID: OWNER_MISMATCH, or
+      // OWNER_IS_SYSTEM if an elevated runner made SYSTEM the owner.
+      expect([
+        store.CONTROL_ANCHOR_REJECTION.OWNER_MISMATCH,
+        store.CONTROL_ANCHOR_REJECTION.OWNER_IS_SYSTEM,
+      ]).toContain(result.reason);
     }
   });
 
-  it('fails closed against a swapped binary (hash mismatch) using the real helper path', async () => {
+  it('verifyAnchorSnapshot fails closed against a swapped binary (hash mismatch) on the real path', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'abctl-swap-'));
-    const result = await store.verifyAnchorOwner(operator, dir, runner, {
+    const result = await store.verifyAnchorSnapshot(operator, dir, runner, {
       // Real provenance + real binary, but a tampered expected hash.
       loadProvenance: () =>
         Promise.resolve({ filename: 'agentbridge-win-owner.exe', sha256: 'd'.repeat(64) }),
