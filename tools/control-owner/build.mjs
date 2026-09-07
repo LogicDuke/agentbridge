@@ -20,13 +20,20 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const HELPER_BASENAME = 'agentbridge-win-owner.exe';
+import {
+  OWNER_HELPER_BASENAME,
+  PROVENANCE_BASENAME,
+  encodeProvenance,
+} from './provenance-format.mjs';
+
+const HELPER_BASENAME = OWNER_HELPER_BASENAME;
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(here, '..', '..');
@@ -35,7 +42,7 @@ const srcC = join(here, 'agentbridge-win-owner.c');
 /** Deterministic module-relative runtime output: dist/control/native/. */
 const outDir = join(repoRoot, 'dist', 'control', 'native');
 const exePath = join(outDir, HELPER_BASENAME);
-const provenancePath = join(outDir, 'owner-helper-provenance.js');
+const provenancePath = join(outDir, PROVENANCE_BASENAME);
 
 function fail(message) {
   process.stderr.write(`owner-helper build: ${message}\n`);
@@ -177,16 +184,25 @@ rmSync(objDir, { recursive: true, force: true });
 const bytes = readFileSync(exePath);
 const sha256 = createHash('sha256').update(bytes).digest('hex');
 
-const provenance =
-  '// GENERATED BUILD METADATA — do not edit.\n' +
-  '// Produced by tools/control-owner/build.mjs from the exact compiled binary.\n' +
-  '// This is the runtime trust root for the owner helper (SHA-256 of the binary).\n' +
-  'export const OWNER_HELPER_PROVENANCE = {\n' +
-  `  filename: ${JSON.stringify(HELPER_BASENAME)},\n` +
-  `  sha256: ${JSON.stringify(sha256)},\n` +
-  '  built: true,\n' +
-  '};\n';
-writeFileSync(provenancePath, provenance, { encoding: 'utf8' });
+// One canonical representation, produced by the shared encoder. The launch-time
+// provisioning gate accepts a pair iff the on-disk provenance equals exactly this.
+const provenance = encodeProvenance(sha256);
+
+// Publish atomically: write the complete canonical bytes to a same-directory temp
+// file, then rename/replace onto the final path. On Windows Node's renameSync uses
+// MoveFileExW(REPLACE_EXISTING), atomic within the volume; same directory ⇒ same
+// volume. This shrinks the window in which a truncated provenance is observable. It
+// is defense-in-depth only: canonical byte-equality (gate) is the correctness
+// mechanism, and it does NOT make helper+provenance jointly transactional. A reader
+// never treats the temp file as authoritative — only provenancePath is consumed.
+const tmpProvenance = `${provenancePath}.tmp-${String(process.pid)}`;
+writeFileSync(tmpProvenance, provenance, { encoding: 'utf8' });
+try {
+  renameSync(tmpProvenance, provenancePath);
+} catch {
+  rmSync(tmpProvenance, { force: true });
+  fail('failed to publish provenance atomically (rename).');
+}
 
 process.stderr.write(
   `owner-helper build: wrote ${exePath} (${String(bytes.length)} bytes)\n` +

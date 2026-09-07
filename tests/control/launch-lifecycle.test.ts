@@ -1,21 +1,23 @@
 /**
- * D062 supported-launch lifecycle regression (PR #85 helper-provisioning family).
+ * D062 supported-launch lifecycle regression (PR #85/#90 canonical-provenance).
  *
- * The mandatory owner/DACL helper and its generated provenance are produced only
- * by `tools/control-owner/build.mjs`. The supported production launch scripts
- * (`npm run control`, `npm run cockpit:live`) must ensure a VALID helper/provenance
- * pair exists before control-anchor verification runs — on a clean checkout AND
- * after a partial/torn provisioning. It is not enough that both files merely exist:
- * an interrupted build can leave a new executable beside stale provenance, which
- * the runtime rejects with HELPER_HASH_MISMATCH and which a supported relaunch must
- * self-heal by rebuilding rather than skipping.
+ * The launch-time provisioning gate (tools/control-owner/ensure-helper.mjs) makes a
+ * clean — or partially/torn/malformed — checkout coherent before control-anchor
+ * verification, by rebuilding through the trusted build.mjs unless the on-disk pair
+ * is CANONICAL. Canonical means exactly one thing:
  *
- * These tests pin: (1) the pure pair-validity decision across the full artifact
- * state matrix; (2) that the launch scripts and Windows CI run the provisioning
- * gate between build and launch (an invariant that cannot be masked by manually
- * running `helper:build` first); (3) that the runtime still fails closed on absent
- * or mismatched provenance (independent of the gate); and (4), on Windows, that the
- * real gate skips a valid pair and rebuilds an invalid one.
+ *     provenance bytes == encodeProvenance(sha256(helper bytes))
+ *
+ * produced by the single shared encoder (tools/control-owner/provenance-format.mjs),
+ * which build.mjs also uses to publish. The gate does no field extraction, no regex
+ * acceptance, no JS import/parse, and no normalization — so the ACCEPTED SET is the
+ * singleton {encodeProvenance(sha256(helper))} and the FALSE-VALID SET is empty.
+ *
+ * These tests drive the REAL encoder and REAL validator over the full adversarial
+ * artifact-state matrix (including the exact Codex truncated-module witness and the
+ * duplicate-field witness), pin the launch/CI wiring, confirm the runtime still
+ * fails closed independently, and (on Windows) confirm the real gate skips a
+ * canonical pair without mutating the shared binary.
  */
 
 import { spawnSync } from 'node:child_process';
@@ -27,7 +29,11 @@ import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
-import { validateHelperPair } from '../../tools/control-owner/ensure-helper.mjs';
+import {
+  validateHelperPair,
+  encodeProvenance,
+  OWNER_HELPER_BASENAME,
+} from '../../tools/control-owner/ensure-helper.mjs';
 import {
   CONTROL_ANCHOR_REJECTION,
   verifyAnchorSnapshot,
@@ -36,12 +42,11 @@ import {
   type ProcessRunner,
 } from '../../src/control/control-store.js';
 
-const HELPER_BASENAME = 'agentbridge-win-owner.exe';
 const PROVENANCE_BASENAME = 'owner-helper-provenance.js';
 
 const repoRoot = fileURLToPath(new URL('../../', import.meta.url));
 const ensureScript = join(repoRoot, 'tools', 'control-owner', 'ensure-helper.mjs');
-const realExe = join(repoRoot, 'dist', 'control', 'native', HELPER_BASENAME);
+const realExe = join(repoRoot, 'dist', 'control', 'native', OWNER_HELPER_BASENAME);
 const realProv = join(repoRoot, 'dist', 'control', 'native', PROVENANCE_BASENAME);
 
 const pkg = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')) as {
@@ -49,177 +54,224 @@ const pkg = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')) as 
 };
 const ciYml = readFileSync(join(repoRoot, '.github', 'workflows', 'ci.yml'), 'utf8');
 
-/** Provenance module text in the exact shape build.mjs emits. */
-function provenanceText(filename: string, sha256: string): string {
-  return (
-    '// GENERATED BUILD METADATA — do not edit.\n' +
-    'export const OWNER_HELPER_PROVENANCE = {\n' +
-    `  filename: ${JSON.stringify(filename)},\n` +
-    `  sha256: ${JSON.stringify(sha256)},\n` +
-    '  built: true,\n' +
-    '};\n'
-  );
-}
-
 function sha256Hex(bytes: Buffer): string {
   return createHash('sha256').update(bytes).digest('hex');
+}
+function canonicalFor(bytes: Buffer): string {
+  return encodeProvenance(sha256Hex(bytes));
 }
 
 interface Pair {
   readonly exePath: string;
   readonly provenancePath: string;
-  readonly expectedFilename: string;
 }
-
 function tmpPair(): { dir: string; pair: Pair } {
-  const dir = mkdtempSync(join(tmpdir(), 'ab-lifecycle-'));
+  const dir = mkdtempSync(join(tmpdir(), 'ab-canon-'));
   return {
     dir,
-    pair: {
-      exePath: join(dir, HELPER_BASENAME),
-      provenancePath: join(dir, PROVENANCE_BASENAME),
-      expectedFilename: HELPER_BASENAME,
-    },
+    pair: { exePath: join(dir, OWNER_HELPER_BASENAME), provenancePath: join(dir, PROVENANCE_BASENAME) },
   };
 }
+/** Run `fn` against a fresh temp dir, always cleaning up. */
+function withPair(fn: (pair: Pair) => void): void {
+  const { dir, pair } = tmpPair();
+  try {
+    fn(pair);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+function writeExe(pair: Pair, bytes: Buffer): void {
+  writeFileSync(pair.exePath, bytes);
+}
 
-/* ---- 1. Pure pair-validity across the full artifact-state matrix ------------ */
+/* ---- 1. Canonical-equality acceptance matrix (cross-platform, real encoder) -- */
 
-describe('D062 launch lifecycle — validateHelperPair covers the artifact-state matrix', () => {
-  it('1. neither artifact present → invalid (rebuild)', () => {
-    const { dir, pair } = tmpPair();
-    try {
-      const r = validateHelperPair(pair);
-      expect(r.valid).toBe(false);
-      expect(r.reason).toBe('provenance-missing');
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+const HELPER = Buffer.from('the-real-helper-bytes');
+
+describe('D062 canonical provenance — acceptance matrix (FALSE-VALID set is empty)', () => {
+  it('1. canonical valid pair → VALID (skip)', () => {
+    withPair((p) => {
+      writeExe(p, HELPER);
+      writeFileSync(p.provenancePath, canonicalFor(HELPER));
+      const r = validateHelperPair(p);
+      expect(r).toEqual({ valid: true, reason: 'valid' });
+    });
   });
 
-  it('2. helper only (provenance absent) → invalid (rebuild)', () => {
-    const { dir, pair } = tmpPair();
-    try {
-      writeFileSync(pair.exePath, Buffer.from('helper-bytes'));
-      const r = validateHelperPair(pair);
-      expect(r.valid).toBe(false);
-      expect(r.reason).toBe('provenance-missing');
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+  it('2. neither artifact → INVALID', () => {
+    withPair((p) => {
+      expect(validateHelperPair(p).valid).toBe(false);
+    });
   });
 
-  it('3. provenance only (helper absent) → invalid (rebuild)', () => {
-    const { dir, pair } = tmpPair();
-    try {
-      writeFileSync(pair.provenancePath, provenanceText(HELPER_BASENAME, 'a'.repeat(64)));
-      const r = validateHelperPair(pair);
+  it('3. helper only → INVALID', () => {
+    withPair((p) => {
+      writeExe(p, HELPER);
+      expect(validateHelperPair(p).valid).toBe(false);
+    });
+  });
+
+  it('4. provenance only → INVALID', () => {
+    withPair((p) => {
+      writeFileSync(p.provenancePath, canonicalFor(HELPER));
+      const r = validateHelperPair(p);
       expect(r.valid).toBe(false);
       expect(r.reason).toBe('helper-missing');
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+    });
   });
 
-  it('4. both present + matching hash → VALID (skip)', () => {
-    const { dir, pair } = tmpPair();
-    try {
-      const bytes = Buffer.from('the-real-helper');
-      writeFileSync(pair.exePath, bytes);
-      writeFileSync(pair.provenancePath, provenanceText(HELPER_BASENAME, sha256Hex(bytes)));
-      const r = validateHelperPair(pair);
-      expect(r.valid).toBe(true);
-      expect(r.reason).toBe('valid');
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+  it('5. wrong SHA (canonical-shaped for other bytes) → INVALID', () => {
+    withPair((p) => {
+      writeExe(p, HELPER);
+      writeFileSync(p.provenancePath, canonicalFor(Buffer.from('different')));
+      const r = validateHelperPair(p);
+      expect(r).toEqual({ valid: false, reason: 'not-canonical' });
+    });
   });
 
-  it('5/10/11. torn pair — new helper beside stale provenance hash → invalid (rebuild)', () => {
-    const { dir, pair } = tmpPair();
-    try {
-      const stale = sha256Hex(Buffer.from('OLD-helper-A'));
-      writeFileSync(pair.exePath, Buffer.from('NEW-helper-B')); // different bytes
-      writeFileSync(pair.provenancePath, provenanceText(HELPER_BASENAME, stale));
-      const r = validateHelperPair(pair);
-      expect(r.valid).toBe(false);
-      expect(r.reason).toBe('hash-mismatch');
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+  it('6. torn pair (new helper beside provenance for old bytes) → INVALID', () => {
+    withPair((p) => {
+      const provForOld = canonicalFor(Buffer.from('OLD-helper'));
+      writeExe(p, Buffer.from('NEW-helper'));
+      writeFileSync(p.provenancePath, provForOld);
+      expect(validateHelperPair(p).reason).toBe('not-canonical');
+    });
   });
 
-  it('6. provenance malformed (no generated shape) → invalid (rebuild)', () => {
-    const { dir, pair } = tmpPair();
-    try {
-      writeFileSync(pair.exePath, Buffer.from('x'));
-      writeFileSync(pair.provenancePath, 'this is not the generated module {');
-      const r = validateHelperPair(pair);
-      expect(r.valid).toBe(false);
-      expect(r.reason).toBe('provenance-shape');
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+  it('7. truncated canonical provenance at EVERY byte offset → never VALID', () => {
+    withPair((p) => {
+      writeExe(p, HELPER);
+      const canon = Buffer.from(canonicalFor(HELPER), 'utf8');
+      for (let i = 0; i < canon.length; i += 1) {
+        writeFileSync(p.provenancePath, canon.subarray(0, i));
+        expect(validateHelperPair(p).valid, `prefix len ${String(i)} must be INVALID`).toBe(false);
+      }
+      // The full length is the only VALID representation.
+      writeFileSync(p.provenancePath, canon);
+      expect(validateHelperPair(p).valid).toBe(true);
+    });
+  }, 60000);
+
+  it('7b. exact Codex witness (through the sha256 line, no closing syntax) → INVALID', () => {
+    withPair((p) => {
+      writeExe(p, HELPER);
+      const canon = canonicalFor(HELPER);
+      const cut = canon.indexOf('\n', canon.indexOf('sha256:')) + 1; // end of sha256 line
+      writeFileSync(p.provenancePath, canon.slice(0, cut));
+      expect(validateHelperPair(p).valid).toBe(false);
+    });
   });
 
-  it('7. provenance missing required fields → invalid (rebuild)', () => {
-    const { dir, pair } = tmpPair();
-    try {
-      writeFileSync(pair.exePath, Buffer.from('x'));
-      writeFileSync(pair.provenancePath, 'export const OWNER_HELPER_PROVENANCE = { built: true };\n');
-      const r = validateHelperPair(pair);
-      expect(r.valid).toBe(false);
-      expect(r.reason).toBe('provenance-fields-missing');
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+  it('8. duplicate filename field → INVALID', () => {
+    withPair((p) => {
+      writeExe(p, HELPER);
+      const canon = canonicalFor(HELPER);
+      const dup = canon.replace(
+        /( {2}filename: "[^"]*",\n)/,
+        '$1  filename: "agentbridge-win-owner.exe",\n',
+      );
+      expect(dup).not.toBe(canon);
+      writeFileSync(p.provenancePath, dup);
+      expect(validateHelperPair(p).reason).toBe('not-canonical');
+    });
   });
 
-  it('8. provenance references the wrong helper filename → invalid (rebuild)', () => {
-    const { dir, pair } = tmpPair();
-    try {
-      const bytes = Buffer.from('x');
-      writeFileSync(pair.exePath, bytes);
-      writeFileSync(pair.provenancePath, provenanceText('some-other.exe', sha256Hex(bytes)));
-      const r = validateHelperPair(pair);
-      expect(r.valid).toBe(false);
-      expect(r.reason).toBe('provenance-wrong-filename');
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+  it('9. duplicate sha256 field → INVALID', () => {
+    withPair((p) => {
+      writeExe(p, HELPER);
+      const canon = canonicalFor(HELPER);
+      const dup = canon.replace(/( {2}sha256: "[^"]*",\n)/, '$1$1');
+      expect(dup).not.toBe(canon);
+      writeFileSync(p.provenancePath, dup);
+      expect(validateHelperPair(p).reason).toBe('not-canonical');
+    });
   });
 
-  it('9. provenance sha is not a lowercase 64-hex digest → invalid (rebuild)', () => {
-    const { dir, pair } = tmpPair();
-    try {
-      writeFileSync(pair.exePath, Buffer.from('x'));
-      writeFileSync(pair.provenancePath, provenanceText(HELPER_BASENAME, 'NOThex'));
-      const r = validateHelperPair(pair);
-      expect(r.valid).toBe(false);
-      expect(r.reason).toBe('provenance-bad-hash-shape');
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+  it('10. leading extra content → INVALID', () => {
+    withPair((p) => {
+      writeExe(p, HELPER);
+      writeFileSync(p.provenancePath, `\uFEFF${canonicalFor(HELPER)}`);
+      expect(validateHelperPair(p).valid).toBe(false);
+    });
   });
 
-  it('12. provenance tampered (valid shape, hash rewritten) while helper stays → invalid', () => {
-    const { dir, pair } = tmpPair();
-    try {
-      const bytes = Buffer.from('the-real-helper');
-      writeFileSync(pair.exePath, bytes);
-      writeFileSync(pair.provenancePath, provenanceText(HELPER_BASENAME, 'b'.repeat(64)));
-      const r = validateHelperPair(pair);
-      expect(r.valid).toBe(false);
-      expect(r.reason).toBe('hash-mismatch');
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+  it('11. trailing extra content → INVALID', () => {
+    withPair((p) => {
+      writeExe(p, HELPER);
+      writeFileSync(p.provenancePath, `${canonicalFor(HELPER)}// extra\n`);
+      expect(validateHelperPair(p).valid).toBe(false);
+    });
   });
+
+  it('12. injected comment → INVALID', () => {
+    withPair((p) => {
+      writeExe(p, HELPER);
+      const canon = canonicalFor(HELPER);
+      writeFileSync(p.provenancePath, canon.replace('export const', '/* x */ export const'));
+      expect(validateHelperPair(p).valid).toBe(false);
+    });
+  });
+
+  it('13. alternate whitespace → INVALID', () => {
+    withPair((p) => {
+      writeExe(p, HELPER);
+      writeFileSync(p.provenancePath, canonicalFor(HELPER).replace('  filename', '    filename'));
+      expect(validateHelperPair(p).valid).toBe(false);
+    });
+  });
+
+  it('14. CRLF instead of canonical LF → INVALID', () => {
+    withPair((p) => {
+      writeExe(p, HELPER);
+      writeFileSync(p.provenancePath, canonicalFor(HELPER).replace(/\n/g, '\r\n'));
+      expect(validateHelperPair(p).valid).toBe(false);
+    });
+  });
+
+  it('15. uppercase hash → INVALID (encoder emits lowercase)', () => {
+    withPair((p) => {
+      writeExe(p, HELPER);
+      const upper = canonicalFor(HELPER).replace(/(sha256: ")([0-9a-f]{64})(")/, (_m, a: string, h: string, b: string) => a + h.toUpperCase() + b);
+      writeFileSync(p.provenancePath, upper);
+      expect(validateHelperPair(p).valid).toBe(false);
+    });
+  });
+
+  it('16. malformed UTF-8 / garbage provenance → INVALID', () => {
+    withPair((p) => {
+      writeExe(p, HELPER);
+      writeFileSync(p.provenancePath, Buffer.from([0xff, 0xfe, 0x00, 0x9f, 0x28]));
+      expect(validateHelperPair(p).valid).toBe(false);
+    });
+  });
+
+  it('17. helper tampered after provenance written → INVALID', () => {
+    withPair((p) => {
+      writeExe(p, HELPER);
+      writeFileSync(p.provenancePath, canonicalFor(HELPER));
+      writeExe(p, Buffer.concat([HELPER, Buffer.from([0])])); // tamper helper
+      expect(validateHelperPair(p).reason).toBe('not-canonical');
+    });
+  });
+
+  it('18. provenance tampered (single byte) at every position → INVALID', () => {
+    withPair((p) => {
+      writeExe(p, HELPER);
+      const canon = Buffer.from(canonicalFor(HELPER), 'utf8');
+      for (let i = 0; i < canon.length; i += 1) {
+        const m = Buffer.from(canon);
+        m[i] = (m[i] ?? 0) ^ 0x01;
+        writeFileSync(p.provenancePath, m);
+        expect(validateHelperPair(p).valid, `byte ${String(i)} flipped must be INVALID`).toBe(false);
+      }
+    });
+  }, 60000);
 });
 
 /* ---- 2. Supported-launch + CI wiring (cross-platform, definition-level) ----- */
 
-describe('D062 launch lifecycle — provisioning gate is wired into launch and CI', () => {
+describe('D062 canonical provenance — gate wired into launch and CI', () => {
   it('the provisioning gate exists', () => {
     expect(existsSync(ensureScript)).toBe(true);
   });
@@ -239,7 +291,7 @@ describe('D062 launch lifecycle — provisioning gate is wired into launch and C
     expect(launchIndex, `${name} must launch after provisioning`).toBeGreaterThan(gateIndex);
   });
 
-  it('helper:build still points at the trusted builder (unchanged trust root)', () => {
+  it('helper:build still points at the trusted builder', () => {
     expect(pkg.scripts['helper:build']).toBe('node tools/control-owner/build.mjs');
   });
 
@@ -257,8 +309,8 @@ const unusedRunner: ProcessRunner = () => {
   throw new Error('runProcess must not be reached when provenance is rejected');
 };
 
-describe('D062 launch lifecycle — runtime fails closed without a valid pair', () => {
-  it('absent provenance → HELPER_PROVENANCE_MISSING (helper never executed)', async () => {
+describe('D062 canonical provenance — runtime fails closed without a valid pair', () => {
+  it('absent provenance → HELPER_PROVENANCE_MISSING', async () => {
     const result = await verifyAnchorSnapshot(operator, anchorPath, unusedRunner, {
       loadProvenance: (): Promise<OwnerHelperProvenance | null> => Promise.resolve(null),
     });
@@ -268,10 +320,10 @@ describe('D062 launch lifecycle — runtime fails closed without a valid pair', 
     }
   });
 
-  it('torn/mismatched pair → HELPER_HASH_MISMATCH (fail closed)', async () => {
+  it('mismatched pair → HELPER_HASH_MISMATCH', async () => {
     const result = await verifyAnchorSnapshot(operator, anchorPath, unusedRunner, {
       loadProvenance: (): Promise<OwnerHelperProvenance> =>
-        Promise.resolve({ filename: HELPER_BASENAME, sha256: 'a'.repeat(64) }),
+        Promise.resolve({ filename: OWNER_HELPER_BASENAME, sha256: 'a'.repeat(64) }),
       readHelperBytes: (): Buffer => Buffer.from('new helper B'),
       hashBytes: (): string => 'b'.repeat(64),
     });
@@ -282,16 +334,16 @@ describe('D062 launch lifecycle — runtime fails closed without a valid pair', 
   });
 });
 
-/* ---- 4. Real gate on Windows: skip a valid pair, rebuild an invalid one ------ */
+/* ---- 4. Real gate on Windows: skip a canonical pair (non-mutating) ---------- */
 
 function runGate(): ReturnType<typeof spawnSync> {
   return spawnSync(process.execPath, [ensureScript], { encoding: 'utf8' });
 }
 
 describe.skipIf(process.platform === 'win32')(
-  'D062 launch lifecycle — gate skips cleanly on non-Windows',
+  'D062 canonical provenance — gate skips cleanly on non-Windows',
   () => {
-    it('exits 0 and requires no compiler (control channel is Windows-only)', () => {
+    it('exits 0 and requires no compiler', () => {
       const before = existsSync(realExe);
       const run = runGate();
       expect(run.status).toBe(0);
@@ -300,38 +352,25 @@ describe.skipIf(process.platform === 'win32')(
   },
 );
 
-// On Windows, gate on the artifacts already being present (the state after build
-// + a prior gate run, as the CI Windows lane provisions). This asserts only the
-// NON-mutating idempotent skip against the real pair: it must not rewrite the
-// shared generated executable, because owner-helper.win.test.ts executes that same
-// binary in a parallel worker and a concurrent rebuild would lock it (EBUSY). The
-// real torn-pair → rebuild self-heal is exercised race-free by the CI provisioning
-// step (clean checkout, before vitest); the rebuild DECISION is covered by the
-// validateHelperPair matrix above.
+// Windows: gate on the artifacts already present (post build + gate, as CI/the
+// operator provisions). Non-mutating: assert only the canonical-pair idempotent
+// skip — never rewrite the shared exe that owner-helper.win.test.ts executes
+// concurrently (a rebuild would lock it, EBUSY). Real absent/torn/truncated →
+// rebuild is exercised race-free by the CI provisioning step and the session's
+// clean-artifact reproductions.
 const winReady = process.platform === 'win32' && existsSync(realExe) && existsSync(realProv);
 
-describe.skipIf(!winReady)(
-  'D062 launch lifecycle — real gate is idempotent on a valid Windows pair',
-  () => {
-    it('a valid pair is skipped without rebuilding, and stays valid', () => {
-      const v = validateHelperPair({
-        exePath: realExe,
-        provenancePath: realProv,
-        expectedFilename: HELPER_BASENAME,
-      });
-      expect(v.valid).toBe(true);
+describe.skipIf(!winReady)('D062 canonical provenance — real gate idempotent on a canonical pair', () => {
+  it('the real pair is canonical, and the gate skips it without rebuilding', () => {
+    const bytes = readFileSync(realExe);
+    expect(readFileSync(realProv, 'utf8')).toBe(encodeProvenance(sha256Hex(bytes)));
+    const v = validateHelperPair({ exePath: realExe, provenancePath: realProv });
+    expect(v.valid).toBe(true);
 
-      const run = runGate();
-      expect(run.status).toBe(0);
-      // The skip message (not a rebuild message) proves no recompilation occurred.
-      expect(String(run.stderr)).toContain('skipping build');
+    const run = runGate();
+    expect(run.status).toBe(0);
+    expect(String(run.stderr)).toContain('skipping build');
 
-      const after = validateHelperPair({
-        exePath: realExe,
-        provenancePath: realProv,
-        expectedFilename: HELPER_BASENAME,
-      });
-      expect(after.valid).toBe(true);
-    });
-  },
-);
+    expect(validateHelperPair({ exePath: realExe, provenancePath: realProv }).valid).toBe(true);
+  });
+});
