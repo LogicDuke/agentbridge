@@ -22,7 +22,7 @@
 
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -373,4 +373,97 @@ describe.skipIf(!winReady)('D062 canonical provenance — real gate idempotent o
 
     expect(validateHelperPair({ exePath: realExe, provenancePath: realProv }).valid).toBe(true);
   });
+});
+
+/* ---- 5. Concurrent helper rebuild — isolation invariant (PR #90 P2) --------- */
+
+// Definition-level (cross-platform): build.mjs must compile into a process-unique
+// PRIVATE workspace (mkdtempSync) and target that workspace — never a shared object
+// directory or the final executable path — during compilation. This pins the
+// isolation mechanism so the concurrent-rebuild race cannot regress silently.
+const buildMjs = readFileSync(join(repoRoot, 'tools', 'control-owner', 'build.mjs'), 'utf8');
+
+describe('D062 concurrent rebuild — build.mjs isolates mutable compilation state', () => {
+  it('creates a per-invocation private workspace via mkdtempSync', () => {
+    expect(buildMjs).toMatch(/mkdtempSync\(/);
+  });
+  it('compiles /Fe and /Fo into the private workspace, not the final paths', () => {
+    expect(buildMjs).toMatch(/\/Fe:\$\{workExe\}/);
+    expect(buildMjs).toMatch(/\/Fo:\$\{workObjDir\}/);
+    // No shared object directory under the authoritative native dir, and the final
+    // exe path is never a compiler output target.
+    expect(buildMjs).not.toMatch(/const objDir = join\(outDir, 'obj'\)/);
+    expect(buildMjs).not.toMatch(/\/Fe:\$\{exePath\}/);
+  });
+  it('publishes by atomic rename and cleans the private workspace best-effort', () => {
+    expect(buildMjs).toMatch(/renameSync\(/);
+    expect(buildMjs).toMatch(/cleanupWorkspace\(/);
+  });
+});
+
+// Real concurrent builds (Windows) run in an ISOLATED COPY of the build tools under
+// a temp tree, so they never touch the shared dist that owner-helper.win.test.ts
+// reads/executes. Gated on winReady as a proxy for MSVC availability.
+type SpawnResult = ReturnType<typeof spawnSync>;
+
+function isolatedToolsTree(): { root: string; buildScript: string; nativeDir: string } {
+  const root = mkdtempSync(join(tmpdir(), 'ab-cc-'));
+  const toolDir = join(root, 'tools', 'control-owner');
+  mkdirSync(toolDir, { recursive: true });
+  for (const f of ['build.mjs', 'provenance-format.mjs', 'agentbridge-win-owner.c']) {
+    cpSync(join(repoRoot, 'tools', 'control-owner', f), join(toolDir, f));
+  }
+  return {
+    root,
+    buildScript: join(toolDir, 'build.mjs'),
+    nativeDir: join(root, 'dist', 'control', 'native'),
+  };
+}
+
+function runConcurrentBuilds(buildScript: string, n: number): SpawnResult[] {
+  // Launch n builders as detached children, then wait — spawnSync is blocking, so
+  // start them via a single node driver that runs them concurrently.
+  const driver = `
+    import { spawn } from 'node:child_process';
+    const n = ${String(n)};
+    const script = ${JSON.stringify(buildScript)};
+    const runs = Array.from({ length: n }, () => new Promise((res) => {
+      const c = spawn(process.execPath, [script], { stdio: 'ignore' });
+      c.on('exit', (code) => res(code ?? 1));
+    }));
+    Promise.all(runs).then((codes) => { process.stdout.write(JSON.stringify(codes)); });
+  `;
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e', driver], { encoding: 'utf8' });
+  const codes = JSON.parse(r.stdout || '[]') as number[];
+  return codes.map((code) => ({ status: code }) as SpawnResult);
+}
+
+describe.skipIf(!winReady)('D062 concurrent rebuild — isolated real builds converge (Windows)', () => {
+  it.each([2, 3])('%d concurrent builders all succeed and converge on the canonical pair', (n) => {
+    const t = isolatedToolsTree();
+    try {
+      const results = runConcurrentBuilds(t.buildScript, n);
+      expect(results).toHaveLength(n);
+      for (const r of results) {
+        expect(r.status).toBe(0);
+      }
+      const exe = join(t.nativeDir, OWNER_HELPER_BASENAME);
+      const prov = join(t.nativeDir, PROVENANCE_BASENAME);
+      expect(existsSync(exe)).toBe(true);
+      expect(existsSync(prov)).toBe(true);
+      // Final pair canonical.
+      expect(readFileSync(prov, 'utf8')).toBe(encodeProvenance(sha256Hex(readFileSync(exe))));
+      // No shared object directory and no private workspace leaked into native/.
+      expect(existsSync(join(t.nativeDir, 'obj'))).toBe(false);
+      // Every entry under native/ is one of the two authoritative artifacts.
+      // (A leaked .build-* dir would violate isolation cleanup.)
+      const entries = spawnSync(process.execPath, ['-e',
+        `const {readdirSync}=require('node:fs');process.stdout.write(JSON.stringify(readdirSync(${JSON.stringify(t.nativeDir)})))`,
+      ], { encoding: 'utf8' });
+      const names = JSON.parse(entries.stdout || '[]') as string[];
+      expect(names.sort()).toEqual([OWNER_HELPER_BASENAME, PROVENANCE_BASENAME].sort());
+    } finally {
+      rmSync(t.root, { recursive: true, force: true });
+    }
+  }, 120000);
 });
