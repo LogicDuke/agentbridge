@@ -8,10 +8,12 @@ import { describe, expect, it } from 'vitest';
  * D062 authority-boundary source scans over `src/control/` (and the one wiring
  * edit in `src/runtime/live-cockpit.ts`). These pin the frozen product boundary:
  * exactly one command, no generic event surface, no Git/GitHub/provider/Policy,
- * no shell, and strict token discipline. Decision 062 Amendment A (PR #84 F1)
- * adds exactly one further read-only executable — the build-provenanced owner-SID
- * helper — making three (whoami, icacls, owner helper) and no more; its identity
- * lives in generated build metadata, never as a hardcoded source `.exe` literal.
+ * no shell, and strict token discipline. Decision 062 Amendment B (PR #85 F3)
+ * reads a single canonical OWNER + DACL snapshot from the build-provenanced native
+ * helper and removes the localized `icacls` read entirely — leaving exactly two
+ * read-only executables (whoami and the owner+DACL helper) and no more; the
+ * helper's identity lives in generated build metadata, never as a hardcoded
+ * source `.exe` literal.
  */
 
 const controlDir = fileURLToPath(new URL('../../src/control/', import.meta.url));
@@ -91,7 +93,7 @@ describe('D062 authority boundary — no Git/GitHub/provider/Policy/network', ()
   });
 });
 
-describe('D062 authority boundary — no shell, three read-only executables', () => {
+describe('D062 authority boundary — no shell, two read-only executables', () => {
   const forbiddenShell: readonly RegExp[] = [
     /powershell/i,
     /\bpwsh\b/,
@@ -113,19 +115,20 @@ describe('D062 authority boundary — no shell, three read-only executables', ()
     }
   });
 
-  it('the only hardcoded executables are whoami.exe and icacls.exe under System32, shell:false', () => {
+  it('the only hardcoded executable is whoami.exe under System32, shell:false', () => {
     const store = textOf('control-store.ts');
     expect(store).toMatch(/whoami\.exe/);
-    expect(store).toMatch(/icacls\.exe/);
+    // Amendment B removed the localized icacls read from the authorization path.
+    expect(store).not.toMatch(/icacls/i);
     expect(store).toMatch(/System32/);
     expect(store).toMatch(/shell:\s*false/);
     // No other .exe literal is referenced anywhere in the control layer. The
-    // owner helper is deliberately NOT hardcoded: its filename is read from
+    // owner+DACL helper is deliberately NOT hardcoded: its filename is read from
     // generated build metadata, so it never appears as a source literal here.
     for (const { file, text } of controlSources()) {
       const exeMatches = text.match(/[A-Za-z0-9]+\.exe(?![A-Za-z0-9])/g) ?? [];
       for (const match of exeMatches) {
-        expect(['whoami.exe', 'icacls.exe'], `${file} references ${match}`).toContain(match);
+        expect(['whoami.exe'], `${file} references ${match}`).toContain(match);
       }
     }
   });
@@ -153,7 +156,7 @@ describe('D062 authority boundary — owner-SID gate is provenance-rooted and ha
 
   it('requires the anchor OWNER SID to equal the operator SID and rejects SYSTEM ownership', () => {
     const store = textOf('control-store.ts');
-    expect(store).toMatch(/verifyAnchorOwner/);
+    expect(store).toMatch(/verifyAnchorSnapshot/);
     expect(store).toMatch(/OWNER_IS_SYSTEM/);
     expect(store).toMatch(/OWNER_MISMATCH/);
   });
