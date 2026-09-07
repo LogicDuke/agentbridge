@@ -131,6 +131,30 @@ adapter observations) are out of D3's scope.
 builds `src/**` to `dist/` and starts the host, printing the exact loopback URL.
 The user opens it manually; the host starts no browser and holds no shell.
 
+### Clean Windows checkout / first use (live runtime + control)
+
+If the control channel is wanted immediately, provision the native owner helper
+**before** starting the live runtime:
+
+    npm run control:provision
+    npm run cockpit:live
+    npm run control
+
+`control:provision` runs the existing validated gate
+(`node tools/control-owner/ensure-helper.mjs`) and nothing else. The live
+runtime makes exactly **one** control-startup attempt at launch; if the
+helper/provenance pair is not yet provisioned, that attempt fails closed and —
+by design — there is no automatic or background retry, no polling, and no
+watcher. Provisioning *after* the runtime is already running does not
+dynamically start the control channel: restart `cockpit:live` after
+provisioning.
+
+Provisioning is **not** required for read-only Cockpit use, and a provisioning
+failure never prevents the Cockpit from launching or serving
+(`CONTROL_PROVISION_FAILURE ⇏ COCKPIT_FAILURE`): the gate is on the
+`control:provision` and `npm run control` paths only, never on `cockpit` or
+`cockpit:live`.
+
 ## Tests
 
 `tests/cockpit-host/` covers fixture-passes-D1, fail-closed on malformed input,

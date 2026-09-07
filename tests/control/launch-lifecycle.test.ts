@@ -355,6 +355,35 @@ describe('D062 coherent launch model — provisioning gates control only, never 
     expect(pkg.scripts['helper:build']).toBe('node tools/control-owner/build.mjs');
   });
 
+  it('`npm run control:provision` exists and is exactly the existing validated gate', () => {
+    // PR #92 P2 repair: on a clean checkout the live runtime's ONE-SHOT control
+    // startup runs before the helper/provenance pair exists and fails closed by
+    // design (no retry, no watcher, no polling). The supported operator order is
+    // therefore explicit pre-provisioning:
+    //
+    //     npm run control:provision → npm run cockpit:live → npm run control
+    //
+    // The command must reuse the one validated gate — no second provisioning
+    // mechanism may exist.
+    expect(pkg.scripts['control:provision']).toBe('node tools/control-owner/ensure-helper.mjs');
+  });
+
+  it('`control:provision` is a single explicit operator step — no build, launch, or server', () => {
+    // An OPERATOR command, not runtime behavior: it invokes only the gate. It
+    // starts no runtime, compiles no TypeScript, and is never a hidden step of
+    // another launch script.
+    const steps = (pkg.scripts['control:provision'] ?? '').split('&&').map((s) => s.trim());
+    expect(steps).toEqual(['node tools/control-owner/ensure-helper.mjs']);
+  });
+
+  it('adding `control:provision` leaves both Cockpit launches provisioning-free', () => {
+    // CONTROL_PROVISION_FAILURE ⇏ COCKPIT_FAILURE: the new command must not
+    // leak into the read-only Cockpit paths — `cockpit:live` stays the exact
+    // frozen build → runtime-launch string with no gate on its path.
+    expect(pkg.scripts['cockpit'] ?? '').not.toMatch(/ensure-helper|helper:build|control-owner|control:provision/);
+    expect(pkg.scripts['cockpit:live']).toBe('npm run build && node dist/runtime/live-cockpit.js');
+  });
+
   it('Windows CI provisions the helper before the control tests', () => {
     expect(ciYml).toMatch(/npm run helper:build|ensure-helper\.mjs/);
   });
