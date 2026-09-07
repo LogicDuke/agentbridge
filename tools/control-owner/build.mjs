@@ -18,15 +18,23 @@ import { createHash } from 'node:crypto';
 import {
   existsSync,
   mkdirSync,
+  mkdtempSync,
   readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const HELPER_BASENAME = 'agentbridge-win-owner.exe';
+import {
+  OWNER_HELPER_BASENAME,
+  PROVENANCE_BASENAME,
+  encodeProvenance,
+} from './provenance-format.mjs';
+
+const HELPER_BASENAME = OWNER_HELPER_BASENAME;
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(here, '..', '..');
@@ -35,7 +43,7 @@ const srcC = join(here, 'agentbridge-win-owner.c');
 /** Deterministic module-relative runtime output: dist/control/native/. */
 const outDir = join(repoRoot, 'dist', 'control', 'native');
 const exePath = join(outDir, HELPER_BASENAME);
-const provenancePath = join(outDir, 'owner-helper-provenance.js');
+const provenancePath = join(outDir, PROVENANCE_BASENAME);
 
 function fail(message) {
   process.stderr.write(`owner-helper build: ${message}\n`);
@@ -120,13 +128,37 @@ process.stderr.write(
     `owner-helper build: cl=${cl}\n`,
 );
 
-/* ---- 2. Compile + link to the deterministic runtime location ------------ */
+/* ---- 2. Compile + link inside a private, per-invocation workspace -------- */
 
+// Isolate ALL mutable compilation state so concurrent builders never share an
+// object directory or the executable output path. mkdtempSync yields a
+// collision-safe unique directory (not a predictable PID-only name); nothing
+// under it is ever authoritative — the runtime and the launch gate read only the
+// final paths (exePath / provenancePath). This closes the concurrent-rebuild
+// race: two builders compile into disjoint private workspaces and cannot delete,
+// replace, or lock each other's compiler intermediates or output.
 mkdirSync(outDir, { recursive: true });
-const objDir = join(outDir, 'obj');
-rmSync(objDir, { recursive: true, force: true });
-mkdirSync(objDir, { recursive: true });
-rmSync(exePath, { force: true });
+const workspace = mkdtempSync(join(outDir, '.build-'));
+
+/** Best-effort removal of ONLY this invocation's private workspace. Never fails
+ *  the build: a cleanup error must not invalidate a published canonical pair, and
+ *  an abandoned `.build-*` directory is never authoritative. */
+function cleanupWorkspace() {
+  try {
+    rmSync(workspace, { recursive: true, force: true });
+  } catch {
+    /* best-effort */
+  }
+}
+/** Clean the private workspace, then fail loud/closed. */
+function failClean(message) {
+  cleanupWorkspace();
+  fail(message);
+}
+
+const workObjDir = join(workspace, 'obj');
+const workExe = join(workspace, HELPER_BASENAME);
+mkdirSync(workObjDir, { recursive: true });
 
 const clEnv = {
   SystemRoot: process.env['SystemRoot'] ?? 'C:\\Windows',
@@ -147,8 +179,8 @@ const clArgs = [
   '/D_UNICODE',
   '/Brepro',
   srcC,
-  `/Fe:${exePath}`,
-  `/Fo:${objDir}\\`,
+  `/Fe:${workExe}`,
+  `/Fo:${workObjDir}\\`,
   '/link',
   '/Brepro',
   '/SUBSYSTEM:CONSOLE',
@@ -157,39 +189,102 @@ const clArgs = [
 
 try {
   execFileSync(cl, clArgs, {
-    cwd: objDir,
+    cwd: workObjDir,
     env: clEnv,
     stdio: ['ignore', 'inherit', 'inherit'],
   });
 } catch {
-  fail('cl.exe failed to build the owner helper.');
+  failClean('cl.exe failed to build the owner helper.');
 }
 
-if (!existsSync(exePath)) {
-  fail('cl.exe reported success but the helper binary is missing.');
+if (!existsSync(workExe)) {
+  failClean('cl.exe reported success but the helper binary is missing.');
 }
 
-// Remove build intermediates so only the trusted binary remains under native/.
-rmSync(objDir, { recursive: true, force: true });
+// Validate the private helper and compute its digest before publication.
+const privateBytes = readFileSync(workExe);
+const privateSha = createHash('sha256').update(privateBytes).digest('hex');
 
-/* ---- 3. Generate the provenance metadata (trusted built JS artifact) ---- */
+/* ---- 3. Idempotent atomic publication ------------------------------------ */
 
-const bytes = readFileSync(exePath);
-const sha256 = createHash('sha256').update(bytes).digest('hex');
+/** SHA-256 (lowercase hex) of a file, or null if it cannot be read. */
+function sha256File(path) {
+  try {
+    return createHash('sha256').update(readFileSync(path)).digest('hex');
+  } catch {
+    return null;
+  }
+}
 
-const provenance =
-  '// GENERATED BUILD METADATA — do not edit.\n' +
-  '// Produced by tools/control-owner/build.mjs from the exact compiled binary.\n' +
-  '// This is the runtime trust root for the owner helper (SHA-256 of the binary).\n' +
-  'export const OWNER_HELPER_PROVENANCE = {\n' +
-  `  filename: ${JSON.stringify(HELPER_BASENAME)},\n` +
-  `  sha256: ${JSON.stringify(sha256)},\n` +
-  '  built: true,\n' +
-  '};\n';
-writeFileSync(provenancePath, provenance, { encoding: 'utf8' });
+// Publish the completed private helper to the authoritative path. Because the
+// build is deterministic (/Brepro), concurrent builders produce byte-identical
+// helpers; a builder that finds the final helper already equal to its own
+// validated bytes treats publication as satisfied and neither clobbers nor fails.
+if (sha256File(exePath) !== privateSha) {
+  try {
+    renameSync(workExe, exePath);
+  } catch {
+    // A concurrent builder may have published first; converge only if the final
+    // helper is byte-identical to our validated private build. A differing final
+    // helper is never silently accepted.
+    if (sha256File(exePath) !== privateSha) {
+      failClean('failed to publish helper (rename) and final helper is not the built binary.');
+    }
+  }
+}
+
+// Derive provenance from the FINAL authoritative helper bytes (not the private
+// pre-publication assumption), so the canonical pair holds under any concurrent
+// publication interleaving.
+const finalSha = sha256File(exePath);
+if (finalSha === null) {
+  failClean('authoritative helper missing after publication.');
+}
+const provenance = encodeProvenance(finalSha);
+
+// Publish provenance atomically: write the complete canonical bytes to a temp file
+// inside this private workspace (same volume as the final path), then rename/replace
+// onto the final path. Node's renameSync uses MoveFileExW(REPLACE_EXISTING) on
+// Windows, atomic within the volume. A concurrent builder writing the identical
+// canonical bytes is benign: convergence, not failure.
+const tmpProvenance = join(workspace, `${PROVENANCE_BASENAME}.tmp`);
+writeFileSync(tmpProvenance, provenance, { encoding: 'utf8' });
+try {
+  renameSync(tmpProvenance, provenancePath);
+} catch {
+  try {
+    rmSync(tmpProvenance, { force: true });
+  } catch {
+    /* best-effort */
+  }
+  let current = null;
+  try {
+    current = readFileSync(provenancePath, 'utf8');
+  } catch {
+    current = null;
+  }
+  if (current !== provenance) {
+    failClean('failed to publish provenance (rename) and final provenance is not canonical.');
+  }
+}
+
+// Post-build canonicality: re-read the AUTHORITATIVE pair and require it valid.
+// "Our private build succeeded" is never sufficient — the final state governs.
+const checkSha = sha256File(exePath);
+let checkProvenance = null;
+try {
+  checkProvenance = readFileSync(provenancePath, 'utf8');
+} catch {
+  checkProvenance = null;
+}
+if (checkSha === null || checkProvenance !== encodeProvenance(checkSha)) {
+  failClean('post-build authoritative helper/provenance pair is not canonical.');
+}
+
+cleanupWorkspace();
 
 process.stderr.write(
-  `owner-helper build: wrote ${exePath} (${String(bytes.length)} bytes)\n` +
-    `owner-helper build: sha256 ${sha256}\n` +
+  `owner-helper build: wrote ${exePath} (${String(privateBytes.length)} bytes)\n` +
+    `owner-helper build: sha256 ${finalSha}\n` +
     `owner-helper build: wrote ${provenancePath}\n`,
 );

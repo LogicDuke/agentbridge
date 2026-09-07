@@ -54,8 +54,14 @@ jobs:
       - name: Build runtime (tsc)
         run: npm run build
 
-      - name: Build owner helper (MSVC + Windows SDK)
-        run: npm run helper:build
+      # Exercise the SUPPORTED clean-checkout provisioning gate (the same one the
+      # `control` / `cockpit:live` launch scripts run) rather than a manual
+      # `helper:build`. From a fresh `npm ci` the gate must compile the helper
+      # (MSVC + Windows SDK) and emit a VALID provenance pair; running it here
+      # proves the operator lifecycle self-provisions and prevents a future
+      # regression from being masked by manually building the helper first.
+      - name: Provision owner helper (supported launch gate)
+        run: node tools/control-owner/ensure-helper.mjs
 
       - name: Windows control + owner-helper tests
         run: npx vitest run tests/control
