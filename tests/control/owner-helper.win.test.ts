@@ -27,6 +27,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { beforeAll, describe, expect, it } from 'vitest';
 
 import type {
+  AclSnapshot,
   OperatorIdentity,
   ProcessRunner,
 } from '../../src/control/control-store.js';
@@ -56,6 +57,75 @@ describe.skipIf(!ready)('D062 control helper — real Windows binary integration
   let runtime!: RuntimeModule;
   let operator!: OperatorIdentity;
   let runner!: ProcessRunner;
+
+  const readNativeAclSnapshot = async (target: string): Promise<AclSnapshot> => {
+    const result = await runner(exePath, ['--acl', target]);
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      throw new Error(`native ACL snapshot failed for ${target}`);
+    }
+    const snapshot = store.parseAclSnapshot(result.stdout);
+    expect(snapshot).not.toBeNull();
+    if (snapshot === null) {
+      throw new Error(`native ACL snapshot was malformed for ${target}`);
+    }
+    return snapshot;
+  };
+
+  const establishAnchorAcl = async (
+    anchor: string,
+    operatorAccess: 'F' | 'M',
+  ): Promise<AclSnapshot> => {
+    const icacls = join(systemRoot, 'System32', 'icacls.exe');
+    const ownerSet = await runner(icacls, [anchor, '/setowner', `*${operator.sid}`]);
+    expect(ownerSet.ok).toBe(true);
+
+    const inheritanceRemoved = await runner(icacls, [anchor, '/inheritance:r']);
+    expect(inheritanceRemoved.ok).toBe(true);
+
+    // /grant:r only replaces ALLOW entries for the named principal. Discover and
+    // remove every surviving explicit ALLOW or DENY entry by canonical SID so an
+    // ambient explicit temp-directory ACE cannot leak into this fixture.
+    const inheritedAcl = await readNativeAclSnapshot(anchor);
+    expect(inheritedAcl.ownerSid).toBe(operator.sid);
+    expect(inheritedAcl.daclProtected).toBe(true);
+    expect(inheritedAcl.aces.every((ace) => (ace.flags & 0x10) === 0)).toBe(true);
+    const removals = new Map<string, { readonly type: 'ALLOW' | 'DENY'; readonly sid: string }>();
+    for (const ace of inheritedAcl.aces) {
+      removals.set(`${ace.type}:${ace.sid}`, { type: ace.type, sid: ace.sid });
+    }
+    for (const removal of [...removals.values()].sort((left, right) =>
+      `${left.type}:${left.sid}`.localeCompare(`${right.type}:${right.sid}`),
+    )) {
+      const removed = await runner(icacls, [
+        anchor,
+        removal.type === 'ALLOW' ? '/remove:g' : '/remove:d',
+        `*${removal.sid}`,
+      ]);
+      expect(removed.ok).toBe(true);
+    }
+
+    const granted = await runner(icacls, [
+      anchor,
+      '/grant:r',
+      `*${operator.sid}:(OI)(CI)${operatorAccess}`,
+      '*S-1-5-18:(OI)(CI)F',
+    ]);
+    expect(granted.ok).toBe(true);
+
+    const finalAcl = await readNativeAclSnapshot(anchor);
+    expect(finalAcl.ownerSid).toBe(operator.sid);
+    expect(finalAcl.daclState).toBe('PRESENT');
+    expect(finalAcl.daclProtected).toBe(true);
+    expect(finalAcl.aces).toHaveLength(2);
+    expect(new Set(finalAcl.aces.map((ace) => ace.sid))).toEqual(
+      new Set([operator.sid, SYSTEM_SID]),
+    );
+    expect(finalAcl.aces.every((ace) => ace.type === 'ALLOW')).toBe(true);
+    expect(finalAcl.aces.every((ace) => ace.flags === 0x03)).toBe(true);
+    expect(store.evaluateAnchorSnapshot(operator, finalAcl)).toEqual({ ok: true });
+    return finalAcl;
+  };
 
   beforeAll(async () => {
     store = (await import(pathToFileURL(distStore).href)) as StoreModule;
@@ -150,25 +220,7 @@ describe.skipIf(!ready)('D062 control helper — real Windows binary integration
     const icacls = join(systemRoot, 'System32', 'icacls.exe');
 
     try {
-      const hardened = await runner(icacls, [
-        anchor,
-        '/inheritance:r',
-        '/grant:r',
-        `*${operator.sid}:(OI)(CI)F`,
-        '*S-1-5-18:(OI)(CI)F',
-      ]);
-      expect(hardened.ok).toBe(true);
-
-      const before = await runner(exePath, ['--acl', anchor]);
-      expect(before.ok).toBe(true);
-      const anchorSnapshot = before.ok ? store.parseAclSnapshot(before.stdout) : null;
-      expect(anchorSnapshot).not.toBeNull();
-      if (anchorSnapshot === null) {
-        return;
-      }
-      expect(store.evaluateAnchorSnapshot(operator, anchorSnapshot)).toEqual({ ok: true });
-      expect(anchorSnapshot.daclProtected).toBe(true);
-      expect(anchorSnapshot.aces.every((ace) => (ace.flags & 0x01) !== 0)).toBe(true);
+      const anchorSnapshot = await establishAnchorAcl(anchor, 'F');
 
       // Widen the parent after validation. SE_DACL_PROTECTED prevents this new
       // inheritable Everyone ACE from entering the anchor or its later child.
@@ -226,16 +278,25 @@ describe.skipIf(!ready)('D062 control helper — real Windows binary integration
       // This anchor still passes the V2 policy: it is protected and every direct
       // ACE is file-inheritable and limited to operator/SYSTEM. The operator may
       // create/write, but deny DELETE + DELETE_CHILD makes stale unlink fail.
-      const hardened = await runner(icacls, [
+      await establishAnchorAcl(anchor, 'M');
+      const denied = await runner(icacls, [
         anchor,
-        '/inheritance:r',
-        '/grant:r',
-        `*${operator.sid}:(OI)(CI)M`,
-        '*S-1-5-18:(OI)(CI)F',
         '/deny',
         `*${operator.sid}:(OI)(CI)(D,DC)`,
       ]);
-      expect(hardened.ok).toBe(true);
+      expect(denied.ok).toBe(true);
+      const deniedAcl = await readNativeAclSnapshot(anchor);
+      const intentionalDenies = deniedAcl.aces.filter(
+        (ace) =>
+          ace.type === 'DENY' &&
+          ace.sid === operator.sid &&
+          (ace.flags & 0x03) === 0x03 &&
+          (ace.mask & 0x00010040) === 0x00010040,
+      );
+      expect(intentionalDenies).toHaveLength(1);
+      expect(new Set(deniedAcl.aces.map((ace) => ace.sid))).toEqual(
+        new Set([operator.sid, SYSTEM_SID]),
+      );
       const anchorResult = await store.verifyAnchorSnapshot(operator, anchor, runner);
       expect(anchorResult.ok).toBe(true);
 
@@ -246,6 +307,14 @@ describe.skipIf(!ready)('D062 control helper — real Windows binary integration
       expect(staleAcl.ok).toBe(true);
       const staleSnapshot = staleAcl.ok ? store.parseAclSnapshot(staleAcl.stdout) : null;
       expect(staleSnapshot?.aces.some((ace) => ace.sid === 's-1-1-0')).toBe(true);
+      expect(
+        staleSnapshot?.aces.some(
+          (ace) =>
+            ace.type === 'DENY' &&
+            ace.sid === operator.sid &&
+            (ace.mask & 0x00010040) === 0x00010040,
+        ),
+      ).toBe(true);
 
       const handle = await runtime.startControlChannel({
         // Startup must stop before the orchestrator or server is used.
