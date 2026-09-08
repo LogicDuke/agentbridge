@@ -62,6 +62,13 @@ import {
   OWNER_HELPER_BASENAME,
 } from '../../tools/control-owner/ensure-helper.mjs';
 import {
+  resolveBuildToolchain,
+  isBuildEligible,
+  selectSdkVersion,
+  vswherePathFor,
+  VC_TOOLS_COMPONENT,
+} from '../../tools/control-owner/msvc-toolchain.mjs';
+import {
   CONTROL_ANCHOR_REJECTION,
   verifyAnchorSnapshot,
   type ControlAnchorVerification,
@@ -594,7 +601,12 @@ function isolatedGateTree(withSource: boolean): {
   const root = mkdtempSync(join(tmpdir(), 'ab-gate-'));
   const toolDir = join(root, 'tools', 'control-owner');
   mkdirSync(toolDir, { recursive: true });
-  const files = ['ensure-helper.mjs', 'build.mjs', 'provenance-format.mjs'];
+  const files = [
+    'ensure-helper.mjs',
+    'build.mjs',
+    'provenance-format.mjs',
+    'msvc-toolchain.mjs',
+  ];
   if (withSource) {
     files.push('agentbridge-win-owner.c');
   }
@@ -609,75 +621,22 @@ function isolatedGateTree(withSource: boolean): {
   };
 }
 
-// PR #92 P2 (Codex): vswhere.exe existing is NOT "MSVC available". The Visual
-// Studio Installer ships vswhere.exe even when the VC workload is absent (for
-// example a .NET-only Visual Studio / Build Tools install); build.mjs then
-// queries for the component below, finds no usable installation, and fails
-// loudly. The test predicate must therefore apply the SAME component
-// requirement the production builder passes to `vswhere -requires`, so the
-// unavailable-toolchain configuration SKIPS this describe instead of failing.
-const VC_TOOLS_COMPONENT = 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64';
+/* ---- PR #92 root-cause: single-source MSVC/SDK build eligibility ------------- */
+// The recurring MSVC-gate drift — vswhere existence → VC workload → SDK roots →
+// the exact per-version ucrt/um/shared include and ucrt/um x64 lib paths cl.exe
+// consumes — came from this test RE-DERIVING builder eligibility with its own,
+// weaker logic. That duplication is gone: both the trusted builder (build.mjs) and
+// this gate resolve eligibility through the ONE authoritative module
+// tools/control-owner/msvc-toolchain.mjs. TEST_BUILD_ELIGIBLE is therefore derived
+// from exactly the prerequisites that make the real builder proceed AND succeed; it
+// cannot claim availability the builder would not, and any new builder prerequisite
+// added to the module updates the builder and this gate together.
 
-const vswherePath = join(
-  process.env['ProgramFiles(x86)'] ?? 'C:\\Program Files (x86)',
-  'Microsoft Visual Studio',
-  'Installer',
-  'vswhere.exe',
-);
+const vswherePath = vswherePathFor(process.env['ProgramFiles(x86)'] ?? 'C:\\Program Files (x86)');
 
-/** installationPath of the newest Visual Studio providing `component`, exactly
- *  as build.mjs resolves it (same vswhere binary, same -requires query), or
- *  null when vswhere or a qualifying installation is unavailable. */
-function vcInstallationPathFor(component: string): string | null {
-  if (process.platform !== 'win32' || !existsSync(vswherePath)) {
-    return null;
-  }
-  const run = spawnSync(
-    vswherePath,
-    ['-latest', '-products', '*', '-requires', component, '-property', 'installationPath'],
-    { encoding: 'utf8' },
-  );
-  if (run.status !== 0) {
-    return null;
-  }
-  const installationPath = run.stdout.trim();
-  return installationPath.length > 0 && existsSync(installationPath) ? installationPath : null;
-}
-
-// PR #92 P2 (Codex, follow-up): the VC toolset is necessary but NOT sufficient.
-// build.mjs additionally reconciles a Windows SDK under
-// %ProgramFiles(x86)%\Windows Kits\10 and fails loudly when it is missing — it
-// requires BOTH SDK roots (Include, Lib) AND at least one 10.x.x.x version whose
-// Include\<ver>\ucrt headers exist (the ucrt/um/shared include and ucrt/um lib
-// dirs the compile consumes). A machine can carry the VC workload with no Windows
-// SDK component installed, so the availability gate must mirror this precondition
-// too — otherwise the MSVC describe RUNS and then FAILS at the builder's SDK check
-// instead of SKIPPING. Filesystem-only mirror (no shell), matching build.mjs.
-function windowsSdkAvailable(
-  programFilesX86: string = process.env['ProgramFiles(x86)'] ?? 'C:\\Program Files (x86)',
-): boolean {
-  const sdkRoot = join(programFilesX86, 'Windows Kits', '10');
-  const sdkIncludeRoot = join(sdkRoot, 'Include');
-  const sdkLibRoot = join(sdkRoot, 'Lib');
-  if (!existsSync(sdkIncludeRoot) || !existsSync(sdkLibRoot)) {
-    return false;
-  }
-  return readdirSync(sdkIncludeRoot)
-    .filter((name) => /^10\.\d+\.\d+\.\d+$/.test(name))
-    .some((name) => existsSync(join(sdkIncludeRoot, name, 'ucrt')));
-}
-
-/** The MSVC-specific describe may run only when the builder's FULL precondition
- *  holds: the VC toolset (vswhere -requires component) AND the Windows SDK/UCRT.
- *  Either prerequisite absent → the describe skips rather than fails. */
-function msvcToolchainAvailable(
-  vcInstallationPath: string | null,
-  sdkProgramFilesX86?: string,
-): boolean {
-  return vcInstallationPath !== null && windowsSdkAvailable(sdkProgramFilesX86);
-}
-
-const msvcAvailable = msvcToolchainAvailable(vcInstallationPathFor(VC_TOOLS_COMPONENT));
+// Authoritative gate: the builder resolves a plan (same vswhere VC query, same SDK
+// version selection) AND every include/lib dir it will hand cl.exe exists.
+const msvcAvailable = isBuildEligible();
 
 describe.skipIf(!msvcAvailable)('D062 explicit provisioning — MSVC available + helper missing', () => {
   it('the gate compiles the helper and publishes a canonical pair (exit 0)', () => {
@@ -698,183 +657,255 @@ describe.skipIf(!msvcAvailable)('D062 explicit provisioning — MSVC available +
   }, 120000);
 });
 
-// PR #92 P2 adversarial coverage: the availability predicate itself, driven
-// through the REAL vswhere binary. Both directions of the finding are proven —
-// with the required VC workload installed the MSVC describe above may run, and
-// with vswhere.exe present but the required workload absent the detection
-// yields no installation, so the describe above SKIPS instead of failing.
+// The root-cause proof: builder and gate share ONE eligibility source, so the
+// detection can no longer be duplicated with weaker semantics. Cross-platform.
+describe('D062 explicit provisioning — builder and gate share one eligibility source', () => {
+  const readTool = (name: string): string =>
+    readFileSync(join(repoRoot, 'tools', 'control-owner', name), 'utf8');
+
+  it('build.mjs consumes the shared resolver and no longer re-implements detection', () => {
+    const builder = readTool('build.mjs');
+    // The builder imports and uses the shared resolver …
+    expect(builder).toContain("from './msvc-toolchain.mjs'");
+    expect(builder).toContain('resolveBuildToolchain(');
+    // … and no longer inlines the drift-prone detection literals (they moved to the
+    // module), so nothing is left in the builder for a test mirror to drift from.
+    expect(builder).not.toContain(VC_TOOLS_COMPONENT); // vswhere -requires component
+    expect(builder).not.toContain('/^10\\.\\d+\\.\\d+\\.\\d+$/'); // SDK version regex
+    expect(builder).not.toContain("'Windows Kits', '10'"); // SDK root discovery
+  });
+
+  it('the authoritative detection/selection lives in the shared module', () => {
+    const mod = readTool('msvc-toolchain.mjs');
+    expect(mod).toContain(VC_TOOLS_COMPONENT);
+    expect(mod).toContain("'Windows Kits', '10'");
+    // Every per-version path category cl.exe consumes is selected in one place.
+    expect(mod).toContain("'ucrt'");
+    expect(mod).toContain("'um'");
+    expect(mod).toContain("'shared'");
+  });
+});
+
+// On a real Windows machine with vswhere present: the run/skip gate equals the
+// shared resolver's verdict and consumes the FULL set of builder paths.
 describe.skipIf(process.platform !== 'win32' || !existsSync(vswherePath))(
-  'D062 explicit provisioning — MSVC availability predicate matches the builder requirement',
+  'D062 explicit provisioning — real gate equals the builder resolver on this machine',
   () => {
-    it('the predicate requires the exact VC workload component build.mjs queries', () => {
-      // Single shared requirement: the component id above must be the literal
-      // build.mjs passes to `vswhere -requires`, so test predicate and
-      // production builder cannot drift apart silently.
-      const builderSource = readFileSync(
-        join(repoRoot, 'tools', 'control-owner', 'build.mjs'),
-        'utf8',
-      );
-      expect(builderSource).toContain(`'${VC_TOOLS_COMPONENT}',`);
-    });
-
-    it('vswhere present but required workload absent → no installation → skip, not fail', () => {
-      // Exactly the Codex configuration: the real vswhere.exe answers the real
-      // query shape for a component that is never installed and returns no
-      // installation — the predicate is false and the MSVC describe skips.
-      expect(vcInstallationPathFor('AgentBridge.Test.Component.Never.Installed.x86.x64')).toBeNull();
-    });
-
-    it('MSVC-describe gating equals VC-workload-present AND Windows-SDK-present', () => {
-      const detected = vcInstallationPathFor(VC_TOOLS_COMPONENT);
-      const sdk = windowsSdkAvailable();
-      if (detected === null) {
-        // VC workload absent on this machine: the MSVC describe must be skipped
-        // regardless of whether a Windows SDK is present.
+    it('msvcAvailable is exactly "plan resolves AND every builder path exists"', () => {
+      const resolved = resolveBuildToolchain();
+      if (!resolved.ok) {
+        // Builder would reject before compilation → the gate must be closed.
         expect(msvcAvailable).toBe(false);
       } else {
-        // VC workload present: the detected root is a real installation path —
-        // the same installationPath build.mjs would resolve — and the MSVC
-        // describe is allowed to run IFF the Windows SDK/UCRT prerequisite the
-        // builder also enforces is present, exactly the compound precondition.
-        expect(existsSync(detected)).toBe(true);
-        expect(msvcAvailable).toBe(sdk);
+        const allPresent = [...resolved.plan.includeDirs, ...resolved.plan.libDirs].every((dir) =>
+          existsSync(dir),
+        );
+        // The gate is open IFF every include/lib path the builder hands cl.exe
+        // exists — the exact set from the shared plan, never a weaker subset.
+        expect(msvcAvailable).toBe(allPresent);
+        expect(resolved.plan.includeDirs).toHaveLength(4); // msvc, ucrt, um, shared
+        expect(resolved.plan.libDirs).toHaveLength(3); // msvc, ucrt/x64, um/x64
       }
+    });
+
+    it('an empty VC installationPath (workload absent) → not eligible (skip, not fail)', () => {
+      // The original Codex configuration, via the shared resolver: no VC
+      // installation resolved → ineligible, so the MSVC describe skips.
+      expect(isBuildEligible({ vcInstallationPath: '' })).toBe(false);
     });
   },
 );
 
-// PR #92 P2 (Codex) adversarial coverage for the Windows SDK prerequisite. These
-// drive the SDK predicate and the combined toolchain gate through synthetic
-// %ProgramFiles(x86)% layouts — filesystem only, no shell, deterministic on every
-// OS — so both directions of the finding are pinned independently of the runner's
-// installed toolchain.
-const SDK_VERSION_DIR = '10.0.22621.0';
+// PR #92 root-cause adversarial coverage: synthetic %ProgramFiles(x86)% toolchains
+// exercised through the SHARED resolver with an injected VC installationPath (no
+// vswhere, no shell), so every builder prerequisite and the exact SDK-version
+// SELECTION are proven identical for the gate and the builder, deterministically on
+// every OS. A "complete" SDK version carries all include (ucrt/um/shared) and lib
+// (ucrt/um → x64) dirs the compile consumes.
+const TOOLSET = '14.44.35207';
+type IncludePart = 'ucrt' | 'um' | 'shared';
+type LibPart = 'ucrt' | 'um';
+interface SdkVersionSpec {
+  readonly version: string;
+  readonly include?: readonly IncludePart[];
+  readonly lib?: readonly LibPart[];
+}
+interface ToolchainSpec {
+  readonly vc?: boolean; // create VS toolset + cl + msvc include/lib (default true)
+  readonly sdkRoots?: boolean; // create SDK Include & Lib roots (default true)
+  readonly sdkVersions?: readonly SdkVersionSpec[];
+}
+const ALL_INCLUDE: readonly IncludePart[] = ['ucrt', 'um', 'shared'];
+const ALL_LIB: readonly LibPart[] = ['ucrt', 'um'];
+const completeVersion = (version: string): SdkVersionSpec => ({
+  version,
+  include: ALL_INCLUDE,
+  lib: ALL_LIB,
+});
 
-/** Build a synthetic `Windows Kits\10` tree under a fresh temp ProgramFiles(x86)
- *  root and run `fn` against that root, always cleaning up. */
-function withSdkRoot(
-  build: (paths: { include: string; lib: string }) => void,
-  fn: (programFilesX86: string) => void,
-): void {
-  const root = mkdtempSync(join(tmpdir(), 'ab-sdk-'));
+interface ToolchainCtx {
+  readonly programFilesX86: string;
+  readonly vsRoot: string;
+}
+
+/** Build a synthetic toolchain under a fresh temp ProgramFiles(x86) and run `fn`
+ *  with { programFilesX86, vsRoot }, always cleaning up. */
+function withToolchain(spec: ToolchainSpec, fn: (ctx: ToolchainCtx) => void): void {
+  const root = mkdtempSync(join(tmpdir(), 'ab-toolchain-'));
   try {
-    const kits = join(root, 'Windows Kits', '10');
-    build({ include: join(kits, 'Include'), lib: join(kits, 'Lib') });
-    fn(root);
+    const vsRoot = join(root, 'VS');
+    if (spec.vc ?? true) {
+      const auxBuild = join(vsRoot, 'VC', 'Auxiliary', 'Build');
+      mkdirSync(auxBuild, { recursive: true });
+      writeFileSync(join(auxBuild, 'Microsoft.VCToolsVersion.default.txt'), `${TOOLSET}\n`);
+      const msvcRoot = join(vsRoot, 'VC', 'Tools', 'MSVC', TOOLSET);
+      mkdirSync(join(msvcRoot, 'bin', 'Hostx64', 'x64'), { recursive: true });
+      writeFileSync(join(msvcRoot, 'bin', 'Hostx64', 'x64', 'cl.exe'), '');
+      mkdirSync(join(msvcRoot, 'include'), { recursive: true });
+      mkdirSync(join(msvcRoot, 'lib', 'x64'), { recursive: true });
+    }
+    if (spec.sdkRoots ?? true) {
+      const kits = join(root, 'Windows Kits', '10');
+      const includeRoot = join(kits, 'Include');
+      const libRoot = join(kits, 'Lib');
+      mkdirSync(includeRoot, { recursive: true });
+      mkdirSync(libRoot, { recursive: true });
+      for (const v of spec.sdkVersions ?? []) {
+        for (const part of v.include ?? []) {
+          mkdirSync(join(includeRoot, v.version, part), { recursive: true });
+        }
+        for (const part of v.lib ?? []) {
+          mkdirSync(join(libRoot, v.version, part, 'x64'), { recursive: true });
+        }
+      }
+    }
+    fn({ programFilesX86: root, vsRoot });
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 }
 
-function makeUcrtVersion(includeRoot: string, version: string): void {
-  mkdirSync(join(includeRoot, version, 'ucrt'), { recursive: true });
+/** Eligibility / plan through the shared resolver with the fixture's VC path. */
+function eligibleFor(ctx: ToolchainCtx): boolean {
+  return isBuildEligible({ programFilesX86: ctx.programFilesX86, vcInstallationPath: ctx.vsRoot });
+}
+function planFor(ctx: ToolchainCtx): ReturnType<typeof resolveBuildToolchain> {
+  return resolveBuildToolchain({
+    programFilesX86: ctx.programFilesX86,
+    vcInstallationPath: ctx.vsRoot,
+  });
 }
 
-describe('D062 explicit provisioning — Windows SDK/UCRT gate mirrors the builder', () => {
-  it('the SDK predicate mirrors the exact roots + ucrt requirement build.mjs enforces', () => {
-    // Source-level pin (like the VC component pin above): the builder discovers
-    // the SDK under "Windows Kits"\"10", requires an Include\<ver>\ucrt, and only
-    // accepts 10.x.x.x version dirs — the mirror must not drift from those markers.
-    const builderSource = readFileSync(
-      join(repoRoot, 'tools', 'control-owner', 'build.mjs'),
-      'utf8',
-    );
-    expect(builderSource).toContain("'Windows Kits', '10'");
-    expect(builderSource).toContain("'ucrt'");
-    expect(builderSource).toContain('/^10\\.\\d+\\.\\d+\\.\\d+$/');
+describe('D062 explicit provisioning — build eligibility mirrors every builder prerequisite', () => {
+  it('VC present + complete SDK → eligible', () => {
+    withToolchain({ sdkVersions: [completeVersion('10.0.22621.0')] }, (ctx) => {
+      expect(eligibleFor(ctx)).toBe(true);
+    });
   });
 
-  it('full SDK (Include + Lib + a 10.x.x.x ucrt version) → available', () => {
-    withSdkRoot(
-      ({ include, lib }) => {
-        makeUcrtVersion(include, SDK_VERSION_DIR);
-        mkdirSync(lib, { recursive: true });
-      },
-      (pf86) => {
-        expect(windowsSdkAvailable(pf86)).toBe(true);
-      },
-    );
+  it('VC present + UCRT-only SDK (no um/shared, no libs) → ineligible', () => {
+    withToolchain({ sdkVersions: [{ version: '10.0.22621.0', include: ['ucrt'] }] }, (ctx) => {
+      // The builder would PROCEED (a ucrt-include version exists) …
+      expect(planFor(ctx).ok).toBe(true);
+      // … then fail at cl.exe: the gate must not claim availability → skip.
+      expect(eligibleFor(ctx)).toBe(false);
+    });
   });
 
-  it('Include root missing → unavailable', () => {
-    withSdkRoot(
-      ({ lib }) => {
-        mkdirSync(lib, { recursive: true });
-      },
-      (pf86) => {
-        expect(windowsSdkAvailable(pf86)).toBe(false);
+  it('missing um include → ineligible', () => {
+    withToolchain(
+      { sdkVersions: [{ version: '10.0.22621.0', include: ['ucrt', 'shared'], lib: ALL_LIB }] },
+      (ctx) => {
+        expect(eligibleFor(ctx)).toBe(false);
       },
     );
   });
 
-  it('Lib root missing → unavailable', () => {
-    withSdkRoot(
-      ({ include }) => {
-        makeUcrtVersion(include, SDK_VERSION_DIR);
-      },
-      (pf86) => {
-        expect(windowsSdkAvailable(pf86)).toBe(false);
+  it('missing shared include → ineligible', () => {
+    withToolchain(
+      { sdkVersions: [{ version: '10.0.22621.0', include: ['ucrt', 'um'], lib: ALL_LIB }] },
+      (ctx) => {
+        expect(eligibleFor(ctx)).toBe(false);
       },
     );
   });
 
-  it('SDK roots present but NO version carries ucrt headers → unavailable', () => {
-    withSdkRoot(
-      ({ include, lib }) => {
-        mkdirSync(join(include, SDK_VERSION_DIR, 'um'), { recursive: true }); // no ucrt
-        mkdirSync(lib, { recursive: true });
-      },
-      (pf86) => {
-        expect(windowsSdkAvailable(pf86)).toBe(false);
+  it('missing required ucrt lib/x64 → ineligible', () => {
+    withToolchain(
+      { sdkVersions: [{ version: '10.0.22621.0', include: ALL_INCLUDE, lib: ['um'] }] },
+      (ctx) => {
+        expect(eligibleFor(ctx)).toBe(false);
       },
     );
   });
 
-  it('a ucrt dir under a NON-10.x.x.x version name is not accepted → unavailable', () => {
-    withSdkRoot(
-      ({ include, lib }) => {
-        makeUcrtVersion(include, 'wsdk'); // not 10.x.x.x
-        mkdirSync(lib, { recursive: true });
-      },
-      (pf86) => {
-        expect(windowsSdkAvailable(pf86)).toBe(false);
+  it('missing required um lib/x64 → ineligible', () => {
+    withToolchain(
+      { sdkVersions: [{ version: '10.0.22621.0', include: ALL_INCLUDE, lib: ['ucrt'] }] },
+      (ctx) => {
+        expect(eligibleFor(ctx)).toBe(false);
       },
     );
+  });
+
+  it('VC absent (no installation) → ineligible even with a complete SDK', () => {
+    withToolchain({ vc: false, sdkVersions: [completeVersion('10.0.22621.0')] }, (ctx) => {
+      expect(planFor(ctx).ok).toBe(false);
+      expect(eligibleFor(ctx)).toBe(false);
+    });
+  });
+
+  it('SDK roots absent → ineligible', () => {
+    withToolchain({ sdkRoots: false }, (ctx) => {
+      expect(eligibleFor(ctx)).toBe(false);
+    });
   });
 });
 
-describe('D062 explicit provisioning — combined MSVC toolchain gate truth table', () => {
-  const VC_ROOT = 'C:\\Program Files\\Microsoft Visual Studio\\2022\\Community';
-  const fullSdk = ({ include, lib }: { include: string; lib: string }): void => {
-    makeUcrtVersion(include, SDK_VERSION_DIR);
-    mkdirSync(lib, { recursive: true });
-  };
-  const noSdk = (): void => {
-    /* empty ProgramFiles(x86): no Windows Kits at all */
-  };
-
-  it('VC present + SDK present → gate OPEN (MSVC describe may run)', () => {
-    withSdkRoot(fullSdk, (pf86) => {
-      expect(msvcToolchainAvailable(VC_ROOT, pf86)).toBe(true);
-    });
+describe('D062 explicit provisioning — gate and builder select the exact same SDK version', () => {
+  it('side-by-side versions: the highest ucrt version is selected, via the builder\'s own rule', () => {
+    withToolchain(
+      { sdkVersions: [completeVersion('10.0.19041.0'), completeVersion('10.0.22621.0')] },
+      (ctx) => {
+        const plan = planFor(ctx);
+        expect(plan.ok && plan.plan.sdkVersion).toBe('10.0.22621.0');
+        // Exactly selectSdkVersion() over the same include root — the SAME function
+        // build.mjs → resolveBuildToolchain uses — so the two cannot diverge.
+        const includeRoot = join(ctx.programFilesX86, 'Windows Kits', '10', 'Include');
+        expect(plan.ok && plan.plan.sdkVersion).toBe(selectSdkVersion(includeRoot));
+        expect(eligibleFor(ctx)).toBe(true);
+      },
+    );
   });
 
-  it('VC present + SDK absent → gate CLOSED (MSVC describe skips, does not fail)', () => {
-    withSdkRoot(noSdk, (pf86) => {
-      expect(msvcToolchainAvailable(VC_ROOT, pf86)).toBe(false);
-    });
+  it('the SELECTED (highest ucrt) version being incomplete → ineligible, NOT rescued by a complete lower version', () => {
+    withToolchain(
+      {
+        sdkVersions: [
+          completeVersion('10.0.19041.0'), // complete, but NOT the one selected
+          { version: '10.0.22621.0', include: ['ucrt'] }, // highest ucrt → selected, incomplete
+        ],
+      },
+      (ctx) => {
+        const plan = planFor(ctx);
+        // The builder selects 22621 (highest with ucrt headers) and would fail at
+        // cl.exe (no um/shared/libs). The gate must select the SAME version and
+        // SKIP — it must never be rescued by the complete-but-unselected 19041.
+        expect(plan.ok && plan.plan.sdkVersion).toBe('10.0.22621.0');
+        expect(eligibleFor(ctx)).toBe(false);
+      },
+    );
   });
 
-  it('VC absent + SDK present → gate CLOSED (existing VC-absent case remains correct)', () => {
-    withSdkRoot(fullSdk, (pf86) => {
-      expect(msvcToolchainAvailable(null, pf86)).toBe(false);
-    });
-  });
-
-  it('VC absent + SDK absent → gate CLOSED', () => {
-    withSdkRoot(noSdk, (pf86) => {
-      expect(msvcToolchainAvailable(null, pf86)).toBe(false);
-    });
+  it('a ucrt dir under a non-10.x.x.x version name is not selectable → ineligible', () => {
+    withToolchain(
+      { sdkVersions: [{ version: 'wsdk', include: ALL_INCLUDE, lib: ALL_LIB }] },
+      (ctx) => {
+        // No 10.x.x.x ucrt version → the builder rejects with sdk-version-missing.
+        expect(planFor(ctx).ok).toBe(false);
+        expect(eligibleFor(ctx)).toBe(false);
+      },
+    );
   });
 });
 

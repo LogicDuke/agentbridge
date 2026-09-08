@@ -19,7 +19,6 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
-  readdirSync,
   readFileSync,
   renameSync,
   rmSync,
@@ -33,6 +32,7 @@ import {
   PROVENANCE_BASENAME,
   encodeProvenance,
 } from './provenance-format.mjs';
+import { resolveBuildToolchain } from './msvc-toolchain.mjs';
 
 const HELPER_BASENAME = OWNER_HELPER_BASENAME;
 
@@ -50,78 +50,43 @@ function fail(message) {
   process.exit(1);
 }
 
+/** Map a toolchain-resolution rejection to the builder's exact failure message. */
+function toolchainRejectionMessage(resolution) {
+  switch (resolution.reason) {
+    case 'vswhere-missing':
+      return `vswhere.exe not found at ${resolution.vswhere}`;
+    case 'vc-installation-missing':
+      return 'no Visual Studio installation with the VC x64 toolset was found.';
+    case 'toolset-file-missing':
+      return `MSVC toolset version file missing: ${resolution.toolsetFile}`;
+    case 'cl-missing':
+      return `cl.exe not found: ${resolution.cl}`;
+    case 'sdk-roots-missing':
+      return `Windows SDK not found under ${resolution.sdkRoot}`;
+    case 'sdk-version-missing':
+      return 'no usable Windows SDK version (with ucrt headers) found.';
+    default:
+      return `unusable MSVC/Windows SDK toolchain (${resolution.reason}).`;
+  }
+}
+
 if (process.platform !== 'win32') {
   fail('the owner helper builds only on Windows (MSVC + Windows SDK required).');
 }
 
-/* ---- 1. Reconcile MSVC + Windows SDK via vswhere (not PATH) ------------- */
+/* ---- 1. Reconcile MSVC + Windows SDK via the shared authoritative resolver ---
+ * The detection/selection algorithm — vswhere VC workload, MSVC toolset + cl, the
+ * Windows SDK roots, the selected SDK version, and the exact ucrt/um/shared include
+ * and ucrt/um x64 lib paths cl.exe consumes — lives in msvc-toolchain.mjs so the
+ * build regression gate derives eligibility from the SAME source and cannot drift
+ * to weaker semantics. Behavior here is unchanged: the builder proceeds exactly when
+ * a plan resolves, and rejects with the same messages otherwise. */
 
-const programFilesX86 = process.env['ProgramFiles(x86)'] ?? 'C:\\Program Files (x86)';
-const vswhere = join(programFilesX86, 'Microsoft Visual Studio', 'Installer', 'vswhere.exe');
-if (!existsSync(vswhere)) {
-  fail(`vswhere.exe not found at ${vswhere}`);
+const resolved = resolveBuildToolchain();
+if (!resolved.ok) {
+  fail(toolchainRejectionMessage(resolved));
 }
-
-function vswhereProp(prop) {
-  return execFileSync(
-    vswhere,
-    [
-      '-latest',
-      '-products',
-      '*',
-      '-requires',
-      'Microsoft.VisualStudio.Component.VC.Tools.x86.x64',
-      '-property',
-      prop,
-    ],
-    { encoding: 'utf8' },
-  ).trim();
-}
-
-const vsRoot = vswhereProp('installationPath');
-if (vsRoot.length === 0 || !existsSync(vsRoot)) {
-  fail('no Visual Studio installation with the VC x64 toolset was found.');
-}
-
-const toolsetFile = join(vsRoot, 'VC', 'Auxiliary', 'Build', 'Microsoft.VCToolsVersion.default.txt');
-if (!existsSync(toolsetFile)) {
-  fail(`MSVC toolset version file missing: ${toolsetFile}`);
-}
-const toolset = readFileSync(toolsetFile, 'utf8').trim();
-const msvcRoot = join(vsRoot, 'VC', 'Tools', 'MSVC', toolset);
-const hostBin = join(msvcRoot, 'bin', 'Hostx64', 'x64');
-const cl = join(hostBin, 'cl.exe');
-if (!existsSync(cl)) {
-  fail(`cl.exe not found: ${cl}`);
-}
-
-const sdkRoot = join(programFilesX86, 'Windows Kits', '10');
-const sdkIncludeRoot = join(sdkRoot, 'Include');
-const sdkLibRoot = join(sdkRoot, 'Lib');
-if (!existsSync(sdkIncludeRoot) || !existsSync(sdkLibRoot)) {
-  fail(`Windows SDK not found under ${sdkRoot}`);
-}
-// Highest installed SDK version directory that provides ucrt headers.
-const sdkVersions = readdirSync(sdkIncludeRoot)
-  .filter((name) => /^10\.\d+\.\d+\.\d+$/.test(name))
-  .filter((name) => existsSync(join(sdkIncludeRoot, name, 'ucrt')))
-  .sort();
-const sdkVersion = sdkVersions[sdkVersions.length - 1];
-if (sdkVersion === undefined) {
-  fail('no usable Windows SDK version (with ucrt headers) found.');
-}
-
-const includeDirs = [
-  join(msvcRoot, 'include'),
-  join(sdkIncludeRoot, sdkVersion, 'ucrt'),
-  join(sdkIncludeRoot, sdkVersion, 'um'),
-  join(sdkIncludeRoot, sdkVersion, 'shared'),
-];
-const libDirs = [
-  join(msvcRoot, 'lib', 'x64'),
-  join(sdkLibRoot, sdkVersion, 'ucrt', 'x64'),
-  join(sdkLibRoot, sdkVersion, 'um', 'x64'),
-];
+const { hostBin, cl, toolset, sdkVersion, includeDirs, libDirs } = resolved.plan;
 
 process.stderr.write(
   `owner-helper build: MSVC ${toolset}, Windows SDK ${sdkVersion}\n` +
