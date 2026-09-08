@@ -644,7 +644,40 @@ function vcInstallationPathFor(component: string): string | null {
   return installationPath.length > 0 && existsSync(installationPath) ? installationPath : null;
 }
 
-const msvcAvailable = vcInstallationPathFor(VC_TOOLS_COMPONENT) !== null;
+// PR #92 P2 (Codex, follow-up): the VC toolset is necessary but NOT sufficient.
+// build.mjs additionally reconciles a Windows SDK under
+// %ProgramFiles(x86)%\Windows Kits\10 and fails loudly when it is missing — it
+// requires BOTH SDK roots (Include, Lib) AND at least one 10.x.x.x version whose
+// Include\<ver>\ucrt headers exist (the ucrt/um/shared include and ucrt/um lib
+// dirs the compile consumes). A machine can carry the VC workload with no Windows
+// SDK component installed, so the availability gate must mirror this precondition
+// too — otherwise the MSVC describe RUNS and then FAILS at the builder's SDK check
+// instead of SKIPPING. Filesystem-only mirror (no shell), matching build.mjs.
+function windowsSdkAvailable(
+  programFilesX86: string = process.env['ProgramFiles(x86)'] ?? 'C:\\Program Files (x86)',
+): boolean {
+  const sdkRoot = join(programFilesX86, 'Windows Kits', '10');
+  const sdkIncludeRoot = join(sdkRoot, 'Include');
+  const sdkLibRoot = join(sdkRoot, 'Lib');
+  if (!existsSync(sdkIncludeRoot) || !existsSync(sdkLibRoot)) {
+    return false;
+  }
+  return readdirSync(sdkIncludeRoot)
+    .filter((name) => /^10\.\d+\.\d+\.\d+$/.test(name))
+    .some((name) => existsSync(join(sdkIncludeRoot, name, 'ucrt')));
+}
+
+/** The MSVC-specific describe may run only when the builder's FULL precondition
+ *  holds: the VC toolset (vswhere -requires component) AND the Windows SDK/UCRT.
+ *  Either prerequisite absent → the describe skips rather than fails. */
+function msvcToolchainAvailable(
+  vcInstallationPath: string | null,
+  sdkProgramFilesX86?: string,
+): boolean {
+  return vcInstallationPath !== null && windowsSdkAvailable(sdkProgramFilesX86);
+}
+
+const msvcAvailable = msvcToolchainAvailable(vcInstallationPathFor(VC_TOOLS_COMPONENT));
 
 describe.skipIf(!msvcAvailable)('D062 explicit provisioning — MSVC available + helper missing', () => {
   it('the gate compiles the helper and publishes a canonical pair (exit 0)', () => {
@@ -691,21 +724,159 @@ describe.skipIf(process.platform !== 'win32' || !existsSync(vswherePath))(
       expect(vcInstallationPathFor('AgentBridge.Test.Component.Never.Installed.x86.x64')).toBeNull();
     });
 
-    it('detection outcome and MSVC-describe gating agree with the builder precondition', () => {
+    it('MSVC-describe gating equals VC-workload-present AND Windows-SDK-present', () => {
       const detected = vcInstallationPathFor(VC_TOOLS_COMPONENT);
+      const sdk = windowsSdkAvailable();
       if (detected === null) {
-        // Workload absent on this machine: the MSVC describe must be skipped.
+        // VC workload absent on this machine: the MSVC describe must be skipped
+        // regardless of whether a Windows SDK is present.
         expect(msvcAvailable).toBe(false);
       } else {
-        // Workload present: the detected root is a real installation path —
+        // VC workload present: the detected root is a real installation path —
         // the same installationPath build.mjs would resolve — and the MSVC
-        // describe is allowed to run.
+        // describe is allowed to run IFF the Windows SDK/UCRT prerequisite the
+        // builder also enforces is present, exactly the compound precondition.
         expect(existsSync(detected)).toBe(true);
-        expect(msvcAvailable).toBe(true);
+        expect(msvcAvailable).toBe(sdk);
       }
     });
   },
 );
+
+// PR #92 P2 (Codex) adversarial coverage for the Windows SDK prerequisite. These
+// drive the SDK predicate and the combined toolchain gate through synthetic
+// %ProgramFiles(x86)% layouts — filesystem only, no shell, deterministic on every
+// OS — so both directions of the finding are pinned independently of the runner's
+// installed toolchain.
+const SDK_VERSION_DIR = '10.0.22621.0';
+
+/** Build a synthetic `Windows Kits\10` tree under a fresh temp ProgramFiles(x86)
+ *  root and run `fn` against that root, always cleaning up. */
+function withSdkRoot(
+  build: (paths: { include: string; lib: string }) => void,
+  fn: (programFilesX86: string) => void,
+): void {
+  const root = mkdtempSync(join(tmpdir(), 'ab-sdk-'));
+  try {
+    const kits = join(root, 'Windows Kits', '10');
+    build({ include: join(kits, 'Include'), lib: join(kits, 'Lib') });
+    fn(root);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function makeUcrtVersion(includeRoot: string, version: string): void {
+  mkdirSync(join(includeRoot, version, 'ucrt'), { recursive: true });
+}
+
+describe('D062 explicit provisioning — Windows SDK/UCRT gate mirrors the builder', () => {
+  it('the SDK predicate mirrors the exact roots + ucrt requirement build.mjs enforces', () => {
+    // Source-level pin (like the VC component pin above): the builder discovers
+    // the SDK under "Windows Kits"\"10", requires an Include\<ver>\ucrt, and only
+    // accepts 10.x.x.x version dirs — the mirror must not drift from those markers.
+    const builderSource = readFileSync(
+      join(repoRoot, 'tools', 'control-owner', 'build.mjs'),
+      'utf8',
+    );
+    expect(builderSource).toContain("'Windows Kits', '10'");
+    expect(builderSource).toContain("'ucrt'");
+    expect(builderSource).toContain('/^10\\.\\d+\\.\\d+\\.\\d+$/');
+  });
+
+  it('full SDK (Include + Lib + a 10.x.x.x ucrt version) → available', () => {
+    withSdkRoot(
+      ({ include, lib }) => {
+        makeUcrtVersion(include, SDK_VERSION_DIR);
+        mkdirSync(lib, { recursive: true });
+      },
+      (pf86) => {
+        expect(windowsSdkAvailable(pf86)).toBe(true);
+      },
+    );
+  });
+
+  it('Include root missing → unavailable', () => {
+    withSdkRoot(
+      ({ lib }) => {
+        mkdirSync(lib, { recursive: true });
+      },
+      (pf86) => {
+        expect(windowsSdkAvailable(pf86)).toBe(false);
+      },
+    );
+  });
+
+  it('Lib root missing → unavailable', () => {
+    withSdkRoot(
+      ({ include }) => {
+        makeUcrtVersion(include, SDK_VERSION_DIR);
+      },
+      (pf86) => {
+        expect(windowsSdkAvailable(pf86)).toBe(false);
+      },
+    );
+  });
+
+  it('SDK roots present but NO version carries ucrt headers → unavailable', () => {
+    withSdkRoot(
+      ({ include, lib }) => {
+        mkdirSync(join(include, SDK_VERSION_DIR, 'um'), { recursive: true }); // no ucrt
+        mkdirSync(lib, { recursive: true });
+      },
+      (pf86) => {
+        expect(windowsSdkAvailable(pf86)).toBe(false);
+      },
+    );
+  });
+
+  it('a ucrt dir under a NON-10.x.x.x version name is not accepted → unavailable', () => {
+    withSdkRoot(
+      ({ include, lib }) => {
+        makeUcrtVersion(include, 'wsdk'); // not 10.x.x.x
+        mkdirSync(lib, { recursive: true });
+      },
+      (pf86) => {
+        expect(windowsSdkAvailable(pf86)).toBe(false);
+      },
+    );
+  });
+});
+
+describe('D062 explicit provisioning — combined MSVC toolchain gate truth table', () => {
+  const VC_ROOT = 'C:\\Program Files\\Microsoft Visual Studio\\2022\\Community';
+  const fullSdk = ({ include, lib }: { include: string; lib: string }): void => {
+    makeUcrtVersion(include, SDK_VERSION_DIR);
+    mkdirSync(lib, { recursive: true });
+  };
+  const noSdk = (): void => {
+    /* empty ProgramFiles(x86): no Windows Kits at all */
+  };
+
+  it('VC present + SDK present → gate OPEN (MSVC describe may run)', () => {
+    withSdkRoot(fullSdk, (pf86) => {
+      expect(msvcToolchainAvailable(VC_ROOT, pf86)).toBe(true);
+    });
+  });
+
+  it('VC present + SDK absent → gate CLOSED (MSVC describe skips, does not fail)', () => {
+    withSdkRoot(noSdk, (pf86) => {
+      expect(msvcToolchainAvailable(VC_ROOT, pf86)).toBe(false);
+    });
+  });
+
+  it('VC absent + SDK present → gate CLOSED (existing VC-absent case remains correct)', () => {
+    withSdkRoot(fullSdk, (pf86) => {
+      expect(msvcToolchainAvailable(null, pf86)).toBe(false);
+    });
+  });
+
+  it('VC absent + SDK absent → gate CLOSED', () => {
+    withSdkRoot(noSdk, (pf86) => {
+      expect(msvcToolchainAvailable(null, pf86)).toBe(false);
+    });
+  });
+});
 
 describe.skipIf(process.platform !== 'win32')(
   'D062 explicit provisioning — toolchain unavailable + helper missing fails loudly',
