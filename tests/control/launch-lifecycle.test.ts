@@ -27,14 +27,20 @@
  *        CONTROL_STARTUP_FAILURE   ⇏ COCKPIT_FAILURE
  *        RUNTIME_COMPILER_AUTHORITY = NONE
  *
+ * 3. ONE BUILD-ELIGIBILITY PREDICATE. Every real-compilation test runs or skips
+ *    on exactly `isBuildEligible` from tools/control-owner/msvc-toolchain.mjs —
+ *    the builder's own resolver PLUS an execution probe that compiles+links the
+ *    helper's dependency surface through the exact shared cl/env/paths/flags. No
+ *    test re-derives eligibility from filesystem existence or artifact presence.
+ *
  * These tests drive the REAL encoder and REAL validator over the full adversarial
  * artifact-state matrix (including the exact Codex truncated-module witness and
  * the duplicate-field witness), pin the launch wiring, confirm the runtime still
  * fails closed independently, prove a fail-closed control startup leaves the
  * Cockpit serving, and (on Windows) exercise the real gate: idempotent skip on a
  * canonical pair, real clean-checkout provisioning in an isolated tree, loud
- * nonzero failure when the toolchain is unavailable, and concurrent-builder
- * isolation/convergence.
+ * nonzero failure when the toolchain is unavailable, provisioning through a
+ * junction/symlink alias, and concurrent-builder isolation/convergence.
  */
 
 import { spawnSync } from 'node:child_process';
@@ -46,7 +52,9 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  rmdirSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import http from 'node:http';
@@ -60,13 +68,21 @@ import {
   validateHelperPair,
   encodeProvenance,
   OWNER_HELPER_BASENAME,
-} from '../../tools/control-owner/ensure-helper.mjs';
+} from '../../tools/control-owner/helper-pair.mjs';
 import {
   resolveBuildToolchain,
   isBuildEligible,
+  probeBuildToolchain,
+  compileArgsFor,
+  compileEnvFor,
   selectSdkVersion,
   vswherePathFor,
+  CL_COMPILE_FLAGS,
+  CL_LINK_FLAGS,
+  PROBE_SOURCE,
   VC_TOOLS_COMPONENT,
+  type BuildPlan,
+  type CompilerRunner,
 } from '../../tools/control-owner/msvc-toolchain.mjs';
 import {
   CONTROL_ANCHOR_REJECTION,
@@ -603,6 +619,7 @@ function isolatedGateTree(withSource: boolean): {
   mkdirSync(toolDir, { recursive: true });
   const files = [
     'ensure-helper.mjs',
+    'helper-pair.mjs',
     'build.mjs',
     'provenance-format.mjs',
     'msvc-toolchain.mjs',
@@ -634,11 +651,14 @@ function isolatedGateTree(withSource: boolean): {
 
 const vswherePath = vswherePathFor(process.env['ProgramFiles(x86)'] ?? 'C:\\Program Files (x86)');
 
-// Authoritative gate: the builder resolves a plan (same vswhere VC query, same SDK
-// version selection) AND every include/lib dir it will hand cl.exe exists.
-const msvcAvailable = isBuildEligible();
+// THE authoritative gate — the only `isBuildEligible` call site in this file:
+// the builder resolves a plan (same vswhere VC query, same SDK version selection),
+// every include/lib dir it will hand cl.exe exists, AND the exact toolchain
+// compiles+links the helper's dependency surface (execution probe). Every real
+// compilation below (provisioning AND concurrent builds) is gated on this one value.
+const TEST_BUILD_ELIGIBLE = isBuildEligible();
 
-describe.skipIf(!msvcAvailable)('D062 explicit provisioning — MSVC available + helper missing', () => {
+describe.skipIf(!TEST_BUILD_ELIGIBLE)('D062 explicit provisioning — MSVC available + helper missing', () => {
   it('the gate compiles the helper and publishes a canonical pair (exit 0)', () => {
     const t = isolatedGateTree(true);
     try {
@@ -675,6 +695,54 @@ describe('D062 explicit provisioning — builder and gate share one eligibility 
     expect(builder).not.toContain("'Windows Kits', '10'"); // SDK root discovery
   });
 
+  it('build.mjs consumes the shared compiler environment + argument shape (no second copy of flags)', () => {
+    const builder = readTool('build.mjs');
+    expect(builder).toContain('compileEnvFor(');
+    expect(builder).toContain('compileArgsFor(');
+    // No inline compiler flags, link flags, or env construction remain in the
+    // builder — the probe and the builder cannot drift in flags, PATH, INCLUDE, LIB.
+    for (const flag of [...CL_COMPILE_FLAGS, ...CL_LINK_FLAGS]) {
+      expect(builder, `builder must not inline ${flag}`).not.toContain(`'${flag}'`);
+    }
+    expect(builder).not.toMatch(/INCLUDE:|LIB:|System32/);
+  });
+
+  it('the shared argv shape is exactly the builder\'s: flags, source, /Fe, /Fo, /link flags', () => {
+    const args = compileArgsFor({ source: 'S.c', exe: 'E.exe', objDir: 'O' });
+    expect(args).toEqual([...CL_COMPILE_FLAGS, 'S.c', '/Fe:E.exe', '/Fo:O\\', '/link', ...CL_LINK_FLAGS]);
+    expect(CL_LINK_FLAGS).toContain('advapi32.lib');
+    expect(CL_LINK_FLAGS).toContain('/SUBSYSTEM:CONSOLE');
+  });
+
+  it('the probe exercises the owner helper\'s exact dependency surface', () => {
+    // Every header the helper source includes is included by the probe, and the
+    // probe references the same advapi32 imports so the link needs advapi32.lib.
+    const helperSource = readTool('agentbridge-win-owner.c');
+    const includes = [...helperSource.matchAll(/^#include <([^>]+)>/gm)].map((m) => m[1]);
+    expect(includes.length).toBeGreaterThan(0);
+    for (const header of includes) {
+      expect(PROBE_SOURCE, `probe must include <${String(header)}>`).toContain(`#include <${String(header)}>`);
+    }
+    expect(PROBE_SOURCE).toContain('GetNamedSecurityInfoW(');
+    expect(PROBE_SOURCE).toContain('ConvertSidToStringSidW(');
+    expect(PROBE_SOURCE).toContain('int wmain(');
+  });
+
+  it('this file has exactly ONE eligibility call site and gates every real compilation on it', () => {
+    // T5 root cause: a second, weaker run/skip proxy (artifact presence) gated the
+    // concurrent-build tests. There is one predicate and both real-compile
+    // describes use it; no real compilation is gated on `winReady`.
+    const self = readFileSync(fileURLToPath(import.meta.url), 'utf8');
+    expect(self.match(/isBuildEligible\(\)/g)).toHaveLength(1);
+    expect(self).toContain(
+      "describe.skipIf(!TEST_BUILD_ELIGIBLE)('D062 explicit provisioning — MSVC available + helper missing'",
+    );
+    expect(self).toContain(
+      "describe.skipIf(!TEST_BUILD_ELIGIBLE)('D062 concurrent rebuild — isolated real builds converge (Windows)'",
+    );
+    expect(self).not.toMatch(/skipIf\(!winReady\)\('D062 concurrent rebuild/);
+  });
+
   it('the authoritative detection/selection lives in the shared module', () => {
     const mod = readTool('msvc-toolchain.mjs');
     expect(mod).toContain(VC_TOOLS_COMPONENT);
@@ -691,18 +759,19 @@ describe('D062 explicit provisioning — builder and gate share one eligibility 
 describe.skipIf(process.platform !== 'win32' || !existsSync(vswherePath))(
   'D062 explicit provisioning — real gate equals the builder resolver on this machine',
   () => {
-    it('msvcAvailable is exactly "plan resolves AND every builder path exists"', () => {
+    it('TEST_BUILD_ELIGIBLE is exactly "plan resolves AND every builder path exists AND the probe links"', () => {
       const resolved = resolveBuildToolchain();
       if (!resolved.ok) {
         // Builder would reject before compilation → the gate must be closed.
-        expect(msvcAvailable).toBe(false);
+        expect(TEST_BUILD_ELIGIBLE).toBe(false);
       } else {
         const allPresent = [...resolved.plan.includeDirs, ...resolved.plan.libDirs].every((dir) =>
           existsSync(dir),
         );
         // The gate is open IFF every include/lib path the builder hands cl.exe
-        // exists — the exact set from the shared plan, never a weaker subset.
-        expect(msvcAvailable).toBe(allPresent);
+        // exists AND the exact toolchain actually compiles+links the probe.
+        const probe = allPresent ? probeBuildToolchain(resolved.plan).ok : false;
+        expect(TEST_BUILD_ELIGIBLE).toBe(allPresent && probe);
         expect(resolved.plan.includeDirs).toHaveLength(4); // msvc, ucrt, um, shared
         expect(resolved.plan.libDirs).toHaveLength(3); // msvc, ucrt/x64, um/x64
       }
@@ -785,9 +854,34 @@ function withToolchain(spec: ToolchainSpec, fn: (ctx: ToolchainCtx) => void): vo
   }
 }
 
-/** Eligibility / plan through the shared resolver with the fixture's VC path. */
-function eligibleFor(ctx: ToolchainCtx): boolean {
-  return isBuildEligible({ programFilesX86: ctx.programFilesX86, vcInstallationPath: ctx.vsRoot });
+/** A compiler runner that "succeeds": produces the /Fe output and records the call. */
+interface RecordedCompile {
+  readonly cl: string;
+  readonly args: readonly string[];
+  readonly cwd: string;
+  readonly env: Record<string, string>;
+}
+function recordingCompiler(calls: RecordedCompile[]): CompilerRunner {
+  return (cl, args, { cwd, env }): void => {
+    calls.push({ cl, args, cwd, env: { ...env } });
+    const fe = args.find((a) => a.startsWith('/Fe:'));
+    writeFileSync((fe ?? '/Fe:').slice(4), 'probe-output');
+  };
+}
+const succeedingCompiler: CompilerRunner = recordingCompiler([]);
+const failingCompiler: CompilerRunner = (): void => {
+  throw new Error('cl.exe exited 2');
+};
+
+/** Eligibility through the shared resolver with the fixture's VC path and the given
+ *  compiler runner (structural fixtures inject a succeeding runner: their cl.exe is
+ *  an empty file, so the STRUCTURE is what is under test). */
+function eligibleFor(ctx: ToolchainCtx, runCompiler: CompilerRunner = succeedingCompiler): boolean {
+  return isBuildEligible({
+    programFilesX86: ctx.programFilesX86,
+    vcInstallationPath: ctx.vsRoot,
+    runCompiler,
+  });
 }
 function planFor(ctx: ToolchainCtx): ReturnType<typeof resolveBuildToolchain> {
   return resolveBuildToolchain({
@@ -797,7 +891,7 @@ function planFor(ctx: ToolchainCtx): ReturnType<typeof resolveBuildToolchain> {
 }
 
 describe('D062 explicit provisioning — build eligibility mirrors every builder prerequisite', () => {
-  it('VC present + complete SDK → eligible', () => {
+  it('VC present + complete SDK (+ working compiler) → eligible', () => {
     withToolchain({ sdkVersions: [completeVersion('10.0.22621.0')] }, (ctx) => {
       expect(eligibleFor(ctx)).toBe(true);
     });
@@ -909,6 +1003,155 @@ describe('D062 explicit provisioning — gate and builder select the exact same 
   });
 });
 
+/* ---- Terminal toolchain-class closure: eligibility = the toolchain CAN BUILD ---- */
+// Existence of directories can never certify compilation (a missing link.exe,
+// compiler DLL, header inside an existing include dir, or advapi32.lib inside an
+// existing lib dir all pass existence and fail cl.exe). The predicate therefore
+// compiles+links a probe through the exact shared plan/env/flags. Deterministic on
+// every OS via an injected compiler runner; the real cl.exe is exercised on Windows.
+describe('D062 explicit provisioning — eligibility is an execution probe through the shared plan', () => {
+  it('structural plan complete + probe compiles → eligible; the probe ran the exact shared cl/args/env', () => {
+    withToolchain({ sdkVersions: [completeVersion('10.0.22621.0')] }, (ctx) => {
+      const calls: RecordedCompile[] = [];
+      expect(eligibleFor(ctx, recordingCompiler(calls))).toBe(true);
+      expect(calls).toHaveLength(1);
+      const plan = planFor(ctx);
+      expect(plan.ok).toBe(true);
+      if (!plan.ok) {
+        return;
+      }
+      const call = calls[0];
+      expect(call).toBeDefined();
+      if (call === undefined) {
+        return;
+      }
+      // Exact resolved compiler, the builder's argv shape, and the builder's env.
+      expect(call.cl).toBe(plan.plan.cl);
+      const fe = call.args.find((a) => a.startsWith('/Fe:')) ?? '';
+      const fo = call.args.find((a) => a.startsWith('/Fo:')) ?? '';
+      expect(call.args).toEqual(
+        compileArgsFor({ source: join(call.cwd, '..', 'probe.c'), exe: fe.slice(4), objDir: fo.slice(4, -1) }),
+      );
+      expect(call.env).toEqual(compileEnvFor(plan.plan));
+      expect(call.env['INCLUDE']).toBe(plan.plan.includeDirs.join(';'));
+      expect(call.env['LIB']).toBe(plan.plan.libDirs.join(';'));
+      expect((call.env['PATH'] ?? '').startsWith(`${plan.plan.hostBin};`)).toBe(true);
+    });
+  });
+
+  it('structural plan complete + compiler invocation fails → ineligible', () => {
+    withToolchain({ sdkVersions: [completeVersion('10.0.22621.0')] }, (ctx) => {
+      expect(planFor(ctx).ok).toBe(true);
+      expect(eligibleFor(ctx, failingCompiler)).toBe(false);
+      // Without injection the fixture's cl.exe is an empty file: direct execution
+      // fails on every OS, so a structurally complete toolchain that cannot run its
+      // compiler is ineligible — never a claimed availability.
+      expect(
+        isBuildEligible({ programFilesX86: ctx.programFilesX86, vcInstallationPath: ctx.vsRoot }),
+      ).toBe(false);
+    });
+  });
+
+  it('selected (highest ucrt) SDK incomplete → ineligible via the builder\'s selection; the probe never runs', () => {
+    withToolchain(
+      {
+        sdkVersions: [
+          completeVersion('10.0.19041.0'), // complete, but NOT the one selected
+          { version: '10.0.22621.0', include: ['ucrt'] }, // highest ucrt → selected, incomplete
+        ],
+      },
+      (ctx) => {
+        const calls: RecordedCompile[] = [];
+        const plan = planFor(ctx);
+        expect(plan.ok && plan.plan.sdkVersion).toBe('10.0.22621.0');
+        expect(eligibleFor(ctx, recordingCompiler(calls))).toBe(false);
+        expect(calls).toHaveLength(0); // rejected before compilation, like the builder
+      },
+    );
+  });
+
+  it('the probe compiles in a private temp workspace, publishes nothing, and cleans up', () => {
+    withToolchain({ sdkVersions: [completeVersion('10.0.22621.0')] }, (ctx) => {
+      const probeRoot = mkdtempSync(join(tmpdir(), 'ab-probe-root-'));
+      try {
+        const plan = planFor(ctx);
+        expect(plan.ok).toBe(true);
+        if (!plan.ok) {
+          return;
+        }
+        for (const runner of [succeedingCompiler, failingCompiler]) {
+          const calls: RecordedCompile[] = [];
+          const recorded: CompilerRunner = (cl, args, opts): void => {
+            calls.push({ cl, args, cwd: opts.cwd, env: { ...opts.env } });
+            runner(cl, args, opts);
+          };
+          const result = probeBuildToolchain(plan.plan, { runCompiler: recorded, probeRoot });
+          expect(result.ok).toBe(runner === succeedingCompiler);
+          // The compile ran inside the private workspace under probeRoot …
+          expect(calls[0]?.cwd.startsWith(probeRoot)).toBe(true);
+          // … and nothing is left behind afterwards, success or failure.
+          expect(readdirSync(probeRoot)).toEqual([]);
+        }
+        // Nothing was written anywhere under the synthetic toolchain root either.
+        expect(existsSync(join(ctx.programFilesX86, 'dist'))).toBe(false);
+      } finally {
+        rmSync(probeRoot, { recursive: true, force: true });
+      }
+    });
+  });
+});
+
+// Real compiler (Windows with a usable toolchain): the probe detects a required
+// header or library missing from an EXISTING directory — the exact class a
+// directory-existence gate can never see.
+describe.skipIf(!TEST_BUILD_ELIGIBLE)(
+  'D062 explicit provisioning — real cl.exe probe rejects unusable-but-present toolchains',
+  () => {
+    const realPlan = (): BuildPlan => {
+      const resolved = resolveBuildToolchain();
+      if (!resolved.ok) {
+        throw new Error('gate is open, so the plan must resolve');
+      }
+      return resolved.plan;
+    };
+
+    it('positive control: the real plan compiles+links the probe', () => {
+      expect(probeBuildToolchain(realPlan()).ok).toBe(true);
+    });
+
+    it('required header unavailable (um include dir dropped) → ineligible', () => {
+      const plan = realPlan();
+      const noUm = plan.includeDirs.filter((dir) => !dir.endsWith('um'));
+      expect(noUm).toHaveLength(plan.includeDirs.length - 1);
+      expect(probeBuildToolchain({ ...plan, includeDirs: noUm }).ok).toBe(false);
+    });
+
+    it('required library unavailable (um lib dir dropped → no advapi32.lib) → ineligible', () => {
+      const plan = realPlan();
+      const noUmLib = plan.libDirs.filter((dir) => !dir.includes(join('um', 'x64')));
+      expect(noUmLib).toHaveLength(plan.libDirs.length - 1);
+      expect(probeBuildToolchain({ ...plan, libDirs: noUmLib }).ok).toBe(false);
+    });
+
+    it('existing SDK directories with the required headers ABSENT → ineligible through the full gate', () => {
+      // Real VS/MSVC root (so cl.exe genuinely runs) + a synthetic %ProgramFiles(x86)%
+      // whose Windows Kits dirs all EXIST but are empty: structure and existence
+      // pass, the probe fails on <windows.h>, and the gate is closed.
+      const plan = realPlan();
+      withToolchain({ vc: false, sdkVersions: [completeVersion(plan.sdkVersion)] }, (ctx) => {
+        const structural = resolveBuildToolchain({
+          programFilesX86: ctx.programFilesX86,
+          vcInstallationPath: plan.vsRoot,
+        });
+        expect(structural.ok).toBe(true);
+        expect(
+          isBuildEligible({ programFilesX86: ctx.programFilesX86, vcInstallationPath: plan.vsRoot }),
+        ).toBe(false);
+      });
+    });
+  },
+);
+
 describe.skipIf(process.platform !== 'win32')(
   'D062 explicit provisioning — toolchain unavailable + helper missing fails loudly',
   () => {
@@ -940,6 +1183,61 @@ describe.skipIf(process.platform !== 'win32')(
   },
 );
 
+/* ---- N1: provisioning through a junction/symlink alias must never silently pass -- */
+// Node realpaths the loaded main module but leaves process.argv[1] as the alias, so
+// an `import.meta.url === pathToFileURL(argv[1])` entry guard never ran main()
+// through a junction: no output, exit 0, nothing provisioned. The gate is now an
+// unconditional entry script, so an aliased invocation runs the full lifecycle.
+describe('D062 explicit provisioning — the gate runs through a junction/symlink alias (never a silent exit 0)', () => {
+  it('invoked via an alias, the gate validates, attempts provisioning, and reports loudly', () => {
+    const t = isolatedGateTree(false);
+    const aliasRoot = mkdtempSync(join(tmpdir(), 'ab-alias-'));
+    const alias = join(aliasRoot, 'link');
+    try {
+      symlinkSync(t.root, alias, process.platform === 'win32' ? 'junction' : 'dir');
+      const aliasedGate = join(alias, 'tools', 'control-owner', 'ensure-helper.mjs');
+      expect(existsSync(aliasedGate)).toBe(true);
+      const emptyPf86 = join(t.root, 'empty-pf86');
+      mkdirSync(emptyPf86, { recursive: true });
+      const env: NodeJS.ProcessEnv = Object.fromEntries(
+        Object.entries(process.env).filter(([key]) => key.toLowerCase() !== 'programfiles(x86)'),
+      );
+      env['ProgramFiles(x86)'] = emptyPf86;
+      const run = spawnSync(process.execPath, [aliasedGate], { encoding: 'utf8', env });
+      // main() ran: the gate always speaks. Never the pre-fix silent `exit 0`.
+      expect(run.stderr).toContain('ensure-helper:');
+      if (process.platform === 'win32') {
+        // Windows: pair missing → rebuild attempted → toolchain hidden → LOUD nonzero.
+        expect(run.stderr).toContain('rebuilding via build.mjs');
+        expect(run.stderr).toContain('FAILED to build the owner helper');
+        expect(run.status).toBe(1);
+        expect(existsSync(join(t.nativeDir, OWNER_HELPER_BASENAME))).toBe(false);
+      } else {
+        expect(run.stderr).toContain('skipping');
+        expect(run.status).toBe(0);
+      }
+    } finally {
+      // Remove the reparse point itself (never its target), then the temp trees.
+      try {
+        rmdirSync(alias);
+      } catch {
+        /* already gone */
+      }
+      rmSync(aliasRoot, { recursive: true, force: true });
+      rmSync(t.root, { recursive: true, force: true });
+    }
+  });
+
+  it('the gate is an unconditional entry script: no exports, no alias-sensitive entry guard', () => {
+    const gate = readFileSync(ensureScript, 'utf8');
+    expect(gate).not.toMatch(/pathToFileURL|isEntry/);
+    expect(gate).not.toMatch(/^export /m);
+    expect(gate).toMatch(/^main\(\);\s*$/m);
+    // The reusable validator lives in the plain (side-effect-free) module.
+    expect(gate).toContain("from './helper-pair.mjs'");
+  });
+});
+
 /* ---- 6. Concurrent helper rebuild — isolation invariant (PR #90/#91) --------- */
 
 // Definition-level (cross-platform): build.mjs must compile into a process-unique
@@ -953,12 +1251,13 @@ describe('D062 concurrent rebuild — build.mjs isolates mutable compilation sta
     expect(buildMjs).toMatch(/mkdtempSync\(/);
   });
   it('compiles /Fe and /Fo into the private workspace, not the final paths', () => {
-    expect(buildMjs).toMatch(/\/Fe:\$\{workExe\}/);
-    expect(buildMjs).toMatch(/\/Fo:\$\{workObjDir\}/);
+    // The argv shape is the shared compileArgsFor (source, /Fe:exe, /Fo:objDir\);
+    // the builder targets ONLY its private workspace exe/obj dir.
+    expect(buildMjs).toContain('compileArgsFor({ source: srcC, exe: workExe, objDir: workObjDir })');
     // No shared object directory under the authoritative native dir, and the final
     // exe path is never a compiler output target.
     expect(buildMjs).not.toMatch(/const objDir = join\(outDir, 'obj'\)/);
-    expect(buildMjs).not.toMatch(/\/Fe:\$\{exePath\}/);
+    expect(buildMjs).not.toMatch(/\/Fe:|exe: exePath|objDir: outDir/);
   });
   it('publishes by atomic rename and cleans the private workspace best-effort', () => {
     expect(buildMjs).toMatch(/renameSync\(/);
@@ -968,7 +1267,8 @@ describe('D062 concurrent rebuild — build.mjs isolates mutable compilation sta
 
 // Real concurrent builds (Windows) run in an ISOLATED COPY of the build tools under
 // a temp tree, so they never touch the shared dist that owner-helper.win.test.ts
-// reads/executes. Gated on winReady as a proxy for MSVC availability.
+// reads/executes. Gated on the ONE authoritative eligibility predicate (T5): artifact
+// presence is not toolchain availability.
 type SpawnResult = ReturnType<typeof spawnSync>;
 
 function runConcurrentBuilds(buildScript: string, n: number): SpawnResult[] {
@@ -989,7 +1289,7 @@ function runConcurrentBuilds(buildScript: string, n: number): SpawnResult[] {
   return codes.map((code) => ({ status: code }) as SpawnResult);
 }
 
-describe.skipIf(!winReady)('D062 concurrent rebuild — isolated real builds converge (Windows)', () => {
+describe.skipIf(!TEST_BUILD_ELIGIBLE)('D062 concurrent rebuild — isolated real builds converge (Windows)', () => {
   it.each([2, 4])('%d concurrent builders all succeed and converge on the canonical pair', (n) => {
     const t = isolatedGateTree(true);
     try {
@@ -1014,4 +1314,71 @@ describe.skipIf(!winReady)('D062 concurrent rebuild — isolated real builds con
       rmSync(t.root, { recursive: true, force: true });
     }
   }, 240000);
+});
+
+/* ---- T5 reproducer: artifacts present, toolchain hidden → skip, not fail -------- */
+// Runs THIS file in a child vitest filtered to the concurrent-build tests. With
+// %ProgramFiles(x86)% pointed at an empty directory the artifacts still exist
+// (winReady) but the toolchain cannot be resolved, so the concurrent-build tests
+// must SKIP (child exit 0, zero failures); with the real environment they must RUN
+// and pass when this machine is eligible.
+interface VitestJson {
+  readonly numFailedTests: number;
+  readonly numPassedTests: number;
+  readonly numPendingTests: number;
+}
+function childVitest(env: NodeJS.ProcessEnv): { status: number | null; report: VitestJson } {
+  const outDir = mkdtempSync(join(tmpdir(), 'ab-t5-'));
+  const outFile = join(outDir, 'report.json');
+  try {
+    const run = spawnSync(
+      process.execPath,
+      [
+        join(repoRoot, 'node_modules', 'vitest', 'vitest.mjs'),
+        'run',
+        fileURLToPath(import.meta.url),
+        '-t',
+        'concurrent builders all succeed',
+        '--reporter=json',
+        `--outputFile=${outFile}`,
+      ],
+      {
+        cwd: repoRoot,
+        encoding: 'utf8',
+        // A fresh vitest: drop the parent worker's VITEST* markers.
+        env: Object.fromEntries(Object.entries(env).filter(([key]) => !key.startsWith('VITEST'))),
+        timeout: 180000,
+      },
+    );
+    const report = JSON.parse(readFileSync(outFile, 'utf8')) as VitestJson;
+    return { status: run.status, report };
+  } finally {
+    rmSync(outDir, { recursive: true, force: true });
+  }
+}
+
+describe.skipIf(!winReady)('D062 T5 — the concurrent-build gate follows toolchain eligibility, not artifact presence', () => {
+  it('toolchain unavailable (artifacts present) → the concurrent-build tests skip; nothing fails', () => {
+    const emptyPf86 = mkdtempSync(join(tmpdir(), 'ab-empty-pf86-'));
+    try {
+      const env: NodeJS.ProcessEnv = Object.fromEntries(
+        Object.entries(process.env).filter(([key]) => key.toLowerCase() !== 'programfiles(x86)'),
+      );
+      env['ProgramFiles(x86)'] = emptyPf86;
+      const { status, report } = childVitest(env);
+      expect(report.numFailedTests).toBe(0);
+      expect(report.numPassedTests).toBe(0);
+      expect(report.numPendingTests).toBeGreaterThan(0);
+      expect(status).toBe(0);
+    } finally {
+      rmSync(emptyPf86, { recursive: true, force: true });
+    }
+  }, 200000);
+
+  it.skipIf(!TEST_BUILD_ELIGIBLE)('toolchain available → the concurrent-build tests still run and pass', () => {
+    const { status, report } = childVitest(process.env);
+    expect(report.numFailedTests).toBe(0);
+    expect(report.numPassedTests).toBe(2); // it.each([2, 4])
+    expect(status).toBe(0);
+  }, 200000);
 });

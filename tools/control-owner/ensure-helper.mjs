@@ -18,7 +18,7 @@
  * control-anchor verification runs; a provisioning failure is loud and nonzero.
  *
  * The idempotent skip is taken ONLY when the helper and provenance form the
- * CANONICAL pair (see validateHelperPair): the on-disk provenance bytes must equal
+ * CANONICAL pair (see validateHelperPair in helper-pair.mjs): the on-disk provenance bytes must equal
  * `encodeProvenance(sha256(helper bytes))` exactly. Existence — or fields found
  * somewhere in the text — is NOT sufficient: an interrupted `build.mjs` can leave a
  * new executable beside stale provenance (a torn pair), or a truncated/duplicated/
@@ -46,20 +46,10 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 
-import {
-  OWNER_HELPER_BASENAME,
-  PROVENANCE_BASENAME,
-  encodeProvenance,
-} from './provenance-format.mjs';
-
-// Re-export the canonical producers so the strict-TypeScript lifecycle regression
-// imports the REAL encoder + validator from one module (a single declaration seam).
-export { OWNER_HELPER_BASENAME, encodeProvenance } from './provenance-format.mjs';
+import { OWNER_HELPER_BASENAME, PROVENANCE_BASENAME, validateHelperPair } from './helper-pair.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(here, '..', '..');
@@ -68,47 +58,6 @@ const buildScript = join(here, 'build.mjs');
 const outDir = join(repoRoot, 'dist', 'control', 'native');
 const exePath = join(outDir, OWNER_HELPER_BASENAME);
 const provenancePath = join(outDir, PROVENANCE_BASENAME);
-
-/**
- * Decide, for LIFECYCLE purposes only, whether the helper/provenance pair on disk
- * is the canonical pair — enough to choose skip vs rebuild.
- *
- * Mechanism: helper bytes → SHA-256 → the single canonical encoder → the exact
- * expected complete provenance bytes. The pair is VALID iff the on-disk provenance
- * bytes equal `encodeProvenance(sha256(helper bytes))`, byte-for-byte. There is no
- * other positive path: no field extraction, no regex acceptance, no JS import/parse,
- * and no normalization of whitespace, line endings, casing, comments, property
- * order, or duplicate fields. Any representation not emitted verbatim by the encoder
- * — missing/partial/truncated/malformed/duplicated/augmented/re-formatted/torn — is
- * INVALID and rebuilds. This never binds to the C source revision.
- *
- * Returns `{ valid: boolean, reason: string }`.
- */
-export function validateHelperPair({ exePath: exe, provenancePath: prov }) {
-  if (!existsSync(prov)) {
-    return { valid: false, reason: 'provenance-missing' };
-  }
-  if (!existsSync(exe)) {
-    return { valid: false, reason: 'helper-missing' };
-  }
-  let bytes;
-  try {
-    bytes = readFileSync(exe);
-  } catch {
-    return { valid: false, reason: 'helper-unreadable' };
-  }
-  const expected = encodeProvenance(createHash('sha256').update(bytes).digest('hex'));
-  let actual;
-  try {
-    actual = readFileSync(prov, 'utf8');
-  } catch {
-    return { valid: false, reason: 'provenance-unreadable' };
-  }
-  if (actual !== expected) {
-    return { valid: false, reason: 'not-canonical' };
-  }
-  return { valid: true, reason: 'valid' };
-}
 
 function note(message) {
   process.stderr.write(`ensure-helper: ${message}\n`);
@@ -159,8 +108,11 @@ function main() {
   note('owner helper provisioned (valid pair).');
 }
 
-const entry = process.argv[1];
-const isEntry = entry !== undefined && import.meta.url === pathToFileURL(entry).href;
-if (isEntry) {
-  main();
-}
+// ENTRY SCRIPT — no exports, no entry guard. This file is only ever executed
+// (`npm run control` / `control:provision`), never imported; the reusable validator
+// lives in helper-pair.mjs. A guard comparing import.meta.url with the argv[1] file
+// URL is alias-sensitive on Windows (Node realpaths the loaded module but argv keeps
+// a junction/symlink alias), which made this gate exit 0 silently without provisioning.
+// Explicit provisioning must never silently succeed: run unconditionally, exactly
+// as build.mjs does.
+main();

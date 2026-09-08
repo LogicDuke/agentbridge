@@ -1,8 +1,9 @@
 /*
- * Type declaration for the authoritative MSVC + Windows SDK toolchain resolver, so
- * the strict-TypeScript lifecycle regression can import and exercise the REAL
- * detection/selection the trusted builder (build.mjs) uses — not a copy. The module
- * itself (msvc-toolchain.mjs) lives under tools/ and is plain Node ESM.
+ * Type declaration for the authoritative MSVC + Windows SDK toolchain resolver,
+ * shared compiler env/flags, and eligibility probe, so the strict-TypeScript
+ * lifecycle regression can import and exercise the REAL detection/selection/
+ * compilation the trusted builder (build.mjs) uses — not a copy. The module itself
+ * (msvc-toolchain.mjs) lives under tools/ and is plain Node ESM.
  */
 
 /** The exact VC workload component the builder requires from vswhere. */
@@ -59,5 +60,58 @@ export interface ResolveOptions {
 /** Resolve the exact build plan, or the first precondition the builder rejects on. */
 export declare function resolveBuildToolchain(options?: ResolveOptions): BuildToolchainResolution;
 
-/** The builder will proceed AND succeed: a plan resolves and every path exists. */
-export declare function isBuildEligible(options?: ResolveOptions): boolean;
+/** The exact cl.exe compile flags (before the source) and `/link` flags the builder uses. */
+export declare const CL_COMPILE_FLAGS: readonly string[];
+export declare const CL_LINK_FLAGS: readonly string[];
+
+/** The one controlled compiler environment derived from a plan (PATH/INCLUDE/LIB). */
+export interface CompileEnv {
+  readonly SystemRoot: string;
+  readonly windir: string;
+  readonly PATH: string;
+  readonly INCLUDE: string;
+  readonly LIB: string;
+}
+export declare function compileEnvFor(plan: BuildPlan, env?: NodeJS.ProcessEnv): CompileEnv;
+
+/** The one compile+link argv shape (shared flags, source, /Fe, /Fo, /link flags). */
+export interface CompileTargets {
+  readonly source: string;
+  readonly exe: string;
+  readonly objDir: string;
+}
+export declare function compileArgsFor(targets: CompileTargets): string[];
+
+/** Direct cl.exe runner (absolute path, explicit argv, shell:false); throws on failure. */
+export type CompilerRunner = (
+  cl: string,
+  args: readonly string[],
+  options: { readonly cwd: string; readonly env: CompileEnv },
+) => void;
+export declare function defaultRunCompiler(
+  cl: string,
+  args: readonly string[],
+  options: { readonly cwd: string; readonly env: CompileEnv },
+): void;
+
+/** The probe translation unit exercising the owner helper's dependency surface. */
+export declare const PROBE_SOURCE: string;
+
+/** Options for the eligibility probe (in addition to resolution options). */
+export interface ProbeOptions {
+  readonly runCompiler?: CompilerRunner;
+  readonly probeRoot?: string;
+  readonly env?: NodeJS.ProcessEnv;
+}
+
+/** Compile+link the probe through the exact plan in a private temp workspace. */
+export declare function probeBuildToolchain(
+  plan: BuildPlan,
+  options?: ProbeOptions,
+): { readonly ok: true } | { readonly ok: false; readonly reason: string };
+
+/**
+ * The ONE run-vs-skip predicate for real-compilation tests: a plan resolves, every
+ * builder path exists, AND the exact toolchain compiles+links the probe.
+ */
+export declare function isBuildEligible(options?: ResolveOptions & ProbeOptions): boolean;

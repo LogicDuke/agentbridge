@@ -32,7 +32,7 @@ import {
   PROVENANCE_BASENAME,
   encodeProvenance,
 } from './provenance-format.mjs';
-import { resolveBuildToolchain } from './msvc-toolchain.mjs';
+import { compileArgsFor, compileEnvFor, resolveBuildToolchain } from './msvc-toolchain.mjs';
 
 const HELPER_BASENAME = OWNER_HELPER_BASENAME;
 
@@ -86,7 +86,7 @@ const resolved = resolveBuildToolchain();
 if (!resolved.ok) {
   fail(toolchainRejectionMessage(resolved));
 }
-const { hostBin, cl, toolset, sdkVersion, includeDirs, libDirs } = resolved.plan;
+const { cl, toolset, sdkVersion } = resolved.plan;
 
 process.stderr.write(
   `owner-helper build: MSVC ${toolset}, Windows SDK ${sdkVersion}\n` +
@@ -125,32 +125,11 @@ const workObjDir = join(workspace, 'obj');
 const workExe = join(workspace, HELPER_BASENAME);
 mkdirSync(workObjDir, { recursive: true });
 
-const clEnv = {
-  SystemRoot: process.env['SystemRoot'] ?? 'C:\\Windows',
-  windir: process.env['windir'] ?? 'C:\\Windows',
-  PATH: `${hostBin};${process.env['SystemRoot'] ?? 'C:\\Windows'}\\System32`,
-  INCLUDE: includeDirs.join(';'),
-  LIB: libDirs.join(';'),
-};
-
-const clArgs = [
-  '/nologo',
-  '/W3',
-  '/O2',
-  '/GS',
-  '/utf-8',
-  '/std:c17',
-  '/DUNICODE',
-  '/D_UNICODE',
-  '/Brepro',
-  srcC,
-  `/Fe:${workExe}`,
-  `/Fo:${workObjDir}\\`,
-  '/link',
-  '/Brepro',
-  '/SUBSYSTEM:CONSOLE',
-  'advapi32.lib',
-];
+// The compiler environment and the compile/link argument shape are the SHARED
+// ones from msvc-toolchain.mjs — the same the eligibility probe uses — so the
+// builder and the test gate cannot drift in env, include/lib paths, or flags.
+const clEnv = compileEnvFor(resolved.plan);
+const clArgs = compileArgsFor({ source: srcC, exe: workExe, objDir: workObjDir });
 
 try {
   execFileSync(cl, clArgs, {
