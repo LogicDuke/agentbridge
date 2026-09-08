@@ -131,6 +131,59 @@ adapter observations) are out of D3's scope.
 builds `src/**` to `dist/` and starts the host, printing the exact loopback URL.
 The user opens it manually; the host starts no browser and holds no shell.
 
+### Clean Windows checkout / first use (live runtime + control)
+
+Read-only Cockpit (`npm run cockpit`) needs **neither** the control anchor
+**nor** helper provisioning; the prerequisites below apply only when the control
+channel is wanted.
+
+The control channel has **two** distinct prerequisites, in this order:
+
+    externally provisioned hardened control anchor   (external prerequisite)
+      -> npm run control:provision                    (native owner-helper/provenance pair)
+      -> npm run cockpit:live                          (one-shot control-startup attempt)
+      -> npm run control
+
+**1. The hardened control anchor is an external prerequisite.** Before control
+can start, the deployment-anchored control directory must already exist **and**
+already satisfy the runtime's hardened-anchor trust policy. On Windows that
+directory is:
+
+    %LOCALAPPDATA%\AgentBridge\control
+
+`verifyControlAnchor` (`src/control/control-store.ts`) reads this anchor
+**read-only and fail-closed**: it requires the anchor OWNER to be the exact
+runtime operator SID and the DACL to be exactly operator + SYSTEM, present and
+**non-inherited**. It never creates the directory and never mutates ACLs.
+AgentBridge V1 — the current control flow — does **not** create or harden this
+anchor; there is no anchor provisioner in the codebase. A plain `mkdir` is
+therefore insufficient: a freshly created directory inherits its parent's ACLs,
+which the anchor policy rejects. Establishing an anchor that satisfies the trust
+policy is a separate operator/deployment responsibility, outside the scope of
+these npm scripts.
+
+**2. `control:provision` provisions only the native helper.**
+`control:provision` runs the existing validated gate
+(`node tools/control-owner/ensure-helper.mjs`) and nothing else: it provisions
+the native owner-helper/provenance pair. It does **not** create, harden, or
+verify the control anchor.
+
+If immediate control availability is required, the control anchor must already
+satisfy the runtime's trust policy **before** `cockpit:live` starts. The live
+runtime makes exactly **one** control-startup attempt at launch; if either
+prerequisite is unmet — the hardened anchor is missing or non-compliant, or the
+helper/provenance pair is not yet provisioned — that attempt fails closed and —
+by design — there is no automatic or background retry, no polling, and no
+watcher. Satisfying the prerequisites *after* the runtime is already running
+does not dynamically start the control channel: restart `cockpit:live` to make a
+new one-shot control-startup attempt.
+
+Provisioning is **not** required for read-only Cockpit use, and a provisioning
+failure never prevents the Cockpit from launching or serving
+(`CONTROL_PROVISION_FAILURE ⇏ COCKPIT_FAILURE`): the gate is on the
+`control:provision` and `npm run control` paths only, never on `cockpit` or
+`cockpit:live`.
+
 ## Tests
 
 `tests/cockpit-host/` covers fixture-passes-D1, fail-closed on malformed input,
