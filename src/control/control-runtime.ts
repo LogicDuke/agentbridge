@@ -24,6 +24,7 @@ import { createControlDispatcher } from './control-dispatch.js';
 import {
   createRuntimeDescriptor,
   pipePathFromName,
+  readDescriptorFile,
   removeDescriptorFile,
   verifyControlAnchor,
   writeDescriptorFile,
@@ -32,7 +33,28 @@ import {
   type VerifyControlAnchorDeps,
 } from './control-store.js';
 
-/** A running control channel; `close()` stops it and removes its descriptor. */
+/**
+ * Remove the fixed descriptor only while it still identifies THIS runtime
+ * instance (exact pipeName match — the per-process 128-bit-random identity; a
+ * pid can be reused, a pipeName cannot). If the descriptor is missing,
+ * malformed, unreadable, or was replaced by a successor runtime, it is left
+ * untouched so the successor stays discoverable. Read-compare-unlink is not
+ * atomic; the residual window is the sub-millisecond gap between the match and
+ * the unlink, not the successor's whole lifetime.
+ */
+function removeOwnDescriptorFile(
+  anchorPath: string,
+  ownPipeName: string,
+  deps?: DescriptorFileDeps,
+): void {
+  const current = readDescriptorFile(anchorPath, deps);
+  if (current === null || current.descriptor.pipeName !== ownPipeName) {
+    return;
+  }
+  removeDescriptorFile(anchorPath, deps);
+}
+
+/** A running control channel; `close()` stops it and removes its own descriptor. */
 export interface ControlChannelHandle {
   readonly pipeName: string;
   readonly pipePath: string;
@@ -105,8 +127,9 @@ export async function startControlChannel(
       });
     });
   } catch {
-    // A same-name collision or any listen failure fails closed.
-    removeDescriptorFile(anchorPath, deps.descriptorDeps);
+    // A same-name collision or any listen failure fails closed. Remove only our
+    // own descriptor: a successor may already have replaced it.
+    removeOwnDescriptorFile(anchorPath, descriptor.pipeName, deps.descriptorDeps);
     log('AgentBridge control channel: disabled (pipe unavailable).');
     return null;
   }
@@ -121,7 +144,10 @@ export async function startControlChannel(
     pipePath,
     close: (): Promise<void> =>
       new Promise<void>((resolvePromise) => {
-        removeDescriptorFile(anchorPath, deps.descriptorDeps);
+        // Remove only our own descriptor: a successor runtime may have rotated
+        // the fixed path already, and deleting its descriptor would make the
+        // live successor undiscoverable.
+        removeOwnDescriptorFile(anchorPath, descriptor.pipeName, deps.descriptorDeps);
         server.close(() => {
           resolvePromise();
         });

@@ -1,3 +1,4 @@
+import { EventEmitter } from 'node:events';
 import net from 'node:net';
 
 import { afterEach, describe, expect, it } from 'vitest';
@@ -6,13 +7,15 @@ import { createControlChannelServer } from '../../src/control/control-channel.js
 import { createControlDispatcher } from '../../src/control/control-dispatch.js';
 import {
   createRuntimeDescriptor,
+  parseDescriptor,
   pipePathFromName,
+  serializeDescriptor,
   type ControlAnchorVerification,
   type DescriptorFileDeps,
 } from '../../src/control/control-store.js';
 import { startControlChannel, type ControlChannelHandle } from '../../src/control/control-runtime.js';
 import { CONTROL_ANCHOR_REJECTION } from '../../src/control/control-store.js';
-import { FAKE_ANCHOR, newOrchestrator } from './support.js';
+import { FAKE_ANCHOR, memStore, newOrchestrator, passingVerify, type MemStore } from './support.js';
 
 const handles: ControlChannelHandle[] = [];
 const servers: net.Server[] = [];
@@ -152,6 +155,261 @@ describe('D062 startControlChannel — fail closed', () => {
       await handle.close();
     }
     expect(state.stored).toBeNull();
+  });
+});
+
+/** The pipeName of the descriptor currently in the store (must be valid). */
+function storedPipeName(store: MemStore): string {
+  const serialized = store.get();
+  expect(serialized).not.toBeNull();
+  const parsed = parseDescriptor(serialized);
+  expect(parsed).not.toBeNull();
+  if (serialized === null || parsed === null) {
+    throw new Error('no valid descriptor in store');
+  }
+  return parsed.descriptor.pipeName;
+}
+
+/** An in-memory store whose removeFile calls are counted (rotation + cleanup alike). */
+function countingStore(): { store: MemStore; removes: () => number } {
+  let data: string | null = null;
+  let removeCalls = 0;
+  const store: MemStore = {
+    deps: {
+      readFile: (): string => {
+        if (data === null) {
+          throw new Error('ENOENT');
+        }
+        return data;
+      },
+      writeFile: (_path: string, value: string): void => {
+        data = value;
+      },
+      removeFile: (): void => {
+        removeCalls += 1;
+        data = null;
+      },
+    },
+    get: (): string | null => data,
+    set: (value: string | null): void => {
+      data = value;
+    },
+  };
+  return { store, removes: (): number => removeCalls };
+}
+
+/**
+ * A createControlChannelServer stand-in whose listen() always fails, invoking
+ * `beforeFailure` first — deterministic listen-failure without pipe timing.
+ */
+function failingServerFactory(beforeFailure: () => void): typeof createControlChannelServer {
+  return ((): net.Server => {
+    const emitter = new EventEmitter();
+    const fake = {
+      once: (event: string, listener: (...args: unknown[]) => void): net.Server => {
+        emitter.once(event, listener);
+        return fake as unknown as net.Server;
+      },
+      removeListener: (event: string, listener: (...args: unknown[]) => void): net.Server => {
+        emitter.removeListener(event, listener);
+        return fake as unknown as net.Server;
+      },
+      on: (event: string, listener: (...args: unknown[]) => void): net.Server => {
+        emitter.on(event, listener);
+        return fake as unknown as net.Server;
+      },
+      listen: (): net.Server => {
+        beforeFailure();
+        emitter.emit('error', new Error('EADDRINUSE'));
+        return fake as unknown as net.Server;
+      },
+      close: (callback?: () => void): net.Server => {
+        callback?.();
+        return fake as unknown as net.Server;
+      },
+    };
+    return fake as unknown as net.Server;
+  }) as typeof createControlChannelServer;
+}
+
+describe('D062 F2 descriptor ownership — cleanup unlinks only its own descriptor', () => {
+  it('overlap: A.close() does not delete the successor descriptor; B stays discoverable and B.close() still cleans up', async () => {
+    const { orchestrator } = newOrchestrator();
+    const store = memStore();
+
+    const handleA = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      descriptorDeps: store.deps,
+    });
+    expect(handleA).not.toBeNull();
+    if (handleA === null) {
+      return;
+    }
+    handles.push(handleA);
+    expect(storedPipeName(store)).toBe(handleA.pipeName);
+
+    // B starts before A closes: rotation replaces the fixed descriptor with B's.
+    const handleB = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      descriptorDeps: store.deps,
+    });
+    expect(handleB).not.toBeNull();
+    if (handleB === null) {
+      return;
+    }
+    handles.push(handleB);
+    expect(handleB.pipeName).not.toBe(handleA.pipeName);
+    expect(storedPipeName(store)).toBe(handleB.pipeName);
+
+    // A closes late: descriptor B must survive, exactly as written.
+    await handleA.close();
+    expect(storedPipeName(store)).toBe(handleB.pipeName);
+
+    // B is still the owner: its own close removes the descriptor normally.
+    await handleB.close();
+    expect(store.get()).toBeNull();
+  });
+
+  it('missing descriptor during close() is harmless and triggers no unlink', async () => {
+    const { orchestrator } = newOrchestrator();
+    const { store, removes } = countingStore();
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      descriptorDeps: store.deps,
+    });
+    expect(handle).not.toBeNull();
+    if (handle === null) {
+      return;
+    }
+    handles.push(handle);
+    store.set(null);
+    const removesBeforeClose = removes();
+    await handle.close();
+    expect(removes()).toBe(removesBeforeClose);
+    expect(store.get()).toBeNull();
+  });
+
+  it('a malformed descriptor is never deleted by close()', async () => {
+    const { orchestrator } = newOrchestrator();
+    const { store, removes } = countingStore();
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      descriptorDeps: store.deps,
+    });
+    expect(handle).not.toBeNull();
+    if (handle === null) {
+      return;
+    }
+    handles.push(handle);
+    store.set('{not json');
+    const removesBeforeClose = removes();
+    await handle.close();
+    expect(removes()).toBe(removesBeforeClose);
+    expect(store.get()).toBe('{not json');
+  });
+
+  it('an unreadable descriptor is never deleted by close()', async () => {
+    const { orchestrator } = newOrchestrator();
+    let data: string | null = null;
+    let unreadable = false;
+    let removeCalls = 0;
+    const deps: DescriptorFileDeps = {
+      readFile: (): string => {
+        if (unreadable || data === null) {
+          throw new Error(unreadable ? 'EACCES' : 'ENOENT');
+        }
+        return data;
+      },
+      writeFile: (_path: string, value: string): void => {
+        data = value;
+      },
+      removeFile: (): void => {
+        removeCalls += 1;
+        data = null;
+      },
+    };
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      descriptorDeps: deps,
+    });
+    expect(handle).not.toBeNull();
+    if (handle === null) {
+      return;
+    }
+    handles.push(handle);
+    unreadable = true;
+    const removesBeforeClose = removeCalls;
+    await handle.close();
+    expect(removeCalls).toBe(removesBeforeClose);
+    expect(data).not.toBeNull();
+  });
+
+  it('close() does not use pid as identity: same pid, different pipeName is foreign', async () => {
+    const { orchestrator } = newOrchestrator();
+    const store = memStore();
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      pid: 4242,
+      descriptorDeps: store.deps,
+    });
+    expect(handle).not.toBeNull();
+    if (handle === null) {
+      return;
+    }
+    handles.push(handle);
+    const foreign = createRuntimeDescriptor(4242).descriptor;
+    expect(foreign.pid).toBe(4242);
+    expect(foreign.pipeName).not.toBe(handle.pipeName);
+    store.set(serializeDescriptor(foreign));
+    await handle.close();
+    expect(storedPipeName(store)).toBe(foreign.pipeName);
+  });
+
+  it('listen-failure cleanup does not delete a descriptor belonging to another runtime', async () => {
+    const { orchestrator } = newOrchestrator();
+    const { store, removes } = countingStore();
+    const foreign = createRuntimeDescriptor(999).descriptor;
+    let removesAfterWrite = 0;
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      descriptorDeps: store.deps,
+      createServer: failingServerFactory((): void => {
+        // The successor replaces the descriptor before our listen fails.
+        store.set(serializeDescriptor(foreign));
+        removesAfterWrite = removes();
+      }),
+      logger: (): void => {
+        /* silent */
+      },
+    });
+    expect(handle).toBeNull();
+    expect(removes()).toBe(removesAfterWrite);
+    expect(storedPipeName(store)).toBe(foreign.pipeName);
+  });
+
+  it('listen-failure cleanup still removes the runtime own matching descriptor', async () => {
+    const { orchestrator } = newOrchestrator();
+    const store = memStore();
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      descriptorDeps: store.deps,
+      createServer: failingServerFactory((): void => {
+        expect(store.get()).not.toBeNull();
+      }),
+      logger: (): void => {
+        /* silent */
+      },
+    });
+    expect(handle).toBeNull();
+    expect(store.get()).toBeNull();
   });
 });
 
