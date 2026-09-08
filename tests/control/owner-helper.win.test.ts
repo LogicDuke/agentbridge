@@ -150,6 +150,9 @@ describe.skipIf(!ready)('D062 control helper — real Windows binary integration
     const icacls = join(systemRoot, 'System32', 'icacls.exe');
 
     try {
+      const ownerSet = await runner(icacls, [anchor, '/setowner', `*${operator.sid}`]);
+      expect(ownerSet.ok).toBe(true);
+
       const hardened = await runner(icacls, [
         anchor,
         '/inheritance:r',
@@ -166,6 +169,7 @@ describe.skipIf(!ready)('D062 control helper — real Windows binary integration
       if (anchorSnapshot === null) {
         return;
       }
+      expect(anchorSnapshot.ownerSid).toBe(operator.sid);
       expect(store.evaluateAnchorSnapshot(operator, anchorSnapshot)).toEqual({ ok: true });
       expect(anchorSnapshot.daclProtected).toBe(true);
       expect(anchorSnapshot.aces.every((ace) => (ace.flags & 0x01) !== 0)).toBe(true);
@@ -223,6 +227,9 @@ describe.skipIf(!ready)('D062 control helper — real Windows binary integration
     let serverCreates = 0;
 
     try {
+      const ownerSet = await runner(icacls, [anchor, '/setowner', `*${operator.sid}`]);
+      expect(ownerSet.ok).toBe(true);
+
       // This anchor still passes the V2 policy: it is protected and every direct
       // ACE is file-inheritable and limited to operator/SYSTEM. The operator may
       // create/write, but deny DELETE + DELETE_CHILD makes stale unlink fail.
@@ -236,6 +243,10 @@ describe.skipIf(!ready)('D062 control helper — real Windows binary integration
         `*${operator.sid}:(OI)(CI)(D,DC)`,
       ]);
       expect(hardened.ok).toBe(true);
+      const anchorAcl = await runner(exePath, ['--acl', anchor]);
+      expect(anchorAcl.ok).toBe(true);
+      const anchorSnapshot = anchorAcl.ok ? store.parseAclSnapshot(anchorAcl.stdout) : null;
+      expect(anchorSnapshot?.ownerSid).toBe(operator.sid);
       const anchorResult = await store.verifyAnchorSnapshot(operator, anchor, runner);
       expect(anchorResult.ok).toBe(true);
 
