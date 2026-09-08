@@ -609,15 +609,44 @@ function isolatedGateTree(withSource: boolean): {
   };
 }
 
+// PR #92 P2 (Codex): vswhere.exe existing is NOT "MSVC available". The Visual
+// Studio Installer ships vswhere.exe even when the VC workload is absent (for
+// example a .NET-only Visual Studio / Build Tools install); build.mjs then
+// queries for the component below, finds no usable installation, and fails
+// loudly. The test predicate must therefore apply the SAME component
+// requirement the production builder passes to `vswhere -requires`, so the
+// unavailable-toolchain configuration SKIPS this describe instead of failing.
+const VC_TOOLS_COMPONENT = 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64';
+
 const vswherePath = join(
   process.env['ProgramFiles(x86)'] ?? 'C:\\Program Files (x86)',
   'Microsoft Visual Studio',
   'Installer',
   'vswhere.exe',
 );
-const msvcMaybe = process.platform === 'win32' && existsSync(vswherePath);
 
-describe.skipIf(!msvcMaybe)('D062 explicit provisioning — MSVC available + helper missing', () => {
+/** installationPath of the newest Visual Studio providing `component`, exactly
+ *  as build.mjs resolves it (same vswhere binary, same -requires query), or
+ *  null when vswhere or a qualifying installation is unavailable. */
+function vcInstallationPathFor(component: string): string | null {
+  if (process.platform !== 'win32' || !existsSync(vswherePath)) {
+    return null;
+  }
+  const run = spawnSync(
+    vswherePath,
+    ['-latest', '-products', '*', '-requires', component, '-property', 'installationPath'],
+    { encoding: 'utf8' },
+  );
+  if (run.status !== 0) {
+    return null;
+  }
+  const installationPath = run.stdout.trim();
+  return installationPath.length > 0 && existsSync(installationPath) ? installationPath : null;
+}
+
+const msvcAvailable = vcInstallationPathFor(VC_TOOLS_COMPONENT) !== null;
+
+describe.skipIf(!msvcAvailable)('D062 explicit provisioning — MSVC available + helper missing', () => {
   it('the gate compiles the helper and publishes a canonical pair (exit 0)', () => {
     const t = isolatedGateTree(true);
     try {
@@ -635,6 +664,48 @@ describe.skipIf(!msvcMaybe)('D062 explicit provisioning — MSVC available + hel
     }
   }, 120000);
 });
+
+// PR #92 P2 adversarial coverage: the availability predicate itself, driven
+// through the REAL vswhere binary. Both directions of the finding are proven —
+// with the required VC workload installed the MSVC describe above may run, and
+// with vswhere.exe present but the required workload absent the detection
+// yields no installation, so the describe above SKIPS instead of failing.
+describe.skipIf(process.platform !== 'win32' || !existsSync(vswherePath))(
+  'D062 explicit provisioning — MSVC availability predicate matches the builder requirement',
+  () => {
+    it('the predicate requires the exact VC workload component build.mjs queries', () => {
+      // Single shared requirement: the component id above must be the literal
+      // build.mjs passes to `vswhere -requires`, so test predicate and
+      // production builder cannot drift apart silently.
+      const builderSource = readFileSync(
+        join(repoRoot, 'tools', 'control-owner', 'build.mjs'),
+        'utf8',
+      );
+      expect(builderSource).toContain(`'${VC_TOOLS_COMPONENT}',`);
+    });
+
+    it('vswhere present but required workload absent → no installation → skip, not fail', () => {
+      // Exactly the Codex configuration: the real vswhere.exe answers the real
+      // query shape for a component that is never installed and returns no
+      // installation — the predicate is false and the MSVC describe skips.
+      expect(vcInstallationPathFor('AgentBridge.Test.Component.Never.Installed.x86.x64')).toBeNull();
+    });
+
+    it('detection outcome and MSVC-describe gating agree with the builder precondition', () => {
+      const detected = vcInstallationPathFor(VC_TOOLS_COMPONENT);
+      if (detected === null) {
+        // Workload absent on this machine: the MSVC describe must be skipped.
+        expect(msvcAvailable).toBe(false);
+      } else {
+        // Workload present: the detected root is a real installation path —
+        // the same installationPath build.mjs would resolve — and the MSVC
+        // describe is allowed to run.
+        expect(existsSync(detected)).toBe(true);
+        expect(msvcAvailable).toBe(true);
+      }
+    });
+  },
+);
 
 describe.skipIf(process.platform !== 'win32')(
   'D062 explicit provisioning — toolchain unavailable + helper missing fails loudly',
