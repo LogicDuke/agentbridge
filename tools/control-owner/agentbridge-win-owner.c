@@ -15,20 +15,25 @@
  *         agentbridge-win-owner.exe --acl <absolute-path>
  *       prints, from ONE GetNamedSecurityInfoW(OWNER | DACL) read, a bounded,
  *       deterministic, locale-independent snapshot of the OWNER SID and every
- *       DACL ACE (type, inheritance, access mask, canonical SID). No account
+ *       DACL ACE (type, exact flags, access mask, canonical SID), plus the DACL
+ *       presence and protection state. No account
  *       name lookup ever happens, so the output is identical on any locale.
  *
  * ACL-snapshot grammar (LF-terminated ASCII lines, in this exact order):
  *
- *     AGENTBRIDGE-ACL-V1
+ *     AGENTBRIDGE-ACL-V2
  *     OWNER <sid>
- *     DACL <PRESENT|NULL>
+ *     DACL <PRESENT|NULL|ABSENT> <PROTECTED|UNPROTECTED>
  *     ACES <count>
- *     ACE <ALLOW|DENY> <INHERITED|DIRECT> 0xXXXXXXXX <sid>   (x <count>, PRESENT only)
+ *     ACE <ALLOW|DENY> 0xXX 0xXXXXXXXX <sid>   (x <count>, PRESENT only)
  *
  *   - <sid> is a canonical SID string from ConvertSidToStringSidW.
- *   - a NULL DACL emits `DACL NULL` + `ACES 0` and no ACE lines (the consumer
- *     fails closed on it); an empty-but-present DACL emits `ACES 0`.
+ *   - the DACL state and SE_DACL_PROTECTED control bit come from the same
+ *     security descriptor as the owner and ACEs. NULL/ABSENT DACLs emit zero
+ *     ACEs and are rejected by the consumer.
+ *   - ACE flags are the exact two-digit ACE_HEADER AceFlags value. Only the
+ *     propagation/inheritance bit mask 0x1F is supported; any other bit
+ *     fails closed rather than being collapsed into lossy prose.
  *   - only ACCESS_ALLOWED and ACCESS_DENIED simple ACEs are representable; any
  *     other ACE type, an invalid SID, an unconvertible SID, more than
  *     ACL_MAX_ACES ACEs, or an over-long snapshot fails closed (nothing partial
@@ -240,10 +245,27 @@ static int print_acl_snapshot(const wchar_t *path) {
     return EXIT_OWNER_INVALID;
   }
 
-  /* A NULL DACL grants everyone full control; represent it explicitly so the
-   * consumer fails closed. A present DACL must be structurally valid. */
-  int dacl_present = (dacl != NULL);
-  if (dacl_present && !IsValidAcl(dacl)) {
+  SECURITY_DESCRIPTOR_CONTROL control = 0;
+  DWORD control_revision = 0;
+  BOOL sd_dacl_present = FALSE;
+  BOOL dacl_defaulted = FALSE;
+  PACL sd_dacl = NULL;
+  if (!GetSecurityDescriptorControl(sd, &control, &control_revision) ||
+      !GetSecurityDescriptorDacl(sd, &sd_dacl_present, &sd_dacl,
+                                 &dacl_defaulted)) {
+    if (sd != NULL) {
+      LocalFree(sd);
+    }
+    emit_err("ERR_ACL");
+    return EXIT_ACL_FAILED;
+  }
+  (void)control_revision;
+  (void)dacl_defaulted;
+
+  /* Preserve all three states. An absent or NULL DACL grants access broadly;
+   * the consumer rejects both. A present DACL must be structurally valid. */
+  int dacl_present = sd_dacl_present && sd_dacl != NULL;
+  if (dacl_present && (dacl != sd_dacl || !IsValidAcl(sd_dacl))) {
     if (sd != NULL) {
       LocalFree(sd);
     }
@@ -278,11 +300,16 @@ static int print_acl_snapshot(const wchar_t *path) {
   size_t len = 0;
   char header[128];
   (void)_snprintf_s(header, sizeof(header), _TRUNCATE,
-                    "AGENTBRIDGE-ACL-V1\nOWNER ");
+                    "AGENTBRIDGE-ACL-V2\nOWNER ");
   int ok = append_str(out, &len, header);
   ok = ok && append_sid(out, &len, owner);
   ok = ok && append_str(out, &len, "\nDACL ");
-  ok = ok && append_str(out, &len, dacl_present ? "PRESENT" : "NULL");
+  ok = ok && append_str(out, &len, dacl_present ? "PRESENT" :
+                        (sd_dacl_present ? "NULL" : "ABSENT"));
+  ok = ok && append_str(out, &len,
+                        (control & SE_DACL_PROTECTED) != 0
+                            ? " PROTECTED"
+                            : " UNPROTECTED");
 
   char aces_line[64];
   (void)_snprintf_s(aces_line, sizeof(aces_line), _TRUNCATE, "\nACES %lu\n",
@@ -311,12 +338,17 @@ static int print_acl_snapshot(const wchar_t *path) {
     /* ACCESS_ALLOWED_ACE and ACCESS_DENIED_ACE share Mask + SidStart layout. */
     ACCESS_ALLOWED_ACE *ace = (ACCESS_ALLOWED_ACE *)ace_ptr;
     PSID ace_sid = (PSID)&ace->SidStart;
-    int inherited = (hdr->AceFlags & INHERITED_ACE) != 0;
+    /* ALLOW/DENY ACEs support only inheritance/propagation flags. Audit,
+     * critical, or future/unknown flag bits are not safely representable. */
+    if ((hdr->AceFlags & (BYTE)~0x1F) != 0) {
+      ok = 0;
+      break;
+    }
 
     char ace_prefix[64];
     (void)_snprintf_s(ace_prefix, sizeof(ace_prefix), _TRUNCATE,
-                      "ACE %s %s 0x%08X ", type_str,
-                      inherited ? "INHERITED" : "DIRECT",
+                      "ACE %s 0x%02X 0x%08X ", type_str,
+                      (unsigned int)hdr->AceFlags,
                       (unsigned int)ace->Mask);
     ok = ok && append_str(out, &len, ace_prefix);
     ok = ok && append_sid(out, &len, ace_sid);

@@ -28,6 +28,7 @@ import {
   pipePathFromName,
   serializeDescriptor,
   type ControlAnchorVerification,
+  type DescriptorAclVerification,
   type DescriptorFileDeps,
 } from '../../src/control/control-store.js';
 import { startControlChannel, type ControlChannelHandle } from '../../src/control/control-runtime.js';
@@ -44,6 +45,10 @@ export const FAKE_ANCHOR = 'C:\\FakeAnchor';
 
 export function passingVerify(): Promise<ControlAnchorVerification> {
   return Promise.resolve({ ok: true, anchorPath: FAKE_ANCHOR });
+}
+
+export function passingDescriptorVerify(): Promise<DescriptorAclVerification> {
+  return Promise.resolve({ ok: true });
 }
 
 export interface MemStore {
@@ -64,6 +69,11 @@ export function memStore(): MemStore {
         return data;
       },
       writeFile: (_path: string, value: string): void => {
+        if (data !== null) {
+          const exists = new Error('already exists') as NodeJS.ErrnoException;
+          exists.code = 'EEXIST';
+          throw exists;
+        }
         data = value;
       },
       removeFile: (): void => {
@@ -95,6 +105,7 @@ export async function startServer(
   const handle = await startControlChannel({
     orchestrator,
     verify: passingVerify,
+    verifyDescriptor: passingDescriptorVerify,
     descriptorDeps: store.deps,
     ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
   });

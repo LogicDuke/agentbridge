@@ -1,3 +1,7 @@
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -5,6 +9,7 @@ import {
   createRuntimeDescriptor,
   enumeratePathComponents,
   evaluateAnchorSnapshot,
+  evaluateDescriptorSnapshot,
   evaluatePathSafety,
   parseAclSnapshot,
   parseDescriptor,
@@ -13,8 +18,10 @@ import {
   pipePathFromName,
   resolveControlAnchorPath,
   serializeDescriptor,
+  writeDescriptorFile,
   verifyAnchorSnapshot,
   verifyControlAnchor,
+  verifyDescriptorSnapshot,
   type AclSnapshotAce,
   type LstatProbe,
   type OperatorIdentity,
@@ -42,7 +49,7 @@ const SYSTEM_SID = 'S-1-5-18';
 
 interface AceSpec {
   readonly type?: 'ALLOW' | 'DENY';
-  readonly inherited?: boolean;
+  readonly flags?: string;
   readonly mask?: string;
   readonly sid: string;
 }
@@ -51,17 +58,18 @@ interface AceSpec {
 function snapshot(
   owner: string,
   aces: readonly AceSpec[],
-  daclPresent = true,
+  daclState: 'PRESENT' | 'NULL' | 'ABSENT' = 'PRESENT',
+  daclProtected = true,
 ): string {
   const lines = [
-    'AGENTBRIDGE-ACL-V1',
+    'AGENTBRIDGE-ACL-V2',
     `OWNER ${owner}`,
-    `DACL ${daclPresent ? 'PRESENT' : 'NULL'}`,
+    `DACL ${daclState} ${daclProtected ? 'PROTECTED' : 'UNPROTECTED'}`,
     `ACES ${String(aces.length)}`,
   ];
   for (const ace of aces) {
     lines.push(
-      `ACE ${ace.type ?? 'ALLOW'} ${ace.inherited ? 'INHERITED' : 'DIRECT'} ${
+      `ACE ${ace.type ?? 'ALLOW'} ${ace.flags ?? '0x03'} ${
         ace.mask ?? '0x001F01FF'
       } ${ace.sid}`,
     );
@@ -88,32 +96,33 @@ describe('D062 canonical ACL snapshot parsing (Amendment B)', () => {
   it('parses owner, DACL presence, and every ACE by canonical SID', () => {
     const parsed = parseAclSnapshot(
       snapshot(OPERATOR_SID, [
-        { type: 'ALLOW', inherited: false, mask: '0x001F01FF', sid: SYSTEM_SID },
-        { type: 'DENY', inherited: false, mask: '0x00000004', sid: OPERATOR_SID },
+        { type: 'ALLOW', flags: '0x03', mask: '0x001F01FF', sid: SYSTEM_SID },
+        { type: 'DENY', flags: '0x01', mask: '0x00000004', sid: OPERATOR_SID },
       ]),
     );
     expect(parsed).not.toBeNull();
     expect(parsed?.ownerSid).toBe('s-1-5-21-111-222-333-1001');
-    expect(parsed?.daclPresent).toBe(true);
+    expect(parsed?.daclState).toBe('PRESENT');
+    expect(parsed?.daclProtected).toBe(true);
     expect(parsed?.aces).toEqual<readonly AclSnapshotAce[]>([
-      { type: 'ALLOW', inherited: false, mask: 0x001f01ff, sid: 's-1-5-18' },
-      { type: 'DENY', inherited: false, mask: 0x00000004, sid: 's-1-5-21-111-222-333-1001' },
+      { type: 'ALLOW', flags: 0x03, mask: 0x001f01ff, sid: 's-1-5-18' },
+      { type: 'DENY', flags: 0x01, mask: 0x00000004, sid: 's-1-5-21-111-222-333-1001' },
     ]);
   });
 
-  it('preserves the inherited flag independently of the allow/deny type', () => {
+  it('preserves exact supported ACE flags independently of the allow/deny type', () => {
     const parsed = parseAclSnapshot(
-      snapshot(OPERATOR_SID, [{ inherited: true, sid: OPERATOR_SID }]),
+      snapshot(OPERATOR_SID, [{ flags: '0x13', sid: OPERATOR_SID }]),
     );
-    expect(parsed?.aces[0]?.inherited).toBe(true);
-    const direct = parseAclSnapshot(snapshot(OPERATOR_SID, [{ inherited: false, sid: OPERATOR_SID }]));
-    expect(direct?.aces[0]?.inherited).toBe(false);
+    expect(parsed?.aces[0]?.flags).toBe(0x13);
+    const direct = parseAclSnapshot(snapshot(OPERATOR_SID, [{ flags: '0x03', sid: OPERATOR_SID }]));
+    expect(direct?.aces[0]?.flags).toBe(0x03);
   });
 
-  it('represents a NULL DACL as daclPresent=false with zero ACEs', () => {
-    const parsed = parseAclSnapshot(snapshot(OPERATOR_SID, [], false));
+  it('represents a NULL DACL distinctly with zero ACEs', () => {
+    const parsed = parseAclSnapshot(snapshot(OPERATOR_SID, [], 'NULL'));
     expect(parsed).not.toBeNull();
-    expect(parsed?.daclPresent).toBe(false);
+    expect(parsed?.daclState).toBe('NULL');
     expect(parsed?.aces).toEqual([]);
   });
 
@@ -121,47 +130,56 @@ describe('D062 canonical ACL snapshot parsing (Amendment B)', () => {
     expect(parseAclSnapshot('')).toBeNull();
     expect(parseAclSnapshot('not a snapshot\n')).toBeNull();
     // Wrong magic.
-    expect(parseAclSnapshot('AGENTBRIDGE-ACL-V0\nOWNER S-1-5-18\nDACL PRESENT\nACES 0\n')).toBeNull();
+    expect(parseAclSnapshot('AGENTBRIDGE-ACL-V1\nOWNER S-1-5-18\nDACL PRESENT PROTECTED\nACES 0\n')).toBeNull();
     // Non-canonical owner (a display name can never enter authorization).
     expect(
-      parseAclSnapshot('AGENTBRIDGE-ACL-V1\nOWNER desktop-x\\dell\nDACL PRESENT\nACES 0\n'),
+      parseAclSnapshot('AGENTBRIDGE-ACL-V2\nOWNER desktop-x\\dell\nDACL PRESENT PROTECTED\nACES 0\n'),
     ).toBeNull();
     // ACE count mismatch (claims 2, supplies 1).
     expect(
       parseAclSnapshot(
-        `AGENTBRIDGE-ACL-V1\nOWNER ${OPERATOR_SID}\nDACL PRESENT\nACES 2\nACE ALLOW DIRECT 0x00000001 ${SYSTEM_SID}\n`,
+        `AGENTBRIDGE-ACL-V2\nOWNER ${OPERATOR_SID}\nDACL PRESENT PROTECTED\nACES 2\nACE ALLOW 0x03 0x00000001 ${SYSTEM_SID}\n`,
       ),
     ).toBeNull();
     // Unknown ACE type token (audit/alarm/object/callback → unrepresentable).
     expect(
       parseAclSnapshot(
-        `AGENTBRIDGE-ACL-V1\nOWNER ${OPERATOR_SID}\nDACL PRESENT\nACES 1\nACE AUDIT DIRECT 0x00000001 ${SYSTEM_SID}\n`,
+        `AGENTBRIDGE-ACL-V2\nOWNER ${OPERATOR_SID}\nDACL PRESENT PROTECTED\nACES 1\nACE AUDIT 0x03 0x00000001 ${SYSTEM_SID}\n`,
       ),
     ).toBeNull();
     // Non-canonical ACE SID.
     expect(
       parseAclSnapshot(
-        `AGENTBRIDGE-ACL-V1\nOWNER ${OPERATOR_SID}\nDACL PRESENT\nACES 1\nACE ALLOW DIRECT 0x00000001 BUILTIN\\Administrators\n`,
+        `AGENTBRIDGE-ACL-V2\nOWNER ${OPERATOR_SID}\nDACL PRESENT PROTECTED\nACES 1\nACE ALLOW 0x03 0x00000001 BUILTIN\\Administrators\n`,
       ),
     ).toBeNull();
     // Malformed mask (not 0x + 8 hex).
     expect(
       parseAclSnapshot(
-        `AGENTBRIDGE-ACL-V1\nOWNER ${OPERATOR_SID}\nDACL PRESENT\nACES 1\nACE ALLOW DIRECT 1F01FF ${SYSTEM_SID}\n`,
+        `AGENTBRIDGE-ACL-V2\nOWNER ${OPERATOR_SID}\nDACL PRESENT PROTECTED\nACES 1\nACE ALLOW 0x03 1F01FF ${SYSTEM_SID}\n`,
       ),
     ).toBeNull();
     // NULL DACL that nonetheless carries an ACE.
     expect(
       parseAclSnapshot(
-        `AGENTBRIDGE-ACL-V1\nOWNER ${OPERATOR_SID}\nDACL NULL\nACES 1\nACE ALLOW DIRECT 0x00000001 ${SYSTEM_SID}\n`,
+        `AGENTBRIDGE-ACL-V2\nOWNER ${OPERATOR_SID}\nDACL NULL PROTECTED\nACES 1\nACE ALLOW 0x03 0x00000001 ${SYSTEM_SID}\n`,
       ),
     ).toBeNull();
     // Trailing garbage after the final newline.
     expect(parseAclSnapshot(GOOD_SNAPSHOT + 'extra')).toBeNull();
+    // Unknown DACL-control state and unknown ACE flag bits.
+    expect(
+      parseAclSnapshot(
+        GOOD_SNAPSHOT.replace('DACL PRESENT PROTECTED', 'DACL PRESENT MAYBE_PROTECTED'),
+      ),
+    ).toBeNull();
+    expect(parseAclSnapshot(GOOD_SNAPSHOT.replace('DACL PRESENT PROTECTED', 'DACL PRESENT'))).toBeNull();
+    expect(parseAclSnapshot(GOOD_SNAPSHOT.replace('ACE ALLOW 0x03', 'ACE ALLOW 0x23'))).toBeNull();
+    expect(parseAclSnapshot(GOOD_SNAPSHOT.replace('ACE ALLOW 0x03', 'ACE ALLOW 0xGG'))).toBeNull();
     // Extra token on an ACE line.
     expect(
       parseAclSnapshot(
-        `AGENTBRIDGE-ACL-V1\nOWNER ${OPERATOR_SID}\nDACL PRESENT\nACES 1\nACE ALLOW DIRECT 0x00000001 ${SYSTEM_SID} extra\n`,
+        `AGENTBRIDGE-ACL-V2\nOWNER ${OPERATOR_SID}\nDACL PRESENT PROTECTED\nACES 1\nACE ALLOW 0x03 0x00000001 ${SYSTEM_SID} extra\n`,
       ),
     ).toBeNull();
   });
@@ -209,7 +227,7 @@ describe('D062 anchor snapshot evaluation — exactly operator + SYSTEM by SID',
   });
 
   it('rejects a NULL DACL', () => {
-    const result = evaluate(snapshot(OPERATOR_SID, [], false));
+    const result = evaluate(snapshot(OPERATOR_SID, [], 'NULL'));
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.reason).toBe(CONTROL_ANCHOR_REJECTION.DACL_ABSENT);
@@ -224,9 +242,27 @@ describe('D062 anchor snapshot evaluation — exactly operator + SYSTEM by SID',
     }
   });
 
+  it('rejects an unprotected DACL', () => {
+    const result = evaluate(snapshot(OPERATOR_SID, [{ sid: OPERATOR_SID }, { sid: SYSTEM_SID }], 'PRESENT', false));
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe(CONTROL_ANCHOR_REJECTION.DACL_UNPROTECTED);
+    }
+  });
+
+  it('rejects a direct ACE without file inheritance', () => {
+    const result = evaluate(
+      snapshot(OPERATOR_SID, [{ flags: '0x00', sid: OPERATOR_SID }, { sid: SYSTEM_SID }]),
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe(CONTROL_ANCHOR_REJECTION.FILE_INHERITANCE_ABSENT);
+    }
+  });
+
   it('rejects an inherited ACE', () => {
     const result = evaluate(
-      snapshot(OPERATOR_SID, [{ inherited: true, sid: OPERATOR_SID }, { sid: SYSTEM_SID }]),
+      snapshot(OPERATOR_SID, [{ flags: '0x13', sid: OPERATOR_SID }, { sid: SYSTEM_SID }]),
     );
     expect(result.ok).toBe(false);
     if (!result.ok) {
@@ -256,7 +292,7 @@ describe('D062 anchor snapshot evaluation — exactly operator + SYSTEM by SID',
     // SYSTEM is authorized solely by S-1-5-18, never by "NT AUTHORITY\\SYSTEM";
     // the snapshot never carries a name, so localization cannot affect the result.
     const localized = parseAclSnapshot(
-      `AGENTBRIDGE-ACL-V1\nOWNER ${OPERATOR_SID}\nDACL PRESENT\nACES 2\nACE ALLOW DIRECT 0x001F01FF NT AUTHORITY\\SYSTEM\nACE ALLOW DIRECT 0x001F01FF ${OPERATOR_SID}\n`,
+      `AGENTBRIDGE-ACL-V2\nOWNER ${OPERATOR_SID}\nDACL PRESENT PROTECTED\nACES 2\nACE ALLOW 0x03 0x001F01FF NT AUTHORITY\\SYSTEM\nACE ALLOW 0x03 0x001F01FF ${OPERATOR_SID}\n`,
     );
     expect(localized).toBeNull(); // a name is not a canonical SID → unparseable
   });
@@ -360,6 +396,75 @@ describe('D062 descriptor lifecycle', () => {
       'AgentBridge',
     );
     expect(resolveControlAnchorPath({})).toBeNull();
+  });
+});
+
+describe('D062 descriptor ACL evaluation', () => {
+  const operator: OperatorIdentity = { name: 'desktop-x\\dell', sid: OPERATOR_SID.toLowerCase() };
+
+  it('accepts the actual file result with exactly operator + SYSTEM', () => {
+    const parsed = parseAclSnapshot(
+      snapshot(OPERATOR_SID, [
+        { flags: '0x10', sid: OPERATOR_SID },
+        { flags: '0x10', sid: SYSTEM_SID },
+      ], 'PRESENT', false),
+    );
+    expect(parsed).not.toBeNull();
+    if (parsed !== null) {
+      expect(evaluateDescriptorSnapshot(operator, parsed)).toEqual({ ok: true });
+    }
+  });
+
+  it('rejects a resulting file ACL that exposes the token to Everyone', () => {
+    const parsed = parseAclSnapshot(
+      snapshot(OPERATOR_SID, [
+        { flags: '0x10', sid: OPERATOR_SID },
+        { flags: '0x10', sid: SYSTEM_SID },
+        { flags: '0x10', mask: '0x00120089', sid: 'S-1-1-0' },
+      ], 'PRESENT', false),
+    );
+    expect(parsed).not.toBeNull();
+    if (parsed !== null) {
+      expect(evaluateDescriptorSnapshot(operator, parsed)).toEqual({
+        ok: false,
+        reason: CONTROL_ANCHOR_REJECTION.FOREIGN_PRINCIPAL,
+      });
+    }
+  });
+
+  it('uses the provenanced native snapshot query for the actual descriptor path', async () => {
+    const ownerDeps: OwnerVerifierDeps = {
+      loadProvenance: (): Promise<{ filename: string; sha256: string }> =>
+        Promise.resolve({ filename: 'owner-helper', sha256: 'a'.repeat(64) }),
+      resolveHelperPath: (): string => 'C:\\Program\\owner-helper',
+      readHelperBytes: (): Buffer => Buffer.from('helper-bytes'),
+      hashBytes: (): string => 'a'.repeat(64),
+    };
+    let queriedPath: string | null = null;
+    const runner: ProcessRunner = (_exe, args): Promise<ProcessResult> => {
+      expect(args[0]).toBe('--acl');
+      queriedPath = args[1] ?? null;
+      return Promise.resolve({ ok: true, stdout: GOOD_SNAPSHOT });
+    };
+    const descriptorPath = 'C:\\Anchor\\runtime-descriptor.json';
+    const result = await verifyDescriptorSnapshot(operator, descriptorPath, runner, ownerDeps);
+    expect(result).toEqual({ ok: true });
+    expect(queriedPath).toBe(descriptorPath);
+  });
+
+  it('uses exclusive creation and cannot overwrite an unexpected existing pathname', () => {
+    const anchor = mkdtempSync(join(tmpdir(), 'abctl-exclusive-'));
+    const path = join(anchor, 'runtime-descriptor.json');
+    const existing = 'stale descriptor bytes';
+    writeFileSync(path, existing, 'utf8');
+    try {
+      expect(() => {
+        writeDescriptorFile(anchor, createRuntimeDescriptor(1).descriptor);
+      }).toThrow();
+      expect(readFileSync(path, 'utf8')).toBe(existing);
+    } finally {
+      rmSync(anchor, { recursive: true, force: true });
+    }
   });
 });
 
@@ -550,7 +655,7 @@ describe('D062 owner+DACL snapshot gate — verifyAnchorSnapshot (Amendment B)',
     const result = await verifyAnchorSnapshot(
       OPERATOR,
       ANCHOR_PATH,
-      snapshotRunner(snapshot(OPERATOR_SID, [], false)),
+      snapshotRunner(snapshot(OPERATOR_SID, [], 'NULL')),
       ownerDeps(),
     );
     expect(result.ok).toBe(false);
@@ -563,7 +668,7 @@ describe('D062 owner+DACL snapshot gate — verifyAnchorSnapshot (Amendment B)',
     const result = await verifyAnchorSnapshot(
       OPERATOR,
       ANCHOR_PATH,
-      snapshotRunner(snapshot(OPERATOR_SID, [{ inherited: true, sid: OPERATOR_SID }, { sid: SYSTEM_SID }])),
+      snapshotRunner(snapshot(OPERATOR_SID, [{ flags: '0x13', sid: OPERATOR_SID }, { sid: SYSTEM_SID }])),
       ownerDeps(),
     );
     expect(result.ok).toBe(false);

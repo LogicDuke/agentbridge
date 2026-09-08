@@ -5,11 +5,11 @@
  * invoked **after** the read-only Cockpit host is available (§17). It:
  *
  *   1. verifies the hardened control anchor (read-only, fail closed);
- *   2. mints a fresh per-process descriptor + rotating 256-bit token;
- *   3. rotates any stale crash descriptor, then writes the new one — only after
- *      verification succeeds;
- *   4. builds the one narrow dispatcher over the orchestrator writer;
- *   5. listens on the unpredictable per-process pipe; a same-name collision or
+ *   2. removes any stale descriptor, failing closed if it cannot be removed;
+ *   3. mints a fresh token and exclusively creates its descriptor;
+ *   4. verifies the created file's actual ACL through the native snapshot path;
+ *   5. builds the one narrow dispatcher over the orchestrator writer;
+ *   6. listens on the unpredictable per-process pipe; a same-name collision or
  *      any listen error fails the channel **closed**.
  *
  * A failure at any step disables the control channel and returns `null`; it never
@@ -23,12 +23,16 @@ import { createControlChannelServer } from './control-channel.js';
 import { createControlDispatcher } from './control-dispatch.js';
 import {
   createRuntimeDescriptor,
+  descriptorPathFor,
   pipePathFromName,
   readDescriptorFile,
   removeDescriptorFile,
+  removeStaleDescriptorFile,
   verifyControlAnchor,
+  verifyDescriptorAcl,
   writeDescriptorFile,
   type ControlAnchorVerification,
+  type DescriptorAclVerification,
   type DescriptorFileDeps,
   type VerifyControlAnchorDeps,
 } from './control-store.js';
@@ -68,6 +72,10 @@ export interface StartControlChannelDeps {
   readonly timeoutMs?: number;
   /** Injection seams (tests); production defaults verify and use the real fs/pipe. */
   readonly verify?: (deps: VerifyControlAnchorDeps) => Promise<ControlAnchorVerification>;
+  readonly verifyDescriptor?: (
+    descriptorPath: string,
+    deps: VerifyControlAnchorDeps,
+  ) => Promise<DescriptorAclVerification>;
   readonly descriptorDeps?: DescriptorFileDeps;
   readonly createServer?: typeof createControlChannelServer;
   readonly logger?: (message: string) => void;
@@ -84,6 +92,7 @@ export async function startControlChannel(
   const env = deps.env ?? process.env;
   const pid = deps.pid ?? process.pid;
   const verify = deps.verify ?? verifyControlAnchor;
+  const verifyDescriptor = deps.verifyDescriptor ?? verifyDescriptorAcl;
   const createServer = deps.createServer ?? createControlChannelServer;
   const log = deps.logger ?? ((message: string): void => {
     console.error(message);
@@ -96,14 +105,31 @@ export async function startControlChannel(
   }
   const anchorPath = verification.anchorPath;
 
-  // Rotate: replace any stale crash descriptor before serving.
-  removeDescriptorFile(anchorPath, deps.descriptorDeps);
+  // A stale pathname must be gone before minting or writing a new token. Only
+  // ENOENT is harmless; access denied/locking and every other failure stop here.
+  if (!removeStaleDescriptorFile(anchorPath, deps.descriptorDeps)) {
+    log('AgentBridge control channel: disabled (stale descriptor removal failed).');
+    return null;
+  }
 
   const { descriptor, token } = createRuntimeDescriptor(pid);
   try {
     writeDescriptorFile(anchorPath, descriptor, deps.descriptorDeps);
   } catch {
-    log('AgentBridge control channel: disabled (descriptor write failed).');
+    log('AgentBridge control channel: disabled (exclusive descriptor creation failed).');
+    return null;
+  }
+  let descriptorAcl: DescriptorAclVerification;
+  try {
+    descriptorAcl = await verifyDescriptor(descriptorPathFor(anchorPath), { env });
+  } catch {
+    removeDescriptorFile(anchorPath, deps.descriptorDeps);
+    log('AgentBridge control channel: disabled (descriptor ACL verification failed).');
+    return null;
+  }
+  if (!descriptorAcl.ok) {
+    removeDescriptorFile(anchorPath, deps.descriptorDeps);
+    log(`AgentBridge control channel: disabled (descriptor ACL not verified: ${descriptorAcl.reason}).`);
     return null;
   }
 

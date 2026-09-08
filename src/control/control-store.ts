@@ -19,9 +19,10 @@
  *     - the anchor **OWNER SID** must equal the exact runtime operator SID. SYSTEM
  *       is an allowed DACL principal but **never** an allowed owner, because an
  *       owner can rewrite the DACL;
- *     - the DACL principals must be **exactly** the runtime operator plus SYSTEM,
- *       by canonical SID — an inherited ACE, a NULL DACL, any foreign SID, or an
- *       unhandled ACE type fails closed, and the operator SID must be present.
+ *     - the DACL must be present/non-NULL and protected, and its principals must
+ *       be **exactly** the runtime operator plus SYSTEM by canonical SID; every
+ *       ACE must be direct and file-inheritable so the token descriptor receives
+ *       the same restricted principal set. Any unsupported state fails closed.
  *   A display name can never satisfy any comparison (Amendment B removed the
  *   earlier localized-`icacls` DACL read entirely: it failed closed on non-English
  *   Windows because `icacls` reports localized account names and never exposes
@@ -41,8 +42,9 @@
  * only, rotated every start, and represented base64url **only** inside the
  * hardened descriptor file. It is never an environment variable, argv, Scheduled
  * Task field, log line, error message, and is never sent raw over the pipe (it is
- * an HMAC key). A stale crash descriptor is safely replaced before serving; an
- * orderly shutdown removes it best-effort.
+ * an HMAC key). A stale crash descriptor must be removed before an exclusively
+ * created replacement is written; the replacement's actual ACL is then verified
+ * before serving. An orderly shutdown removes it best-effort.
  */
 
 import { execFile } from 'node:child_process';
@@ -202,7 +204,8 @@ export type AceType = 'ALLOW' | 'DENY';
 /** One DACL ACE from the native snapshot, addressed by canonical SID. */
 export interface AclSnapshotAce {
   readonly type: AceType;
-  readonly inherited: boolean;
+  /** Exact supported ACE_HEADER AceFlags propagation/inheritance bitset. */
+  readonly flags: number;
   /** The ACCESS_MASK as an unsigned 32-bit value. */
   readonly mask: number;
   /** The principal's canonical SID (normalized lowercase). */
@@ -212,8 +215,9 @@ export interface AclSnapshotAce {
 /** A canonical OWNER + DACL snapshot as parsed from the native `--acl` helper. */
 export interface AclSnapshot {
   readonly ownerSid: string;
-  /** `false` iff the object has a NULL DACL (grants everyone — fail closed). */
-  readonly daclPresent: boolean;
+  readonly daclState: 'PRESENT' | 'NULL' | 'ABSENT';
+  /** True only when SE_DACL_PROTECTED was set in the snapshotted descriptor. */
+  readonly daclProtected: boolean;
   readonly aces: readonly AclSnapshotAce[];
 }
 
@@ -240,13 +244,16 @@ export const CONTROL_ANCHOR_REJECTION = Object.freeze({
   // Owner policy: the anchor OWNER must be the exact runtime operator SID.
   OWNER_IS_SYSTEM: 'OWNER_IS_SYSTEM',
   OWNER_MISMATCH: 'OWNER_MISMATCH',
-  // DACL policy: exactly operator + SYSTEM by SID, none inherited, present, and
-  // the operator SID present.
+  // DACL policy: exactly operator + SYSTEM by SID, protected, none inherited,
+  // file-inheritable, present/non-NULL, and the operator SID present.
   DACL_ABSENT: 'DACL_ABSENT',
+  DACL_UNPROTECTED: 'DACL_UNPROTECTED',
   NO_ENTRIES: 'NO_ENTRIES',
   INHERITED_PRINCIPAL: 'INHERITED_PRINCIPAL',
+  FILE_INHERITANCE_ABSENT: 'FILE_INHERITANCE_ABSENT',
   FOREIGN_PRINCIPAL: 'FOREIGN_PRINCIPAL',
   RUNTIME_PRINCIPAL_ABSENT: 'RUNTIME_PRINCIPAL_ABSENT',
+  SYSTEM_PRINCIPAL_ABSENT: 'SYSTEM_PRINCIPAL_ABSENT',
 } as const);
 
 export type ControlAnchorRejection =
@@ -290,11 +297,11 @@ export function parseWhoamiUser(stdout: string): OperatorIdentity | null {
  * The native helper's `--acl <path>` mode emits a bounded, deterministic,
  * locale-independent snapshot (see tools/control-owner/agentbridge-win-owner.c):
  *
- *     AGENTBRIDGE-ACL-V1\n
+ *     AGENTBRIDGE-ACL-V2\n
  *     OWNER <sid>\n
- *     DACL <PRESENT|NULL>\n
+ *     DACL <PRESENT|NULL|ABSENT> <PROTECTED|UNPROTECTED>\n
  *     ACES <count>\n
- *     ACE <ALLOW|DENY> <INHERITED|DIRECT> 0xXXXXXXXX <sid>\n   (x count, PRESENT)
+ *     ACE <ALLOW|DENY> 0xXX 0xXXXXXXXX <sid>\n   (x count, PRESENT)
  *
  * Every SID is canonical (ConvertSidToStringSidW); no account name ever appears.
  * The parser below is total and bounded: any deviation — wrong magic, a
@@ -302,25 +309,33 @@ export function parseWhoamiUser(stdout: string): OperatorIdentity | null {
  * ACEs, trailing bytes, or over-length input — yields `null` (fail closed).
  */
 
-const SNAPSHOT_MAGIC = 'AGENTBRIDGE-ACL-V1';
+const SNAPSHOT_MAGIC = 'AGENTBRIDGE-ACL-V2';
 /** Hard cap on a snapshot we are willing to parse (the runner also caps output). */
 const MAX_SNAPSHOT_BYTES = 128 * 1024;
 /** Hard cap on ACE lines, matching the helper's own ACL_MAX_ACES. */
 const MAX_SNAPSHOT_ACES = 256;
 /** An 8-hex-digit access mask with the exact `0x` prefix the helper emits. */
 const ACE_MASK_PATTERN = /^0x[0-9A-Fa-f]{8}$/;
+const ACE_FLAGS_PATTERN = /^0x[0-9A-Fa-f]{2}$/;
+const SUPPORTED_ACE_FLAGS = 0x1f;
+const OBJECT_INHERIT_ACE = 0x01;
+const INHERITED_ACE = 0x10;
 
-/** Parse one `ACE <type> <inh> <mask> <sid>` line, or `null` (fail closed). */
+/** Parse one `ACE <type> <flags> <mask> <sid>` line, or `null` (fail closed). */
 function parseAceLine(line: string): AclSnapshotAce | null {
   const parts = line.split(' ');
   if (parts.length !== 5 || parts[0] !== 'ACE') {
     return null;
   }
-  const [, typeToken, inhToken, maskToken, sidToken] = parts;
+  const [, typeToken, flagsToken, maskToken, sidToken] = parts;
   if (typeToken !== 'ALLOW' && typeToken !== 'DENY') {
     return null;
   }
-  if (inhToken !== 'INHERITED' && inhToken !== 'DIRECT') {
+  if (flagsToken === undefined || !ACE_FLAGS_PATTERN.test(flagsToken)) {
+    return null;
+  }
+  const flags = Number.parseInt(flagsToken, 16);
+  if (!Number.isInteger(flags) || (flags & ~SUPPORTED_ACE_FLAGS) !== 0) {
     return null;
   }
   if (maskToken === undefined || !ACE_MASK_PATTERN.test(maskToken)) {
@@ -335,7 +350,7 @@ function parseAceLine(line: string): AclSnapshotAce | null {
   }
   return {
     type: typeToken,
-    inherited: inhToken === 'INHERITED',
+    flags,
     mask,
     sid: normalizePrincipal(sidToken),
   };
@@ -375,15 +390,12 @@ export function parseAclSnapshot(stdout: string): AclSnapshot | null {
   }
   const ownerSid = normalizePrincipal(ownerSidRaw);
 
-  const daclLine = lines[2];
-  let daclPresent: boolean;
-  if (daclLine === 'DACL PRESENT') {
-    daclPresent = true;
-  } else if (daclLine === 'DACL NULL') {
-    daclPresent = false;
-  } else {
+  const daclMatch = /^DACL (PRESENT|NULL|ABSENT) (PROTECTED|UNPROTECTED)$/.exec(lines[2] ?? '');
+  if (daclMatch === null) {
     return null;
   }
+  const daclState = daclMatch[1] as AclSnapshot['daclState'];
+  const daclProtected = daclMatch[2] === 'PROTECTED';
 
   const acesLine = lines[3] ?? '';
   if (!acesLine.startsWith('ACES ')) {
@@ -403,7 +415,7 @@ export function parseAclSnapshot(stdout: string): AclSnapshot | null {
     return null;
   }
   // A NULL DACL must carry no ACEs; a present DACL may be empty.
-  if (!daclPresent && count !== 0) {
+  if (daclState !== 'PRESENT' && count !== 0) {
     return null;
   }
 
@@ -420,7 +432,7 @@ export function parseAclSnapshot(stdout: string): AclSnapshot | null {
     aces.push(ace);
   }
 
-  return { ownerSid, daclPresent, aces };
+  return { ownerSid, daclState, daclProtected, aces };
 }
 
 /**
@@ -429,9 +441,10 @@ export function parseAclSnapshot(stdout: string): AclSnapshot | null {
  * Owner: the OWNER SID must equal the exact runtime operator SID; SYSTEM (which
  * may own then rewrite the DACL) and any foreign owner are rejected.
  *
- * DACL: it must be present and non-empty, no ACE may be inherited, every ACE
- * principal must be the operator or SYSTEM by canonical SID, and the operator
- * SID must be present. Deliberately unchanged from the pre-Amendment-B invariant,
+ * DACL: it must be present, non-empty, and protected; no ACE may be inherited,
+ * every ACE must propagate to files, every principal must be the operator or
+ * SYSTEM by canonical SID, and the operator SID must be present. Deliberately
+ * unchanged from the pre-Amendment-B invariant,
  * the allow/deny type and access mask are carried in the snapshot but do NOT gate
  * authorization — an operator ACE counts as present regardless of allow/deny,
  * exactly as the previous icacls-name check did. Token possession (mutual HMAC)
@@ -447,8 +460,11 @@ export function evaluateAnchorSnapshot(
   if (snapshot.ownerSid !== operator.sid) {
     return { ok: false, reason: CONTROL_ANCHOR_REJECTION.OWNER_MISMATCH };
   }
-  if (!snapshot.daclPresent) {
+  if (snapshot.daclState !== 'PRESENT') {
     return { ok: false, reason: CONTROL_ANCHOR_REJECTION.DACL_ABSENT };
+  }
+  if (!snapshot.daclProtected) {
+    return { ok: false, reason: CONTROL_ANCHOR_REJECTION.DACL_UNPROTECTED };
   }
   if (snapshot.aces.length === 0) {
     return { ok: false, reason: CONTROL_ANCHOR_REJECTION.NO_ENTRIES };
@@ -459,7 +475,7 @@ export function evaluateAnchorSnapshot(
     if (ace === undefined) {
       return { ok: false, reason: CONTROL_ANCHOR_REJECTION.SNAPSHOT_MALFORMED };
     }
-    if (ace.inherited) {
+    if ((ace.flags & INHERITED_ACE) !== 0) {
       return { ok: false, reason: CONTROL_ANCHOR_REJECTION.INHERITED_PRINCIPAL };
     }
     const isOperator = ace.sid === operator.sid;
@@ -467,12 +483,56 @@ export function evaluateAnchorSnapshot(
     if (!isOperator && !isSystem) {
       return { ok: false, reason: CONTROL_ANCHOR_REJECTION.FOREIGN_PRINCIPAL };
     }
+    if ((ace.flags & OBJECT_INHERIT_ACE) === 0) {
+      return { ok: false, reason: CONTROL_ANCHOR_REJECTION.FILE_INHERITANCE_ABSENT };
+    }
     if (isOperator) {
       operatorPresent = true;
     }
   }
   if (!operatorPresent) {
     return { ok: false, reason: CONTROL_ANCHOR_REJECTION.RUNTIME_PRINCIPAL_ABSENT };
+  }
+  return { ok: true };
+}
+
+/**
+ * Evaluate the resulting descriptor file ACL. File ACEs may be inherited and
+ * need not themselves carry propagation flags, but the owner must be the
+ * operator and the complete principal set must be exactly operator + SYSTEM.
+ */
+export function evaluateDescriptorSnapshot(
+  operator: OperatorIdentity,
+  snapshot: AclSnapshot,
+): { readonly ok: true } | { readonly ok: false; readonly reason: ControlAnchorRejection } {
+  if (snapshot.ownerSid === SYSTEM_SID) {
+    return { ok: false, reason: CONTROL_ANCHOR_REJECTION.OWNER_IS_SYSTEM };
+  }
+  if (snapshot.ownerSid !== operator.sid) {
+    return { ok: false, reason: CONTROL_ANCHOR_REJECTION.OWNER_MISMATCH };
+  }
+  if (snapshot.daclState !== 'PRESENT') {
+    return { ok: false, reason: CONTROL_ANCHOR_REJECTION.DACL_ABSENT };
+  }
+  if (snapshot.aces.length === 0) {
+    return { ok: false, reason: CONTROL_ANCHOR_REJECTION.NO_ENTRIES };
+  }
+  let operatorPresent = false;
+  let systemPresent = false;
+  for (const ace of snapshot.aces) {
+    if (ace.sid === operator.sid) {
+      operatorPresent = true;
+    } else if (ace.sid === SYSTEM_SID) {
+      systemPresent = true;
+    } else {
+      return { ok: false, reason: CONTROL_ANCHOR_REJECTION.FOREIGN_PRINCIPAL };
+    }
+  }
+  if (!operatorPresent) {
+    return { ok: false, reason: CONTROL_ANCHOR_REJECTION.RUNTIME_PRINCIPAL_ABSENT };
+  }
+  if (!systemPresent) {
+    return { ok: false, reason: CONTROL_ANCHOR_REJECTION.SYSTEM_PRINCIPAL_ABSENT };
   }
   return { ok: true };
 }
@@ -596,8 +656,8 @@ function whoamiPath(systemRoot: string): string {
  * not prove who owns or may access the anchor. Decision 062 Amendment B closes
  * that gap with ONE snapshot: the anchor OWNER SID must equal the exact runtime
  * operator SID (SYSTEM is an allowed DACL principal but never an allowed owner,
- * because an owner can rewrite the DACL), and the DACL principals must be exactly
- * operator + SYSTEM by canonical SID.
+ * because an owner can rewrite the DACL), and the protected, file-inheritable
+ * DACL principals must be exactly operator + SYSTEM by canonical SID.
  *
  * The snapshot is read by a single, minimal, source-in-repo native helper built
  * from reviewed C by the trusted Windows build (`tools/control-owner/`). Its
@@ -626,6 +686,10 @@ export interface OwnerVerifierDeps {
 
 export type AnchorSnapshotVerification =
   | { readonly ok: true; readonly ownerSid: string }
+  | { readonly ok: false; readonly reason: ControlAnchorRejection };
+
+export type DescriptorAclVerification =
+  | { readonly ok: true }
   | { readonly ok: false; readonly reason: ControlAnchorRejection };
 
 /** A lowercase 64-hex SHA-256 digest. */
@@ -710,9 +774,9 @@ export function parseOwnerHelperSid(stdout: string): string | null {
  * provenance, then run read-only via the supplied bounded runner with exactly the
  * `--acl <anchor-path>` arguments. Its output is parsed totally (canonical SIDs
  * only) and evaluated: the OWNER must be the exact operator SID (SYSTEM and any
- * foreign owner rejected), and the DACL must be exactly operator + SYSTEM by SID,
- * present, non-inherited, with the operator present. A display name can never
- * satisfy any comparison.
+ * foreign owner rejected), and the DACL must be protected, present/non-NULL,
+ * exactly operator + SYSTEM by SID, direct and file-inheritable, with the operator
+ * present. A display name can never satisfy any comparison.
  */
 export async function verifyAnchorSnapshot(
   operator: OperatorIdentity,
@@ -755,6 +819,62 @@ export async function verifyAnchorSnapshot(
     return { ok: false, reason: evaluation.reason };
   }
   return { ok: true, ownerSid: snapshot.ownerSid };
+}
+
+/** Verify one created descriptor through the same provenanced ACL snapshot path. */
+export async function verifyDescriptorSnapshot(
+  operator: OperatorIdentity,
+  descriptorPath: string,
+  runProcess: ProcessRunner,
+  deps: OwnerVerifierDeps = {},
+): Promise<DescriptorAclVerification> {
+  const provenance = await (deps.loadProvenance ?? defaultLoadProvenance)();
+  if (
+    provenance === null ||
+    !HELPER_SHA256_PATTERN.test(provenance.sha256) ||
+    !HELPER_FILENAME_PATTERN.test(provenance.filename)
+  ) {
+    return { ok: false, reason: CONTROL_ANCHOR_REJECTION.HELPER_PROVENANCE_MISSING };
+  }
+
+  const helperPath = (deps.resolveHelperPath ?? defaultResolveHelperPath)(provenance.filename);
+  const bytes = (deps.readHelperBytes ?? defaultReadHelperBytes)(helperPath);
+  if (bytes === null) {
+    return { ok: false, reason: CONTROL_ANCHOR_REJECTION.HELPER_MISSING };
+  }
+  const actualHash = (deps.hashBytes ?? sha256Hex)(bytes);
+  if (!digestsEqual(actualHash, provenance.sha256)) {
+    return { ok: false, reason: CONTROL_ANCHOR_REJECTION.HELPER_HASH_MISMATCH };
+  }
+
+  const query = await runProcess(helperPath, ['--acl', descriptorPath]);
+  if (!query.ok) {
+    return { ok: false, reason: CONTROL_ANCHOR_REJECTION.SNAPSHOT_QUERY_FAILED };
+  }
+  const snapshot = parseAclSnapshot(query.stdout);
+  if (snapshot === null) {
+    return { ok: false, reason: CONTROL_ANCHOR_REJECTION.SNAPSHOT_MALFORMED };
+  }
+  return evaluateDescriptorSnapshot(operator, snapshot);
+}
+
+/** Resolve the operator and verify the created descriptor's actual ACL read-only. */
+export async function verifyDescriptorAcl(
+  descriptorPath: string,
+  deps: VerifyControlAnchorDeps = {},
+): Promise<DescriptorAclVerification> {
+  const env = deps.env ?? process.env;
+  const systemRoot = deps.systemRoot ?? env['SystemRoot'] ?? 'C:\\Windows';
+  const runProcess = deps.runProcess ?? defaultProcessRunner(systemRoot);
+  const whoami = await runProcess(whoamiPath(systemRoot), ['/user']);
+  if (!whoami.ok) {
+    return { ok: false, reason: CONTROL_ANCHOR_REJECTION.WHOAMI_FAILED };
+  }
+  const operator = parseWhoamiUser(whoami.stdout);
+  if (operator === null) {
+    return { ok: false, reason: CONTROL_ANCHOR_REJECTION.OPERATOR_UNREADABLE };
+  }
+  return verifyDescriptorSnapshot(operator, descriptorPath, runProcess, deps.owner);
 }
 
 export interface VerifyControlAnchorDeps {
@@ -806,7 +926,8 @@ export async function verifyControlAnchor(
   // 3. One canonical OWNER + DACL snapshot from the build-provenanced helper is
   //    the single security truth source: the OWNER must be the exact operator SID
   //    (SYSTEM/foreign owner rejected), and the DACL must be exactly operator +
-  //    SYSTEM by canonical SID, present, non-inherited, with the operator present.
+  //    SYSTEM by canonical SID, protected, present/non-NULL, direct and
+  //    file-inheritable, with the operator present.
   const snapshot = await verifyAnchorSnapshot(operator, anchorPath, runProcess, deps.owner);
   if (!snapshot.ok) {
     return { ok: false, reason: snapshot.reason };
@@ -829,15 +950,20 @@ function defaultReadFile(path: string): string {
   return readFileSync(path, { encoding: 'utf8' });
 }
 function defaultWriteFile(path: string, data: string): void {
-  writeFileSync(path, data, { encoding: 'utf8', mode: 0o600 });
+  writeFileSync(path, data, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
 }
 function defaultRemoveFile(path: string): void {
   unlinkSync(path);
 }
 
+function isErrnoException(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error && 'code' in error;
+}
+
 /**
- * Write the descriptor into the (already verified) anchor, replacing any stale
- * crash descriptor. Throws on I/O failure so startup fails closed.
+ * Exclusively create the descriptor inside the already verified anchor. `wx`
+ * makes an unexpected existing pathname fatal instead of overwriting a file
+ * whose old Windows DACL would survive. Throws on every I/O failure.
  */
 export function writeDescriptorFile(
   anchorPath: string,
@@ -863,12 +989,29 @@ export function readDescriptorFile(
   return parseDescriptor(text);
 }
 
-/** Best-effort removal of the descriptor (orderly shutdown / stale rotation). */
+/** Best-effort removal of the descriptor (orderly shutdown / failure cleanup). */
 export function removeDescriptorFile(anchorPath: string, deps: DescriptorFileDeps = {}): void {
   const remove = deps.removeFile ?? defaultRemoveFile;
   try {
     remove(descriptorPathFor(anchorPath));
   } catch {
-    // Best-effort only; a missing or locked descriptor is not fatal.
+    // Best-effort only; a missing or locked descriptor is not fatal here.
+  }
+}
+
+/**
+ * Remove a stale descriptor before startup. Absence is success; every other
+ * unlink failure is fatal so a fresh token can never overwrite stale ACL state.
+ */
+export function removeStaleDescriptorFile(
+  anchorPath: string,
+  deps: DescriptorFileDeps = {},
+): boolean {
+  const remove = deps.removeFile ?? defaultRemoveFile;
+  try {
+    remove(descriptorPathFor(anchorPath));
+    return true;
+  } catch (error: unknown) {
+    return isErrnoException(error) && error.code === 'ENOENT';
   }
 }

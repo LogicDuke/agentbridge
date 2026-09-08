@@ -15,7 +15,14 @@ import {
 } from '../../src/control/control-store.js';
 import { startControlChannel, type ControlChannelHandle } from '../../src/control/control-runtime.js';
 import { CONTROL_ANCHOR_REJECTION } from '../../src/control/control-store.js';
-import { FAKE_ANCHOR, memStore, newOrchestrator, passingVerify, type MemStore } from './support.js';
+import {
+  FAKE_ANCHOR,
+  memStore,
+  newOrchestrator,
+  passingDescriptorVerify,
+  passingVerify,
+  type MemStore,
+} from './support.js';
 
 const handles: ControlChannelHandle[] = [];
 const servers: net.Server[] = [];
@@ -63,10 +70,166 @@ describe('D062 startControlChannel — fail closed', () => {
       orchestrator,
       verify: (): Promise<ControlAnchorVerification> =>
         Promise.resolve({ ok: false, reason: CONTROL_ANCHOR_REJECTION.FOREIGN_PRINCIPAL }),
+      verifyDescriptor: passingDescriptorVerify,
       descriptorDeps: deps,
     });
     expect(handle).toBeNull();
     expect(writeCalls).toBe(0);
+  });
+
+  it('a stale descriptor that cannot be removed blocks startup and keeps its old token', async () => {
+    const { orchestrator } = newOrchestrator();
+    const stale = serializeDescriptor(createRuntimeDescriptor(77).descriptor);
+    const stored = stale;
+    let writeCalls = 0;
+    let aclChecks = 0;
+    let serverCreates = 0;
+    const descriptorDeps: DescriptorFileDeps = {
+      readFile: (): string => stored,
+      writeFile: (): void => {
+        writeCalls += 1;
+      },
+      removeFile: (): void => {
+        const denied = new Error('access denied') as NodeJS.ErrnoException;
+        denied.code = 'EACCES';
+        throw denied;
+      },
+    };
+
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: (): Promise<{ readonly ok: true }> => {
+        aclChecks += 1;
+        return Promise.resolve({ ok: true });
+      },
+      descriptorDeps,
+      createServer: ((...args: Parameters<typeof createControlChannelServer>) => {
+        serverCreates += 1;
+        return createControlChannelServer(...args);
+      }) as typeof createControlChannelServer,
+      logger: (): void => {
+        /* silent */
+      },
+    });
+
+    expect(handle).toBeNull();
+    expect(stored).toBe(stale);
+    expect(writeCalls).toBe(0);
+    expect(aclChecks).toBe(0);
+    expect(serverCreates).toBe(0);
+  });
+
+  it('an unexpected pathname appearing before exclusive creation is never overwritten', async () => {
+    const { orchestrator } = newOrchestrator();
+    const unexpected = serializeDescriptor(createRuntimeDescriptor(88).descriptor);
+    let stored: string | null = null;
+    const descriptorDeps: DescriptorFileDeps = {
+      readFile: (): string => {
+        if (stored === null) {
+          throw new Error('ENOENT');
+        }
+        return stored;
+      },
+      removeFile: (): void => {
+        stored = unexpected;
+      },
+      writeFile: (): void => {
+        if (stored !== null) {
+          const exists = new Error('already exists') as NodeJS.ErrnoException;
+          exists.code = 'EEXIST';
+          throw exists;
+        }
+      },
+    };
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: passingDescriptorVerify,
+      descriptorDeps,
+      logger: (): void => {
+        /* silent */
+      },
+    });
+    expect(handle).toBeNull();
+    expect(stored).toBe(unexpected);
+  });
+
+  it('successfully removes a stale descriptor before exclusive new creation', async () => {
+    const { orchestrator } = newOrchestrator();
+    const store = memStore();
+    const stale = serializeDescriptor(createRuntimeDescriptor(99).descriptor);
+    store.set(stale);
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: passingDescriptorVerify,
+      descriptorDeps: store.deps,
+    });
+    expect(handle).not.toBeNull();
+    expect(store.get()).not.toBe(stale);
+    if (handle !== null) {
+      expect(storedPipeName(store)).toBe(handle.pipeName);
+      handles.push(handle);
+    }
+  });
+
+  it('verifies the created descriptor ACL before constructing or listening on the pipe', async () => {
+    const { orchestrator } = newOrchestrator();
+    const store = memStore();
+    let resolveAcl!: (result: { readonly ok: true }) => void;
+    const aclResult = new Promise<{ readonly ok: true }>((resolvePromise) => {
+      resolveAcl = resolvePromise;
+    });
+    let aclSawDescriptor = false;
+    let serverCreates = 0;
+    const started = startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: (): Promise<{ readonly ok: true }> => {
+        aclSawDescriptor = store.get() !== null;
+        return aclResult;
+      },
+      descriptorDeps: store.deps,
+      createServer: ((...args: Parameters<typeof createControlChannelServer>) => {
+        serverCreates += 1;
+        return createControlChannelServer(...args);
+      }) as typeof createControlChannelServer,
+    });
+
+    await Promise.resolve();
+    expect(aclSawDescriptor).toBe(true);
+    expect(serverCreates).toBe(0);
+    resolveAcl({ ok: true });
+    const handle = await started;
+    expect(handle).not.toBeNull();
+    expect(serverCreates).toBe(1);
+    if (handle !== null) {
+      handles.push(handle);
+    }
+  });
+
+  it('a bad resulting descriptor ACL is removed and startup fails before pipe creation', async () => {
+    const { orchestrator } = newOrchestrator();
+    const store = memStore();
+    let serverCreates = 0;
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: (): Promise<{ readonly ok: false; readonly reason: typeof CONTROL_ANCHOR_REJECTION.FOREIGN_PRINCIPAL }> =>
+        Promise.resolve({ ok: false, reason: CONTROL_ANCHOR_REJECTION.FOREIGN_PRINCIPAL }),
+      descriptorDeps: store.deps,
+      createServer: ((...args: Parameters<typeof createControlChannelServer>) => {
+        serverCreates += 1;
+        return createControlChannelServer(...args);
+      }) as typeof createControlChannelServer,
+      logger: (): void => {
+        /* silent */
+      },
+    });
+    expect(handle).toBeNull();
+    expect(store.get()).toBeNull();
+    expect(serverCreates).toBe(0);
   });
 
   it('writes the descriptor only AFTER anchor verification succeeds', async () => {
@@ -95,6 +258,7 @@ describe('D062 startControlChannel — fail closed', () => {
         state.verified = true;
         return Promise.resolve({ ok: true, anchorPath: FAKE_ANCHOR });
       },
+      verifyDescriptor: passingDescriptorVerify,
       descriptorDeps: deps,
     });
     expect(handle).not.toBeNull();
@@ -122,6 +286,7 @@ describe('D062 startControlChannel — fail closed', () => {
       orchestrator,
       verify: (): Promise<ControlAnchorVerification> =>
         Promise.resolve({ ok: true, anchorPath: FAKE_ANCHOR }),
+      verifyDescriptor: passingDescriptorVerify,
       descriptorDeps: deps,
     });
     expect(handle).toBeNull();
@@ -148,6 +313,7 @@ describe('D062 startControlChannel — fail closed', () => {
       orchestrator,
       verify: (): Promise<ControlAnchorVerification> =>
         Promise.resolve({ ok: true, anchorPath: FAKE_ANCHOR }),
+      verifyDescriptor: passingDescriptorVerify,
       descriptorDeps: deps,
     });
     expect(state.stored).not.toBeNull();
@@ -240,6 +406,7 @@ describe('D062 F2 descriptor ownership — cleanup unlinks only its own descript
     const handleA = await startControlChannel({
       orchestrator,
       verify: passingVerify,
+      verifyDescriptor: passingDescriptorVerify,
       descriptorDeps: store.deps,
     });
     expect(handleA).not.toBeNull();
@@ -253,6 +420,7 @@ describe('D062 F2 descriptor ownership — cleanup unlinks only its own descript
     const handleB = await startControlChannel({
       orchestrator,
       verify: passingVerify,
+      verifyDescriptor: passingDescriptorVerify,
       descriptorDeps: store.deps,
     });
     expect(handleB).not.toBeNull();
@@ -278,6 +446,7 @@ describe('D062 F2 descriptor ownership — cleanup unlinks only its own descript
     const handle = await startControlChannel({
       orchestrator,
       verify: passingVerify,
+      verifyDescriptor: passingDescriptorVerify,
       descriptorDeps: store.deps,
     });
     expect(handle).not.toBeNull();
@@ -298,6 +467,7 @@ describe('D062 F2 descriptor ownership — cleanup unlinks only its own descript
     const handle = await startControlChannel({
       orchestrator,
       verify: passingVerify,
+      verifyDescriptor: passingDescriptorVerify,
       descriptorDeps: store.deps,
     });
     expect(handle).not.toBeNull();
@@ -335,6 +505,7 @@ describe('D062 F2 descriptor ownership — cleanup unlinks only its own descript
     const handle = await startControlChannel({
       orchestrator,
       verify: passingVerify,
+      verifyDescriptor: passingDescriptorVerify,
       descriptorDeps: deps,
     });
     expect(handle).not.toBeNull();
@@ -355,6 +526,7 @@ describe('D062 F2 descriptor ownership — cleanup unlinks only its own descript
     const handle = await startControlChannel({
       orchestrator,
       verify: passingVerify,
+      verifyDescriptor: passingDescriptorVerify,
       pid: 4242,
       descriptorDeps: store.deps,
     });
@@ -379,6 +551,7 @@ describe('D062 F2 descriptor ownership — cleanup unlinks only its own descript
     const handle = await startControlChannel({
       orchestrator,
       verify: passingVerify,
+      verifyDescriptor: passingDescriptorVerify,
       descriptorDeps: store.deps,
       createServer: failingServerFactory((): void => {
         // The successor replaces the descriptor before our listen fails.
@@ -400,6 +573,7 @@ describe('D062 F2 descriptor ownership — cleanup unlinks only its own descript
     const handle = await startControlChannel({
       orchestrator,
       verify: passingVerify,
+      verifyDescriptor: passingDescriptorVerify,
       descriptorDeps: store.deps,
       createServer: failingServerFactory((): void => {
         expect(store.get()).not.toBeNull();
