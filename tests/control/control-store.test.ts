@@ -1043,7 +1043,7 @@ describe('D062 createDescriptorFileNative — provenance, transport, fail-closed
     );
     expect(ok).toEqual({ ok: true });
     expect(written).toEqual([
-      `${CREATOR_ANCHOR}\\runtime-descriptor.json|${serializeDescriptor(descriptor)}`,
+      `${join(CREATOR_ANCHOR, 'runtime-descriptor.json')}|${serializeDescriptor(descriptor)}`,
     ]);
     // The native creator is not reached when a seam is supplied.
     expect(ran).toBe(0);
