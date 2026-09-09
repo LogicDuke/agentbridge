@@ -9,17 +9,24 @@
  * attempts the control channel only after the Cockpit is serving, and any
  * control fault there fails closed while the Cockpit stays up and read-only.
  *
- * The explicit control launch must not silently omit the mandatory native helper
- * and its generated provenance: without a VALID pair `defaultLoadProvenance()` /
- * the runtime hash gate fail closed (HELPER_PROVENANCE_MISSING / HELPER_MISSING /
- * HELPER_HASH_MISMATCH) and the control channel is unavailable. The control script
+ * The explicit control launch must not silently omit the mandatory native artifacts
+ * and their generated provenance. There are TWO, each with its own provenance and its
+ * own runtime hash gate (Decision 062 Amendment C):
+ *
+ *   agentbridge-win-owner.exe             READ-ONLY   owner/DACL snapshot probe
+ *   agentbridge-win-descriptor-create.exe CREATE-ONLY runtime-descriptor primitive
+ *
+ * Without a VALID pair the corresponding runtime gate fails closed
+ * (HELPER_PROVENANCE_MISSING / HELPER_MISSING / HELPER_HASH_MISMATCH, and the creator's
+ * CREATOR_* equivalents) and the control channel is unavailable. The control script
  * runs this orchestrator between the TypeScript build and the Node launch so a
  * clean — or a partially/torn-provisioned — checkout is made coherent before
  * control-anchor verification runs; a provisioning failure is loud and nonzero.
  *
- * The idempotent skip is taken ONLY when the helper and provenance form the
- * CANONICAL pair (see validateHelperPair in helper-pair.mjs): the on-disk provenance bytes must equal
- * `encodeProvenance(sha256(helper bytes))` exactly. Existence — or fields found
+ * The idempotent skip is taken ONLY when EVERY artifact and its provenance form the
+ * CANONICAL pair (validateHelperPair / validateCreatorPair in helper-pair.mjs, each
+ * against its own encoder): the on-disk provenance bytes must equal
+ * that artifact's `encode(sha256(binary bytes))` exactly. Existence — or fields found
  * somewhere in the text — is NOT sufficient: an interrupted `build.mjs` can leave a
  * new executable beside stale provenance (a torn pair), or a truncated/duplicated/
  * augmented provenance module. Any representation not emitted verbatim by the shared
@@ -49,15 +56,55 @@ import { execFileSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { OWNER_HELPER_BASENAME, PROVENANCE_BASENAME, validateHelperPair } from './helper-pair.mjs';
+import {
+  CREATOR_PROVENANCE_BASENAME,
+  DESCRIPTOR_CREATOR_BASENAME,
+  OWNER_HELPER_BASENAME,
+  PROVENANCE_BASENAME,
+  validateCreatorPair,
+  validateHelperPair,
+} from './helper-pair.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(here, '..', '..');
 const buildScript = join(here, 'build.mjs');
 
 const outDir = join(repoRoot, 'dist', 'control', 'native');
-const exePath = join(outDir, OWNER_HELPER_BASENAME);
-const provenancePath = join(outDir, PROVENANCE_BASENAME);
+
+/**
+ * Every native artifact the control launch requires, each with its OWN canonical
+ * pair validator. The launch is provisioned only when ALL pairs are canonical: a
+ * missing or torn creator pair fails the runtime's creator hash gate exactly as a
+ * missing owner-helper pair fails its own, so neither may be skipped.
+ */
+const ARTIFACTS = [
+  {
+    label: 'owner helper',
+    exePath: join(outDir, OWNER_HELPER_BASENAME),
+    provenancePath: join(outDir, PROVENANCE_BASENAME),
+    validate: validateHelperPair,
+  },
+  {
+    label: 'descriptor creator',
+    exePath: join(outDir, DESCRIPTOR_CREATOR_BASENAME),
+    provenancePath: join(outDir, CREATOR_PROVENANCE_BASENAME),
+    validate: validateCreatorPair,
+  },
+];
+
+/** The first artifact whose on-disk pair is not canonical, or null when all are. */
+function firstInvalidPair() {
+  for (const artifact of ARTIFACTS) {
+    const result = artifact.validate({
+      exePath: artifact.exePath,
+      provenancePath: artifact.provenancePath,
+    });
+    if (!result.valid) {
+      return { artifact, result };
+    }
+  }
+  return null;
+}
 
 function note(message) {
   process.stderr.write(`ensure-helper: ${message}\n`);
@@ -72,15 +119,17 @@ function main() {
     process.exit(0);
   }
 
-  const before = validateHelperPair({ exePath, provenancePath });
-  if (before.valid) {
-    // Already provisioned with a VALID pair: do not recompile on every launch. The
-    // runtime still hashes the binary against the generated provenance before use.
-    note('valid helper/provenance pair already present; skipping build.');
+  const before = firstInvalidPair();
+  if (before === null) {
+    // Already provisioned with VALID pairs: do not recompile on every launch. The
+    // runtime still hashes each binary against its generated provenance before use.
+    note('valid helper/provenance pairs already present; skipping build.');
     process.exit(0);
   }
 
-  note(`helper/provenance pair not valid (${before.reason}); rebuilding via build.mjs.`);
+  note(
+    `${before.artifact.label} pair not valid (${before.result.reason}); rebuilding via build.mjs.`,
+  );
   try {
     execFileSync(process.execPath, [buildScript], { stdio: ['ignore', 'inherit', 'inherit'] });
   } catch {
@@ -96,16 +145,16 @@ function main() {
     process.exit(1);
   }
 
-  const after = validateHelperPair({ exePath, provenancePath });
-  if (!after.valid) {
-    // Rebuild reported success but the pair is still not valid — never launch into a
+  const after = firstInvalidPair();
+  if (after !== null) {
+    // Rebuild reported success but a pair is still not valid — never launch into a
     // fail-closed channel; stop loudly so the operator resolves the build.
     process.stderr.write(
-      `ensure-helper: build completed but the helper/provenance pair is still invalid (${after.reason}).\n`,
+      `ensure-helper: build completed but the ${after.artifact.label} pair is still invalid (${after.result.reason}).\n`,
     );
     process.exit(1);
   }
-  note('owner helper provisioned (valid pair).');
+  note('native control artifacts provisioned (valid pairs).');
 }
 
 // ENTRY SCRIPT — no exports, no entry guard. This file is only ever executed

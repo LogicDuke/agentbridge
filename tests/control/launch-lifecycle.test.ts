@@ -65,8 +65,11 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import {
+  validateCreatorPair,
   validateHelperPair,
+  encodeCreatorProvenance,
   encodeProvenance,
+  DESCRIPTOR_CREATOR_BASENAME,
   OWNER_HELPER_BASENAME,
 } from '../../tools/control-owner/helper-pair.mjs';
 import {
@@ -100,6 +103,7 @@ import { AutoflowRuntime } from '../../src/autoflow/runtime.js';
 import { newOrchestrator } from './support.js';
 
 const PROVENANCE_BASENAME = 'owner-helper-provenance.js';
+const CREATOR_PROVENANCE_BASENAME = 'descriptor-creator-provenance.js';
 
 const repoRoot = fileURLToPath(new URL('../../', import.meta.url));
 const ensureScript = join(repoRoot, 'tools', 'control-owner', 'ensure-helper.mjs');
@@ -625,7 +629,9 @@ function isolatedGateTree(withSource: boolean): {
     'msvc-toolchain.mjs',
   ];
   if (withSource) {
-    files.push('agentbridge-win-owner.c');
+    // BOTH reviewed sources: the builder publishes two artifacts, so a tree missing
+    // either one cannot provision a coherent control launch.
+    files.push('agentbridge-win-owner.c', 'agentbridge-win-descriptor-create.c');
   }
   for (const f of files) {
     cpSync(join(repoRoot, 'tools', 'control-owner', f), join(toolDir, f));
@@ -671,6 +677,19 @@ describe.skipIf(!TEST_BUILD_ELIGIBLE)('D062 explicit provisioning — MSVC avail
         valid: true,
         reason: 'valid',
       });
+      // The create-only artifact is provisioned by the SAME gate run, with its own
+      // canonical pair: a control launch needs both, so neither may be skipped.
+      const creatorExe = join(t.nativeDir, DESCRIPTOR_CREATOR_BASENAME);
+      const creatorProv = join(t.nativeDir, CREATOR_PROVENANCE_BASENAME);
+      expect(existsSync(creatorExe)).toBe(true);
+      expect(validateCreatorPair({ exePath: creatorExe, provenancePath: creatorProv })).toEqual({
+        valid: true,
+        reason: 'valid',
+      });
+      // Two distinct trust roots: neither artifact's provenance validates the other's
+      // binary, so a swapped or cross-wired provenance module is never accepted.
+      expect(validateCreatorPair({ exePath: exe, provenancePath: creatorProv }).valid).toBe(false);
+      expect(validateHelperPair({ exePath: creatorExe, provenancePath: prov }).valid).toBe(false);
     } finally {
       rmSync(t.root, { recursive: true, force: true });
     }
@@ -714,17 +733,31 @@ describe('D062 explicit provisioning — builder and gate share one eligibility 
     expect(CL_LINK_FLAGS).toContain('/SUBSYSTEM:CONSOLE');
   });
 
-  it('the probe exercises the owner helper\'s exact dependency surface', () => {
-    // Every header the helper source includes is included by the probe, and the
-    // probe references the same advapi32 imports so the link needs advapi32.lib.
-    const helperSource = readTool('agentbridge-win-owner.c');
-    const includes = [...helperSource.matchAll(/^#include <([^>]+)>/gm)].map((m) => m[1]);
-    expect(includes.length).toBeGreaterThan(0);
-    for (const header of includes) {
-      expect(PROBE_SOURCE, `probe must include <${String(header)}>`).toContain(`#include <${String(header)}>`);
+  it('the probe exercises every built artifact\'s exact dependency surface', () => {
+    // Every header either reviewed source includes is included by the probe, and the
+    // probe references the same imports so the link needs the same import libraries.
+    // Adding a SECOND compiled artifact must not re-open the MSVC-gate drift class:
+    // the one eligibility predicate covers everything the builder actually compiles.
+    for (const sourceName of ['agentbridge-win-owner.c', 'agentbridge-win-descriptor-create.c']) {
+      const source = readTool(sourceName);
+      const includes = [...source.matchAll(/^#include <([^>]+)>/gm)].map((m) => m[1]);
+      expect(includes.length, `${sourceName} must include headers`).toBeGreaterThan(0);
+      for (const header of includes) {
+        expect(PROBE_SOURCE, `probe must include <${String(header)}> for ${sourceName}`).toContain(
+          `#include <${String(header)}>`,
+        );
+      }
     }
+    // Read-only helper imports.
     expect(PROBE_SOURCE).toContain('GetNamedSecurityInfoW(');
     expect(PROBE_SOURCE).toContain('ConvertSidToStringSidW(');
+    // Create-only artifact imports.
+    expect(PROBE_SOURCE).toContain('ConvertStringSidToSidW(');
+    expect(PROBE_SOURCE).toContain('SetEntriesInAclW(');
+    expect(PROBE_SOURCE).toContain('AllocateAndInitializeSid(');
+    expect(PROBE_SOURCE).toContain('OpenProcessToken(');
+    expect(PROBE_SOURCE).toContain('GetTokenInformation(');
+    expect(PROBE_SOURCE).toContain('SetFileInformationByHandle(');
     expect(PROBE_SOURCE).toContain('int wmain(');
   });
 
@@ -1300,16 +1333,30 @@ describe.skipIf(!TEST_BUILD_ELIGIBLE)('D062 concurrent rebuild — isolated real
       }
       const exe = join(t.nativeDir, OWNER_HELPER_BASENAME);
       const prov = join(t.nativeDir, PROVENANCE_BASENAME);
+      const creatorExe = join(t.nativeDir, DESCRIPTOR_CREATOR_BASENAME);
+      const creatorProv = join(t.nativeDir, CREATOR_PROVENANCE_BASENAME);
       expect(existsSync(exe)).toBe(true);
       expect(existsSync(prov)).toBe(true);
-      // Final pair canonical.
+      expect(existsSync(creatorExe)).toBe(true);
+      expect(existsSync(creatorProv)).toBe(true);
+      // Both final pairs canonical, each against its OWN encoder.
       expect(readFileSync(prov, 'utf8')).toBe(encodeProvenance(sha256Hex(readFileSync(exe))));
+      expect(readFileSync(creatorProv, 'utf8')).toBe(
+        encodeCreatorProvenance(sha256Hex(readFileSync(creatorExe))),
+      );
       // No shared object directory and no private workspace leaked into native/.
       expect(existsSync(join(t.nativeDir, 'obj'))).toBe(false);
-      // Every entry under native/ is one of the two authoritative artifacts.
-      // (A leaked .build-* dir would violate isolation cleanup.)
+      // Every entry under native/ is one of the four authoritative artifacts. (A
+      // leaked .build-* dir, or a per-artifact object dir, would violate isolation.)
       const names = readdirSync(t.nativeDir);
-      expect(names.sort()).toEqual([OWNER_HELPER_BASENAME, PROVENANCE_BASENAME].sort());
+      expect(names.sort()).toEqual(
+        [
+          OWNER_HELPER_BASENAME,
+          PROVENANCE_BASENAME,
+          DESCRIPTOR_CREATOR_BASENAME,
+          CREATOR_PROVENANCE_BASENAME,
+        ].sort(),
+      );
     } finally {
       rmSync(t.root, { recursive: true, force: true });
     }

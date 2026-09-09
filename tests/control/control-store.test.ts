@@ -6,6 +6,9 @@ import { describe, expect, it } from 'vitest';
 
 import {
   CONTROL_ANCHOR_REJECTION,
+  DESCRIPTOR_CREATION_REJECTION,
+  createDescriptorFile,
+  createDescriptorFileNative,
   createRuntimeDescriptor,
   enumeratePathComponents,
   evaluateAnchorSnapshot,
@@ -23,6 +26,10 @@ import {
   verifyControlAnchor,
   verifyDescriptorSnapshot,
   type AclSnapshotAce,
+  type CreatorRunResult,
+  type CreatorRunner,
+  type DescriptorCreatorDeps,
+  type DescriptorCreatorProvenance,
   type LstatProbe,
   type OperatorIdentity,
   type OwnerVerifierDeps,
@@ -403,11 +410,13 @@ describe('D062 descriptor ACL evaluation', () => {
   const operator: OperatorIdentity = { name: 'desktop-x\\dell', sid: OPERATOR_SID.toLowerCase() };
 
   it('accepts the actual file result with exactly operator + SYSTEM', () => {
+    // The creator's real contract: PROTECTED, and both ACEs direct (leaf ACEs,
+    // so no propagation flags and no INHERITED_ACE).
     const parsed = parseAclSnapshot(
       snapshot(OPERATOR_SID, [
-        { flags: '0x10', sid: OPERATOR_SID },
-        { flags: '0x10', sid: SYSTEM_SID },
-      ], 'PRESENT', false),
+        { flags: '0x00', sid: OPERATOR_SID },
+        { flags: '0x00', sid: SYSTEM_SID },
+      ]),
     );
     expect(parsed).not.toBeNull();
     if (parsed !== null) {
@@ -418,16 +427,55 @@ describe('D062 descriptor ACL evaluation', () => {
   it('rejects a resulting file ACL that exposes the token to Everyone', () => {
     const parsed = parseAclSnapshot(
       snapshot(OPERATOR_SID, [
-        { flags: '0x10', sid: OPERATOR_SID },
-        { flags: '0x10', sid: SYSTEM_SID },
-        { flags: '0x10', mask: '0x00120089', sid: 'S-1-1-0' },
-      ], 'PRESENT', false),
+        { flags: '0x00', sid: OPERATOR_SID },
+        { flags: '0x00', sid: SYSTEM_SID },
+        { flags: '0x00', mask: '0x00120089', sid: 'S-1-1-0' },
+      ]),
     );
     expect(parsed).not.toBeNull();
     if (parsed !== null) {
       expect(evaluateDescriptorSnapshot(operator, parsed)).toEqual({
         ok: false,
         reason: CONTROL_ANCHOR_REJECTION.FOREIGN_PRINCIPAL,
+      });
+    }
+  });
+
+  it('rejects an UNPROTECTED descriptor DACL even when owner and principals are exact', () => {
+    // Owner is the exact operator and the principal set is exactly
+    // operator + SYSTEM, but the DACL is unprotected: after this one-time
+    // verification the descriptor keeps inheriting from its parent, so a later
+    // inheritable foreign ACE on the anchor would widen the token-bearing file.
+    const parsed = parseAclSnapshot(
+      snapshot(OPERATOR_SID, [
+        { flags: '0x00', sid: OPERATOR_SID },
+        { flags: '0x00', sid: SYSTEM_SID },
+      ], 'PRESENT', false),
+    );
+    expect(parsed).not.toBeNull();
+    if (parsed !== null) {
+      expect(evaluateDescriptorSnapshot(operator, parsed)).toEqual({
+        ok: false,
+        reason: CONTROL_ANCHOR_REJECTION.DACL_UNPROTECTED,
+      });
+    }
+  });
+
+  it('rejects a protected descriptor DACL carrying any INHERITED_ACE', () => {
+    // The creator builds a fresh ACL from NO_INHERITANCE entries, so no ACE it
+    // writes can carry INHERITED_ACE; an inherited ACE proves the descriptor is
+    // not the creator's direct ACL, whatever principal it names.
+    const parsed = parseAclSnapshot(
+      snapshot(OPERATOR_SID, [
+        { flags: '0x00', sid: OPERATOR_SID },
+        { flags: '0x10', sid: SYSTEM_SID },
+      ]),
+    );
+    expect(parsed).not.toBeNull();
+    if (parsed !== null) {
+      expect(evaluateDescriptorSnapshot(operator, parsed)).toEqual({
+        ok: false,
+        reason: CONTROL_ANCHOR_REJECTION.INHERITED_PRINCIPAL,
       });
     }
   });
@@ -807,5 +855,227 @@ describe('D062 owner+DACL snapshot gate — verifyAnchorSnapshot (Amendment B)',
     expect(parseOwnerHelperSid(' S-1-5-18\n')).toBeNull();
     expect(parseOwnerHelperSid('S-1-5-18\nS-1-5-19\n')).toBeNull();
     expect(parseOwnerHelperSid('desktop-x\\dell\n')).toBeNull();
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Descriptor CREATION gate (Decision 062 Amendment C) — pure/injected
+ * ------------------------------------------------------------------ *
+ *
+ * Windows chooses a new file's OWNER from the creating token's DEFAULT owner and
+ * its DACL from the parent's inheritable ACEs, so `writeFileSync` cannot produce a
+ * descriptor that satisfies the exact-owner gate under an elevated token. Creation
+ * therefore goes through a SECOND build-provenanced native artifact with create-only
+ * authority. These cases prove the gate around it: separate provenance, hash before
+ * execute, the anchor as the ONLY argument, the secret on stdin, and fail-closed on
+ * every transport fault. The real binary's own behaviour is proven against the
+ * compiled artifact in owner-helper.win.test.ts.
+ */
+describe('D062 createDescriptorFileNative — provenance, transport, fail-closed', () => {
+  const CREATOR_SHA = 'c'.repeat(64);
+  const CREATOR_ABS = 'C:\\Program\\agentbridge-win-descriptor-create.exe';
+  const CREATOR_BYTES = Buffer.from('creator-bytes');
+  const CREATOR_ANCHOR = 'C:\\Anchor';
+
+  interface CreatorCall {
+    readonly exe: string;
+    readonly args: readonly string[];
+    readonly input: Buffer;
+  }
+
+  function creatorDeps(overrides: Partial<DescriptorCreatorDeps> = {}): DescriptorCreatorDeps {
+    return {
+      loadProvenance: (): Promise<DescriptorCreatorProvenance | null> =>
+        Promise.resolve({
+          filename: 'agentbridge-win-descriptor-create.exe',
+          sha256: CREATOR_SHA,
+        }),
+      resolveCreatorPath: (): string => CREATOR_ABS,
+      readCreatorBytes: (): Buffer | null => CREATOR_BYTES,
+      hashBytes: (): string => CREATOR_SHA,
+      runCreator: (): Promise<CreatorRunResult> => Promise.resolve({ ok: true }),
+      ...overrides,
+    };
+  }
+
+  function recordingCreator(calls: CreatorCall[]): CreatorRunner {
+    return (exe, args, input): Promise<CreatorRunResult> => {
+      calls.push({ exe, args, input });
+      return Promise.resolve({ ok: true });
+    };
+  }
+
+  it('runs the provenanced creator with the anchor as its ONLY argument', async () => {
+    const calls: CreatorCall[] = [];
+    const { descriptor } = createRuntimeDescriptor(4242);
+    const result = await createDescriptorFileNative(
+      CREATOR_ANCHOR,
+      descriptor,
+      creatorDeps({ runCreator: recordingCreator(calls) }),
+    );
+    expect(result).toEqual({ ok: true });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.exe).toBe(CREATOR_ABS);
+    // Exactly one argument: no owner SID, no filename, no path below the anchor.
+    expect(calls[0]?.args).toEqual([CREATOR_ANCHOR]);
+  });
+
+  it('delivers the descriptor on stdin ONLY — the token never reaches argv', async () => {
+    const calls: CreatorCall[] = [];
+    const { descriptor } = createRuntimeDescriptor(7);
+    await createDescriptorFileNative(
+      CREATOR_ANCHOR,
+      descriptor,
+      creatorDeps({ runCreator: recordingCreator(calls) }),
+    );
+    const call = calls[0];
+    expect(call).toBeDefined();
+    if (call === undefined) {
+      return;
+    }
+    // stdin carries exactly the serialized descriptor bytes …
+    expect(call.input.toString('utf8')).toBe(serializeDescriptor(descriptor));
+    // … and the secret appears in no argument.
+    for (const arg of call.args) {
+      expect(arg).not.toContain(descriptor.token);
+      expect(arg).not.toContain(descriptor.pipeName);
+    }
+    expect(call.args.join('\u0000')).not.toContain(descriptor.token);
+  });
+
+  it('fails closed when the creator provenance is missing or malformed', async () => {
+    const { descriptor } = createRuntimeDescriptor(1);
+    const rejected: (DescriptorCreatorProvenance | null)[] = [
+      null,
+      { filename: 'agentbridge-win-descriptor-create.exe', sha256: 'nope' },
+      { filename: '..\\escape.exe', sha256: CREATOR_SHA },
+      { filename: 'C:\\abs.exe', sha256: CREATOR_SHA },
+    ];
+    for (const bad of rejected) {
+      const result = await createDescriptorFileNative(
+        CREATOR_ANCHOR,
+        descriptor,
+        creatorDeps({
+          loadProvenance: (): Promise<DescriptorCreatorProvenance | null> => Promise.resolve(bad),
+        }),
+      );
+      expect(result).toEqual({
+        ok: false,
+        reason: DESCRIPTOR_CREATION_REJECTION.CREATOR_PROVENANCE_MISSING,
+      });
+    }
+  });
+
+  it('fails closed when the creator binary is missing', async () => {
+    const { descriptor } = createRuntimeDescriptor(1);
+    const result = await createDescriptorFileNative(
+      CREATOR_ANCHOR,
+      descriptor,
+      creatorDeps({ readCreatorBytes: (): Buffer | null => null }),
+    );
+    expect(result).toEqual({
+      ok: false,
+      reason: DESCRIPTOR_CREATION_REJECTION.CREATOR_MISSING,
+    });
+  });
+
+  it('hashes the creator BEFORE running it and fails closed on a mismatch', async () => {
+    const { descriptor } = createRuntimeDescriptor(1);
+    let ran = 0;
+    const result = await createDescriptorFileNative(
+      CREATOR_ANCHOR,
+      descriptor,
+      creatorDeps({
+        hashBytes: (): string => 'd'.repeat(64),
+        runCreator: (): Promise<CreatorRunResult> => {
+          ran += 1;
+          return Promise.resolve({ ok: true });
+        },
+      }),
+    );
+    expect(result).toEqual({
+      ok: false,
+      reason: DESCRIPTOR_CREATION_REJECTION.CREATOR_HASH_MISMATCH,
+    });
+    // A swapped binary is never executed at all.
+    expect(ran).toBe(0);
+  });
+
+  it('propagates each terminal transport cause distinctly and fails closed', async () => {
+    const { descriptor } = createRuntimeDescriptor(1);
+    const causes = [
+      DESCRIPTOR_CREATION_REJECTION.CREATOR_SPAWN_FAILED,
+      DESCRIPTOR_CREATION_REJECTION.CREATOR_TIMEOUT,
+      DESCRIPTOR_CREATION_REJECTION.CREATOR_FAILED,
+    ] as const;
+    for (const reason of causes) {
+      const result = await createDescriptorFileNative(
+        CREATOR_ANCHOR,
+        descriptor,
+        creatorDeps({
+          runCreator: (): Promise<CreatorRunResult> => Promise.resolve({ ok: false, reason }),
+        }),
+      );
+      expect(result).toEqual({ ok: false, reason });
+    }
+  });
+
+  it('the injected writeFile seam is used when present, and its throw fails closed', async () => {
+    const { descriptor } = createRuntimeDescriptor(9);
+    let ran = 0;
+    const written: string[] = [];
+    const creator = creatorDeps({
+      runCreator: (): Promise<CreatorRunResult> => {
+        ran += 1;
+        return Promise.resolve({ ok: true });
+      },
+    });
+
+    const ok = await createDescriptorFile(
+      CREATOR_ANCHOR,
+      descriptor,
+      {
+        writeFile: (path: string, data: string): void => {
+          written.push(`${path}|${data}`);
+        },
+      },
+      creator,
+    );
+    expect(ok).toEqual({ ok: true });
+    expect(written).toEqual([
+      `${CREATOR_ANCHOR}\\runtime-descriptor.json|${serializeDescriptor(descriptor)}`,
+    ]);
+    // The native creator is not reached when a seam is supplied.
+    expect(ran).toBe(0);
+
+    // An unexpected existing pathname (the `wx` EEXIST) is a rejection, not an
+    // overwrite, exactly as exclusive creation requires.
+    const denied = await createDescriptorFile(
+      CREATOR_ANCHOR,
+      descriptor,
+      {
+        writeFile: (): void => {
+          const exists = new Error('already exists') as NodeJS.ErrnoException;
+          exists.code = 'EEXIST';
+          throw exists;
+        },
+      },
+      creator,
+    );
+    expect(denied.ok).toBe(false);
+  });
+
+  it('with no seam, creation goes through the native creator (production default)', async () => {
+    const calls: CreatorCall[] = [];
+    const { descriptor } = createRuntimeDescriptor(11);
+    const result = await createDescriptorFile(
+      CREATOR_ANCHOR,
+      descriptor,
+      {},
+      creatorDeps({ runCreator: recordingCreator(calls) }),
+    );
+    expect(result).toEqual({ ok: true });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.args).toEqual([CREATOR_ANCHOR]);
   });
 });

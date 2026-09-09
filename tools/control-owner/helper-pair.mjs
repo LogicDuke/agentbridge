@@ -16,10 +16,17 @@
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 
-import { encodeProvenance } from './provenance-format.mjs';
+import { encodeCreatorProvenance, encodeProvenance } from './provenance-format.mjs';
 
 // Re-export the canonical producers so tests import everything from one module.
-export { OWNER_HELPER_BASENAME, PROVENANCE_BASENAME, encodeProvenance } from './provenance-format.mjs';
+export {
+  CREATOR_PROVENANCE_BASENAME,
+  DESCRIPTOR_CREATOR_BASENAME,
+  OWNER_HELPER_BASENAME,
+  PROVENANCE_BASENAME,
+  encodeCreatorProvenance,
+  encodeProvenance,
+} from './provenance-format.mjs';
 
 /**
  * Decide, for LIFECYCLE purposes only, whether the helper/provenance pair on disk
@@ -36,7 +43,27 @@ export { OWNER_HELPER_BASENAME, PROVENANCE_BASENAME, encodeProvenance } from './
  *
  * Returns `{ valid: boolean, reason: string }`.
  */
-export function validateHelperPair({ exePath: exe, provenancePath: prov }) {
+export function validateHelperPair({ exePath, provenancePath }) {
+  return validateArtifactPair({ exePath, provenancePath, encode: encodeProvenance });
+}
+
+/**
+ * The same canonical-pair decision for the DESCRIPTOR CREATOR, against its OWN
+ * encoder. The creator and the owner helper are separate artifacts with separate
+ * provenance; a pair is valid only against its own canonical encoding, so a
+ * cross-wired or swapped provenance module is never accepted.
+ *
+ * Returns `{ valid: boolean, reason: string }`.
+ */
+export function validateCreatorPair({ exePath, provenancePath }) {
+  return validateArtifactPair({ exePath, provenancePath, encode: encodeCreatorProvenance });
+}
+
+/**
+ * The one pair-validity mechanism, parameterized by the artifact's canonical encoder.
+ * Both artifacts decide skip-vs-rebuild through exactly this function.
+ */
+function validateArtifactPair({ exePath: exe, provenancePath: prov, encode }) {
   if (!existsSync(prov)) {
     return { valid: false, reason: 'provenance-missing' };
   }
@@ -49,7 +76,7 @@ export function validateHelperPair({ exePath: exe, provenancePath: prov }) {
   } catch {
     return { valid: false, reason: 'helper-unreadable' };
   }
-  const expected = encodeProvenance(createHash('sha256').update(bytes).digest('hex'));
+  const expected = encode(createHash('sha256').update(bytes).digest('hex'));
   let actual;
   try {
     actual = readFileSync(prov, 'utf8');

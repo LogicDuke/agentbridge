@@ -25,11 +25,23 @@ export interface HelperPairInput {
  */
 export declare function validateHelperPair(input: HelperPairInput): HelperPairValidity;
 
-/** The one native helper's filename (re-exported from provenance-format.mjs). */
+/**
+ * The same decision for the DESCRIPTOR CREATOR, against its OWN canonical encoder.
+ * The two artifacts have separate provenance; a cross-wired module is never valid.
+ */
+export declare function validateCreatorPair(input: HelperPairInput): HelperPairValidity;
+
+/** The read-only owner helper's filename (re-exported from provenance-format.mjs). */
 export declare const OWNER_HELPER_BASENAME: string;
 
-/** The generated provenance module's basename (re-exported from provenance-format.mjs). */
+/** The generated owner-helper provenance module's basename (re-exported). */
 export declare const PROVENANCE_BASENAME: string;
+
+/** The descriptor creator's filename (re-exported from provenance-format.mjs). */
+export declare const DESCRIPTOR_CREATOR_BASENAME: string;
+
+/** The generated creator provenance module's basename (re-exported). */
+export declare const CREATOR_PROVENANCE_BASENAME: string;
 
 /**
  * The single canonical provenance encoder (re-exported from provenance-format.mjs):
@@ -37,3 +49,10 @@ export declare const PROVENANCE_BASENAME: string;
  * TypeError on a non-64-hex digest.
  */
 export declare function encodeProvenance(sha256Hex: string): string;
+
+/**
+ * The canonical provenance encoder for the descriptor creator (re-exported from
+ * provenance-format.mjs): creator SHA-256 (lowercase 64-hex) → exact provenance module
+ * text, with its own binding name. Pure; throws a TypeError on a non-64-hex digest.
+ */
+export declare function encodeCreatorProvenance(sha256Hex: string): string;

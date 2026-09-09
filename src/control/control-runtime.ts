@@ -6,8 +6,12 @@
  *
  *   1. verifies the hardened control anchor (read-only, fail closed);
  *   2. removes any stale descriptor, failing closed if it cannot be removed;
- *   3. mints a fresh token and exclusively creates its descriptor;
- *   4. verifies the created file's actual ACL through the native snapshot path;
+ *   3. mints a fresh token and exclusively creates its descriptor through the
+ *      build-provenanced create-only native artifact — `CREATE_NEW`, owner = the
+ *      exact runtime operator SID, protected operator+SYSTEM DACL — with the
+ *      secret bytes delivered on stdin, never in argv;
+ *   4. verifies the file that ACTUALLY exists through the INDEPENDENT read-only
+ *      native snapshot path (creation is never trusted on its own word);
  *   5. builds the one narrow dispatcher over the orchestrator writer;
  *   6. listens on the unpredictable per-process pipe; a same-name collision or
  *      any listen error fails the channel **closed**.
@@ -22,6 +26,7 @@ import type { AutoflowOrchestrator } from '../autoflow/orchestrator.js';
 import { createControlChannelServer } from './control-channel.js';
 import { createControlDispatcher } from './control-dispatch.js';
 import {
+  createDescriptorFile,
   createRuntimeDescriptor,
   descriptorPathFor,
   pipePathFromName,
@@ -30,10 +35,12 @@ import {
   removeStaleDescriptorFile,
   verifyControlAnchor,
   verifyDescriptorAcl,
-  writeDescriptorFile,
   type ControlAnchorVerification,
   type DescriptorAclVerification,
+  type DescriptorCreation,
+  type DescriptorCreatorDeps,
   type DescriptorFileDeps,
+  type RuntimeDescriptor,
   type VerifyControlAnchorDeps,
 } from './control-store.js';
 
@@ -77,6 +84,12 @@ export interface StartControlChannelDeps {
     deps: VerifyControlAnchorDeps,
   ) => Promise<DescriptorAclVerification>;
   readonly descriptorDeps?: DescriptorFileDeps;
+  /** Seams for the build-provenanced create-only native descriptor creator. */
+  readonly creatorDeps?: DescriptorCreatorDeps;
+  readonly createDescriptor?: (
+    anchorPath: string,
+    descriptor: RuntimeDescriptor,
+  ) => Promise<DescriptorCreation>;
   readonly createServer?: typeof createControlChannelServer;
   readonly logger?: (message: string) => void;
 }
@@ -93,6 +106,10 @@ export async function startControlChannel(
   const pid = deps.pid ?? process.pid;
   const verify = deps.verify ?? verifyControlAnchor;
   const verifyDescriptor = deps.verifyDescriptor ?? verifyDescriptorAcl;
+  const createDescriptor =
+    deps.createDescriptor ??
+    ((anchorPath: string, descriptor: RuntimeDescriptor): Promise<DescriptorCreation> =>
+      createDescriptorFile(anchorPath, descriptor, deps.descriptorDeps, deps.creatorDeps));
   const createServer = deps.createServer ?? createControlChannelServer;
   const log = deps.logger ?? ((message: string): void => {
     console.error(message);
@@ -113,10 +130,20 @@ export async function startControlChannel(
   }
 
   const { descriptor, token } = createRuntimeDescriptor(pid);
+  // Exclusive creation through the build-provenanced create-only native artifact:
+  // owner = the exact runtime operator SID, protected operator+SYSTEM DACL, CREATE_NEW.
+  // The token travels on the creator's stdin and is never an argument or a log line.
+  let creation: DescriptorCreation;
   try {
-    writeDescriptorFile(anchorPath, descriptor, deps.descriptorDeps);
+    creation = await createDescriptor(anchorPath, descriptor);
   } catch {
     log('AgentBridge control channel: disabled (exclusive descriptor creation failed).');
+    return null;
+  }
+  if (!creation.ok) {
+    log(
+      `AgentBridge control channel: disabled (exclusive descriptor creation failed: ${creation.reason}).`,
+    );
     return null;
   }
   let descriptorAcl: DescriptorAclVerification;

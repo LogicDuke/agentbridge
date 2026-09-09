@@ -45,6 +45,31 @@
  * an HMAC key). A stale crash descriptor must be removed before an exclusively
  * created replacement is written; the replacement's actual ACL is then verified
  * before serving. An orderly shutdown removes it best-effort.
+ *
+ * ## Descriptor creation (Decision 062 Amendment C)
+ *
+ * The descriptor's own security is chosen by **Windows**, not by whoever calls
+ * `writeFile`: a newly created file's OWNER comes from the creating token's
+ * DEFAULT owner (`TokenOwner`), and its DACL from the parent's inheritable ACEs.
+ * On an elevated Administrator token that default owner is `BUILTIN\Administrators`
+ * (S-1-5-32-544), so a `writeFileSync`-created descriptor is owned by
+ * Administrators while the runtime operator SID is the account SID — and the
+ * exact-owner descriptor gate below correctly rejects it (`OWNER_MISMATCH`),
+ * leaving the control channel unavailable on a perfectly valid anchor.
+ *
+ * The fix is a SECOND build-provenanced native artifact with create-only
+ * authority — {@link createDescriptorFileNative} — that creates exactly
+ * `<anchor>\runtime-descriptor.json` with `CREATE_NEW` and an EXPLICIT security
+ * descriptor: owner = its own process `TokenUser` SID (never the token default),
+ * and a PROTECTED DACL whose principals are exactly that operator plus SYSTEM. It
+ * derives the operator itself, accepts no owner or filename input, receives the
+ * secret descriptor bytes only on stdin (never argv), and is hash-verified against
+ * its own generated provenance before it is executed.
+ *
+ * Creation is never trusted on its own word: the existing READ-ONLY helper then
+ * inspects the file that actually exists and {@link evaluateDescriptorSnapshot}
+ * must accept it before any pipe is created. `CONTROL_AVAILABLE` still implies
+ * every descriptor trust gate passed.
  */
 
 import { execFile } from 'node:child_process';
@@ -497,9 +522,14 @@ export function evaluateAnchorSnapshot(
 }
 
 /**
- * Evaluate the resulting descriptor file ACL. File ACEs may be inherited and
- * need not themselves carry propagation flags, but the owner must be the
- * operator and the complete principal set must be exactly operator + SYSTEM.
+ * Evaluate the resulting descriptor file ACL. The owner must be the operator,
+ * the complete principal set must be exactly operator + SYSTEM, and the DACL
+ * must independently prove the creator's direct/protected contract: PROTECTED,
+ * with no ACE carrying INHERITED_ACE. Descriptor ACEs are leaf ACEs and so need
+ * not carry propagation flags, but an unprotected or inherited DACL is rejected
+ * rather than trusted — an unprotected descriptor keeps inheriting from its
+ * parent after this one-time verification, so a later inheritable foreign ACE
+ * on the anchor would silently widen the token-bearing file.
  */
 export function evaluateDescriptorSnapshot(
   operator: OperatorIdentity,
@@ -514,12 +544,18 @@ export function evaluateDescriptorSnapshot(
   if (snapshot.daclState !== 'PRESENT') {
     return { ok: false, reason: CONTROL_ANCHOR_REJECTION.DACL_ABSENT };
   }
+  if (!snapshot.daclProtected) {
+    return { ok: false, reason: CONTROL_ANCHOR_REJECTION.DACL_UNPROTECTED };
+  }
   if (snapshot.aces.length === 0) {
     return { ok: false, reason: CONTROL_ANCHOR_REJECTION.NO_ENTRIES };
   }
   let operatorPresent = false;
   let systemPresent = false;
   for (const ace of snapshot.aces) {
+    if ((ace.flags & INHERITED_ACE) !== 0) {
+      return { ok: false, reason: CONTROL_ANCHOR_REJECTION.INHERITED_PRINCIPAL };
+    }
     if (ace.sid === operator.sid) {
       operatorPresent = true;
     } else if (ace.sid === SYSTEM_SID) {
@@ -961,9 +997,18 @@ function isErrnoException(error: unknown): error is NodeJS.ErrnoException {
 }
 
 /**
- * Exclusively create the descriptor inside the already verified anchor. `wx`
- * makes an unexpected existing pathname fatal instead of overwriting a file
- * whose old Windows DACL would survive. Throws on every I/O failure.
+ * Exclusively create the descriptor with Node's own file APIs. `wx` makes an
+ * unexpected existing pathname fatal instead of overwriting a file whose old
+ * Windows DACL would survive. Throws on every I/O failure.
+ *
+ * **This is NOT the production creation path.** `writeFileSync` cannot choose the
+ * created file's owner or DACL — Windows takes the owner from the creating token's
+ * DEFAULT owner (`BUILTIN\Administrators` under elevation) and the DACL from the
+ * parent's inheritable ACEs — so a descriptor created this way fails the exact-owner
+ * gate on an elevated operator. Production uses
+ * {@link createDescriptorFileNative} via {@link createDescriptorFile}. This remains
+ * only as the injectable/portable counterpart and as the regression fixture that
+ * demonstrates the difference.
  */
 export function writeDescriptorFile(
   anchorPath: string,
@@ -1014,4 +1059,298 @@ export function removeStaleDescriptorFile(
   } catch (error: unknown) {
     return isErrnoException(error) && error.code === 'ENOENT';
   }
+}
+
+/* ------------------------------------------------------------------ *
+ * Descriptor creation — the build-provenanced create-only executable
+ * ------------------------------------------------------------------ *
+ *
+ * Decision 062 Amendment C. See the module header for why `writeFileSync` cannot
+ * produce an acceptable descriptor under an elevated token. This gate mirrors the
+ * read-only owner gate exactly — generated provenance, module-relative resolution,
+ * SHA-256 of the exact bytes before execution — but for a SEPARATE binary with a
+ * SEPARATE provenance module and a SEPARATE exported binding, so neither artifact's
+ * trust root can ever satisfy the other's.
+ *
+ * Transport is a security boundary: the descriptor carries the runtime token, so it
+ * travels on stdin only. It never appears in argv (the only argument is the already
+ * verified anchor path), never in an environment variable, and the creator writes
+ * nothing to stdout, so a captured stream can never contain it.
+ */
+
+/** Why a descriptor could not be created. Every value is fail-closed. */
+export const DESCRIPTOR_CREATION_REJECTION = Object.freeze({
+  CREATOR_PROVENANCE_MISSING: 'CREATOR_PROVENANCE_MISSING',
+  CREATOR_MISSING: 'CREATOR_MISSING',
+  CREATOR_HASH_MISMATCH: 'CREATOR_HASH_MISMATCH',
+  /** The serialized descriptor exceeded the transport/creator cap. */
+  DESCRIPTOR_TOO_LARGE: 'DESCRIPTOR_TOO_LARGE',
+  /** The process could not be started at all (spawn/EACCES/ENOENT). */
+  CREATOR_SPAWN_FAILED: 'CREATOR_SPAWN_FAILED',
+  /** It did not settle within the finite deadline and was killed. */
+  CREATOR_TIMEOUT: 'CREATOR_TIMEOUT',
+  /** It ran and refused: nonzero exit, a signal, or stdin could not be delivered. */
+  CREATOR_FAILED: 'CREATOR_FAILED',
+} as const);
+
+export type DescriptorCreationRejection =
+  (typeof DESCRIPTOR_CREATION_REJECTION)[keyof typeof DESCRIPTOR_CREATION_REJECTION];
+
+export type DescriptorCreation =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly reason: DescriptorCreationRejection };
+
+/** The build-generated provenance of the descriptor creator (its trust root). */
+export interface DescriptorCreatorProvenance {
+  readonly filename: string;
+  readonly sha256: string;
+}
+
+/** Outcome of one bounded creator invocation; never carries the child's output. */
+export type CreatorRunResult =
+  | { readonly ok: true }
+  | {
+      readonly ok: false;
+      readonly reason:
+        | typeof DESCRIPTOR_CREATION_REJECTION.CREATOR_SPAWN_FAILED
+        | typeof DESCRIPTOR_CREATION_REJECTION.CREATOR_TIMEOUT
+        | typeof DESCRIPTOR_CREATION_REJECTION.CREATOR_FAILED;
+    };
+
+/**
+ * Runs one absolute create-only executable with an explicit argv and a bounded
+ * stdin payload; never a shell. Deliberately a DISTINCT type from
+ * {@link ProcessRunner}, which is read-only, accepts no input, and returns stdout:
+ * the read-only contract is not widened to carry a payload, and this one cannot
+ * return captured bytes, so neither runner can be used for the other's job.
+ */
+export type CreatorRunner = (
+  exe: string,
+  args: readonly string[],
+  input: Buffer,
+) => Promise<CreatorRunResult>;
+
+/** Node's error code when a child overruns `maxBuffer` (an output fault, not a timeout). */
+const MAXBUFFER_CODE = 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER';
+
+/**
+ * The production creator runner. It is the SAME process primitive the read-only gate
+ * already uses — `child_process.execFile`, `shell:false`, absolute exe path (no PATH
+ * lookup, no cmd, no PowerShell), explicit trusted argv and cwd, controlled minimal
+ * environment, `windowsHide`, a finite timeout, and a bounded output buffer. No
+ * general process runner is introduced; the control layer's executable authority is
+ * unchanged in kind, only in which provenanced binary may be run.
+ *
+ * The one addition is a bounded stdin payload, written to the child's pipe. `execFile`
+ * settles its callback exactly once and owns its own timer and listeners, so there is
+ * no hand-rolled settlement race and nothing to clean up on either path.
+ *
+ * Terminal-cause precedence is explicit: an output overrun is an output fault; a child
+ * we killed on the deadline is a timeout even though it also exits nonzero; a numeric
+ * exit status or a foreign signal is a refusal; anything else (the process never
+ * started — ENOENT, EACCES, a non-executable image) is a spawn failure.
+ *
+ * The child's stdout/stderr are captured by `execFile` only so they can be bounded and
+ * discarded: this function returns ok/reason and nothing else, so no child stream can
+ * carry descriptor bytes back into the runtime.
+ */
+export function defaultCreatorRunner(systemRoot: string): CreatorRunner {
+  const system32 = join(systemRoot, 'System32');
+  return (exe: string, args: readonly string[], input: Buffer): Promise<CreatorRunResult> =>
+    new Promise<CreatorRunResult>((resolvePromise) => {
+      let child: ReturnType<typeof execFile>;
+      try {
+        child = execFile(
+          exe,
+          [...args],
+          {
+            cwd: system32,
+            env: { SystemRoot: systemRoot, windir: systemRoot },
+            timeout: PROCESS_TIMEOUT_MS,
+            maxBuffer: PROCESS_MAX_BUFFER,
+            windowsHide: true,
+            shell: false,
+            encoding: 'buffer',
+          },
+          (error: unknown) => {
+            if (error === null || error === undefined) {
+              resolvePromise({ ok: true });
+              return;
+            }
+            const failure = error as {
+              code?: unknown;
+              killed?: unknown;
+              signal?: unknown;
+            };
+            if (failure.code === MAXBUFFER_CODE) {
+              resolvePromise({ ok: false, reason: DESCRIPTOR_CREATION_REJECTION.CREATOR_FAILED });
+              return;
+            }
+            if (failure.killed === true) {
+              resolvePromise({ ok: false, reason: DESCRIPTOR_CREATION_REJECTION.CREATOR_TIMEOUT });
+              return;
+            }
+            if (typeof failure.code === 'number' || typeof failure.signal === 'string') {
+              resolvePromise({ ok: false, reason: DESCRIPTOR_CREATION_REJECTION.CREATOR_FAILED });
+              return;
+            }
+            resolvePromise({
+              ok: false,
+              reason: DESCRIPTOR_CREATION_REJECTION.CREATOR_SPAWN_FAILED,
+            });
+          },
+        );
+      } catch {
+        // Windows can reject a non-executable image synchronously (spawn UNKNOWN)
+        // instead of through the callback. A process that never started is a spawn
+        // failure, and this runner always answers with a result, never a throw.
+        resolvePromise({
+          ok: false,
+          reason: DESCRIPTOR_CREATION_REJECTION.CREATOR_SPAWN_FAILED,
+        });
+        return;
+      }
+
+      const stdinPipe = child.stdin;
+      if (stdinPipe === null) {
+        // Nothing to deliver the descriptor through; the callback above still
+        // settles this promise from the child's own outcome.
+        return;
+      }
+      stdinPipe.on('error', () => {
+        // A child that exited before reading (EPIPE) is judged by its exit status,
+        // not by our write failing; swallow so it cannot become an unhandled error.
+      });
+      // `end` honours backpressure internally and flushes the complete payload; the
+      // creator reads to EOF, so the descriptor is delivered whole or not at all.
+      stdinPipe.end(input);
+    });
+}
+
+/** Injection seams for the creator gate; production defaults use the real build output. */
+export interface DescriptorCreatorDeps {
+  readonly loadProvenance?: () => Promise<DescriptorCreatorProvenance | null>;
+  readonly resolveCreatorPath?: (filename: string) => string;
+  readonly readCreatorBytes?: (creatorPath: string) => Buffer | null;
+  readonly hashBytes?: (bytes: Buffer) => string;
+  readonly runCreator?: CreatorRunner;
+  readonly systemRoot?: string;
+}
+
+/**
+ * Load the generated creator provenance module the trusted build wrote beside the
+ * binary (module-relative to this compiled runtime). It exports its OWN binding name,
+ * so the owner helper's provenance module can never satisfy this lookup. Any failure
+ * or shape violation yields `null`, which the caller treats as fail-closed.
+ */
+async function defaultLoadCreatorProvenance(): Promise<DescriptorCreatorProvenance | null> {
+  try {
+    const href = new URL('./native/descriptor-creator-provenance.js', import.meta.url).href;
+    const loaded = (await import(href)) as unknown;
+    if (typeof loaded !== 'object' || loaded === null) {
+      return null;
+    }
+    const provenance = (loaded as { DESCRIPTOR_CREATOR_PROVENANCE?: unknown })
+      .DESCRIPTOR_CREATOR_PROVENANCE;
+    if (typeof provenance !== 'object' || provenance === null) {
+      return null;
+    }
+    const record = provenance as { filename?: unknown; sha256?: unknown };
+    if (typeof record.filename !== 'string' || typeof record.sha256 !== 'string') {
+      return null;
+    }
+    return { filename: record.filename, sha256: record.sha256 };
+  } catch {
+    return null;
+  }
+}
+
+/** Resolve the creator's absolute path from the trusted runtime module location. */
+function defaultResolveCreatorPath(filename: string): string {
+  return fileURLToPath(new URL(`./native/${filename}`, import.meta.url));
+}
+
+/**
+ * Create the descriptor through the build-provenanced create-only native artifact.
+ *
+ * The creator is resolved module-relative from generated provenance, its exact bytes
+ * are SHA-256-verified before it is executed, and it is then run with a single
+ * argument — the already verified anchor path — and the serialized descriptor on
+ * stdin. It derives the runtime operator from its own token, refuses to run as
+ * SYSTEM, derives the fixed filename itself, and uses `CREATE_NEW`, so an unexpected
+ * existing pathname is an error rather than an overwrite whose old DACL would survive.
+ *
+ * Returns fail-closed on every fault. Success means only "the creator reported it
+ * created the file"; the caller must still verify the file that actually exists
+ * through the independent read-only helper before serving.
+ */
+export async function createDescriptorFileNative(
+  anchorPath: string,
+  descriptor: RuntimeDescriptor,
+  deps: DescriptorCreatorDeps = {},
+): Promise<DescriptorCreation> {
+  const provenance = await (deps.loadProvenance ?? defaultLoadCreatorProvenance)();
+  if (
+    provenance === null ||
+    !HELPER_SHA256_PATTERN.test(provenance.sha256) ||
+    !HELPER_FILENAME_PATTERN.test(provenance.filename)
+  ) {
+    return { ok: false, reason: DESCRIPTOR_CREATION_REJECTION.CREATOR_PROVENANCE_MISSING };
+  }
+
+  const creatorPath = (deps.resolveCreatorPath ?? defaultResolveCreatorPath)(provenance.filename);
+  const bytes = (deps.readCreatorBytes ?? defaultReadHelperBytes)(creatorPath);
+  if (bytes === null) {
+    return { ok: false, reason: DESCRIPTOR_CREATION_REJECTION.CREATOR_MISSING };
+  }
+  const actualHash = (deps.hashBytes ?? sha256Hex)(bytes);
+  if (!digestsEqual(actualHash, provenance.sha256)) {
+    return { ok: false, reason: DESCRIPTOR_CREATION_REJECTION.CREATOR_HASH_MISMATCH };
+  }
+
+  const payload = Buffer.from(serializeDescriptor(descriptor), 'utf8');
+  if (payload.length === 0 || payload.length > MAX_DESCRIPTOR_BYTES) {
+    return { ok: false, reason: DESCRIPTOR_CREATION_REJECTION.DESCRIPTOR_TOO_LARGE };
+  }
+
+  const systemRoot = deps.systemRoot ?? process.env['SystemRoot'] ?? 'C:\\Windows';
+  const runCreator = deps.runCreator ?? defaultCreatorRunner(systemRoot);
+  // The anchor path is the ONLY argument. The descriptor — and therefore the token —
+  // is never an argument, an environment variable, or a log line.
+  const run = await runCreator(creatorPath, [anchorPath], payload);
+  if (!run.ok) {
+    return { ok: false, reason: run.reason };
+  }
+  return { ok: true };
+}
+
+/**
+ * Create the descriptor inside the already verified anchor.
+ *
+ * `DescriptorFileDeps.writeFile` is the descriptor-creation injection seam. When a
+ * caller supplies one (tests, in-memory stores) it is used and the result mirrors
+ * exclusive creation: a throw — the `wx` `EEXIST` an unexpected existing pathname
+ * produces — is a fail-closed rejection, never an overwrite.
+ *
+ * With no seam supplied (production) creation goes through the build-provenanced
+ * native creator, because Node's `writeFileSync` cannot choose the created file's
+ * owner or DACL: Windows takes those from the creating token's default owner and the
+ * parent's inheritable ACEs. See {@link createDescriptorFileNative}.
+ */
+export async function createDescriptorFile(
+  anchorPath: string,
+  descriptor: RuntimeDescriptor,
+  fileDeps: DescriptorFileDeps = {},
+  creatorDeps: DescriptorCreatorDeps = {},
+): Promise<DescriptorCreation> {
+  const write = fileDeps.writeFile;
+  if (write !== undefined) {
+    try {
+      write(descriptorPathFor(anchorPath), serializeDescriptor(descriptor));
+      return { ok: true };
+    } catch {
+      return { ok: false, reason: DESCRIPTOR_CREATION_REJECTION.CREATOR_FAILED };
+    }
+  }
+  return createDescriptorFileNative(anchorPath, descriptor, creatorDeps);
 }

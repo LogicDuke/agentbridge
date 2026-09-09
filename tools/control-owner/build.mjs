@@ -1,12 +1,29 @@
 /*
- * Trusted Windows build for the Decision 062 / PR #84 F1 owner-SID helper.
+ * Trusted Windows build for the Decision 062 / PR #84 native control artifacts.
  *
- * Reconciles the exact installed MSVC + Windows SDK via vswhere (never PATH),
- * compiles tools/control-owner/agentbridge-win-owner.c to a deterministic
- * module-relative runtime location under dist/, then computes the SHA-256 of the
- * exact produced binary and emits it as GENERATED BUILD METADATA — a small JS
- * module consumed by the trusted runtime. The expected hash is never a manually
- * committed literal, an env/argv/registry value, nor a mutable .sha256 sidecar.
+ * Reconciles the exact installed MSVC + Windows SDK via vswhere (never PATH), then
+ * compiles EACH reviewed C source to a deterministic module-relative runtime location
+ * under dist/, computes the SHA-256 of the exact produced binary, and emits it as
+ * GENERATED BUILD METADATA — a small JS module consumed by the trusted runtime. An
+ * expected hash is never a manually committed literal, an env/argv/registry value, nor
+ * a mutable .sha256 sidecar.
+ *
+ * TWO artifacts are built, with SEPARATE identities and SEPARATE provenance modules
+ * (Decision 062 Amendment C). Neither can stand in for the other: each generated module
+ * exports its own binding name, and each runtime consumer hashes its own binary against
+ * its own provenance before executing it.
+ *
+ *   agentbridge-win-owner.c             → agentbridge-win-owner.exe
+ *                                         owner-helper-provenance.js
+ *                                         (READ-ONLY security-descriptor probe)
+ *   agentbridge-win-descriptor-create.c → agentbridge-win-descriptor-create.exe
+ *                                         descriptor-creator-provenance.js
+ *                                         (CREATE-ONLY runtime-descriptor primitive)
+ *
+ * Every artifact is compiled inside the SAME private, per-invocation workspace but in
+ * its OWN object directory and to its OWN private executable path, so no mutable
+ * compilation state is shared — neither between concurrent builders nor between the two
+ * artifacts of one builder. Publication stays atomic and idempotent per artifact.
  *
  * This build script is not part of the runtime trust path; it is a build tool.
  * It uses no shell: every external program is invoked by absolute path with an
@@ -28,22 +45,45 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
+  CREATOR_PROVENANCE_BASENAME,
+  DESCRIPTOR_CREATOR_BASENAME,
   OWNER_HELPER_BASENAME,
   PROVENANCE_BASENAME,
+  encodeCreatorProvenance,
   encodeProvenance,
 } from './provenance-format.mjs';
 import { compileArgsFor, compileEnvFor, resolveBuildToolchain } from './msvc-toolchain.mjs';
 
-const HELPER_BASENAME = OWNER_HELPER_BASENAME;
-
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(here, '..', '..');
-const srcC = join(here, 'agentbridge-win-owner.c');
 
 /** Deterministic module-relative runtime output: dist/control/native/. */
 const outDir = join(repoRoot, 'dist', 'control', 'native');
-const exePath = join(outDir, HELPER_BASENAME);
-const provenancePath = join(outDir, PROVENANCE_BASENAME);
+
+/**
+ * The complete set of native artifacts this build publishes. Each entry is fully
+ * self-describing: reviewed source, published basename, its OWN provenance module
+ * basename, and its OWN canonical encoder. Adding an artifact here is the only place
+ * the build learns about it.
+ */
+const ARTIFACTS = [
+  {
+    key: 'owner',
+    label: 'owner helper',
+    source: join(here, 'agentbridge-win-owner.c'),
+    basename: OWNER_HELPER_BASENAME,
+    provenanceBasename: PROVENANCE_BASENAME,
+    encode: encodeProvenance,
+  },
+  {
+    key: 'creator',
+    label: 'descriptor creator',
+    source: join(here, 'agentbridge-win-descriptor-create.c'),
+    basename: DESCRIPTOR_CREATOR_BASENAME,
+    provenanceBasename: CREATOR_PROVENANCE_BASENAME,
+    encode: encodeCreatorProvenance,
+  },
+];
 
 function fail(message) {
   process.stderr.write(`owner-helper build: ${message}\n`);
@@ -96,12 +136,14 @@ process.stderr.write(
 /* ---- 2. Compile + link inside a private, per-invocation workspace -------- */
 
 // Isolate ALL mutable compilation state so concurrent builders never share an
-// object directory or the executable output path. mkdtempSync yields a
+// object directory or an executable output path. mkdtempSync yields a
 // collision-safe unique directory (not a predictable PID-only name); nothing
 // under it is ever authoritative — the runtime and the launch gate read only the
-// final paths (exePath / provenancePath). This closes the concurrent-rebuild
-// race: two builders compile into disjoint private workspaces and cannot delete,
-// replace, or lock each other's compiler intermediates or output.
+// final published paths under outDir. This closes the concurrent-rebuild race:
+// two builders compile into disjoint private workspaces and cannot delete,
+// replace, or lock each other's compiler intermediates or output. Within one
+// builder, each artifact additionally gets its own object directory and its own
+// private executable path, so the two compilations never share state either.
 mkdirSync(outDir, { recursive: true });
 const workspace = mkdtempSync(join(outDir, '.build-'));
 
@@ -121,35 +163,10 @@ function failClean(message) {
   fail(message);
 }
 
-const workObjDir = join(workspace, 'obj');
-const workExe = join(workspace, HELPER_BASENAME);
-mkdirSync(workObjDir, { recursive: true });
-
 // The compiler environment and the compile/link argument shape are the SHARED
 // ones from msvc-toolchain.mjs — the same the eligibility probe uses — so the
 // builder and the test gate cannot drift in env, include/lib paths, or flags.
 const clEnv = compileEnvFor(resolved.plan);
-const clArgs = compileArgsFor({ source: srcC, exe: workExe, objDir: workObjDir });
-
-try {
-  execFileSync(cl, clArgs, {
-    cwd: workObjDir,
-    env: clEnv,
-    stdio: ['ignore', 'inherit', 'inherit'],
-  });
-} catch {
-  failClean('cl.exe failed to build the owner helper.');
-}
-
-if (!existsSync(workExe)) {
-  failClean('cl.exe reported success but the helper binary is missing.');
-}
-
-// Validate the private helper and compute its digest before publication.
-const privateBytes = readFileSync(workExe);
-const privateSha = createHash('sha256').update(privateBytes).digest('hex');
-
-/* ---- 3. Idempotent atomic publication ------------------------------------ */
 
 /** SHA-256 (lowercase hex) of a file, or null if it cannot be read. */
 function sha256File(path) {
@@ -160,75 +177,119 @@ function sha256File(path) {
   }
 }
 
-// Publish the completed private helper to the authoritative path. Because the
-// build is deterministic (/Brepro), concurrent builders produce byte-identical
-// helpers; a builder that finds the final helper already equal to its own
-// validated bytes treats publication as satisfied and neither clobbers nor fails.
-if (sha256File(exePath) !== privateSha) {
+/**
+ * Compile one reviewed source in its own private object directory, publish the exact
+ * binary atomically, then publish its OWN provenance derived from the FINAL published
+ * bytes. Returns the published digest. Any failure cleans the workspace and exits.
+ */
+function buildArtifact(artifact) {
+  const srcC = artifact.source;
+  const workObjDir = join(workspace, `obj-${artifact.key}`);
+  const workExe = join(workspace, artifact.basename);
+  const publishedExe = join(outDir, artifact.basename);
+  const publishedProvenance = join(outDir, artifact.provenanceBasename);
+  mkdirSync(workObjDir, { recursive: true });
+
+  const clArgs = compileArgsFor({ source: srcC, exe: workExe, objDir: workObjDir });
   try {
-    renameSync(workExe, exePath);
+    execFileSync(cl, clArgs, {
+      cwd: workObjDir,
+      env: clEnv,
+      stdio: ['ignore', 'inherit', 'inherit'],
+    });
   } catch {
-    // A concurrent builder may have published first; converge only if the final
-    // helper is byte-identical to our validated private build. A differing final
-    // helper is never silently accepted.
-    if (sha256File(exePath) !== privateSha) {
-      failClean('failed to publish helper (rename) and final helper is not the built binary.');
+    failClean(`cl.exe failed to build the ${artifact.label}.`);
+  }
+  if (!existsSync(workExe)) {
+    failClean(`cl.exe reported success but the ${artifact.label} binary is missing.`);
+  }
+
+  // Validate the private binary and compute its digest before publication.
+  const privateBytes = readFileSync(workExe);
+  const privateSha = createHash('sha256').update(privateBytes).digest('hex');
+
+  /* ---- Idempotent atomic publication ------------------------------------- */
+
+  // Publish the completed private binary to the authoritative path. Because the
+  // build is deterministic, concurrent builders produce byte-identical binaries;
+  // a builder that finds the final binary already equal to its own validated
+  // bytes treats publication as satisfied and neither clobbers nor fails.
+  if (sha256File(publishedExe) !== privateSha) {
+    try {
+      renameSync(workExe, publishedExe);
+    } catch {
+      // A concurrent builder may have published first; converge only if the final
+      // binary is byte-identical to our validated private build. A differing final
+      // binary is never silently accepted.
+      if (sha256File(publishedExe) !== privateSha) {
+        failClean(
+          `failed to publish ${artifact.label} (rename) and final binary is not the built one.`,
+        );
+      }
     }
   }
-}
 
-// Derive provenance from the FINAL authoritative helper bytes (not the private
-// pre-publication assumption), so the canonical pair holds under any concurrent
-// publication interleaving.
-const finalSha = sha256File(exePath);
-if (finalSha === null) {
-  failClean('authoritative helper missing after publication.');
-}
-const provenance = encodeProvenance(finalSha);
+  // Derive provenance from the FINAL authoritative bytes (not the private
+  // pre-publication assumption), so the canonical pair holds under any concurrent
+  // publication interleaving.
+  const finalSha = sha256File(publishedExe);
+  if (finalSha === null) {
+    failClean(`authoritative ${artifact.label} missing after publication.`);
+  }
+  const provenance = artifact.encode(finalSha);
 
-// Publish provenance atomically: write the complete canonical bytes to a temp file
-// inside this private workspace (same volume as the final path), then rename/replace
-// onto the final path. Node's renameSync uses MoveFileExW(REPLACE_EXISTING) on
-// Windows, atomic within the volume. A concurrent builder writing the identical
-// canonical bytes is benign: convergence, not failure.
-const tmpProvenance = join(workspace, `${PROVENANCE_BASENAME}.tmp`);
-writeFileSync(tmpProvenance, provenance, { encoding: 'utf8' });
-try {
-  renameSync(tmpProvenance, provenancePath);
-} catch {
+  // Publish provenance atomically: write the complete canonical bytes to a temp file
+  // inside this private workspace (same volume as the final path), then rename/replace
+  // onto the final path. Node's renameSync uses MoveFileExW(REPLACE_EXISTING) on
+  // Windows, atomic within the volume. A concurrent builder writing the identical
+  // canonical bytes is benign: convergence, not failure.
+  const tmpProvenance = join(workspace, `${artifact.provenanceBasename}.tmp`);
+  writeFileSync(tmpProvenance, provenance, { encoding: 'utf8' });
   try {
-    rmSync(tmpProvenance, { force: true });
+    renameSync(tmpProvenance, publishedProvenance);
   } catch {
-    /* best-effort */
+    try {
+      rmSync(tmpProvenance, { force: true });
+    } catch {
+      /* best-effort */
+    }
+    let current = null;
+    try {
+      current = readFileSync(publishedProvenance, 'utf8');
+    } catch {
+      current = null;
+    }
+    if (current !== provenance) {
+      failClean(
+        `failed to publish ${artifact.label} provenance (rename) and it is not canonical.`,
+      );
+    }
   }
-  let current = null;
+
+  // Post-build canonicality: re-read the AUTHORITATIVE pair and require it valid.
+  // "Our private build succeeded" is never sufficient — the final state governs.
+  const checkSha = sha256File(publishedExe);
+  let checkProvenance = null;
   try {
-    current = readFileSync(provenancePath, 'utf8');
+    checkProvenance = readFileSync(publishedProvenance, 'utf8');
   } catch {
-    current = null;
+    checkProvenance = null;
   }
-  if (current !== provenance) {
-    failClean('failed to publish provenance (rename) and final provenance is not canonical.');
+  if (checkSha === null || checkProvenance !== artifact.encode(checkSha)) {
+    failClean(`post-build authoritative ${artifact.label} pair is not canonical.`);
   }
+
+  return { finalSha, size: privateBytes.length, publishedExe, publishedProvenance };
 }
 
-// Post-build canonicality: re-read the AUTHORITATIVE pair and require it valid.
-// "Our private build succeeded" is never sufficient — the final state governs.
-const checkSha = sha256File(exePath);
-let checkProvenance = null;
-try {
-  checkProvenance = readFileSync(provenancePath, 'utf8');
-} catch {
-  checkProvenance = null;
-}
-if (checkSha === null || checkProvenance !== encodeProvenance(checkSha)) {
-  failClean('post-build authoritative helper/provenance pair is not canonical.');
-}
+const summary = ARTIFACTS.map((artifact) => ({ artifact, result: buildArtifact(artifact) }));
 
 cleanupWorkspace();
 
-process.stderr.write(
-  `owner-helper build: wrote ${exePath} (${String(privateBytes.length)} bytes)\n` +
-    `owner-helper build: sha256 ${finalSha}\n` +
-    `owner-helper build: wrote ${provenancePath}\n`,
-);
+for (const { artifact, result } of summary) {
+  process.stderr.write(
+    `owner-helper build: wrote ${result.publishedExe} (${String(result.size)} bytes)\n` +
+      `owner-helper build: ${artifact.label} sha256 ${result.finalSha}\n` +
+      `owner-helper build: wrote ${result.publishedProvenance}\n`,
+  );
+}

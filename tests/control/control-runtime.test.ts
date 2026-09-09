@@ -6,11 +6,13 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { createControlChannelServer } from '../../src/control/control-channel.js';
 import { createControlDispatcher } from '../../src/control/control-dispatch.js';
 import {
+  DESCRIPTOR_CREATION_REJECTION,
   createRuntimeDescriptor,
   parseDescriptor,
   pipePathFromName,
   serializeDescriptor,
   type ControlAnchorVerification,
+  type DescriptorCreation,
   type DescriptorFileDeps,
 } from '../../src/control/control-store.js';
 import { startControlChannel, type ControlChannelHandle } from '../../src/control/control-runtime.js';
@@ -197,7 +199,14 @@ describe('D062 startControlChannel — fail closed', () => {
       }) as typeof createControlChannelServer,
     });
 
-    await Promise.resolve();
+    // Drain every pending microtask while the ACL result is still unresolved. This
+    // is tick-count independent on purpose: descriptor creation is asynchronous
+    // (the build-provenanced native creator), so counting `await`s would pin an
+    // implementation detail rather than the ordering invariant being proven —
+    // the descriptor exists when the ACL check runs, and no pipe exists yet.
+    await new Promise<void>((resolveFlush) => {
+      setImmediate(resolveFlush);
+    });
     expect(aclSawDescriptor).toBe(true);
     expect(serverCreates).toBe(0);
     resolveAcl({ ok: true });
@@ -601,5 +610,153 @@ describe('D062 named-pipe collision fails closed', () => {
     const second = createControlChannelServer({ token, dispatcher });
     servers.push(second);
     await expect(listen(second, pipePath)).rejects.toThrow();
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Descriptor CREATION failure (Decision 062 Amendment C) fails closed
+ * ------------------------------------------------------------------ *
+ *
+ * Startup now creates the descriptor through the build-provenanced create-only
+ * native artifact instead of `writeFileSync`, because Windows — not the caller —
+ * chooses a new file's owner and DACL. Every creator fault must stop startup before
+ * any pipe exists, and must never leave the Cockpit's availability depending on it.
+ */
+describe('D062 startControlChannel — native descriptor creation fails closed', () => {
+  const CREATION_CAUSES = [
+    DESCRIPTOR_CREATION_REJECTION.CREATOR_PROVENANCE_MISSING,
+    DESCRIPTOR_CREATION_REJECTION.CREATOR_MISSING,
+    DESCRIPTOR_CREATION_REJECTION.CREATOR_HASH_MISMATCH,
+    DESCRIPTOR_CREATION_REJECTION.CREATOR_SPAWN_FAILED,
+    DESCRIPTOR_CREATION_REJECTION.CREATOR_TIMEOUT,
+    DESCRIPTOR_CREATION_REJECTION.CREATOR_FAILED,
+    DESCRIPTOR_CREATION_REJECTION.DESCRIPTOR_TOO_LARGE,
+  ] as const;
+
+  it.each(CREATION_CAUSES)(
+    'creation rejected with %s: no ACL check, no pipe, no descriptor, no throw',
+    async (reason) => {
+      const { orchestrator } = newOrchestrator();
+      const store = memStore();
+      let aclChecks = 0;
+      let serverCreates = 0;
+      const logged: string[] = [];
+
+      const handle = await startControlChannel({
+        orchestrator,
+        verify: passingVerify,
+        verifyDescriptor: (): Promise<{ readonly ok: true }> => {
+          aclChecks += 1;
+          return Promise.resolve({ ok: true });
+        },
+        createDescriptor: (): Promise<DescriptorCreation> => Promise.resolve({ ok: false, reason }),
+        descriptorDeps: store.deps,
+        createServer: ((): never => {
+          serverCreates += 1;
+          throw new Error('pipe construction must not be reached');
+        }) as typeof createControlChannelServer,
+        logger: (message: string): void => {
+          logged.push(message);
+        },
+      });
+
+      expect(handle).toBeNull();
+      expect(aclChecks).toBe(0);
+      expect(serverCreates).toBe(0);
+      expect(store.get()).toBeNull();
+      // The cause is surfaced, and no secret ever reaches a log line.
+      expect(logged.join('\n')).toContain(reason);
+    },
+  );
+
+  it('a creator that throws is contained: the channel disables, it never propagates', async () => {
+    const { orchestrator } = newOrchestrator();
+    const store = memStore();
+    let serverCreates = 0;
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: passingDescriptorVerify,
+      createDescriptor: (): Promise<DescriptorCreation> => {
+        throw new Error('creator exploded');
+      },
+      descriptorDeps: store.deps,
+      createServer: ((): never => {
+        serverCreates += 1;
+        throw new Error('pipe construction must not be reached');
+      }) as typeof createControlChannelServer,
+      logger: (): void => {
+        /* silent */
+      },
+    });
+    expect(handle).toBeNull();
+    expect(serverCreates).toBe(0);
+    expect(store.get()).toBeNull();
+  });
+
+  it('the token is never an argument: creation receives only the verified anchor', async () => {
+    const { orchestrator } = newOrchestrator();
+    const store = memStore();
+    const seen: { anchor: string; token: string; pipeName: string }[] = [];
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: passingDescriptorVerify,
+      createDescriptor: (anchorPath, descriptor): Promise<DescriptorCreation> => {
+        seen.push({
+          anchor: anchorPath,
+          token: descriptor.token,
+          pipeName: descriptor.pipeName,
+        });
+        // Mirror the native creator's effect so startup can continue.
+        store.set(serializeDescriptor(descriptor));
+        return Promise.resolve({ ok: true });
+      },
+      descriptorDeps: store.deps,
+    });
+    expect(handle).not.toBeNull();
+    if (handle === null) {
+      return;
+    }
+    handles.push(handle);
+    expect(seen).toHaveLength(1);
+    const call = seen[0];
+    expect(call).toBeDefined();
+    if (call === undefined) {
+      return;
+    }
+    // The anchor is the only path-shaped value creation is given, and it carries
+    // no part of the secret.
+    expect(call.anchor).toBe(FAKE_ANCHOR);
+    expect(call.anchor).not.toContain(call.token);
+    expect(call.pipeName).toBe(handle.pipeName);
+  });
+
+  it('creation succeeds but the descriptor ACL is rejected: still no pipe', async () => {
+    const { orchestrator } = newOrchestrator();
+    const store = memStore();
+    let serverCreates = 0;
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: (): Promise<{ readonly ok: false; readonly reason: 'OWNER_MISMATCH' }> =>
+        Promise.resolve({ ok: false, reason: CONTROL_ANCHOR_REJECTION.OWNER_MISMATCH }),
+      createDescriptor: (_anchorPath, descriptor): Promise<DescriptorCreation> => {
+        store.set(serializeDescriptor(descriptor));
+        return Promise.resolve({ ok: true });
+      },
+      descriptorDeps: store.deps,
+      createServer: ((): never => {
+        serverCreates += 1;
+        throw new Error('pipe construction must not be reached');
+      }) as typeof createControlChannelServer,
+      logger: (): void => {
+        /* silent */
+      },
+    });
+    expect(handle).toBeNull();
+    expect(serverCreates).toBe(0);
+    // The rejected descriptor is removed rather than left carrying a live token.
+    expect(store.get()).toBeNull();
   });
 });
