@@ -35,6 +35,7 @@ import {
   defaultPipeProbe,
   descriptorFilenameFor,
   descriptorPathFor,
+  discoverControlRuntime,
   parseDescriptor,
   pipeNameForRuntimeId,
   pipePathFromName,
@@ -1093,6 +1094,99 @@ describe('D062 lifecycle v2 — startup sweep of foreign descriptors', () => {
     expect(handle).toBeNull();
     expect(serverCreated).toBe(false);
     expect(created).toBe(0);
+  });
+
+  /**
+   * The coherence oracle: after an admitted startup, official discovery over the
+   * post-publication anchor must find this runtime WITHOUT failing over-full.
+   */
+  async function expectDiscoverableNotOverfull(deps: MemAnchor['deps'], runtimeId: string): Promise<void> {
+    const discovery = await discoverControlRuntime(FAKE_ANCHOR, realProbe, deps);
+    expect(discovery.kind).toBe('FOUND');
+    if (discovery.kind === 'FOUND') {
+      expect(discovery.parsed.runtimeId).toBe(runtimeId);
+    }
+  }
+
+  it('FINDING 2 — exactly MAX_ANCHOR_ENTRIES entries leaves no entry slot: startup fails closed before listen/publish', async () => {
+    const { orchestrator } = newOrchestrator();
+    const anchor = memAnchor();
+    for (let index = 0; index < MAX_ANCHOR_ENTRIES; index += 1) {
+      anchor.setRaw(`junk-${String(index)}.txt`, 'x');
+    }
+    let serverCreated = false;
+    let created = 0;
+    const createServer: typeof createControlChannelServer = ((options) => {
+      serverCreated = true;
+      return createControlChannelServer(options);
+    }) as typeof createControlChannelServer;
+    const create: DescriptorCreatorFn = async (dir, id, bytes) => {
+      created += 1;
+      return anchor.create(dir, id, bytes);
+    };
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: passingDescriptorVerify,
+      descriptorDeps: anchor.deps,
+      createDescriptor: create,
+      createServer,
+      probePipe: allAbsentProbe,
+      logger: silent,
+    });
+    expect(handle).toBeNull();
+    expect(serverCreated).toBe(false); // never reached the server / listen
+    expect(created).toBe(0); // nothing published
+    expect(anchor.entries().size).toBe(MAX_ANCHOR_ENTRIES); // still exactly the cap
+  });
+
+  it('FINDING 2 — MAX_ANCHOR_ENTRIES-1 entries leaves one entry slot: startup proceeds to exactly MAX and stays discoverable', async () => {
+    const { orchestrator } = newOrchestrator();
+    const anchor = memAnchor();
+    for (let index = 0; index < MAX_ANCHOR_ENTRIES - 1; index += 1) {
+      anchor.setRaw(`junk-${String(index)}.txt`, 'x');
+    }
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: passingDescriptorVerify,
+      descriptorDeps: anchor.deps,
+      createDescriptor: anchor.create,
+      probePipe: allAbsentProbe,
+      logger: silent,
+    });
+    expect(handle).not.toBeNull();
+    if (handle !== null) {
+      handles.push(handle);
+      expect(anchor.entries().size).toBe(MAX_ANCHOR_ENTRIES); // (MAX-1 junk) + own = MAX
+      await expectDiscoverableNotOverfull(anchor.deps, handle.runtimeId);
+    }
+  });
+
+  it('FINDING 2 — a removable ABSENT descriptor frees entry room: startup proceeds to exactly MAX and stays discoverable', async () => {
+    const { orchestrator } = newOrchestrator();
+    const anchor = memAnchor();
+    for (let index = 0; index < MAX_ANCHOR_ENTRIES - 1; index += 1) {
+      anchor.setRaw(`junk-${String(index)}.txt`, 'x');
+    }
+    const dead = foreignDescriptor(); // valid foreign descriptor; +1 → exactly MAX total
+    anchor.set(dead.runtimeId, dead.text);
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: passingDescriptorVerify,
+      descriptorDeps: anchor.deps,
+      createDescriptor: anchor.create,
+      probePipe: (path) => Promise.resolve(path === dead.pipePath ? 'ABSENT' : 'ABSENT'),
+      logger: silent,
+    });
+    expect(handle).not.toBeNull();
+    if (handle !== null) {
+      handles.push(handle);
+      expect(anchor.removeCalls()).toBe(1); // the ABSENT foreign descriptor was removed
+      expect(anchor.entries().size).toBe(MAX_ANCHOR_ENTRIES); // (MAX-1 junk) + own = MAX
+      await expectDiscoverableNotOverfull(anchor.deps, handle.runtimeId);
+    }
   });
 
   it('a stale file whose unlink fails is reported, not fatal; startup still succeeds', async () => {

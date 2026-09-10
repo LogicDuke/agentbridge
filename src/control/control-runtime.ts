@@ -39,6 +39,7 @@ import { CONTROL_RESULT, type ControlCommand, type ControlResultStatus } from '.
 import { createControlChannelServer } from './control-channel.js';
 import { createControlDispatcher, type ControlDispatcher } from './control-dispatch.js';
 import {
+  MAX_ANCHOR_ENTRIES,
   MAX_DESCRIPTOR_CANDIDATES,
   createDescriptorFileNative,
   createRuntimeDescriptor,
@@ -167,6 +168,17 @@ export async function startControlChannel(
   const survivingCandidates = sweep.examined - sweep.removed.length;
   if (survivingCandidates >= MAX_DESCRIPTOR_CANDIDATES) {
     log('AgentBridge control channel: disabled (no descriptor candidate slot available).');
+    return null;
+  }
+  // Reserve a TOTAL directory-entry slot for our own descriptor, using the exact
+  // scanned count carried out of the SAME bounded sweep pass (no re-enumeration).
+  // The entries that survived the sweep (scanned minus removed) still occupy the
+  // directory; if they already reach the entry cap, publishing ours would make
+  // the anchor over-full and fail discovery closed with ANCHOR_OVERFULL:
+  // CONTROL_START_SUCCESS ⇒ POST_PUBLICATION_ANCHOR_REMAINS_WITHIN_TOTAL_ENTRY_BOUND.
+  const survivingEntries = sweep.scanned - sweep.removed.length;
+  if (survivingEntries >= MAX_ANCHOR_ENTRIES) {
+    log('AgentBridge control channel: disabled (no anchor entry slot available).');
     return null;
   }
   if (sweep.removed.length > 0 || sweep.unremovable.length > 0) {

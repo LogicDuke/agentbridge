@@ -1162,6 +1162,13 @@ export type CandidateEnumeration =
       readonly candidates: readonly DescriptorCandidate[];
       /** More identity-named files existed than the bounded cap allowed. */
       readonly truncated: boolean;
+      /**
+       * Total directory entries consumed by this one bounded pass. Exact for a
+       * complete enumeration (`truncated === false`); a partial count when the
+       * pass stopped early on the candidate cap (`truncated === true`), where it
+       * is not authoritative and callers fail closed on the truncation instead.
+       */
+      readonly scanned: number;
     }
   | { readonly ok: false; readonly reason: CandidateEnumerationFailure };
 
@@ -1218,6 +1225,7 @@ export function enumerateDescriptorCandidates(
     ok: true,
     candidates: truncated ? matched.slice(0, MAX_DESCRIPTOR_CANDIDATES) : matched,
     truncated,
+    scanned,
   };
 }
 
@@ -1319,6 +1327,13 @@ export interface StaleSweepResult {
    * anchor could not be listed), or `truncated` (more candidates than the cap).
    */
   readonly enumeration: SweepEnumeration;
+  /**
+   * Total directory entries the underlying enumeration pass consumed. Exact when
+   * `enumeration === 'complete'`; `0` for every incomplete state (callers must
+   * not rely on it unless the enumeration was complete). Carried out of the SAME
+   * bounded pass — the anchor is never enumerated twice.
+   */
+  readonly scanned: number;
   /** Identity-named files examined (bounded). */
   readonly examined: number;
   /** Runtime ids whose file was removed because its pipe was ABSENT. */
@@ -1359,6 +1374,7 @@ export async function sweepStaleDescriptors(
     // sweep, and do not mutate the anchor.
     return {
       enumeration: enumeration.reason === 'overfull' ? 'overfull' : 'unreadable',
+      scanned: 0,
       examined: 0,
       removed,
       retained,
@@ -1371,7 +1387,7 @@ export async function sweepStaleDescriptors(
     // on (TOO_MANY_CANDIDATES). Surface the truncation and remove nothing: the
     // candidate set we can see is not the whole anchor, so no deadness decision
     // here is trustworthy.
-    return { enumeration: 'truncated', examined: 0, removed, retained, malformed, unremovable };
+    return { enumeration: 'truncated', scanned: 0, examined: 0, removed, retained, malformed, unremovable };
   }
   let examined = 0;
   for (const candidate of enumeration.candidates) {
@@ -1395,7 +1411,17 @@ export async function sweepStaleDescriptors(
       unremovable.push(candidate.runtimeId);
     }
   }
-  return { enumeration: 'complete', examined, removed, retained, malformed, unremovable };
+  // Carry the exact entry count out of this SAME pass — the anchor is not
+  // enumerated a second time.
+  return {
+    enumeration: 'complete',
+    scanned: enumeration.scanned,
+    examined,
+    removed,
+    retained,
+    malformed,
+    unremovable,
+  };
 }
 
 export const DISCOVERY_UNAVAILABLE = Object.freeze({

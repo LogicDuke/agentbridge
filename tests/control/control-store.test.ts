@@ -915,7 +915,40 @@ describe('D062 stale sweep — only ABSENT pipes authorize removal of exactly th
 
   it('an unlistable anchor sweeps nothing and reports enumeration unreadable', async () => {
     const result = await sweepStaleDescriptors(ANCHOR, null, allAbsentProbe, { listAnchor: () => { throw new Error('EACCES'); } });
-    expect(result).toEqual({ enumeration: 'unreadable', examined: 0, removed: [], retained: [], malformed: [], unremovable: [] });
+    expect(result).toEqual({ enumeration: 'unreadable', scanned: 0, examined: 0, removed: [], retained: [], malformed: [], unremovable: [] });
+  });
+
+  it('FINDING 2 — enumeration reports the exact scanned entry count and the sweep propagates it', async () => {
+    // Complete enumeration: `scanned` equals the exact directory entries consumed.
+    const noise: string[] = [];
+    for (let index = 0; index < 5; index += 1) {
+      noise.push(`junk-${String(index)}.txt`);
+    }
+    const realIds = ['a'.repeat(32), 'b'.repeat(32), 'c'.repeat(32)];
+    const listed = [...noise, ...realIds.map((id) => descriptorFilenameFor(id))];
+    const enumeration = enumerateDescriptorCandidates(ANCHOR, { listAnchor: () => listed });
+    expect(enumeration.ok).toBe(true);
+    if (enumeration.ok) {
+      expect(enumeration.truncated).toBe(false);
+      expect(enumeration.scanned).toBe(listed.length); // 5 junk + 3 candidates = 8
+    }
+    // The sweep carries the SAME scanned count out of the one pass (no re-enumeration).
+    const anchor = memAnchor(ANCHOR);
+    for (const id of realIds) {
+      anchor.set(id, serializeDescriptor({ version: 2, pipeName: pipeNameForRuntimeId(id), token: 'x' }));
+    }
+    for (const name of noise) {
+      anchor.setRaw(name, 'x');
+    }
+    const sweep = await sweepStaleDescriptors(ANCHOR, null, allAbsentProbe, anchor.deps);
+    expect(sweep.enumeration).toBe('complete');
+    expect(sweep.scanned).toBe(listed.length);
+    // Incomplete branches report scanned = 0; callers never rely on it there.
+    const unreadable = await sweepStaleDescriptors(ANCHOR, null, allAbsentProbe, { listAnchor: () => { throw new Error('EACCES'); } });
+    expect(unreadable.scanned).toBe(0);
+    const truncated = await sweepStaleDescriptors(ANCHOR, null, allAbsentProbe, seeded(MAX_DESCRIPTOR_CANDIDATES + 1).anchor.deps);
+    expect(truncated.enumeration).toBe('truncated');
+    expect(truncated.scanned).toBe(0);
   });
 
   it('exposes enumeration completeness: unreadable vs truncated vs complete', async () => {
