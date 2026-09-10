@@ -7,6 +7,7 @@ import {
   CONTROL_ANCHOR_REJECTION,
   DESCRIPTOR_CREATION_REJECTION,
   DISCOVERY_UNAVAILABLE,
+  MAX_ANCHOR_ENTRIES,
   MAX_DESCRIPTOR_BYTES,
   MAX_DESCRIPTOR_CANDIDATES,
   createDescriptorFileNative,
@@ -753,7 +754,113 @@ describe('D062 candidate enumeration — bounded, exact-name, deterministic', ()
   });
 
   it('an unlistable anchor is a failure, not an empty set', () => {
-    expect(enumerateDescriptorCandidates(ANCHOR, { listAnchor: () => { throw new Error('EACCES'); } })).toEqual({ ok: false });
+    expect(enumerateDescriptorCandidates(ANCHOR, { listAnchor: () => { throw new Error('EACCES'); } })).toEqual({ ok: false, reason: 'unreadable' });
+  });
+
+  it('a listing error mid-iteration still fails closed as unreadable', () => {
+    // The incremental listing throws after a few entries (models a directory that
+    // becomes unreadable while being read); enumeration must fail closed, not
+    // return a partial candidate set.
+    function* throwingAfter(count: number): IterableIterator<string> {
+      for (let i = 0; i < count; i += 1) {
+        yield `not-a-descriptor-${String(i)}.txt`;
+      }
+      throw new Error('EIO');
+    }
+    expect(enumerateDescriptorCandidates(ANCHOR, { listAnchor: () => throwingAfter(3) })).toEqual({
+      ok: false,
+      reason: 'unreadable',
+    });
+  });
+
+  it('FINDING 2 — huge non-matching directory fails closed (overfull) with bounded scan', () => {
+    const meter = { consumed: 0 };
+    // Far more entries than the total-entry cap, none matching.
+    const huge = MAX_ANCHOR_ENTRIES * 100;
+    function* names(): IterableIterator<string> {
+      for (let i = 0; i < huge; i += 1) {
+        meter.consumed += 1;
+        yield `junk-${String(i)}`;
+      }
+    }
+    const result = enumerateDescriptorCandidates(ANCHOR, { listAnchor: () => names() });
+    expect(result).toEqual({ ok: false, reason: 'overfull' });
+    // Bounded WORK: the scan stopped at the total-entry witness, not at `huge`.
+    expect(meter.consumed).toBeLessThanOrEqual(MAX_ANCHOR_ENTRIES + 1);
+  });
+
+  it('FINDING 2 — huge mixed directory still stops at the total-entry bound', () => {
+    const meter = { consumed: 0 };
+    const huge = MAX_ANCHOR_ENTRIES * 100;
+    // A few valid candidates buried far beyond the total-entry cap.
+    const realIds = ['a'.repeat(32), 'b'.repeat(32)];
+    function* names(): IterableIterator<string> {
+      for (let i = 0; i < huge; i += 1) {
+        meter.consumed += 1;
+        yield `junk-${String(i)}`;
+      }
+      for (const id of realIds) {
+        meter.consumed += 1;
+        yield descriptorFilenameFor(id);
+      }
+    }
+    const result = enumerateDescriptorCandidates(ANCHOR, { listAnchor: () => names() });
+    expect(result).toEqual({ ok: false, reason: 'overfull' });
+    expect(meter.consumed).toBeLessThanOrEqual(MAX_ANCHOR_ENTRIES + 1);
+  });
+
+  it('FINDING 2 — a directory within the total-entry cap enumerates normally', () => {
+    const noise: string[] = [];
+    for (let i = 0; i < MAX_ANCHOR_ENTRIES - 10; i += 1) {
+      noise.push(`junk-${String(i)}.txt`);
+    }
+    const realIds = ['a'.repeat(32), 'b'.repeat(32), 'c'.repeat(32)];
+    const listed = [...noise, ...realIds.map((id) => descriptorFilenameFor(id))];
+    const result = enumerateDescriptorCandidates(ANCHOR, { listAnchor: () => listed });
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+    expect(result.truncated).toBe(false);
+    expect(result.candidates.map((candidate) => candidate.runtimeId).sort()).toEqual([...realIds].sort());
+  });
+
+  it('FINDING 2 — the candidate cap still trips before the total-entry cap when matches dominate', () => {
+    // MAX + 1 matching candidates (well under the total-entry cap): still truncated.
+    const listed: string[] = [];
+    for (let i = 0; i < MAX_DESCRIPTOR_CANDIDATES + 1; i += 1) {
+      listed.push(descriptorFilenameFor(i.toString(16).padStart(32, '0')));
+    }
+    const result = enumerateDescriptorCandidates(ANCHOR, { listAnchor: () => listed });
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+    expect(result.truncated).toBe(true);
+    expect(result.candidates.length).toBeLessThanOrEqual(MAX_DESCRIPTOR_CANDIDATES);
+  });
+
+  it('FINDING 2 — discovery fails closed (ANCHOR_OVERFULL) without probing an over-full anchor', async () => {
+    let probes = 0;
+    const huge = MAX_ANCHOR_ENTRIES * 100;
+    function* names(): IterableIterator<string> {
+      for (let i = 0; i < huge; i += 1) {
+        yield `junk-${String(i)}`;
+      }
+    }
+    const result = await discoverControlRuntime(
+      ANCHOR,
+      () => {
+        probes += 1;
+        return Promise.resolve('PRESENT');
+      },
+      { listAnchor: () => names() },
+    );
+    expect(result.kind).toBe('UNAVAILABLE');
+    if (result.kind === 'UNAVAILABLE') {
+      expect(result.reason).toBe(DISCOVERY_UNAVAILABLE.ANCHOR_OVERFULL);
+    }
+    expect(probes).toBe(0);
   });
 
   it('readDescriptorCandidate requires name/content consistency', () => {

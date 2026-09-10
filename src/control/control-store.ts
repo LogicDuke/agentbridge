@@ -94,7 +94,7 @@
 
 import { execFile } from 'node:child_process';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import { closeSync, lstatSync, openSync, readdirSync, readFileSync, readSync, unlinkSync } from 'node:fs';
+import { closeSync, lstatSync, openSync, opendirSync, readFileSync, readSync, unlinkSync } from 'node:fs';
 import net from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -116,6 +116,16 @@ const PROCESS_MAX_BUFFER = 1024 * 1024;
 const MAX_PATH_DEPTH = 64;
 /** Bounded maximum number of descriptor candidates examined in one pass. */
 export const MAX_DESCRIPTOR_CANDIDATES = 64;
+/**
+ * Total directory-entry scan bound for one control-anchor enumeration. Reading
+ * stops after this many entries — matching or not — and fails closed as an
+ * anomalous anchor. It is 16× the candidate cap: far above any legitimate control
+ * anchor (which holds only identity-named descriptors for the handful of
+ * live/stale runtimes), so it bounds enumeration WORK to O(MAX_ANCHOR_ENTRIES)
+ * without touching MAX_DESCRIPTOR_CANDIDATES selection semantics. It is a
+ * resource/anomaly bound, not an authority rule.
+ */
+export const MAX_ANCHOR_ENTRIES = MAX_DESCRIPTOR_CANDIDATES * 16;
 /** Finite deadline for one pipe liveness probe. */
 const PIPE_PROBE_TIMEOUT_MS = 2000;
 
@@ -1056,14 +1066,32 @@ export async function verifyDescriptorAcl(
 
 /** Injection seams for descriptor reads, removals, and anchor enumeration. */
 export interface DescriptorFileDeps {
-  /** Basenames inside the anchor; throws when the anchor cannot be listed. */
-  readonly listAnchor?: (anchorPath: string) => readonly string[];
+  /**
+   * Basenames inside the anchor as an iterable; throws when the anchor cannot be
+   * listed. An iterable (not a materialized array) so enumeration can consume it
+   * incrementally and stop early once a bound is reached.
+   */
+  readonly listAnchor?: (anchorPath: string) => Iterable<string>;
   readonly readFile?: (path: string) => string;
   readonly removeFile?: (path: string) => void;
 }
 
-function defaultListAnchor(anchorPath: string): readonly string[] {
-  return readdirSync(anchorPath);
+/**
+ * Incremental anchor listing: open the directory once and yield entry names one
+ * at a time via the synchronous {@link opendirSync} handle, closing it when
+ * iteration ends (including an early `break`, via the generator's `finally`). It
+ * never materializes the whole directory, so a consumer that stops early does
+ * O(consumed) work rather than O(directory size).
+ */
+function* defaultListAnchor(anchorPath: string): IterableIterator<string> {
+  const dir = opendirSync(anchorPath);
+  try {
+    for (let entry = dir.readSync(); entry !== null; entry = dir.readSync()) {
+      yield entry.name;
+    }
+  } finally {
+    dir.closeSync();
+  }
 }
 /**
  * Bounded descriptor read: at most {@link MAX_DESCRIPTOR_BYTES} + 1 bytes are
@@ -1121,6 +1149,13 @@ export interface DescriptorCandidate {
   readonly path: string;
 }
 
+/** Why an enumeration failed closed without a usable candidate set. */
+export type CandidateEnumerationFailure =
+  /** The anchor could not be listed at all. */
+  | 'unreadable'
+  /** The directory held more total entries than the total-entry scan bound. */
+  | 'overfull';
+
 export type CandidateEnumeration =
   | {
       readonly ok: true;
@@ -1128,7 +1163,7 @@ export type CandidateEnumeration =
       /** More identity-named files existed than the bounded cap allowed. */
       readonly truncated: boolean;
     }
-  | { readonly ok: false };
+  | { readonly ok: false; readonly reason: CandidateEnumerationFailure };
 
 /**
  * Enumerate the identity-named descriptor candidates in the anchor. Only
@@ -1143,31 +1178,40 @@ export function enumerateDescriptorCandidates(
   deps: DescriptorFileDeps = {},
 ): CandidateEnumeration {
   const list = deps.listAnchor ?? defaultListAnchor;
-  let names: readonly string[];
-  try {
-    names = list(anchorPath);
-  } catch {
-    return { ok: false };
-  }
-  // Bound the WORK, not just the returned result: retain at most
-  // MAX_DESCRIPTOR_CANDIDATES + 1 matching candidates. The +1 is the truncation
-  // witness — the moment it exists the cap is exceeded, so we stop collecting and
-  // never sort more than MAX_DESCRIPTOR_CANDIDATES + 1 records. An anchor holding
-  // a huge number of descriptor-shaped filenames therefore costs
-  // O(MAX_DESCRIPTOR_CANDIDATES) candidate memory and sort work, not O(matches).
+  // Bound the total WORK, not just the returned candidate array. Two independent
+  // caps, both fail-closed:
+  //   1. matching-candidate cap — at most MAX_DESCRIPTOR_CANDIDATES + 1 candidate
+  //      records are ever retained or sorted (the +1 is the truncation witness);
+  //   2. total-entry cap — at most MAX_ANCHOR_ENTRIES + 1 directory entries are
+  //      ever read, so an anchor flooded with non-matching names cannot force
+  //      work proportional to the whole directory.
+  // Listing is consumed incrementally (see defaultListAnchor), so hitting either
+  // cap stops the directory read early. A listing error at any point (open or
+  // mid-iteration) fails closed as `unreadable`.
   const matched: DescriptorCandidate[] = [];
   let truncated = false;
-  for (const name of names) {
-    const runtimeId = runtimeIdFromDescriptorFilename(name);
-    if (runtimeId === null) {
-      continue;
+  let scanned = 0;
+  try {
+    for (const name of list(anchorPath)) {
+      scanned += 1;
+      if (scanned > MAX_ANCHOR_ENTRIES) {
+        // Total-entry witness: an anomalous anchor. Stop reading and fail closed
+        // without materializing or scanning the rest of the directory.
+        return { ok: false, reason: 'overfull' };
+      }
+      const runtimeId = runtimeIdFromDescriptorFilename(name);
+      if (runtimeId === null) {
+        continue;
+      }
+      matched.push({ runtimeId, filename: name, path: join(anchorPath, name) });
+      if (matched.length > MAX_DESCRIPTOR_CANDIDATES) {
+        // The +1 witness proves the candidate cap is exceeded; stop collecting.
+        truncated = true;
+        break;
+      }
     }
-    matched.push({ runtimeId, filename: name, path: join(anchorPath, name) });
-    if (matched.length > MAX_DESCRIPTOR_CANDIDATES) {
-      // The +1 witness proves the cap is exceeded; stop collecting/sorting more.
-      truncated = true;
-      break;
-    }
+  } catch {
+    return { ok: false, reason: 'unreadable' };
   }
   matched.sort((a, b) => (a.runtimeId < b.runtimeId ? -1 : a.runtimeId > b.runtimeId ? 1 : 0));
   return {
@@ -1259,13 +1303,14 @@ export function defaultPipeProbe(timeoutMs: number = PIPE_PROBE_TIMEOUT_MS): Pip
 
 /**
  * Whether the initial descriptor enumeration underpinning the sweep was
- * complete. This is the same enumeration the CLI's discovery runs, so the two
+ * complete. This is the same enumeration the CLI's discovery runs, so the
  * incomplete states mirror discovery's fail-closed reasons exactly:
- * `unreadable` ⇔ ANCHOR_UNREADABLE, `truncated` ⇔ TOO_MANY_CANDIDATES. A caller
- * that starts a control channel must treat anything but `complete` as a reason
- * to fail closed, since a channel it starts could never be discovered.
+ * `unreadable` ⇔ ANCHOR_UNREADABLE, `truncated` ⇔ TOO_MANY_CANDIDATES,
+ * `overfull` ⇔ ANCHOR_OVERFULL (total-entry scan bound exceeded). A caller that
+ * starts a control channel must treat anything but `complete` as a reason to fail
+ * closed, since a channel it starts could never be discovered.
  */
-export type SweepEnumeration = 'complete' | 'unreadable' | 'truncated';
+export type SweepEnumeration = 'complete' | 'unreadable' | 'truncated' | 'overfull';
 
 export interface StaleSweepResult {
   /**
@@ -1309,9 +1354,17 @@ export async function sweepStaleDescriptors(
   const unremovable: string[] = [];
   const enumeration = enumerateDescriptorCandidates(anchorPath, deps);
   if (!enumeration.ok) {
-    // Unreadable anchor: report incompleteness rather than an empty sweep, and
-    // do not mutate the anchor.
-    return { enumeration: 'unreadable', examined: 0, removed, retained, malformed, unremovable };
+    // Incomplete enumeration (unreadable anchor, or more entries than the
+    // total-entry scan bound): report the incompleteness rather than an empty
+    // sweep, and do not mutate the anchor.
+    return {
+      enumeration: enumeration.reason === 'overfull' ? 'overfull' : 'unreadable',
+      examined: 0,
+      removed,
+      retained,
+      malformed,
+      unremovable,
+    };
   }
   if (enumeration.truncated) {
     // More candidates than the bounded cap — exactly what discovery fails closed
@@ -1354,6 +1407,8 @@ export const DISCOVERY_UNAVAILABLE = Object.freeze({
   NO_LIVE_CANDIDATES: 'NO_LIVE_CANDIDATES',
   /** More candidates than the bounded cap — an anomalous anchor; fail closed. */
   TOO_MANY_CANDIDATES: 'TOO_MANY_CANDIDATES',
+  /** More total directory entries than the scan bound — an anomalous anchor. */
+  ANCHOR_OVERFULL: 'ANCHOR_OVERFULL',
 } as const);
 
 export type DiscoveryUnavailableReason =
@@ -1404,7 +1459,13 @@ export async function discoverControlRuntime(
   const enumeration = enumerateDescriptorCandidates(anchorPath, deps);
   const zero: DiscoveryCounts = { candidates: 0, malformed: 0, live: 0, dead: 0, unknown: 0 };
   if (!enumeration.ok) {
-    return { kind: 'UNAVAILABLE', reason: DISCOVERY_UNAVAILABLE.ANCHOR_UNREADABLE, counts: zero };
+    // Both incomplete states fail closed before any probe; distinguish them so
+    // an operator sees why (an unreadable anchor vs. an over-full anchor).
+    const reason =
+      enumeration.reason === 'overfull'
+        ? DISCOVERY_UNAVAILABLE.ANCHOR_OVERFULL
+        : DISCOVERY_UNAVAILABLE.ANCHOR_UNREADABLE;
+    return { kind: 'UNAVAILABLE', reason, counts: zero };
   }
   if (enumeration.truncated) {
     return {

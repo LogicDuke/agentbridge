@@ -29,6 +29,7 @@ import { createControlDispatcher, type ControlDispatcher } from '../../src/contr
 import {
   CONTROL_ANCHOR_REJECTION,
   DESCRIPTOR_CREATION_REJECTION,
+  MAX_ANCHOR_ENTRIES,
   MAX_DESCRIPTOR_CANDIDATES,
   createRuntimeDescriptor,
   defaultPipeProbe,
@@ -971,6 +972,127 @@ describe('D062 lifecycle v2 — startup sweep of foreign descriptors', () => {
     }
     expect(anchor.removeCalls()).toBe(1); // the dead file was swept as before
     expect(anchor.get(dead.runtimeId)).toBeNull();
+  });
+
+  /** Seed `count` valid identity-named descriptors; return their pipe paths. */
+  function seedSurvivors(anchor: MemAnchor, count: number): string[] {
+    const pipePaths: string[] = [];
+    for (let index = 0; index < count; index += 1) {
+      const minted = createRuntimeDescriptor();
+      anchor.set(minted.runtimeId, serializeDescriptor(minted.descriptor));
+      pipePaths.push(pipePathFromName(minted.descriptor.pipeName));
+    }
+    return pipePaths;
+  }
+
+  it('FINDING 1 — exactly MAX surviving descriptors leaves no slot: startup fails closed before listen/publish', async () => {
+    const { orchestrator } = newOrchestrator();
+    const anchor = memAnchor();
+    seedSurvivors(anchor, MAX_DESCRIPTOR_CANDIDATES);
+    const before = filesIn(anchor).length;
+    let serverCreated = false;
+    let created = 0;
+    const createServer: typeof createControlChannelServer = ((options) => {
+      serverCreated = true;
+      return createControlChannelServer(options);
+    }) as typeof createControlChannelServer;
+    const create: DescriptorCreatorFn = async (dir, id, bytes) => {
+      created += 1;
+      return anchor.create(dir, id, bytes);
+    };
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: passingDescriptorVerify,
+      descriptorDeps: anchor.deps,
+      createDescriptor: create,
+      createServer,
+      probePipe: () => Promise.resolve('UNKNOWN'), // every survivor is retained, none removed
+      logger: silent,
+    });
+    expect(handle).toBeNull();
+    expect(serverCreated).toBe(false); // never reached the server / listen
+    expect(created).toBe(0); // never published our own descriptor
+    expect(before).toBe(MAX_DESCRIPTOR_CANDIDATES);
+    expect(filesIn(anchor).length).toBe(before); // still exactly MAX; nothing published
+  });
+
+  it('FINDING 1 — MAX-1 survivors leaves one slot: startup proceeds and publishes to MAX total', async () => {
+    const { orchestrator } = newOrchestrator();
+    const anchor = memAnchor();
+    seedSurvivors(anchor, MAX_DESCRIPTOR_CANDIDATES - 1);
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: passingDescriptorVerify,
+      descriptorDeps: anchor.deps,
+      createDescriptor: anchor.create,
+      probePipe: () => Promise.resolve('UNKNOWN'),
+      logger: silent,
+    });
+    expect(handle).not.toBeNull();
+    if (handle !== null) {
+      handles.push(handle);
+      expect(anchor.get(handle.runtimeId)).not.toBeNull(); // own descriptor published
+    }
+    expect(filesIn(anchor).length).toBe(MAX_DESCRIPTOR_CANDIDATES); // (MAX-1) survivors + own = MAX
+  });
+
+  it('FINDING 1 — a removable ABSENT descriptor frees a slot: startup proceeds, republishing to MAX', async () => {
+    const { orchestrator } = newOrchestrator();
+    const anchor = memAnchor();
+    const pipePaths = seedSurvivors(anchor, MAX_DESCRIPTOR_CANDIDATES);
+    const deadPipe = pipePaths[0];
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: passingDescriptorVerify,
+      descriptorDeps: anchor.deps,
+      createDescriptor: anchor.create,
+      probePipe: (path) => Promise.resolve(path === deadPipe ? 'ABSENT' : 'UNKNOWN'),
+      logger: silent,
+    });
+    expect(handle).not.toBeNull();
+    if (handle !== null) {
+      handles.push(handle);
+    }
+    expect(anchor.removeCalls()).toBe(1); // one proven-ABSENT descriptor removed
+    expect(filesIn(anchor).length).toBe(MAX_DESCRIPTOR_CANDIDATES); // (MAX-1 remaining) + own = MAX
+  });
+
+  it('FINDING 2 — an over-full anchor fails startup closed before listen or publish', async () => {
+    const { orchestrator } = newOrchestrator();
+    const anchor = memAnchor();
+    const huge = MAX_ANCHOR_ENTRIES * 100;
+    function* names(): IterableIterator<string> {
+      for (let index = 0; index < huge; index += 1) {
+        yield `junk-${String(index)}`;
+      }
+    }
+    const deps = { ...anchor.deps, listAnchor: () => names() };
+    let serverCreated = false;
+    let created = 0;
+    const createServer: typeof createControlChannelServer = ((options) => {
+      serverCreated = true;
+      return createControlChannelServer(options);
+    }) as typeof createControlChannelServer;
+    const create: DescriptorCreatorFn = async (dir, id, bytes) => {
+      created += 1;
+      return anchor.create(dir, id, bytes);
+    };
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: passingDescriptorVerify,
+      descriptorDeps: deps,
+      createDescriptor: create,
+      createServer,
+      probePipe: allAbsentProbe,
+      logger: silent,
+    });
+    expect(handle).toBeNull();
+    expect(serverCreated).toBe(false);
+    expect(created).toBe(0);
   });
 
   it('a stale file whose unlink fails is reported, not fatal; startup still succeeds', async () => {

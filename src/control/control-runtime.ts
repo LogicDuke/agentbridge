@@ -39,6 +39,7 @@ import { CONTROL_RESULT, type ControlCommand, type ControlResultStatus } from '.
 import { createControlChannelServer } from './control-channel.js';
 import { createControlDispatcher, type ControlDispatcher } from './control-dispatch.js';
 import {
+  MAX_DESCRIPTOR_CANDIDATES,
   createDescriptorFileNative,
   createRuntimeDescriptor,
   defaultPipeProbe,
@@ -155,6 +156,17 @@ export async function startControlChannel(
   // CONTROL_START_SUCCESS ⇒ INITIAL_DESCRIPTOR_ENUMERATION_COMPLETE.
   if (sweep.enumeration !== 'complete') {
     log(`AgentBridge control channel: disabled (descriptor enumeration ${sweep.enumeration}).`);
+    return null;
+  }
+  // Reserve a candidate slot for our own descriptor BEFORE listening/publishing.
+  // The candidates that survived the sweep (examined minus those removed) still
+  // occupy identity-named slots; if they already fill the cap, publishing ours
+  // would push the anchor to MAX + 1 and make this runtime undiscoverable (the
+  // CLI would fail closed with TOO_MANY_CANDIDATES). Fail closed here instead:
+  // CONTROL_START_SUCCESS ⇒ POST_PUBLICATION_CANDIDATE_SET_DISCOVERABLE.
+  const survivingCandidates = sweep.examined - sweep.removed.length;
+  if (survivingCandidates >= MAX_DESCRIPTOR_CANDIDATES) {
+    log('AgentBridge control channel: disabled (no descriptor candidate slot available).');
     return null;
   }
   if (sweep.removed.length > 0 || sweep.unremovable.length > 0) {
