@@ -1246,6 +1246,7 @@ describe('D062 descriptor creator gate — createDescriptorFileNative (injected)
       DESCRIPTOR_CREATION_REJECTION.CREATOR_SPAWN_FAILED,
       DESCRIPTOR_CREATION_REJECTION.CREATOR_TIMEOUT,
       DESCRIPTOR_CREATION_REJECTION.CREATOR_FAILED,
+      DESCRIPTOR_CREATION_REJECTION.CREATOR_WROTE_THEN_FAILED,
     ] as const) {
       const result = await createDescriptorFileNative(FAKE_ANCHOR, minted.runtimeId, payload, creatorDeps([], {
         runCreator: () => Promise.resolve({ ok: false, reason }),
@@ -1253,6 +1254,7 @@ describe('D062 descriptor creator gate — createDescriptorFileNative (injected)
       expect(result).toEqual({ ok: false, reason });
     }
   });
+
 
   it('the creator provenance comes only from its own generated module (never the owner helper\'s, env, or a sidecar)', async () => {
     // No injected loader: the default module-relative creator provenance import is

@@ -1575,8 +1575,20 @@ export const DESCRIPTOR_CREATION_REJECTION = Object.freeze({
   CREATOR_SPAWN_FAILED: 'CREATOR_SPAWN_FAILED',
   /** It did not settle within the finite deadline and was killed. */
   CREATOR_TIMEOUT: 'CREATOR_TIMEOUT',
-  /** It ran and refused: nonzero exit (CREATE_NEW collision included), a signal, or undeliverable stdin. */
+  /**
+   * It ran and refused BEFORE creating the file: a pre-create nonzero exit
+   * (CREATE_NEW collision — exit 5 — included), a signal, or undeliverable stdin.
+   * The invocation did NOT create the identity-named file, so its pathname is
+   * never cleaned up (an existing file at that path may be foreign or planted).
+   */
   CREATOR_FAILED: 'CREATOR_FAILED',
+  /**
+   * CREATE_NEW succeeded, then a write / flush / close failed (creator exit 6).
+   * This invocation DID create the identity-named file; the creator's own
+   * handle-scoped removal is best effort and may leave a residual, so the caller
+   * is authorized to clean up exactly this runtime's minted descriptor path.
+   */
+  CREATOR_WROTE_THEN_FAILED: 'CREATOR_WROTE_THEN_FAILED',
 } as const);
 
 export type DescriptorCreationRejection =
@@ -1594,7 +1606,8 @@ export type CreatorRunResult =
       readonly reason:
         | typeof DESCRIPTOR_CREATION_REJECTION.CREATOR_SPAWN_FAILED
         | typeof DESCRIPTOR_CREATION_REJECTION.CREATOR_TIMEOUT
-        | typeof DESCRIPTOR_CREATION_REJECTION.CREATOR_FAILED;
+        | typeof DESCRIPTOR_CREATION_REJECTION.CREATOR_FAILED
+        | typeof DESCRIPTOR_CREATION_REJECTION.CREATOR_WROTE_THEN_FAILED;
     };
 
 /**
@@ -1612,6 +1625,13 @@ export type CreatorRunner = (
 
 /** Node's error code when a child overruns `maxBuffer` (an output fault, not a timeout). */
 const MAXBUFFER_CODE = 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER';
+/**
+ * The creator's exit code for "CREATE_NEW succeeded, then write/flush/close
+ * failed" — the ONE nonzero exit that proves this invocation created the file.
+ * Every other nonzero exit (including 5, a CREATE_NEW collision) is a pre-create
+ * refusal. Kept in lockstep with the native creator's documented exit codes.
+ */
+const CREATOR_EXIT_WROTE_THEN_FAILED = 6;
 
 /**
  * The production creator runner: the SAME process primitive the read-only gate
@@ -1659,7 +1679,19 @@ export function defaultCreatorRunner(systemRoot: string): CreatorRunner {
               resolvePromise({ ok: false, reason: DESCRIPTOR_CREATION_REJECTION.CREATOR_TIMEOUT });
               return;
             }
+            if (failure.code === CREATOR_EXIT_WROTE_THEN_FAILED) {
+              // The one nonzero exit that proves the file WAS created (then a
+              // write/flush/close failed); surface it distinctly so the caller can
+              // clean up exactly its own minted descriptor path.
+              resolvePromise({
+                ok: false,
+                reason: DESCRIPTOR_CREATION_REJECTION.CREATOR_WROTE_THEN_FAILED,
+              });
+              return;
+            }
             if (typeof failure.code === 'number' || typeof failure.signal === 'string') {
+              // Every other nonzero exit (including exit 5, a CREATE_NEW collision)
+              // or a signal is a pre-create refusal: the file was not created here.
               resolvePromise({ ok: false, reason: DESCRIPTOR_CREATION_REJECTION.CREATOR_FAILED });
               return;
             }

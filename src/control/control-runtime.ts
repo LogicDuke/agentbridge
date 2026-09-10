@@ -39,6 +39,7 @@ import { CONTROL_RESULT, type ControlCommand, type ControlResultStatus } from '.
 import { createControlChannelServer } from './control-channel.js';
 import { createControlDispatcher, type ControlDispatcher } from './control-dispatch.js';
 import {
+  DESCRIPTOR_CREATION_REJECTION,
   MAX_ANCHOR_ENTRIES,
   MAX_DESCRIPTOR_CANDIDATES,
   createDescriptorFileNative,
@@ -250,9 +251,14 @@ export async function startControlChannel(
     );
   }
   if (!creation.ok) {
+    // Clean up ONLY when the creator proved it created our identity-named file
+    // then failed (exit 6). Every other creation failure — including a CREATE_NEW
+    // collision (exit 5) — did NOT create the file here, so its pathname (which
+    // may be foreign or planted) must never be removed.
+    const published = creation.reason === DESCRIPTOR_CREATION_REJECTION.CREATOR_WROTE_THEN_FAILED;
     return failAfterListen(
       `AgentBridge control channel: disabled (descriptor creation failed: ${creation.reason}).`,
-      false,
+      published,
     );
   }
 

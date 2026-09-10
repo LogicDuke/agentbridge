@@ -675,6 +675,89 @@ describe('D062 lifecycle v2 — creation failures after listen', () => {
     expect(await realProbe(peer.pipePath)).toBe('PRESENT');
   });
 
+  it('FINDING — exit-6 (created-then-failed) cleans up exactly this runtime\'s own descriptor path; no handle, no dispatch', async () => {
+    const { orchestrator } = newOrchestrator();
+    const anchor = memAnchor();
+    let ownId = '';
+    let serverCreated = false;
+    const sink: { dispatcher: ControlDispatcher | null } = { dispatcher: null };
+    const createServer: typeof createControlChannelServer = ((options) => {
+      serverCreated = true;
+      sink.dispatcher = options.dispatcher;
+      return createControlChannelServer(options);
+    }) as typeof createControlChannelServer;
+    const create: DescriptorCreatorFn = (_dir, id, bytes) => {
+      ownId = id;
+      // Model exit 6: CREATE_NEW succeeded (a residual file exists), then a
+      // write/flush/close failed and the creator's own removal did not take.
+      anchor.set(id, bytes.toString('utf8'));
+      return Promise.resolve({ ok: false, reason: DESCRIPTOR_CREATION_REJECTION.CREATOR_WROTE_THEN_FAILED });
+    };
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: passingDescriptorVerify,
+      descriptorDeps: anchor.deps,
+      createDescriptor: create,
+      createServer,
+      probePipe: realProbe,
+      logger: silent,
+    });
+    expect(handle).toBeNull();
+    expect(serverCreated).toBe(true); // listen happened before publish, then closed
+    expect(anchor.get(ownId)).toBeNull(); // the residual descriptor was removed
+    expect(anchor.removeCalls()).toBe(1); // exactly one removal — its own path
+    // The gate dispatcher was armed onto the (now-closed) server but never became
+    // live, so no command can be dispatched to the orchestrator.
+    expect(sink.dispatcher?.dispatch({ command: CONTROL_COMMAND.OPEN_HUMAN_GATE })).toBe(CONTROL_RESULT.UNAVAILABLE);
+  });
+
+  it('FINDING — exit-6 cleanup tolerates the descriptor already being absent (ENOENT is not a second failure)', async () => {
+    const { orchestrator } = newOrchestrator();
+    const anchor = memAnchor();
+    // Model exit 6 where the creator's OWN handle-scoped removal already succeeded,
+    // so no residual remains for the runtime to unlink.
+    const create: DescriptorCreatorFn = () =>
+      Promise.resolve({ ok: false, reason: DESCRIPTOR_CREATION_REJECTION.CREATOR_WROTE_THEN_FAILED });
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: passingDescriptorVerify,
+      descriptorDeps: anchor.deps,
+      createDescriptor: create,
+      probePipe: realProbe,
+      logger: silent,
+    });
+    expect(handle).toBeNull();
+    expect(filesIn(anchor)).toEqual([]); // nothing left behind
+    expect(anchor.removeCalls()).toBe(1); // attempted its own path; ENOENT tolerated, not fatal
+  });
+
+  it('FINDING — exit-5 (pre-create CREATE_NEW collision) NEVER removes the existing pathname (authority boundary)', async () => {
+    const { orchestrator } = newOrchestrator();
+    const anchor = memAnchor();
+    let ownId = '';
+    const create: DescriptorCreatorFn = (_dir, id) => {
+      ownId = id;
+      // A foreign/planted file already occupies OUR attempted path; CREATE_NEW
+      // fails pre-create (exit 5 → generic CREATOR_FAILED). It must not be deleted.
+      anchor.set(id, '{ foreign-or-planted }');
+      return Promise.resolve({ ok: false, reason: DESCRIPTOR_CREATION_REJECTION.CREATOR_FAILED });
+    };
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: passingDescriptorVerify,
+      descriptorDeps: anchor.deps,
+      createDescriptor: create,
+      probePipe: realProbe,
+      logger: silent,
+    });
+    expect(handle).toBeNull();
+    expect(anchor.removeCalls()).toBe(0); // pre-create failure ⇒ NO pathname deletion
+    expect(anchor.get(ownId)).toBe('{ foreign-or-planted }'); // the existing file is untouched
+  });
+
   it('a creator that throws is contained; the channel disables, nothing propagates', async () => {
     const { orchestrator } = newOrchestrator();
     const anchor = memAnchor();
