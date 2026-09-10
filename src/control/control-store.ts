@@ -1407,7 +1407,13 @@ export async function discoverControlRuntime(
     unknown,
   };
   const single = live[0];
-  if (live.length === 1 && single !== undefined) {
+  // A single PRESENT candidate is unique ONLY when no competing candidate is
+  // UNKNOWN. UNKNOWN (probe timeout, access denied, pipe busy, any non-ENOENT
+  // error) is not proof of deadness — only proven-ABSENT (ENOENT) eliminates a
+  // candidate — so an UNKNOWN peer may itself be a live runtime. Returning FOUND
+  // with an unresolved UNKNOWN would let the CLI issue OPEN_HUMAN_GATE without
+  // proving exactly one runtime is viable, so fail closed as AMBIGUOUS instead.
+  if (live.length === 1 && unknown === 0 && single !== undefined) {
     return { kind: 'FOUND', parsed: single.parsed, counts };
   }
   if (live.length === 0) {

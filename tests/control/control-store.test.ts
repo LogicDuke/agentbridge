@@ -794,6 +794,66 @@ describe('D062 discovery — deterministic selection over bounded candidates', (
     }
   });
 
+  it('one PRESENT + one UNKNOWN → AMBIGUOUS, never FOUND (UNKNOWN is not proven dead)', async () => {
+    const { anchor, pipes } = seeded(2);
+    const result = await discoverControlRuntime(
+      ANCHOR,
+      tableProbe({ [pipes[0] ?? '']: 'PRESENT', [pipes[1] ?? '']: 'UNKNOWN' }),
+      anchor.deps,
+    );
+    expect(result.kind).toBe('AMBIGUOUS');
+    expect(result.counts.live).toBe(1);
+    expect(result.counts.unknown).toBe(1);
+  });
+
+  it('one PRESENT + multiple UNKNOWN → AMBIGUOUS, never FOUND', async () => {
+    const { anchor, pipes } = seeded(3);
+    const result = await discoverControlRuntime(
+      ANCHOR,
+      tableProbe(
+        { [pipes[0] ?? '']: 'PRESENT', [pipes[1] ?? '']: 'UNKNOWN', [pipes[2] ?? '']: 'UNKNOWN' },
+      ),
+      anchor.deps,
+    );
+    expect(result.kind).toBe('AMBIGUOUS');
+    expect(result.counts.live).toBe(1);
+    expect(result.counts.unknown).toBe(2);
+  });
+
+  it('one PRESENT with every other candidate proven ABSENT → FOUND (unique path intact)', async () => {
+    const { anchor, ids, pipes } = seeded(3);
+    const result = await discoverControlRuntime(
+      ANCHOR,
+      tableProbe({ [pipes[1] ?? '']: 'PRESENT' }, 'ABSENT'),
+      anchor.deps,
+    );
+    expect(result.kind).toBe('FOUND');
+    if (result.kind === 'FOUND') {
+      expect(result.parsed.runtimeId).toBe(ids[1]);
+      expect(result.counts).toEqual({ candidates: 3, malformed: 0, live: 1, dead: 2, unknown: 0 });
+    }
+  });
+
+  it('two PRESENT (no UNKNOWN) → AMBIGUOUS (existing multi-live behavior unchanged)', async () => {
+    const { anchor, ids } = seeded(2);
+    const result = await discoverControlRuntime(ANCHOR, () => Promise.resolve('PRESENT'), anchor.deps);
+    expect(result.kind).toBe('AMBIGUOUS');
+    if (result.kind === 'AMBIGUOUS') {
+      expect([...result.live].sort()).toEqual([...ids].sort());
+      expect(result.counts.unknown).toBe(0);
+    }
+  });
+
+  it('only UNKNOWN (no PRESENT) → UNAVAILABLE NO_LIVE_CANDIDATES (zero-live behavior preserved)', async () => {
+    const { anchor } = seeded(1);
+    const result = await discoverControlRuntime(ANCHOR, () => Promise.resolve('UNKNOWN'), anchor.deps);
+    expect(result.kind).toBe('UNAVAILABLE');
+    if (result.kind === 'UNAVAILABLE') {
+      expect(result.reason).toBe(DISCOVERY_UNAVAILABLE.NO_LIVE_CANDIDATES);
+      expect(result.counts.unknown).toBe(1);
+    }
+  });
+
   it('an unreadable anchor → UNAVAILABLE ANCHOR_UNREADABLE', async () => {
     const result = await discoverControlRuntime(ANCHOR, allAbsentProbe, { listAnchor: () => { throw new Error('EACCES'); } });
     expect(result.kind).toBe('UNAVAILABLE');
