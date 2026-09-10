@@ -1,4 +1,5 @@
 import net from 'node:net';
+import { join } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
@@ -148,7 +149,7 @@ describe('D062 runtime identity — strict [0-9a-f]{32}', () => {
   it('derives the filename and pipe name only from a valid id, and throws otherwise', () => {
     expect(descriptorFilenameFor(HEX32)).toBe(`runtime-descriptor-${HEX32}.json`);
     expect(pipeNameForRuntimeId(HEX32)).toBe(`agentbridge-control-${HEX32}`);
-    expect(descriptorPathFor(ANCHOR, HEX32)).toBe(`C:\\Anchor\\runtime-descriptor-${HEX32}.json`);
+    expect(descriptorPathFor(ANCHOR, HEX32)).toBe(join(ANCHOR, `runtime-descriptor-${HEX32}.json`));
     for (const bad of ['', '..', `..\\${HEX32}`, HEX32.toUpperCase(), 'runtime-descriptor.json']) {
       expect(() => descriptorFilenameFor(bad)).toThrow(TypeError);
       expect(() => pipeNameForRuntimeId(bad)).toThrow(TypeError);
@@ -590,7 +591,7 @@ describe('D062 descriptor ACL gate — verifyDescriptorSnapshot / verifyDescript
     });
     expect(result).toEqual({ ok: true });
     expect(calls.map((call) => call.args)).toEqual([['/user'], ['--acl', DESCRIPTOR_PATH]]);
-    expect(calls[0]?.exe).toBe('C:\\Windows\\System32\\whoami.exe');
+    expect(calls[0]?.exe).toBe(join('C:\\Windows', 'System32', 'whoami.exe'));
   });
 
   it('verifyDescriptorAcl fails closed when whoami fails, before touching the helper', async () => {
