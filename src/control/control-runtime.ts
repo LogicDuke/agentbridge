@@ -35,8 +35,9 @@ import { timingSafeEqual } from 'node:crypto';
 import type net from 'node:net';
 
 import type { AutoflowOrchestrator } from '../autoflow/orchestrator.js';
+import { CONTROL_RESULT, type ControlCommand, type ControlResultStatus } from './control-command.js';
 import { createControlChannelServer } from './control-channel.js';
-import { createControlDispatcher } from './control-dispatch.js';
+import { createControlDispatcher, type ControlDispatcher } from './control-dispatch.js';
 import {
   createDescriptorFileNative,
   createRuntimeDescriptor,
@@ -161,11 +162,23 @@ export async function startControlChannel(
   const descriptorPath = descriptorPathFor(anchorPath, runtimeId);
 
   // 4. Kernel-owned exclusivity/liveness: listen BEFORE anything is published.
-  const dispatcher = createControlDispatcher(deps.orchestrator);
+  //    The server is armed with an INERT gate dispatcher, never the real one:
+  //    the real dispatcher (the sole write-path capability) is created and
+  //    slotted in only after every descriptor trust gate below has passed. An
+  //    authenticated client that reaches the pipe during the publish→verify
+  //    window therefore gets UNAVAILABLE and the orchestrator is never touched,
+  //    preserving CONTROL_COMMAND_APPLIED ⇒ ALL_TRUST_GATES_PASSED. `live` moves
+  //    NOT_READY(null) → READY(real dispatcher) exactly once and never back.
+  let live: ControlDispatcher | null = null;
+  const gate: ControlDispatcher = Object.freeze({
+    dispatch(command: ControlCommand): ControlResultStatus {
+      return live === null ? CONTROL_RESULT.UNAVAILABLE : live.dispatch(command);
+    },
+  });
   const server = createServer(
     deps.timeoutMs === undefined
-      ? { token: minted.token, dispatcher }
-      : { token: minted.token, dispatcher, timeoutMs: deps.timeoutMs },
+      ? { token: minted.token, dispatcher: gate }
+      : { token: minted.token, dispatcher: gate, timeoutMs: deps.timeoutMs },
   );
   try {
     await listen(server, pipePath);
@@ -244,7 +257,13 @@ export async function startControlChannel(
     );
   }
 
-  // 7. Every trust gate passed: expose the handle.
+  // 7. Every trust gate passed. Arm the write path with NO intervening await
+  //    between the final successful read-back check above and this assignment,
+  //    so no command can be dispatched to the real orchestrator until exactly
+  //    here. This is the one and only NOT_READY → READY transition.
+  live = createControlDispatcher(deps.orchestrator);
+
+  // 8. Expose the handle.
   return {
     runtimeId,
     pipeName: minted.descriptor.pipeName,

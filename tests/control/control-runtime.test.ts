@@ -18,7 +18,14 @@ import { join } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { WORKFLOW_STATUS } from '../../src/domain/index.js';
 import { createControlChannelServer } from '../../src/control/control-channel.js';
+import {
+  CONTROL_COMMAND,
+  CONTROL_RESULT,
+  type ControlCommand,
+} from '../../src/control/control-command.js';
+import { createControlDispatcher, type ControlDispatcher } from '../../src/control/control-dispatch.js';
 import {
   CONTROL_ANCHOR_REJECTION,
   DESCRIPTOR_CREATION_REJECTION,
@@ -45,6 +52,7 @@ import {
   type DescriptorCreatorFn,
 } from '../../src/control/control-runtime.js';
 import {
+  BINDING,
   FAKE_ANCHOR,
   allAbsentProbe,
   closeServer,
@@ -480,6 +488,149 @@ describe('D062 lifecycle v2 — descriptor verification fails closed (real evalu
       expect(handle, label).toBeNull();
       expect(filesIn(anchor), label).toEqual([descriptorFilenameFor(peer.runtimeId)]);
     }
+  });
+});
+
+/* ---- readiness gate: the write path is inert until every trust gate passes ---- */
+
+describe('D062 lifecycle v2 — dispatcher is inert until armed (control readiness)', () => {
+  const OPEN_GATE: ControlCommand = { command: CONTROL_COMMAND.OPEN_HUMAN_GATE };
+
+  /** Wrap the orchestrator so openHumanGate calls are counted (own-property shadow). */
+  function countOpenHumanGate(orchestrator: ReturnType<typeof newOrchestrator>['orchestrator']): {
+    count: () => number;
+  } {
+    let calls = 0;
+    const real = orchestrator.openHumanGate.bind(orchestrator);
+    orchestrator.openHumanGate = (): ReturnType<typeof real> => {
+      calls += 1;
+      return real();
+    };
+    return { count: (): number => calls };
+  }
+
+  /** A createServer that records the exact dispatcher the runtime armed the server with. */
+  function capturingServer(sink: { dispatcher: ControlDispatcher | null }): typeof createControlChannelServer {
+    return ((options) => {
+      sink.dispatcher = options.dispatcher;
+      return createControlChannelServer(options);
+    }) as typeof createControlChannelServer;
+  }
+
+  it('1. the armed dispatcher returns UNAVAILABLE before verification and APPLIED only after it passes', async () => {
+    const { runtime, orchestrator } = newOrchestrator();
+    orchestrator.open(BINDING);
+    const gateCalls = countOpenHumanGate(orchestrator);
+    const anchor = memAnchor();
+    const sink: { dispatcher: ControlDispatcher | null } = { dispatcher: null };
+
+    // Hold verification open so the captured gate can be observed mid-window.
+    let releaseVerify: (v: DescriptorAclVerification) => void = () => {};
+    let reachedResolve: () => void = () => {};
+    const reached = new Promise<void>((resolvePromise) => {
+      reachedResolve = resolvePromise;
+    });
+    const verifyDescriptor = (): Promise<DescriptorAclVerification> => {
+      reachedResolve();
+      return new Promise<DescriptorAclVerification>((resolvePromise) => {
+        releaseVerify = resolvePromise;
+      });
+    };
+
+    const startPromise = startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor,
+      descriptorDeps: anchor.deps,
+      createDescriptor: anchor.create,
+      createServer: capturingServer(sink),
+      probePipe: realProbe,
+      logger: silent,
+    });
+    await reached; // descriptor published, pipe listening, verification pending
+
+    expect(sink.dispatcher).not.toBeNull();
+    // Pre-ready: the gate is inert and the orchestrator is never touched.
+    expect(sink.dispatcher?.dispatch(OPEN_GATE)).toBe(CONTROL_RESULT.UNAVAILABLE);
+    expect(gateCalls.count()).toBe(0);
+    expect(runtime.current()?.status).toBe(WORKFLOW_STATUS.OPEN);
+
+    // Verification succeeds → startup arms the SAME dispatcher object.
+    releaseVerify({ ok: true });
+    const handle = await startPromise;
+    expect(handle).not.toBeNull();
+    handles.push(handle as ControlChannelHandle);
+
+    expect(sink.dispatcher?.dispatch(OPEN_GATE)).toBe(CONTROL_RESULT.APPLIED);
+    expect(gateCalls.count()).toBe(1);
+    expect(runtime.current()?.status).toBe(WORKFLOW_STATUS.AWAITING_HUMAN_DECISION);
+  });
+
+  it('2. a failed descriptor ACL verification never arms the write path', async () => {
+    const { runtime, orchestrator } = newOrchestrator();
+    orchestrator.open(BINDING);
+    const gateCalls = countOpenHumanGate(orchestrator);
+    const anchor = memAnchor();
+    const sink: { dispatcher: ControlDispatcher | null } = { dispatcher: null };
+
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: (): Promise<DescriptorAclVerification> =>
+        Promise.resolve({ ok: false, reason: CONTROL_ANCHOR_REJECTION.DACL_UNPROTECTED }),
+      descriptorDeps: anchor.deps,
+      createDescriptor: anchor.create,
+      createServer: capturingServer(sink),
+      probePipe: realProbe,
+      logger: silent,
+    });
+
+    expect(handle).toBeNull();
+    expect(sink.dispatcher).not.toBeNull();
+    expect(sink.dispatcher?.dispatch(OPEN_GATE)).toBe(CONTROL_RESULT.UNAVAILABLE);
+    expect(gateCalls.count()).toBe(0);
+    expect(runtime.current()?.status).toBe(WORKFLOW_STATUS.OPEN);
+  });
+
+  it('3. a failed descriptor read-back never arms the write path', async () => {
+    const { runtime, orchestrator } = newOrchestrator();
+    orchestrator.open(BINDING);
+    const gateCalls = countOpenHumanGate(orchestrator);
+    const anchor = memAnchor();
+    const sink: { dispatcher: ControlDispatcher | null } = { dispatcher: null };
+    // Creator "succeeds" but leaves foreign bytes, so the read-back check fails.
+    const create: DescriptorCreatorFn = async (dir, id, bytes) => {
+      const result = await anchor.create(dir, id, bytes);
+      anchor.set(id, '{ not a valid descriptor');
+      return result;
+    };
+
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: passingDescriptorVerify,
+      descriptorDeps: anchor.deps,
+      createDescriptor: create,
+      createServer: capturingServer(sink),
+      probePipe: realProbe,
+      logger: silent,
+    });
+
+    expect(handle).toBeNull();
+    expect(sink.dispatcher?.dispatch(OPEN_GATE)).toBe(CONTROL_RESULT.UNAVAILABLE);
+    expect(gateCalls.count()).toBe(0);
+    expect(runtime.current()?.status).toBe(WORKFLOW_STATUS.OPEN);
+  });
+
+  it('negative control: the eager real dispatcher WOULD apply mid-window — the gate assertions have teeth', () => {
+    // This proves the readiness tests above are not tautological: the ONLY thing
+    // standing between an in-window command and a real state change is the gate.
+    // The old eager wiring attached exactly this dispatcher before verification.
+    const { runtime, orchestrator } = newOrchestrator();
+    orchestrator.open(BINDING);
+    const eager = createControlDispatcher(orchestrator);
+    expect(eager.dispatch(OPEN_GATE)).toBe(CONTROL_RESULT.APPLIED);
+    expect(runtime.current()?.status).toBe(WORKFLOW_STATUS.AWAITING_HUMAN_DECISION);
   });
 });
 

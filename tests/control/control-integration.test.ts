@@ -14,8 +14,12 @@ import net from 'node:net';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { WORKFLOW_STATUS } from '../../src/domain/index.js';
+import { CONTROL_ANCHOR_REJECTION } from '../../src/control/control-store.js';
 import { CONTROL_RESULT } from '../../src/control/control-command.js';
-import type { ControlChannelHandle } from '../../src/control/control-runtime.js';
+import {
+  startControlChannel,
+  type ControlChannelHandle,
+} from '../../src/control/control-runtime.js';
 import {
   MAX_DESCRIPTOR_CANDIDATES,
   createRuntimeDescriptor,
@@ -23,6 +27,7 @@ import {
   pipeNameForRuntimeId,
   pipePathFromName,
   serializeDescriptor,
+  type DescriptorAclVerification,
 } from '../../src/control/control-store.js';
 import {
   BINDING,
@@ -31,6 +36,7 @@ import {
   descriptorFacts,
   memAnchor,
   newOrchestrator,
+  passingVerify,
   startRogueServer,
   startServer,
   withTamperedToken,
@@ -281,5 +287,102 @@ describe('D062 discovery — identity-named candidates over real pipes (19–23)
     const run = await callCli(anchor);
     expect(run.outcome.status).toBeNull();
     expect(run.err.some((line) => line.includes('NO_CANDIDATES'))).toBe(true);
+  });
+});
+
+describe('D062 control channel — the write path is inert during the verification window', () => {
+  /**
+   * Start the channel but pause inside descriptor verification, so the descriptor
+   * is already published and the pipe is already live while the runtime is still
+   * proving the file. `reached` resolves once verification is pending; `release`
+   * completes it with the given verdict.
+   */
+  function startWithHeldVerification(
+    orchestrator: ReturnType<typeof newOrchestrator>['orchestrator'],
+    anchor: MemAnchor,
+  ): {
+    handlePromise: Promise<ControlChannelHandle | null>;
+    reached: Promise<void>;
+    release: (verdict: DescriptorAclVerification) => void;
+  } {
+    let release: (verdict: DescriptorAclVerification) => void = () => {};
+    let reachedResolve: () => void = () => {};
+    const reached = new Promise<void>((resolvePromise) => {
+      reachedResolve = resolvePromise;
+    });
+    const verifyDescriptor = (): Promise<DescriptorAclVerification> => {
+      reachedResolve();
+      return new Promise<DescriptorAclVerification>((resolvePromise) => {
+        release = resolvePromise;
+      });
+    };
+    const handlePromise = startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor,
+      descriptorDeps: anchor.deps,
+      createDescriptor: anchor.create,
+      logger: (): void => {
+        /* silent */
+      },
+    });
+    // `release` is reassigned when verifyDescriptor is entered; wrap it so callers
+    // invoke the live resolver, not the initial no-op captured at return time.
+    return {
+      handlePromise,
+      reached,
+      release: (verdict): void => {
+        release(verdict);
+      },
+    };
+  }
+
+  it('24. an authenticated CLI in the window gets UNAVAILABLE; only after arming does it get APPLIED', async () => {
+    const { runtime, orchestrator } = newOrchestrator();
+    orchestrator.open(BINDING);
+    const anchor = memAnchor();
+    const started = startWithHeldVerification(orchestrator, anchor);
+    await started.reached; // descriptor published, pipe live, verification pending
+
+    // The official CLI discovers the live runtime and authenticates, but the
+    // channel is not armed → UNAVAILABLE and the workflow does not advance.
+    const during = await callCli(anchor);
+    expect(during.outcome.authenticated).toBe(true);
+    expect(during.outcome.status).toBe(CONTROL_RESULT.UNAVAILABLE);
+    expect(during.outcome.exitCode).not.toBe(0);
+    expect(during.out.some((line) => line.includes('APPLIED'))).toBe(false);
+    expect(runtime.current()?.status).toBe(WORKFLOW_STATUS.OPEN);
+
+    // Verification passes → the channel arms exactly once.
+    started.release({ ok: true });
+    const handle = await started.handlePromise;
+    expect(handle).not.toBeNull();
+    handles.push(handle as ControlChannelHandle);
+
+    const after = await callCli(anchor);
+    expect(after.outcome.status).toBe(CONTROL_RESULT.APPLIED);
+    expect(runtime.current()?.status).toBe(WORKFLOW_STATUS.AWAITING_HUMAN_DECISION);
+  });
+
+  it('25. if verification fails after the window, no command was applied and the own descriptor is cleaned up', async () => {
+    const { runtime, orchestrator } = newOrchestrator();
+    orchestrator.open(BINDING);
+    const anchor = memAnchor();
+    const started = startWithHeldVerification(orchestrator, anchor);
+    await started.reached;
+    expect(anchor.entries().size).toBe(1); // published during the window
+
+    // A CLI in the window is denied and mutates nothing.
+    const during = await callCli(anchor);
+    expect(during.outcome.status).toBe(CONTROL_RESULT.UNAVAILABLE);
+    expect(runtime.current()?.status).toBe(WORKFLOW_STATUS.OPEN);
+
+    // Verification then FAILS → startup returns null and the own file is removed.
+    started.release({ ok: false, reason: CONTROL_ANCHOR_REJECTION.DACL_UNPROTECTED });
+    const handle = await started.handlePromise;
+    expect(handle).toBeNull();
+    expect(anchor.entries().size).toBe(0); // own descriptor cleaned up
+    expect(anchor.removeCalls()).toBe(1);
+    expect(runtime.current()?.status).toBe(WORKFLOW_STATUS.OPEN);
   });
 });
