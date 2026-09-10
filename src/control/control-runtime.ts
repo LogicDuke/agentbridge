@@ -146,16 +146,23 @@ export async function startControlChannel(
     );
     return null;
   }
+  // Post-creation cleanup is ALWAYS ownership-checked. Between our exclusive creation
+  // and this verification a successor runtime can have removed and recreated the fixed
+  // descriptor; unlinking the pathname blindly would delete the successor's descriptor
+  // and make its live channel undiscoverable. `removeOwnDescriptorFile` removes the
+  // file only while it still names our own minted pipeName — the same rule the
+  // listen-failure and close() paths already apply — so a missing, malformed, or
+  // successor-owned descriptor is left untouched. Startup still fails closed either way.
   let descriptorAcl: DescriptorAclVerification;
   try {
     descriptorAcl = await verifyDescriptor(descriptorPathFor(anchorPath), { env });
   } catch {
-    removeDescriptorFile(anchorPath, deps.descriptorDeps);
+    removeOwnDescriptorFile(anchorPath, descriptor.pipeName, deps.descriptorDeps);
     log('AgentBridge control channel: disabled (descriptor ACL verification failed).');
     return null;
   }
   if (!descriptorAcl.ok) {
-    removeDescriptorFile(anchorPath, deps.descriptorDeps);
+    removeOwnDescriptorFile(anchorPath, descriptor.pipeName, deps.descriptorDeps);
     log(`AgentBridge control channel: disabled (descriptor ACL not verified: ${descriptorAcl.reason}).`);
     return null;
   }

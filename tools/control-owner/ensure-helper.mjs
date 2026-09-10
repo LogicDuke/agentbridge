@@ -25,8 +25,8 @@
  *
  * The idempotent skip is taken ONLY when EVERY artifact and its provenance form the
  * CANONICAL pair (validateHelperPair / validateCreatorPair in helper-pair.mjs, each
- * against its own encoder): the on-disk provenance bytes must equal
- * that artifact's `encode(sha256(binary bytes))` exactly. Existence — or fields found
+ * against its own encoder AND its own reviewed source): the on-disk provenance bytes
+ * must equal that artifact's `encode(sha256(binary bytes), sourceId(source))` exactly. Existence — or fields found
  * somewhere in the text — is NOT sufficient: an interrupted `build.mjs` can leave a
  * new executable beside stale provenance (a torn pair), or a truncated/duplicated/
  * augmented provenance module. Any representation not emitted verbatim by the shared
@@ -46,10 +46,16 @@
  * and remains the security gate; this lifecycle validation is a self-healing
  * convenience that never grants trust the runtime would deny.
  *
- * Scope note: this deliberately does NOT bind the pair to the current C source
- * revision. A binary/provenance pair that is internally valid but built from an
- * older reviewed source is NOT rebuilt — same-revision binding is not the adopted
- * invariant (the runtime trusts binary<->provenance integrity, not source age).
+ * Same-revision binding IS the adopted invariant. The canonical encoding names both
+ * the binary's SHA-256 and `sourceId`, the SHA-256 of the exact reviewed C source the
+ * build compiled, so a pair that is internally self-consistent but built from an OLDER
+ * reviewed source is not canonical and IS rebuilt. This closes the family in which a
+ * stale-but-self-consistent helper survived a rollback or mixed-cache restore, made
+ * this gate report success forever, and left the runtime rejecting the helper's output
+ * as SNAPSHOT_MALFORMED because the runtime parser had moved on to a newer snapshot
+ * protocol. Nothing is read out of the on-disk provenance to decide this: the source
+ * digest is recomputed from the repository, so a stale helper never votes on its own
+ * currency.
  */
 
 import { execFileSync } from 'node:child_process';

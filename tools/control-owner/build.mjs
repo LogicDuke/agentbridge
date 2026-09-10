@@ -3,10 +3,14 @@
  *
  * Reconciles the exact installed MSVC + Windows SDK via vswhere (never PATH), then
  * compiles EACH reviewed C source to a deterministic module-relative runtime location
- * under dist/, computes the SHA-256 of the exact produced binary, and emits it as
- * GENERATED BUILD METADATA — a small JS module consumed by the trusted runtime. An
- * expected hash is never a manually committed literal, an env/argv/registry value, nor
- * a mutable .sha256 sidecar.
+ * under dist/, computes the SHA-256 of the exact produced binary AND of the exact
+ * reviewed source it compiled, and emits both as GENERATED BUILD METADATA — a small JS
+ * module consumed by the trusted runtime. An expected hash is never a manually
+ * committed literal, an env/argv/registry value, nor a mutable .sha256 sidecar.
+ *
+ * Publishing the source digest (`sourceId`) beside the binary digest is what lets the
+ * provisioning gate distinguish "canonical" from "canonical AND current": a pair built
+ * from an older reviewed source no longer satisfies the gate and is rebuilt.
  *
  * TWO artifacts are built, with SEPARATE identities and SEPARATE provenance modules
  * (Decision 062 Amendment C). Neither can stand in for the other: each generated module
@@ -52,6 +56,13 @@ import {
   encodeCreatorProvenance,
   encodeProvenance,
 } from './provenance-format.mjs';
+// The ONE build-source identity function, shared with the provisioning gate so the
+// producer and the acceptor can never derive it with different semantics.
+import {
+  DESCRIPTOR_CREATOR_SOURCE_PATH,
+  OWNER_HELPER_SOURCE_PATH,
+  sourceIdFor,
+} from './helper-pair.mjs';
 import { compileArgsFor, compileEnvFor, resolveBuildToolchain } from './msvc-toolchain.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -70,7 +81,7 @@ const ARTIFACTS = [
   {
     key: 'owner',
     label: 'owner helper',
-    source: join(here, 'agentbridge-win-owner.c'),
+    source: OWNER_HELPER_SOURCE_PATH,
     basename: OWNER_HELPER_BASENAME,
     provenanceBasename: PROVENANCE_BASENAME,
     encode: encodeProvenance,
@@ -78,7 +89,7 @@ const ARTIFACTS = [
   {
     key: 'creator',
     label: 'descriptor creator',
-    source: join(here, 'agentbridge-win-descriptor-create.c'),
+    source: DESCRIPTOR_CREATOR_SOURCE_PATH,
     basename: DESCRIPTOR_CREATOR_BASENAME,
     provenanceBasename: CREATOR_PROVENANCE_BASENAME,
     encode: encodeCreatorProvenance,
@@ -184,6 +195,13 @@ function sha256File(path) {
  */
 function buildArtifact(artifact) {
   const srcC = artifact.source;
+  // Bind the published pair to the EXACT reviewed source being compiled. The gate
+  // recomputes this from the same file, so a pair built from an older source can never
+  // be accepted as canonical later.
+  const sourceId = sourceIdFor(srcC);
+  if (sourceId === null) {
+    failClean(`reviewed ${artifact.label} source is missing or unreadable: ${srcC}`);
+  }
   const workObjDir = join(workspace, `obj-${artifact.key}`);
   const workExe = join(workspace, artifact.basename);
   const publishedExe = join(outDir, artifact.basename);
@@ -236,7 +254,7 @@ function buildArtifact(artifact) {
   if (finalSha === null) {
     failClean(`authoritative ${artifact.label} missing after publication.`);
   }
-  const provenance = artifact.encode(finalSha);
+  const provenance = artifact.encode(finalSha, sourceId);
 
   // Publish provenance atomically: write the complete canonical bytes to a temp file
   // inside this private workspace (same volume as the final path), then rename/replace
@@ -275,7 +293,7 @@ function buildArtifact(artifact) {
   } catch {
     checkProvenance = null;
   }
-  if (checkSha === null || checkProvenance !== artifact.encode(checkSha)) {
+  if (checkSha === null || checkProvenance !== artifact.encode(checkSha, sourceId)) {
     failClean(`post-build authoritative ${artifact.label} pair is not canonical.`);
   }
 

@@ -12,6 +12,7 @@ import {
   pipePathFromName,
   serializeDescriptor,
   type ControlAnchorVerification,
+  type DescriptorAclVerification,
   type DescriptorCreation,
   type DescriptorFileDeps,
 } from '../../src/control/control-store.js';
@@ -593,6 +594,191 @@ describe('D062 F2 descriptor ownership — cleanup unlinks only its own descript
     });
     expect(handle).toBeNull();
     expect(store.get()).toBeNull();
+  });
+});
+
+/* ---- F2 (this PR): the descriptor-ACL-verification failure paths ------------- *
+ * Both post-creation ACL-verification cleanups previously unlinked the FIXED
+ * descriptor pathname unconditionally. A successor runtime that had already removed
+ * and recreated that file therefore lost its descriptor to a predecessor's failed
+ * verification, and its live channel became undiscoverable. Cleanup on these paths is
+ * now ownership-checked exactly like the listen-failure and close() paths. */
+
+describe('D062 F2 descriptor ownership — ACL-verification cleanup unlinks only its own descriptor', () => {
+  /** Start a channel that succeeds, so the store holds a real successor descriptor. */
+  async function startSuccessor(store: MemStore): Promise<ControlChannelHandle> {
+    const { orchestrator } = newOrchestrator();
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: passingDescriptorVerify,
+      descriptorDeps: store.deps,
+    });
+    expect(handle).not.toBeNull();
+    if (handle === null) {
+      throw new Error('successor failed to start');
+    }
+    handles.push(handle);
+    return handle;
+  }
+
+  it('1. verification THROWS and the descriptor is still ours -> our descriptor is removed', async () => {
+    const { orchestrator } = newOrchestrator();
+    const store = memStore();
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: (): Promise<DescriptorAclVerification> => {
+        throw new Error('helper unavailable');
+      },
+      descriptorDeps: store.deps,
+    });
+    expect(handle).toBeNull();
+    expect(store.get()).toBeNull();
+  });
+
+  it('2. verification returns !ok and the descriptor is still ours -> our descriptor is removed', async () => {
+    const { orchestrator } = newOrchestrator();
+    const store = memStore();
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: (): Promise<DescriptorAclVerification> =>
+        Promise.resolve({ ok: false, reason: CONTROL_ANCHOR_REJECTION.DACL_UNPROTECTED }),
+      descriptorDeps: store.deps,
+    });
+    expect(handle).toBeNull();
+    expect(store.get()).toBeNull();
+  });
+
+  it('3. verification THROWS after a successor rotated the descriptor -> successor preserved', async () => {
+    const store = memStore();
+    const successor = await startSuccessor(store);
+    const successorText = store.get();
+    expect(successorText).not.toBeNull();
+
+    const { orchestrator } = newOrchestrator();
+    const late = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: (): Promise<DescriptorAclVerification> => {
+        // The successor removes and recreates the fixed descriptor while our ACL
+        // query is in flight: the file no longer identifies us.
+        store.set(successorText);
+        throw new Error('helper unavailable');
+      },
+      descriptorDeps: store.deps,
+    });
+    expect(late).toBeNull();
+    // The successor's descriptor survived, byte-for-byte, and stays discoverable.
+    expect(store.get()).toBe(successorText);
+    expect(storedPipeName(store)).toBe(successor.pipeName);
+  });
+
+  it('4. verification !ok after a successor rotated the descriptor -> successor preserved', async () => {
+    const store = memStore();
+    const successor = await startSuccessor(store);
+    const successorText = store.get();
+
+    const { orchestrator } = newOrchestrator();
+    const late = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: (): Promise<DescriptorAclVerification> => {
+        store.set(successorText);
+        return Promise.resolve({ ok: false, reason: CONTROL_ANCHOR_REJECTION.OWNER_MISMATCH });
+      },
+      descriptorDeps: store.deps,
+    });
+    expect(late).toBeNull();
+    expect(store.get()).toBe(successorText);
+    expect(storedPipeName(store)).toBe(successor.pipeName);
+  });
+
+  it('5. a malformed replacement during ACL failure is never blindly deleted', async () => {
+    const { orchestrator } = newOrchestrator();
+    const { store, removes } = countingStore();
+    const before = { count: 0 };
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: (): Promise<DescriptorAclVerification> => {
+        store.set('{not json');
+        before.count = removes();
+        return Promise.resolve({ ok: false, reason: CONTROL_ANCHOR_REJECTION.NO_ENTRIES });
+      },
+      descriptorDeps: store.deps,
+    });
+    expect(handle).toBeNull();
+    expect(removes()).toBe(before.count);
+    expect(store.get()).toBe('{not json');
+  });
+
+  it('6. a descriptor already gone during ACL failure triggers no unlink', async () => {
+    const { orchestrator } = newOrchestrator();
+    const { store, removes } = countingStore();
+    const before = { count: 0 };
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: (): Promise<DescriptorAclVerification> => {
+        store.set(null);
+        before.count = removes();
+        throw new Error('helper unavailable');
+      },
+      descriptorDeps: store.deps,
+    });
+    expect(handle).toBeNull();
+    expect(removes()).toBe(before.count);
+    expect(store.get()).toBeNull();
+  });
+
+  it('7. a successor with a DIFFERENT pipeName is never matched by our cleanup', async () => {
+    const store = memStore();
+    const successor = await startSuccessor(store);
+    const successorText = store.get();
+
+    const { orchestrator } = newOrchestrator();
+    let ourPipeName: string | null = null;
+    const late = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: (): Promise<DescriptorAclVerification> => {
+        // Our own descriptor is on disk at this moment; capture its pipeName, then
+        // let the successor replace it before cleanup runs.
+        ourPipeName = storedPipeName(store);
+        store.set(successorText);
+        return Promise.resolve({ ok: false, reason: CONTROL_ANCHOR_REJECTION.DACL_ABSENT });
+      },
+      descriptorDeps: store.deps,
+    });
+    expect(late).toBeNull();
+    expect(ourPipeName).not.toBeNull();
+    expect(ourPipeName).not.toBe(successor.pipeName);
+    expect(storedPipeName(store)).toBe(successor.pipeName);
+  });
+
+  it('8. startup still fails closed, and the failure log carries no token', async () => {
+    const { orchestrator } = newOrchestrator();
+    const store = memStore();
+    const lines: string[] = [];
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: (): Promise<DescriptorAclVerification> =>
+        Promise.resolve({ ok: false, reason: CONTROL_ANCHOR_REJECTION.FILE_INHERITANCE_ABSENT }),
+      descriptorDeps: store.deps,
+      logger: (message: string): void => {
+        lines.push(message);
+      },
+    });
+    // No channel: ownership-checked cleanup never weakens fail-closed startup.
+    expect(handle).toBeNull();
+    expect(lines.some((line) => line.includes('descriptor ACL not verified'))).toBe(true);
+    // The rejection reason is reported; no token or secret material is.
+    for (const line of lines) {
+      expect(line).not.toMatch(/[0-9a-f]{32,}/i);
+    }
   });
 });
 

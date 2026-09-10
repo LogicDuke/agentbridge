@@ -152,21 +152,61 @@ directory is:
     %LOCALAPPDATA%\AgentBridge\control
 
 `verifyControlAnchor` (`src/control/control-store.ts`) reads this anchor
-**read-only and fail-closed**: it requires the anchor OWNER to be the exact
-runtime operator SID and the DACL to be exactly operator + SYSTEM, present and
-**non-inherited**. It never creates the directory and never mutates ACLs.
+**read-only and fail-closed**. The trust policy it enforces
+(`evaluateAnchorSnapshot`) is decided over canonical SIDs only, and **every** one
+of the following must hold — any single failure disables the control channel:
+
+| Requirement | Rejection when unmet |
+| --- | --- |
+| OWNER is the exact runtime operator SID | `OWNER_MISMATCH` |
+| OWNER is **not** SYSTEM — SYSTEM may own a directory and then rewrite its DACL, so it can never substitute for operator ownership | `OWNER_IS_SYSTEM` |
+| The DACL is **PRESENT** (neither absent nor NULL) | `DACL_ABSENT` |
+| The DACL is **PROTECTED** — it does not inherit from the parent | `DACL_UNPROTECTED` |
+| The DACL is **non-empty** | `NO_ENTRIES` |
+| **No** ACE is inherited (no ACE carries `INHERITED_ACE`) | `INHERITED_PRINCIPAL` |
+| Every ACE principal is the operator or SYSTEM, by canonical SID — no third principal, however narrow | `FOREIGN_PRINCIPAL` |
+| **Every** ACE is file-inheritable (each carries `OBJECT_INHERIT_ACE`), so the descriptor created inside the anchor inherits the same closed principal set | `FILE_INHERITANCE_ABSENT` |
+| An ACE for the operator SID is present | `RUNTIME_PRINCIPAL_ABSENT` |
+
+Two of these are easy to miss because a directory can look correct in Explorer
+and still fail: the DACL must be **PROTECTED**, and every ACE must be
+**file-inheritable** (`OBJECT_INHERIT_ACE`). An anchor that merely lists
+operator + SYSTEM as direct, non-inherited entries does **not** satisfy the
+policy.
+
+Two further details, so the table is read exactly as the code behaves. SYSTEM is
+*permitted*, not *required*: an operator-only DACL that meets every other
+requirement is accepted, while any principal beyond operator and SYSTEM is not.
+And the allow/deny type and the access mask are carried in the snapshot but do
+**not** gate authorization — a DENY operator ACE still counts as the operator
+being present — because token possession (mutual HMAC) remains the actual
+authenticator; this policy governs anchor trust, not per-call permission.
+
+It never creates the directory and never mutates ACLs.
 AgentBridge V1 — the current control flow — does **not** create or harden this
 anchor; there is no anchor provisioner in the codebase. A plain `mkdir` is
-therefore insufficient: a freshly created directory inherits its parent's ACLs,
-which the anchor policy rejects. Establishing an anchor that satisfies the trust
-policy is a separate operator/deployment responsibility, outside the scope of
-these npm scripts.
+therefore insufficient on two counts: a freshly created directory inherits its
+parent's ACLs (rejected as `DACL_UNPROTECTED` / `INHERITED_PRINCIPAL`), and
+nothing has established the file-inheritable operator + SYSTEM entries the policy
+requires. Establishing an anchor that satisfies the trust policy is a separate
+operator/deployment responsibility, outside the scope of these npm scripts — this
+document deliberately prescribes no setup command, because no anchor-provisioning
+mechanism is part of the adopted architecture.
 
-**2. `control:provision` provisions only the native helper.**
+**2. `control:provision` provisions only the native artifacts.**
 `control:provision` runs the existing validated gate
 (`node tools/control-owner/ensure-helper.mjs`) and nothing else: it provisions
-the native owner-helper/provenance pair. It does **not** create, harden, or
-verify the control anchor.
+the native owner-helper and descriptor-creator binaries with their generated
+provenance. It does **not** create, harden, or verify the control anchor — the
+anchor above remains an external prerequisite it neither checks nor satisfies.
+
+The gate accepts an artifact pair only when the on-disk provenance is the exact
+canonical encoding of **both** that binary's SHA-256 and the SHA-256 of the
+reviewed C source it was compiled from. A pair that is internally self-consistent
+but was built from an older reviewed source — the state a rollback or a
+mixed-cache restore leaves behind — is therefore **rebuilt**, not skipped, so a
+stale helper can never leave provisioning reporting success while the runtime
+rejects that helper's snapshot output as malformed.
 
 If immediate control availability is required, the control anchor must already
 satisfy the runtime's trust policy **before** `cockpit:live` starts. The live

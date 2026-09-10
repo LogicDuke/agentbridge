@@ -59,7 +59,7 @@ import {
 } from 'node:fs';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { afterEach, describe, expect, it } from 'vitest';
@@ -69,8 +69,13 @@ import {
   validateHelperPair,
   encodeCreatorProvenance,
   encodeProvenance,
+  descriptorCreatorSourceId,
+  ownerHelperSourceId,
+  sourceIdFor,
   DESCRIPTOR_CREATOR_BASENAME,
+  DESCRIPTOR_CREATOR_SOURCE_PATH,
   OWNER_HELPER_BASENAME,
+  OWNER_HELPER_SOURCE_PATH,
 } from '../../tools/control-owner/helper-pair.mjs';
 import {
   resolveBuildToolchain,
@@ -118,8 +123,19 @@ const ciYml = readFileSync(join(repoRoot, '.github', 'workflows', 'ci.yml'), 'ut
 function sha256Hex(bytes: Buffer): string {
   return createHash('sha256').update(bytes).digest('hex');
 }
+/* The CURRENT reviewed-source identities. Lifecycle pair validity binds the binary
+ * digest AND this source digest, so every canonical expectation below is written
+ * against the same source the gate reads. */
+function requireSourceId(id: string | null, what: string): string {
+  if (id === null) {
+    throw new Error(`the reviewed ${what} C source must be readable to derive expectations`);
+  }
+  return id;
+}
+const OWNER_SOURCE_ID = requireSourceId(ownerHelperSourceId(), 'owner helper');
+const CREATOR_SOURCE_ID = requireSourceId(descriptorCreatorSourceId(), 'descriptor creator');
 function canonicalFor(bytes: Buffer): string {
-  return encodeProvenance(sha256Hex(bytes));
+  return encodeProvenance(sha256Hex(bytes), OWNER_SOURCE_ID);
 }
 
 interface Pair {
@@ -328,6 +344,158 @@ describe('D062 canonical provenance — acceptance matrix (FALSE-VALID set is em
       }
     });
   }, 60000);
+});
+
+/* ---- 1b. Build-source identity: canonical AND CURRENT ----------------------- *
+ * The recurrence this closes: a stale-but-self-consistent artifact pair (e.g. an
+ * owner helper emitting the previous snapshot protocol) surviving a rollback or a
+ * mixed-cache restore satisfied pair validity, so provisioning skipped the rebuild
+ * forever while the runtime rejected that helper's output as SNAPSHOT_MALFORMED.
+ *
+ * Lifecycle validity now binds BOTH digests — the binary's and the exact reviewed C
+ * source it was compiled from — so "canonical" implies "built from the current
+ * source", and therefore implies compatibility with the runtime's current snapshot
+ * protocol, whose only definition is that source. Nothing is read OUT of the on-disk
+ * provenance: a stale pair never votes on its own currency. */
+
+/** A prior release's canonical encoding: the SAME encoder, an OLDER source identity. */
+const STALE_SOURCE_ID = 'b'.repeat(64);
+
+describe('D062 build-source identity — provisioning success implies protocol compatibility', () => {
+  it('S1. current binary + current-source provenance → VALID (skips)', () => {
+    withPair((p) => {
+      writeExe(p, HELPER);
+      writeFileSync(p.provenancePath, encodeProvenance(sha256Hex(HELPER), OWNER_SOURCE_ID));
+      expect(validateHelperPair(p)).toEqual({ valid: true, reason: 'valid' });
+    });
+  });
+
+  it('S2. a PREVIOUS-FORMAT canonical pair (no source identity) → INVALID (rebuilds)', () => {
+    withPair((p) => {
+      // The exact witness a rollback or mixed-cache restore leaves on disk: provenance
+      // in the previous canonical format — self-consistent with its binary under the
+      // old rule, which had no source term at all — beside that older binary.
+      const current = encodeProvenance(sha256Hex(HELPER), OWNER_SOURCE_ID);
+      const previousFormat = current
+        .split('\n')
+        .filter((line) => !line.includes('sourceId'))
+        .join('\n');
+      expect(previousFormat).not.toContain('sourceId');
+      expect(previousFormat).toContain(`sha256: "${sha256Hex(HELPER)}"`);
+
+      writeExe(p, HELPER);
+      writeFileSync(p.provenancePath, previousFormat);
+      // Under the pre-fix predicate these bytes WERE the canonical encoding of this
+      // binary, so the gate skipped the rebuild forever while the runtime rejected the
+      // helper's output. Binding the reviewed-source identity makes them non-canonical.
+      expect(validateHelperPair(p)).toEqual({ valid: false, reason: 'not-canonical' });
+    });
+  });
+
+  it('S2b. the same binary with CURRENT-format provenance is VALID → exactly one rebuild ends it', () => {
+    withPair((p) => {
+      writeExe(p, HELPER);
+      writeFileSync(p.provenancePath, encodeProvenance(sha256Hex(HELPER), OWNER_SOURCE_ID));
+      expect(validateHelperPair(p)).toEqual({ valid: true, reason: 'valid' });
+    });
+  });
+
+  it('S3. stale binary + current-source provenance → INVALID', () => {
+    withPair((p) => {
+      const stalePayload = Buffer.from('an-older-helper-binary');
+      writeExe(p, stalePayload);
+      writeFileSync(p.provenancePath, encodeProvenance(sha256Hex(HELPER), OWNER_SOURCE_ID));
+      expect(validateHelperPair(p).valid).toBe(false);
+    });
+  });
+
+  it('S4. current binary + stale-source provenance → INVALID', () => {
+    withPair((p) => {
+      writeExe(p, HELPER);
+      writeFileSync(p.provenancePath, encodeProvenance(sha256Hex(HELPER), STALE_SOURCE_ID));
+      expect(validateHelperPair(p).valid).toBe(false);
+    });
+  });
+
+  it('S5. the creator pair tracks its OWN source, and cross-wiring stays invalid', () => {
+    withPair((p) => {
+      const creatorProv = join(dirname(p.provenancePath), CREATOR_PROVENANCE_BASENAME);
+      const creatorExe = join(dirname(p.exePath), DESCRIPTOR_CREATOR_BASENAME);
+      writeFileSync(creatorExe, HELPER);
+      writeFileSync(creatorProv, encodeCreatorProvenance(sha256Hex(HELPER), CREATOR_SOURCE_ID));
+      expect(
+        validateCreatorPair({ exePath: creatorExe, provenancePath: creatorProv }),
+      ).toEqual({ valid: true, reason: 'valid' });
+      // The owner helper's source identity never satisfies the creator's pair.
+      writeFileSync(creatorProv, encodeCreatorProvenance(sha256Hex(HELPER), OWNER_SOURCE_ID));
+      expect(validateCreatorPair({ exePath: creatorExe, provenancePath: creatorProv }).valid).toBe(
+        false,
+      );
+      // Cross-wired provenance (owner encoding for the creator binary) stays invalid.
+      writeFileSync(creatorProv, encodeProvenance(sha256Hex(HELPER), OWNER_SOURCE_ID));
+      expect(validateCreatorPair({ exePath: creatorExe, provenancePath: creatorProv }).valid).toBe(
+        false,
+      );
+    });
+  });
+
+  it('S6. the two artifacts have DISTINCT source identities, from the ONE mapping', () => {
+    expect(OWNER_SOURCE_ID).not.toBe(CREATOR_SOURCE_ID);
+    expect(OWNER_SOURCE_ID).toMatch(/^[0-9a-f]{64}$/);
+    expect(CREATOR_SOURCE_ID).toMatch(/^[0-9a-f]{64}$/);
+    // The exported artifact→source mapping is the one the builder and the gate use.
+    expect(sourceIdFor(OWNER_HELPER_SOURCE_PATH)).toBe(OWNER_SOURCE_ID);
+    expect(sourceIdFor(DESCRIPTOR_CREATOR_SOURCE_PATH)).toBe(CREATOR_SOURCE_ID);
+  });
+
+  it('S7. source identity is whole-file bytes: any source edit changes it', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ab-src-'));
+    try {
+      const a = join(dir, 'a.c');
+      const b = join(dir, 'b.c');
+      const original = readFileSync(OWNER_HELPER_SOURCE_PATH);
+      writeFileSync(a, original);
+      // A one-byte change anywhere — including inside a comment — is a new identity.
+      writeFileSync(b, Buffer.concat([original, Buffer.from('\n/* x */\n')]));
+      expect(sourceIdFor(a)).toBe(OWNER_SOURCE_ID);
+      expect(sourceIdFor(b)).not.toBe(OWNER_SOURCE_ID);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('S8. an unreadable reviewed source is never VALID (no silent skip)', () => {
+    expect(sourceIdFor(join(tmpdir(), 'definitely-absent-source-file.c'))).toBeNull();
+  });
+
+  it('S9. the encoder refuses a malformed source identity', () => {
+    expect(() => encodeProvenance(sha256Hex(HELPER), 'not-a-digest')).toThrow(TypeError);
+    expect(() => encodeProvenance(sha256Hex(HELPER), 'B'.repeat(64))).toThrow(TypeError);
+    expect(() => encodeCreatorProvenance(sha256Hex(HELPER), '')).toThrow(TypeError);
+  });
+
+  it('S10. the acceptance decision reads NO version text out of the provenance', () => {
+    // No regex/version parser was introduced: the validator's only positive path is
+    // whole-file byte equality against the encoder's output.
+    const validator = readFileSync(
+      join(repoRoot, 'tools', 'control-owner', 'helper-pair.mjs'),
+      'utf8',
+    );
+    expect(validator).toContain('actual !== expected');
+    expect(validator).not.toMatch(/AGENTBRIDGE-ACL-V/);
+    expect(validator).not.toMatch(/match\(|exec\(|JSON\.parse|await import|require\(/);
+  });
+
+  it('S11. rebuild terminates: the builder publishes exactly what the gate recomputes', () => {
+    // build.mjs encodes with sourceIdFor(the same reviewed source path the gate reads),
+    // so one successful build makes the pair valid and the next run skips. There is no
+    // second encoder and no second source mapping.
+    const builder = readFileSync(join(repoRoot, 'tools', 'control-owner', 'build.mjs'), 'utf8');
+    expect(builder).toContain('sourceIdFor(srcC)');
+    expect(builder).toContain('artifact.encode(finalSha, sourceId)');
+    expect(builder).toContain('OWNER_HELPER_SOURCE_PATH');
+    expect(builder).toContain('DESCRIPTOR_CREATOR_SOURCE_PATH');
+  });
 });
 
 /* ---- 2. Coherent launch model (cross-platform, definition-level) ------------- */
@@ -597,7 +765,7 @@ const winReady = process.platform === 'win32' && existsSync(realExe) && existsSy
 describe.skipIf(!winReady)('D062 canonical provenance — real gate idempotent on a canonical pair', () => {
   it('the real pair is canonical, and the gate skips it without rebuilding', () => {
     const bytes = readFileSync(realExe);
-    expect(readFileSync(realProv, 'utf8')).toBe(encodeProvenance(sha256Hex(bytes)));
+    expect(readFileSync(realProv, 'utf8')).toBe(encodeProvenance(sha256Hex(bytes), OWNER_SOURCE_ID));
     const v = validateHelperPair({ exePath: realExe, provenancePath: realProv });
     expect(v.valid).toBe(true);
 
@@ -1340,9 +1508,16 @@ describe.skipIf(!TEST_BUILD_ELIGIBLE)('D062 concurrent rebuild — isolated real
       expect(existsSync(creatorExe)).toBe(true);
       expect(existsSync(creatorProv)).toBe(true);
       // Both final pairs canonical, each against its OWN encoder.
-      expect(readFileSync(prov, 'utf8')).toBe(encodeProvenance(sha256Hex(readFileSync(exe))));
+      // The isolated tree holds byte-identical copies of the reviewed sources, so the
+      // tree's source identity is the repository's; the published pairs must name it.
+      expect(sourceIdFor(join(t.root, 'tools', 'control-owner', 'agentbridge-win-owner.c'))).toBe(
+        OWNER_SOURCE_ID,
+      );
+      expect(readFileSync(prov, 'utf8')).toBe(
+        encodeProvenance(sha256Hex(readFileSync(exe)), OWNER_SOURCE_ID),
+      );
       expect(readFileSync(creatorProv, 'utf8')).toBe(
-        encodeCreatorProvenance(sha256Hex(readFileSync(creatorExe))),
+        encodeCreatorProvenance(sha256Hex(readFileSync(creatorExe)), CREATOR_SOURCE_ID),
       );
       // No shared object directory and no private workspace leaked into native/.
       expect(existsSync(join(t.nativeDir, 'obj'))).toBe(false);
