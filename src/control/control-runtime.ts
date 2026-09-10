@@ -148,6 +148,15 @@ export async function startControlChannel(
   // 2. Best-effort sweep of foreign descriptors proven dead by the kernel pipe
   //    namespace. Nothing PRESENT, UNKNOWN, or malformed is ever removed.
   const sweep = await sweepStaleDescriptors(anchorPath, null, probePipe, deps.descriptorDeps);
+  // Fail closed BEFORE listening or publishing if the initial descriptor
+  // enumeration was not complete. An unreadable anchor or an over-cap candidate
+  // set is exactly what CLI discovery rejects (ANCHOR_UNREADABLE /
+  // TOO_MANY_CANDIDATES), so a channel started here could never be discovered:
+  // CONTROL_START_SUCCESS ⇒ INITIAL_DESCRIPTOR_ENUMERATION_COMPLETE.
+  if (sweep.enumeration !== 'complete') {
+    log(`AgentBridge control channel: disabled (descriptor enumeration ${sweep.enumeration}).`);
+    return null;
+  }
   if (sweep.removed.length > 0 || sweep.unremovable.length > 0) {
     log(
       `AgentBridge control channel: stale descriptor sweep removed ${String(sweep.removed.length)}, ` +

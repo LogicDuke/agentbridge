@@ -29,6 +29,7 @@ import { createControlDispatcher, type ControlDispatcher } from '../../src/contr
 import {
   CONTROL_ANCHOR_REJECTION,
   DESCRIPTOR_CREATION_REJECTION,
+  MAX_DESCRIPTOR_CANDIDATES,
   createRuntimeDescriptor,
   defaultPipeProbe,
   descriptorFilenameFor,
@@ -858,15 +859,87 @@ describe('D062 lifecycle v2 — startup sweep of foreign descriptors', () => {
     expect(anchor.get('b'.repeat(32))).toBe(legacy);
   });
 
-  it('the sweep never probes or removes the runtime\'s own file, and skips an unlistable anchor', async () => {
+  it('an unreadable anchor enumeration fails startup closed before listen or publish', async () => {
     const { orchestrator } = newOrchestrator();
     const anchor = memAnchor();
     const deps = { ...anchor.deps, listAnchor: (): readonly string[] => { throw new Error('EACCES'); } };
+    let serverCreated = false;
+    let created = 0;
+    const createServer: typeof createControlChannelServer = ((options) => {
+      serverCreated = true;
+      return createControlChannelServer(options);
+    }) as typeof createControlChannelServer;
+    const create: DescriptorCreatorFn = async (dir, id, bytes) => {
+      created += 1;
+      return anchor.create(dir, id, bytes);
+    };
     const handle = await startControlChannel({
       orchestrator,
       verify: passingVerify,
       verifyDescriptor: passingDescriptorVerify,
       descriptorDeps: deps,
+      createDescriptor: create,
+      createServer,
+      probePipe: allAbsentProbe,
+      logger: silent,
+    });
+    expect(handle).toBeNull();
+    expect(serverCreated).toBe(false); // never reached the server / listen
+    expect(created).toBe(0); // never published a descriptor
+    expect(anchor.removeCalls()).toBe(0);
+    expect(filesIn(anchor)).toEqual([]);
+  });
+
+  it('a truncated candidate enumeration (> cap) fails startup closed before listen or publish', async () => {
+    const { orchestrator } = newOrchestrator();
+    const anchor = memAnchor();
+    for (let index = 0; index < MAX_DESCRIPTOR_CANDIDATES + 1; index += 1) {
+      const id = index.toString(16).padStart(32, '0');
+      anchor.set(
+        id,
+        serializeDescriptor({
+          version: 2,
+          pipeName: pipeNameForRuntimeId(id),
+          token: Buffer.alloc(32, index % 251).toString('base64url'),
+        }),
+      );
+    }
+    const before = filesIn(anchor).length;
+    let serverCreated = false;
+    let created = 0;
+    const createServer: typeof createControlChannelServer = ((options) => {
+      serverCreated = true;
+      return createControlChannelServer(options);
+    }) as typeof createControlChannelServer;
+    const create: DescriptorCreatorFn = async (dir, id, bytes) => {
+      created += 1;
+      return anchor.create(dir, id, bytes);
+    };
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: passingDescriptorVerify,
+      descriptorDeps: anchor.deps,
+      createDescriptor: create,
+      createServer,
+      probePipe: allAbsentProbe,
+      logger: silent,
+    });
+    expect(handle).toBeNull();
+    expect(serverCreated).toBe(false);
+    expect(created).toBe(0);
+    expect(anchor.removeCalls()).toBe(0);
+    expect(filesIn(anchor).length).toBe(before); // nothing published, nothing removed
+  });
+
+  it('a readable EMPTY anchor is complete → startup proceeds and publishes', async () => {
+    const { orchestrator } = newOrchestrator();
+    const anchor = memAnchor();
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: passingDescriptorVerify,
+      descriptorDeps: anchor.deps,
       createDescriptor: anchor.create,
       probePipe: allAbsentProbe,
       logger: silent,
@@ -874,8 +947,30 @@ describe('D062 lifecycle v2 — startup sweep of foreign descriptors', () => {
     expect(handle).not.toBeNull();
     if (handle !== null) {
       handles.push(handle);
+      expect(anchor.get(handle.runtimeId)).not.toBeNull();
     }
-    expect(anchor.removeCalls()).toBe(0);
+  });
+
+  it('a readable within-cap anchor is complete → the sweep runs and startup proceeds', async () => {
+    const { orchestrator } = newOrchestrator();
+    const anchor = memAnchor();
+    const dead = foreignDescriptor();
+    anchor.set(dead.runtimeId, dead.text);
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: passingDescriptorVerify,
+      descriptorDeps: anchor.deps,
+      createDescriptor: anchor.create,
+      probePipe: allAbsentProbe, // the seeded foreign file's pipe is ABSENT
+      logger: silent,
+    });
+    expect(handle).not.toBeNull();
+    if (handle !== null) {
+      handles.push(handle);
+    }
+    expect(anchor.removeCalls()).toBe(1); // the dead file was swept as before
+    expect(anchor.get(dead.runtimeId)).toBeNull();
   });
 
   it('a stale file whose unlink fails is reported, not fatal; startup still succeeds', async () => {

@@ -1246,7 +1246,23 @@ export function defaultPipeProbe(timeoutMs: number = PIPE_PROBE_TIMEOUT_MS): Pip
  * Stale descriptor sweep (runtime startup) and discovery (CLI)
  * ------------------------------------------------------------------ */
 
+/**
+ * Whether the initial descriptor enumeration underpinning the sweep was
+ * complete. This is the same enumeration the CLI's discovery runs, so the two
+ * incomplete states mirror discovery's fail-closed reasons exactly:
+ * `unreadable` ⇔ ANCHOR_UNREADABLE, `truncated` ⇔ TOO_MANY_CANDIDATES. A caller
+ * that starts a control channel must treat anything but `complete` as a reason
+ * to fail closed, since a channel it starts could never be discovered.
+ */
+export type SweepEnumeration = 'complete' | 'unreadable' | 'truncated';
+
 export interface StaleSweepResult {
+  /**
+   * Completeness of the descriptor enumeration this sweep is built on:
+   * `complete` (anchor listed, within the candidate cap), `unreadable` (the
+   * anchor could not be listed), or `truncated` (more candidates than the cap).
+   */
+  readonly enumeration: SweepEnumeration;
   /** Identity-named files examined (bounded). */
   readonly examined: number;
   /** Runtime ids whose file was removed because its pipe was ABSENT. */
@@ -1282,7 +1298,16 @@ export async function sweepStaleDescriptors(
   const unremovable: string[] = [];
   const enumeration = enumerateDescriptorCandidates(anchorPath, deps);
   if (!enumeration.ok) {
-    return { examined: 0, removed, retained, malformed, unremovable };
+    // Unreadable anchor: report incompleteness rather than an empty sweep, and
+    // do not mutate the anchor.
+    return { enumeration: 'unreadable', examined: 0, removed, retained, malformed, unremovable };
+  }
+  if (enumeration.truncated) {
+    // More candidates than the bounded cap — exactly what discovery fails closed
+    // on (TOO_MANY_CANDIDATES). Surface the truncation and remove nothing: the
+    // candidate set we can see is not the whole anchor, so no deadness decision
+    // here is trustworthy.
+    return { enumeration: 'truncated', examined: 0, removed, retained, malformed, unremovable };
   }
   let examined = 0;
   for (const candidate of enumeration.candidates) {
@@ -1306,7 +1331,7 @@ export async function sweepStaleDescriptors(
       unremovable.push(candidate.runtimeId);
     }
   }
-  return { examined, removed, retained, malformed, unremovable };
+  return { enumeration: 'complete', examined, removed, retained, malformed, unremovable };
 }
 
 export const DISCOVERY_UNAVAILABLE = Object.freeze({

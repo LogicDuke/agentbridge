@@ -715,9 +715,31 @@ describe('D062 stale sweep — only ABSENT pipes authorize removal of exactly th
     expect(result.removed).toEqual([]);
   });
 
-  it('an unlistable anchor sweeps nothing', async () => {
+  it('an unlistable anchor sweeps nothing and reports enumeration unreadable', async () => {
     const result = await sweepStaleDescriptors(ANCHOR, null, allAbsentProbe, { listAnchor: () => { throw new Error('EACCES'); } });
-    expect(result).toEqual({ examined: 0, removed: [], retained: [], malformed: [], unremovable: [] });
+    expect(result).toEqual({ enumeration: 'unreadable', examined: 0, removed: [], retained: [], malformed: [], unremovable: [] });
+  });
+
+  it('exposes enumeration completeness: unreadable vs truncated vs complete', async () => {
+    // Unreadable anchor → enumeration 'unreadable', nothing swept.
+    const unreadable = await sweepStaleDescriptors(ANCHOR, null, allAbsentProbe, { listAnchor: () => { throw new Error('EACCES'); } });
+    expect(unreadable.enumeration).toBe('unreadable');
+    expect(unreadable.examined).toBe(0);
+
+    // Over the candidate cap → enumeration 'truncated', and NOTHING is removed
+    // (the visible set is not the whole anchor, so no deadness decision is made).
+    const big = seeded(MAX_DESCRIPTOR_CANDIDATES + 1).anchor;
+    const truncated = await sweepStaleDescriptors(ANCHOR, null, allAbsentProbe, big.deps);
+    expect(truncated.enumeration).toBe('truncated');
+    expect(truncated.examined).toBe(0);
+    expect(truncated.removed).toEqual([]);
+    expect(big.removeCalls()).toBe(0);
+
+    // Readable and within the cap → enumeration 'complete', normal sweep runs.
+    const small = seeded(2).anchor;
+    const complete = await sweepStaleDescriptors(ANCHOR, null, allAbsentProbe, small.deps);
+    expect(complete.enumeration).toBe('complete');
+    expect(complete.examined).toBe(2);
   });
 
   it('never probes a malformed or mismatched file (no pipe to prove dead, nothing to delete)', async () => {
