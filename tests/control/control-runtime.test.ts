@@ -782,6 +782,241 @@ describe('D062 F2 descriptor ownership — ACL-verification cleanup unlinks only
   });
 });
 
+/* ---- Pre-listen descriptor ownership (this PR) ------------------------------ *
+ * CONTROL_START_SUCCESS => CURRENT_DESCRIPTOR.pipeName == THIS_RUNTIME.pipeName.
+ *
+ * `verifyDescriptor` is asynchronous and path-based: the helper re-opens whatever
+ * file is at the fixed path when it runs. A successor runtime can rotate that path
+ * during the await, so a successful ACL result may describe the SUCCESSOR descriptor
+ * rather than ours. Without a pre-listen ownership proof the predecessor listened on
+ * its own pipe and reported success while no descriptor pointed at it —
+ * undiscoverable, and left with nothing at all once the successor closed. The seam
+ * below rotates the descriptor inside the verification await, so the race is
+ * deterministic: no sleeps, no timing. */
+
+describe('D062 descriptor ownership — startup proves the descriptor is still ours before listening', () => {
+  /** Start a channel that succeeds, so the store holds a real successor descriptor. */
+  async function startSuccessor(store: MemStore): Promise<ControlChannelHandle> {
+    const { orchestrator } = newOrchestrator();
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: passingDescriptorVerify,
+      descriptorDeps: store.deps,
+    });
+    expect(handle).not.toBeNull();
+    if (handle === null) {
+      throw new Error('successor failed to start');
+    }
+    handles.push(handle);
+    return handle;
+  }
+
+  /** Verification that succeeds, having first mutated the store mid-await. */
+  function verifyThenRotate(mutate: () => void): () => Promise<DescriptorAclVerification> {
+    return (): Promise<DescriptorAclVerification> => {
+      mutate();
+      return Promise.resolve({ ok: true });
+    };
+  }
+
+  it('O1. descriptor still ours after verification -> startup proceeds and listens', async () => {
+    const { orchestrator } = newOrchestrator();
+    const store = memStore();
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: passingDescriptorVerify,
+      descriptorDeps: store.deps,
+    });
+    expect(handle).not.toBeNull();
+    if (handle === null) {
+      return;
+    }
+    handles.push(handle);
+    // The invariant, positively: the live channel is exactly what the store advertises.
+    expect(storedPipeName(store)).toBe(handle.pipeName);
+  });
+
+  it('O2. a successor replaces the descriptor during verification -> startup FAILS', async () => {
+    const store = memStore();
+    const successor = await startSuccessor(store);
+    const successorText = store.get();
+
+    const { orchestrator } = newOrchestrator();
+    const late = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      // The helper validated the successor descriptor and returned ok.
+      verifyDescriptor: verifyThenRotate(() => {
+        store.set(successorText);
+      }),
+      descriptorDeps: store.deps,
+    });
+    // No handle: a channel nothing can discover is never reported as started.
+    expect(late).toBeNull();
+    // O3: the successor descriptor is preserved byte-for-byte and stays discoverable.
+    expect(store.get()).toBe(successorText);
+    expect(storedPipeName(store)).toBe(successor.pipeName);
+  });
+
+  it('O4. descriptor missing after verification -> startup FAILS, nothing removed', async () => {
+    const { orchestrator } = newOrchestrator();
+    const { store, removes } = countingStore();
+    const before = { count: 0 };
+    const late = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: verifyThenRotate(() => {
+        store.set(null);
+        before.count = removes();
+      }),
+      descriptorDeps: store.deps,
+    });
+    expect(late).toBeNull();
+    expect(removes()).toBe(before.count);
+    expect(store.get()).toBeNull();
+  });
+
+  it('O5. malformed descriptor after verification -> startup FAILS, never deleted', async () => {
+    const { orchestrator } = newOrchestrator();
+    const { store, removes } = countingStore();
+    const before = { count: 0 };
+    const late = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: verifyThenRotate(() => {
+        store.set('{not json');
+        before.count = removes();
+      }),
+      descriptorDeps: store.deps,
+    });
+    expect(late).toBeNull();
+    // Unprovable ownership is not ownership: it is left alone, never clobbered.
+    expect(removes()).toBe(before.count);
+    expect(store.get()).toBe('{not json');
+  });
+
+  it('O5b. unreadable descriptor after verification -> startup FAILS, never deleted', async () => {
+    const { orchestrator } = newOrchestrator();
+    let data: string | null = null;
+    let unreadable = false;
+    let removeCalls = 0;
+    const deps: DescriptorFileDeps = {
+      readFile: (): string => {
+        if (unreadable || data === null) {
+          throw new Error(unreadable ? 'EACCES' : 'ENOENT');
+        }
+        return data;
+      },
+      writeFile: (_path: string, value: string): void => {
+        data = value;
+      },
+      removeFile: (): void => {
+        removeCalls += 1;
+        data = null;
+      },
+    };
+    // Startup legitimately removes a stale pathname before creating ours, so the
+    // baseline is taken at the moment the descriptor becomes unreadable.
+    const before = { count: 0 };
+    const late = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: verifyThenRotate(() => {
+        before.count = removeCalls;
+        unreadable = true;
+      }),
+      descriptorDeps: deps,
+    });
+    expect(late).toBeNull();
+    // Ownership could not be proven, so nothing was unlinked after that point.
+    expect(removeCalls).toBe(before.count);
+    unreadable = false;
+    expect(data).not.toBeNull();
+  });
+
+  it('O6. a DIFFERENT pipeName after verification -> startup FAILS', async () => {
+    const { orchestrator } = newOrchestrator();
+    const store = memStore();
+    // A well-formed descriptor from an unrelated runtime: valid, simply not ours.
+    const foreign = serializeDescriptor(createRuntimeDescriptor(4242).descriptor);
+    let ourPipeName: string | null = null;
+    const late = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: verifyThenRotate(() => {
+        ourPipeName = storedPipeName(store);
+        store.set(foreign);
+      }),
+      descriptorDeps: store.deps,
+    });
+    expect(late).toBeNull();
+    expect(ourPipeName).not.toBeNull();
+    expect(storedPipeName(store)).not.toBe(ourPipeName);
+    expect(store.get()).toBe(foreign);
+  });
+
+  it('O7. a failed ownership recheck returns no handle and exposes no token', async () => {
+    const store = memStore();
+    const successor = await startSuccessor(store);
+    const successorText = store.get();
+    expect(successorText).not.toBeNull();
+    if (successorText === null) {
+      return;
+    }
+    const parsed = parseDescriptor(successorText);
+    expect(parsed).not.toBeNull();
+    if (parsed === null) {
+      return;
+    }
+    const successorToken = parsed.token.toString('hex');
+
+    const { orchestrator } = newOrchestrator();
+    const lines: string[] = [];
+    const late = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: verifyThenRotate(() => {
+        store.set(successorText);
+      }),
+      descriptorDeps: store.deps,
+      logger: (message: string): void => {
+        lines.push(message);
+      },
+    });
+    // No handle at all, so no pipePath and no channel to authenticate against.
+    expect(late).toBeNull();
+    expect(lines.some((line) => line.includes('no longer identifies this runtime'))).toBe(true);
+    for (const line of lines) {
+      expect(line).not.toContain(successorToken);
+      expect(line).not.toBe(successor.pipeName);
+      expect(line).not.toMatch(/[0-9a-f]{32,}/i);
+    }
+  });
+
+  it('O8. the ownership predicate is shared: cleanup and the pre-listen proof agree', async () => {
+    // A successor rotation is refused before listening (O2) and is equally refused as
+    // a deletion target on the ACL-failure path — one predicate, both call sites.
+    const store = memStore();
+    const successor = await startSuccessor(store);
+    const successorText = store.get();
+
+    const { orchestrator } = newOrchestrator();
+    const failed = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: (): Promise<DescriptorAclVerification> => {
+        store.set(successorText);
+        return Promise.resolve({ ok: false, reason: CONTROL_ANCHOR_REJECTION.DACL_ABSENT });
+      },
+      descriptorDeps: store.deps,
+    });
+    expect(failed).toBeNull();
+    expect(storedPipeName(store)).toBe(successor.pipeName);
+  });
+});
+
 describe('D062 named-pipe collision fails closed', () => {
   it('a second listener on the same pipe name is refused', async () => {
     const { orchestrator } = newOrchestrator();

@@ -58,11 +58,28 @@ function removeOwnDescriptorFile(
   ownPipeName: string,
   deps?: DescriptorFileDeps,
 ): void {
-  const current = readDescriptorFile(anchorPath, deps);
-  if (current === null || current.descriptor.pipeName !== ownPipeName) {
+  if (!descriptorIsOurs(anchorPath, ownPipeName, deps)) {
     return;
   }
   removeDescriptorFile(anchorPath, deps);
+}
+
+/**
+ * Whether the fixed descriptor currently identifies THIS runtime instance. The ONE
+ * ownership predicate: both the cleanup paths and the pre-listen ownership proof
+ * decide through exactly this function, so they cannot drift apart.
+ *
+ * A missing, malformed, or unreadable descriptor is NOT ours: ownership must be
+ * proven, never assumed. Only the token-bearing pipeName is compared, and the token
+ * read alongside it is never logged, returned, or otherwise observed.
+ */
+function descriptorIsOurs(
+  anchorPath: string,
+  ownPipeName: string,
+  deps?: DescriptorFileDeps,
+): boolean {
+  const current = readDescriptorFile(anchorPath, deps);
+  return current !== null && current.descriptor.pipeName === ownPipeName;
 }
 
 /** A running control channel; `close()` stops it and removes its own descriptor. */
@@ -164,6 +181,23 @@ export async function startControlChannel(
   if (!descriptorAcl.ok) {
     removeOwnDescriptorFile(anchorPath, descriptor.pipeName, deps.descriptorDeps);
     log(`AgentBridge control channel: disabled (descriptor ACL not verified: ${descriptorAcl.reason}).`);
+    return null;
+  }
+
+  // The verification above is ASYNCHRONOUS and path-based: the helper re-opens
+  // whatever file sits at the fixed path when it runs. A successor runtime can rotate
+  // that path during the await (its stale-descriptor removal plus its own exclusive
+  // creation), in which case the helper validated the SUCCESSOR's descriptor and
+  // returned ok. Listening now would report a successful startup for a channel no
+  // descriptor points at: undiscoverable while it runs, and leaving nothing behind at
+  // all once the successor closes. Prove the stored descriptor is still ours first.
+  //
+  // Nothing is removed on this path. The only way to reach the failure branch is for
+  // the descriptor to be absent, unprovable, or a successor's — and deleting any of
+  // those is precisely the successor-clobbering this ownership rule exists to prevent.
+  // A later runtime's stale-descriptor removal reclaims an orphaned pathname.
+  if (!descriptorIsOurs(anchorPath, descriptor.pipeName, deps.descriptorDeps)) {
+    log('AgentBridge control channel: disabled (descriptor no longer identifies this runtime).');
     return null;
   }
 
