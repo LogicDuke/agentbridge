@@ -140,7 +140,7 @@ channel is wanted.
 The control channel has **two** distinct prerequisites, in this order:
 
     externally provisioned hardened control anchor   (external prerequisite)
-      -> npm run control:provision                    (native owner-helper/provenance pair)
+      -> npm run control:provision                    (two native artifact/provenance pairs)
       -> npm run cockpit:live                          (one-shot control-startup attempt)
       -> npm run control
 
@@ -152,37 +152,118 @@ directory is:
     %LOCALAPPDATA%\AgentBridge\control
 
 `verifyControlAnchor` (`src/control/control-store.ts`) reads this anchor
-**read-only and fail-closed**: it requires the anchor OWNER to be the exact
-runtime operator SID and the DACL to be exactly operator + SYSTEM, present and
-**non-inherited**. It never creates the directory and never mutates ACLs.
-AgentBridge V1 — the current control flow — does **not** create or harden this
-anchor; there is no anchor provisioner in the codebase. A plain `mkdir` is
-therefore insufficient: a freshly created directory inherits its parent's ACLs,
-which the anchor policy rejects. Establishing an anchor that satisfies the trust
-policy is a separate operator/deployment responsibility, outside the scope of
-these npm scripts.
+**read-only and fail-closed**. The trust policy it enforces
+(`evaluateAnchorSnapshot`) is decided over canonical SIDs only, from one native
+OWNER + DACL snapshot, and **every** one of the following must hold — any single
+failure disables the control channel:
 
-**2. `control:provision` provisions only the native helper.**
+| Requirement | Rejection when unmet |
+| --- | --- |
+| OWNER is the exact runtime operator SID | `OWNER_MISMATCH` |
+| OWNER is **not** SYSTEM — an owner can rewrite the DACL, so SYSTEM ownership can never substitute for operator ownership | `OWNER_IS_SYSTEM` |
+| The DACL is **PRESENT** (neither NULL nor absent) | `DACL_ABSENT` |
+| The DACL is **PROTECTED** — `SE_DACL_PROTECTED`; it does not inherit from its parent, so a later-widened parent can never enter it | `DACL_UNPROTECTED` |
+| The DACL is **non-empty** | `NO_ENTRIES` |
+| **No** ACE is inherited (no ACE carries `INHERITED_ACE`) | `INHERITED_PRINCIPAL` |
+| Every ACE principal is the operator or SYSTEM, by canonical SID — no third principal, however narrow | `FOREIGN_PRINCIPAL` |
+| An ACE for the operator SID is present | `RUNTIME_PRINCIPAL_ABSENT` |
+
+Details, so the table is read exactly as the code behaves. SYSTEM is
+*permitted*, not *required*, on the anchor: an operator-only DACL that meets
+every other requirement is accepted. The allow/deny type and the access mask are
+carried in the snapshot but do **not** gate authorization — a DENY operator ACE
+still counts as the operator being present — because token possession (mutual
+HMAC) remains the actual authenticator; this policy governs anchor trust, not
+per-call permission. No file-inheritance (`OBJECT_INHERIT_ACE`) requirement is
+placed on the anchor's ACEs: nothing relies on a descriptor inheriting the
+anchor's entries, because every descriptor is created with its own explicit
+protected DACL (below).
+
+The runtime is **read-only** with respect to anchor ACLs. It never creates the
+directory and never mutates ACLs. AgentBridge V1 does **not** create or harden
+this anchor; there is no anchor provisioner in the codebase. A plain `mkdir` is
+therefore insufficient: a freshly created directory inherits its parent's ACLs,
+which the policy rejects as `DACL_UNPROTECTED` / `INHERITED_PRINCIPAL`.
+Establishing an anchor that satisfies the trust policy is a separate
+operator/deployment responsibility, outside the scope of these npm scripts.
+
+**2. `control:provision` provisions only the native artifacts.**
 `control:provision` runs the existing validated gate
 (`node tools/control-owner/ensure-helper.mjs`) and nothing else: it provisions
-the native owner-helper/provenance pair. It does **not** create, harden, or
-verify the control anchor.
+the two build-provenanced native artifacts — the read-only owner/DACL snapshot
+helper (`agentbridge-win-owner.exe`) and the create-only descriptor creator
+(`agentbridge-win-descriptor-create.exe`) — each with its own generated
+provenance module. It does **not** create, harden, or verify the control anchor.
+
+The gate accepts an artifact pair only when the on-disk provenance is the exact
+canonical encoding of **both** that binary's SHA-256 and the SHA-256 of the
+reviewed C source it was compiled from (`sourceId`). A pair that is internally
+self-consistent but was built from an older reviewed source — the state a
+rollback or a mixed-cache restore leaves behind — is therefore **rebuilt**, not
+skipped: `SUPPORTED_PROVISIONING_SUCCESS ⇒ NATIVE_ARTIFACT_RUNTIME_COMPATIBLE`.
+The runtime reads only the filename and the binary hash from a provenance module
+and hash-verifies each binary before executing it; `sourceId` is lifecycle
+metadata that grants no trust the runtime would otherwise deny.
 
 If immediate control availability is required, the control anchor must already
 satisfy the runtime's trust policy **before** `cockpit:live` starts. The live
-runtime makes exactly **one** control-startup attempt at launch; if either
-prerequisite is unmet — the hardened anchor is missing or non-compliant, or the
-helper/provenance pair is not yet provisioned — that attempt fails closed and —
-by design — there is no automatic or background retry, no polling, and no
-watcher. Satisfying the prerequisites *after* the runtime is already running
-does not dynamically start the control channel: restart `cockpit:live` to make a
-new one-shot control-startup attempt.
+runtime makes exactly **one** control-startup attempt at launch, and only
+**after** its fixed loopback Cockpit bind has succeeded (the bind is the
+process-level single-runtime gate, so a bind loser never publishes a descriptor);
+if either prerequisite is unmet — the hardened anchor is missing or
+non-compliant, or an artifact pair is not yet provisioned — that attempt fails
+closed and — by design — there is no automatic or background retry, no polling,
+and no watcher. Satisfying the prerequisites *after* the runtime is already
+running does not dynamically start the control channel: restart `cockpit:live`
+to make a new one-shot control-startup attempt.
 
-Provisioning is **not** required for read-only Cockpit use, and a provisioning
-failure never prevents the Cockpit from launching or serving
-(`CONTROL_PROVISION_FAILURE ⇏ COCKPIT_FAILURE`): the gate is on the
+Provisioning is **not** required for read-only Cockpit use, and neither a
+provisioning failure nor a control-startup failure prevents the Cockpit from
+launching or serving (`CONTROL_PROVISION_FAILURE ⇏ COCKPIT_FAILURE`,
+`CONTROL_STARTUP_FAILURE ⇏ COCKPIT_FAILURE`): the gate is on the
 `control:provision` and `npm run control` paths only, never on `cockpit` or
-`cockpit:live`.
+`cockpit:live`, and control is started from the Cockpit's `listening` event with
+every failure contained.
+
+### Descriptor lifecycle v2 (identity-named, listen-before-publish)
+
+There is **no shared fixed descriptor pathname**. Each runtime mints a 128-bit
+random runtime id — the hex suffix of its unpredictable pipe name
+`agentbridge-control-<id>` — and publishes exactly one file inside the anchor:
+
+    runtime-descriptor-<id>.json        (<id> = exactly 32 lowercase hex characters)
+
+The id is whitelisted character-by-character everywhere it enters a filename (the
+runtime, the CLI, and the native creator), so no caller-controlled path,
+separator, or traversal can reach the filesystem. The descriptor holds only
+`{ version: 2, pipeName, token }` — no PID.
+
+Startup order, structurally: verify the anchor → sweep foreign descriptors whose
+pipe the kernel reports absent → mint the identity → **listen** on the pipe (the
+kernel-owned exclusivity/liveness claim; a collision fails closed with nothing
+published) → **then** create the descriptor through the creator (`CREATE_NEW`,
+owner = the creator's own token user, a PROTECTED DACL of exactly operator +
+SYSTEM, bytes on stdin only) → verify that exact file (owner, DACL present +
+protected, direct operator + SYSTEM only, via the read-only helper; then contents
+by read-back against what was minted) → expose the handle. The descriptor-file
+policy (`evaluateDescriptorSnapshot`) is the anchor policy plus a required
+SYSTEM ACE, because that is precisely what the creator produces
+(`SYSTEM_PRINCIPAL_ABSENT` otherwise).
+
+Liveness and cleanup use the kernel pipe namespace, never a PID, a timestamp, or
+file order. A descriptor whose pipe answers `ENOENT` is dead; that — and only
+that — authorizes removing exactly that one file. A pipe that exists but does not
+authenticate is never treated as dead. A runtime removes its own file on orderly
+close (descriptor first, then the pipe) and on a post-publication startup
+failure; it never overwrites or rotates another runtime's file.
+
+Discovery (`npm run control`) enumerates a bounded set of identity-named
+candidates, parses each safely (a file whose name and contents disagree is
+malformed and ignored, never deleted), probes each valid candidate's pipe, and
+proceeds only with **exactly one** live candidate — the mutual-HMAC handshake is
+then attempted against that runtime alone, because the protocol's only message is
+the authoritative command. Zero live candidates is unavailable; two or more is
+ambiguous and fails closed. The CLI never deletes.
 
 ## Tests
 

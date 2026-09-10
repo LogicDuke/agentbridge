@@ -1,6 +1,11 @@
 /**
  * Live Cockpit runtime composition (Live Runtime Wiring milestone, Decision 059).
  *
+ * Decision 062 ordering: the post-start control channel is started only after
+ * this host has bound its fixed loopback port (see
+ * {@link startControlChannelAfterCockpitBind}); a bind loser never publishes a
+ * control descriptor, and a control-startup failure never takes the Cockpit down.
+ *
  * The composition root that wires the three narrow production parts through the
  * existing D5 seam — it configures and wires, it is **not** the workflow
  * authority ({@link AutoflowRuntime} is):
@@ -226,6 +231,75 @@ export function runStartupProgression(
   }
 }
 
+/** A control-channel starter; production binds `startControlChannel` over the orchestrator. */
+export type ControlChannelStarter = () => Promise<ControlChannelHandle | null>;
+
+/** The bind-gated control channel: `current()` is the handle once (and only if) it started. */
+export interface BindGatedControlChannel {
+  current(): ControlChannelHandle | null;
+}
+
+/**
+ * Start the control channel only AFTER the Cockpit host has successfully bound
+ * its loopback port (Decision 062 §17, descriptor lifecycle v2 ordering).
+ *
+ * The fixed loopback bind is the process-level single-runtime gate: a second
+ * runtime's bind fails with `EADDRINUSE` and that runtime exits before it ever
+ * publishes a control descriptor. This function makes that ordering structural:
+ *
+ * - `start` is invoked exactly once, from the server's `'listening'` event (or
+ *   immediately if it is already listening);
+ * - if the server emits `'error'` first (a bind loser), `start` is never invoked
+ *   — nothing is published, no pipe is created;
+ * - a control-startup failure (a `null` handle or a rejection) is contained and
+ *   logged; it never throws into the Cockpit path and never stops the host:
+ *   CONTROL_STARTUP_FAILURE ⇏ COCKPIT_FAILURE. Control provisioning is never a
+ *   prerequisite for Cockpit availability.
+ *
+ * No `await` blocks the Cockpit: it is already serving when `start` runs.
+ */
+export function startControlChannelAfterCockpitBind(
+  server: http.Server,
+  start: ControlChannelStarter,
+  log: (message: string) => void = (message: string): void => {
+    console.error(message);
+  },
+): BindGatedControlChannel {
+  let handle: ControlChannelHandle | null = null;
+  const state = { started: false, failed: false };
+  const begin = (): void => {
+    if (state.started || state.failed) {
+      return;
+    }
+    state.started = true;
+    let started: Promise<ControlChannelHandle | null>;
+    try {
+      started = start();
+    } catch {
+      log('AgentBridge control channel: disabled (startup error).');
+      return;
+    }
+    void started
+      .then((result): void => {
+        handle = result;
+      })
+      .catch((): void => {
+        // Fail closed; the Cockpit remains available.
+        log('AgentBridge control channel: disabled (startup error).');
+      });
+  };
+  server.once('error', (): void => {
+    // A bind loser never starts — and therefore never publishes — control.
+    state.failed = true;
+  });
+  if (server.listening) {
+    begin();
+  } else {
+    server.once('listening', begin);
+  }
+  return { current: (): ControlChannelHandle | null => handle };
+}
+
 /**
  * Production entrypoint (`npm run cockpit:live`). Owns configuration, start,
  * signal handling, and error propagation.
@@ -244,7 +318,7 @@ export function runStartupProgression(
  */
 function main(): void {
   let server: http.Server;
-  let controlChannel: ControlChannelHandle | null = null;
+  let controlChannel: BindGatedControlChannel;
   try {
     const runtime = new AutoflowRuntime();
     const orchestrator = new AutoflowOrchestrator(runtime);
@@ -272,22 +346,19 @@ function main(): void {
     });
 
     // Decision 062: start the post-start operator control channel only AFTER the
-    // read-only Cockpit host is available (§17). It fails **closed** on any
-    // fault — an unverified control anchor, a descriptor write failure, or a pipe
-    // collision disables the channel and returns null; the Cockpit stays up and
-    // read-only, and the writer is never exposed to it. No await here: the
-    // Cockpit is already serving and must not be blocked on the control channel.
-    void startControlChannel({ orchestrator })
-      .then((handle): void => {
-        controlChannel = handle;
-        if (handle !== null) {
-          console.log('AgentBridge control channel: listening (OPEN_HUMAN_GATE).');
-        }
-      })
-      .catch((): void => {
-        // Fail closed; the Cockpit remains available.
-        console.error('AgentBridge control channel: disabled (startup error).');
-      });
+    // read-only Cockpit host has BOUND its loopback port (§17) — the fixed bind
+    // is the single-runtime gate, so a bind loser never publishes a descriptor.
+    // Control fails **closed** on any fault — an unverified control anchor, a
+    // pipe collision, a creation or verification failure disables the channel
+    // and returns null; the Cockpit stays up and read-only, and the writer is
+    // never exposed to it. Nothing awaits: the Cockpit is already serving.
+    controlChannel = startControlChannelAfterCockpitBind(server, async () => {
+      const handle = await startControlChannel({ orchestrator });
+      if (handle !== null) {
+        console.log('AgentBridge control channel: listening (OPEN_HUMAN_GATE).');
+      }
+      return handle;
+    });
   } catch (error) {
     console.error('AgentBridge Cockpit (live): startup failed.', error);
     process.exit(1);
@@ -308,10 +379,11 @@ function main(): void {
         process.exit(0);
       });
     };
-    // Best-effort orderly control-channel shutdown (removes its descriptor),
-    // then close the Cockpit host.
-    if (controlChannel !== null) {
-      void controlChannel.close().then(closeServer, closeServer);
+    // Best-effort orderly control-channel shutdown (removes its own
+    // identity-named descriptor, then its pipe), then close the Cockpit host.
+    const handle = controlChannel.current();
+    if (handle !== null) {
+      void handle.close().then(closeServer, closeServer);
     } else {
       closeServer();
     }

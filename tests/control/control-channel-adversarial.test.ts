@@ -16,7 +16,7 @@ import {
   BINDING,
   delay,
   descriptorFacts,
-  memStore,
+  memAnchor,
   newOrchestrator,
   rawClient,
   startServer,
@@ -33,9 +33,10 @@ describe('D062 control channel — server-level adversarial (real named pipe)', 
   it('a replayed client MAC (bound to a stale server nonce) is rejected AUTH_FAILED, no mutation', async () => {
     const { runtime, orchestrator } = newOrchestrator();
     orchestrator.open(BINDING);
-    const store = memStore();
-    handles.push(await startServer(orchestrator, store));
-    const { token, pipePath } = descriptorFacts(store);
+    const store = memAnchor();
+    const handle = await startServer(orchestrator, store);
+    handles.push(handle);
+    const { token, pipePath } = descriptorFacts(store, handle);
 
     const outcome = await rawClient(pipePath, {
       onHello: (): Buffer => {
@@ -55,9 +56,10 @@ describe('D062 control channel — server-level adversarial (real named pipe)', 
   it('a wrong client MAC is rejected before any mutation', async () => {
     const { runtime, orchestrator } = newOrchestrator();
     orchestrator.open(BINDING);
-    const store = memStore();
-    handles.push(await startServer(orchestrator, store));
-    const { pipePath } = descriptorFacts(store);
+    const store = memAnchor();
+    const handle = await startServer(orchestrator, store);
+    handles.push(handle);
+    const { pipePath } = descriptorFacts(store, handle);
 
     const outcome = await rawClient(pipePath, {
       onHello: (nonceS: Buffer): Buffer => {
@@ -77,9 +79,10 @@ describe('D062 control channel — server-level adversarial (real named pipe)', 
   it('an authenticated but unknown command is rejected MALFORMED, no mutation', async () => {
     const { runtime, orchestrator } = newOrchestrator();
     orchestrator.open(BINDING);
-    const store = memStore();
-    handles.push(await startServer(orchestrator, store));
-    const { token, pipePath } = descriptorFacts(store);
+    const store = memAnchor();
+    const handle = await startServer(orchestrator, store);
+    handles.push(handle);
+    const { token, pipePath } = descriptorFacts(store, handle);
 
     const outcome = await rawClient(pipePath, {
       onHello: (nonceS: Buffer): Buffer => {
@@ -99,9 +102,10 @@ describe('D062 control channel — server-level adversarial (real named pipe)', 
   it('an oversized frame is rejected (connection dropped), no mutation', async () => {
     const { runtime, orchestrator } = newOrchestrator();
     orchestrator.open(BINDING);
-    const store = memStore();
-    handles.push(await startServer(orchestrator, store));
-    const { pipePath } = descriptorFacts(store);
+    const store = memAnchor();
+    const handle = await startServer(orchestrator, store);
+    handles.push(handle);
+    const { pipePath } = descriptorFacts(store, handle);
 
     const outcome = await rawClient(pipePath, {
       onHello: (): Buffer => {
@@ -117,9 +121,10 @@ describe('D062 control channel — server-level adversarial (real named pipe)', 
   it('a zero-length frame is rejected (connection dropped), no mutation', async () => {
     const { runtime, orchestrator } = newOrchestrator();
     orchestrator.open(BINDING);
-    const store = memStore();
-    handles.push(await startServer(orchestrator, store));
-    const { pipePath } = descriptorFacts(store);
+    const store = memAnchor();
+    const handle = await startServer(orchestrator, store);
+    handles.push(handle);
+    const { pipePath } = descriptorFacts(store, handle);
 
     const outcome = await rawClient(pipePath, {
       onHello: (): Buffer => Buffer.from([0, 0, 0, 0]),
@@ -131,9 +136,10 @@ describe('D062 control channel — server-level adversarial (real named pipe)', 
   it('a connection that never sends a request times out and is dropped, no mutation', async () => {
     const { runtime, orchestrator } = newOrchestrator();
     orchestrator.open(BINDING);
-    const store = memStore();
-    handles.push(await startServer(orchestrator, store, { timeoutMs: 150 }));
-    const { pipePath } = descriptorFacts(store);
+    const store = memAnchor();
+    const handle = await startServer(orchestrator, store, { timeoutMs: 150 });
+    handles.push(handle);
+    const { pipePath } = descriptorFacts(store, handle);
 
     const outcome = await rawClient(pipePath, {
       onHello: (): Buffer | null => null, // hold, never send
@@ -146,9 +152,10 @@ describe('D062 control channel — server-level adversarial (real named pipe)', 
   it('a client that disconnects mid-frame does not crash the server or mutate; the server keeps serving', async () => {
     const { runtime, orchestrator } = newOrchestrator();
     orchestrator.open(BINDING);
-    const store = memStore();
-    handles.push(await startServer(orchestrator, store));
-    const { pipePath } = descriptorFacts(store);
+    const store = memAnchor();
+    const handle = await startServer(orchestrator, store);
+    handles.push(handle);
+    const { pipePath } = descriptorFacts(store, handle);
 
     await new Promise<void>((resolvePromise) => {
       const socket = net.connect(pipePath);
@@ -179,7 +186,7 @@ describe('D062 control channel — server-level adversarial (real named pipe)', 
     await delay(50);
     expect(runtime.current()?.status).toBe(WORKFLOW_STATUS.OPEN);
     // The server is still alive and correctly rejects a stale-nonce replay.
-    const { token } = descriptorFacts(store);
+    const { token } = descriptorFacts(store, handle);
     const followUp = await rawClient(pipePath, {
       onHello: (): Buffer => {
         const nonceC = randomBytes(NONCE_BYTES);
@@ -193,9 +200,10 @@ describe('D062 control channel — server-level adversarial (real named pipe)', 
   it('a client that disconnects after dispatch but before reading the result: the mutation still stands', async () => {
     const { runtime, orchestrator } = newOrchestrator();
     orchestrator.open(BINDING);
-    const store = memStore();
-    handles.push(await startServer(orchestrator, store));
-    const { token, pipePath } = descriptorFacts(store);
+    const store = memAnchor();
+    const handle = await startServer(orchestrator, store);
+    handles.push(handle);
+    const { token, pipePath } = descriptorFacts(store, handle);
 
     await new Promise<void>((resolvePromise) => {
       const socket = net.connect(pipePath);

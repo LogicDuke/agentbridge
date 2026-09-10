@@ -5,17 +5,23 @@
  *
  * 1. CANONICAL PAIR VALIDITY. The explicit provisioning gate
  *    (tools/control-owner/ensure-helper.mjs) makes a clean — or partially/torn/
- *    malformed — checkout coherent before control-anchor verification, by
- *    rebuilding through the trusted build.mjs unless the on-disk pair is
- *    CANONICAL. Canonical means exactly one thing:
+ *    malformed/stale — checkout coherent before control-anchor verification, by
+ *    rebuilding through the trusted build.mjs unless EVERY on-disk pair (the
+ *    read-only owner helper AND the create-only descriptor creator) is
+ *    CANONICAL for the CURRENT reviewed source. Canonical means exactly one thing
+ *    per artifact:
  *
- *        provenance bytes == encodeProvenance(sha256(helper bytes))
+ *        provenance bytes == encode(sha256(binary bytes), sha256(reviewed source))
  *
- *    produced by the single shared encoder (tools/control-owner/
+ *    produced by the artifact's single shared encoder (tools/control-owner/
  *    provenance-format.mjs), which build.mjs also uses to publish. The gate does
  *    no field extraction, no regex acceptance, no JS import/parse, and no
  *    normalization — so the ACCEPTED SET is the singleton
- *    {encodeProvenance(sha256(helper))} and the FALSE-VALID SET is empty.
+ *    {encode(sha256(binary), sourceId)} and the FALSE-VALID SET is empty. Because
+ *    the source digest is part of the canonical bytes, a self-consistent pair built
+ *    from an OLDER reviewed source rebuilds instead of being skipped:
+ *
+ *        SUPPORTED_PROVISIONING_SUCCESS ⇒ NATIVE_ARTIFACT_RUNTIME_COMPATIBLE
  *
  * 2. LAUNCH SEPARATION. Provisioning is a prerequisite of the CONTROL-oriented
  *    flow only (`npm run control`); the read-only Cockpit launches (`cockpit`,
@@ -65,9 +71,18 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import {
+  validateCreatorPair,
   validateHelperPair,
+  encodeCreatorProvenance,
   encodeProvenance,
+  descriptorCreatorSourceId,
+  ownerHelperSourceId,
+  sourceIdFor,
+  CREATOR_PROVENANCE_BASENAME,
+  DESCRIPTOR_CREATOR_BASENAME,
+  DESCRIPTOR_CREATOR_SOURCE_PATH,
   OWNER_HELPER_BASENAME,
+  OWNER_HELPER_SOURCE_PATH,
 } from '../../tools/control-owner/helper-pair.mjs';
 import {
   resolveBuildToolchain,
@@ -105,6 +120,19 @@ const repoRoot = fileURLToPath(new URL('../../', import.meta.url));
 const ensureScript = join(repoRoot, 'tools', 'control-owner', 'ensure-helper.mjs');
 const realExe = join(repoRoot, 'dist', 'control', 'native', OWNER_HELPER_BASENAME);
 const realProv = join(repoRoot, 'dist', 'control', 'native', PROVENANCE_BASENAME);
+const realCreator = join(repoRoot, 'dist', 'control', 'native', DESCRIPTOR_CREATOR_BASENAME);
+const realCreatorProv = join(repoRoot, 'dist', 'control', 'native', CREATOR_PROVENANCE_BASENAME);
+
+/** The CURRENT reviewed-source identities (the gate recomputes these on every call). */
+const OWNER_SOURCE_ID = ownerHelperSourceId() ?? '';
+const CREATOR_SOURCE_ID = descriptorCreatorSourceId() ?? '';
+/** Every published native artifact basename (binaries + provenance modules). */
+const ALL_NATIVE_BASENAMES = [
+  OWNER_HELPER_BASENAME,
+  PROVENANCE_BASENAME,
+  DESCRIPTOR_CREATOR_BASENAME,
+  CREATOR_PROVENANCE_BASENAME,
+];
 
 const pkg = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')) as {
   scripts: Record<string, string>;
@@ -115,7 +143,10 @@ function sha256Hex(bytes: Buffer): string {
   return createHash('sha256').update(bytes).digest('hex');
 }
 function canonicalFor(bytes: Buffer): string {
-  return encodeProvenance(sha256Hex(bytes));
+  return encodeProvenance(sha256Hex(bytes), OWNER_SOURCE_ID);
+}
+function creatorCanonicalFor(bytes: Buffer): string {
+  return encodeCreatorProvenance(sha256Hex(bytes), CREATOR_SOURCE_ID);
 }
 
 interface Pair {
@@ -324,6 +355,69 @@ describe('D062 canonical provenance — acceptance matrix (FALSE-VALID set is em
       }
     });
   }, 60000);
+});
+
+/* ---- 1b. Source binding: SUPPORTED_PROVISIONING_SUCCESS ⇒ RUNTIME_COMPATIBLE ---- */
+
+describe('D062 canonical provenance — source binding (a canonical-but-stale pair rebuilds)', () => {
+  it('the current source identities are SHA-256 of the exact reviewed C source bytes (no scan, no regex)', () => {
+    expect(OWNER_SOURCE_ID).toMatch(/^[0-9a-f]{64}$/);
+    expect(CREATOR_SOURCE_ID).toMatch(/^[0-9a-f]{64}$/);
+    expect(OWNER_SOURCE_ID).toBe(sha256Hex(readFileSync(OWNER_HELPER_SOURCE_PATH)));
+    expect(CREATOR_SOURCE_ID).toBe(sha256Hex(readFileSync(DESCRIPTOR_CREATOR_SOURCE_PATH)));
+    expect(OWNER_SOURCE_ID).not.toBe(CREATOR_SOURCE_ID);
+    expect(sourceIdFor(join(tmpdir(), 'ab-no-such-source.c'))).toBeNull();
+  });
+
+  it('28. a pair that is self-consistent but was built from an OLDER reviewed source → INVALID (rebuild)', () => {
+    withPair((p) => {
+      writeExe(p, HELPER);
+      // Exactly the encoder output the old build would have published: same
+      // binary hash, the previous source's digest.
+      const staleSourceId = sha256Hex(Buffer.from('older reviewed source bytes'));
+      writeFileSync(p.provenancePath, encodeProvenance(sha256Hex(HELPER), staleSourceId));
+      expect(validateHelperPair(p)).toEqual({ valid: false, reason: 'not-canonical' });
+      // Only the CURRENT source's encoding is accepted.
+      writeFileSync(p.provenancePath, canonicalFor(HELPER));
+      expect(validateHelperPair(p).valid).toBe(true);
+    });
+  });
+
+  it('29. the encoder names the source id in the canonical bytes, so it cannot be dropped or spoofed', () => {
+    const canon = canonicalFor(HELPER);
+    expect(canon).toContain(`sourceId: ${JSON.stringify(OWNER_SOURCE_ID)}`);
+    expect(() => encodeProvenance(sha256Hex(HELPER), 'not-a-digest')).toThrow(TypeError);
+    expect(() => encodeProvenance('not-a-digest', OWNER_SOURCE_ID)).toThrow(TypeError);
+    expect(() => encodeCreatorProvenance(sha256Hex(HELPER), 'NOPE')).toThrow(TypeError);
+  });
+
+  it('the creator pair validates against ITS OWN encoder and source; a cross-wired provenance is never valid', () => {
+    withPair((p) => {
+      writeExe(p, HELPER);
+      writeFileSync(p.provenancePath, creatorCanonicalFor(HELPER));
+      expect(validateCreatorPair(p)).toEqual({ valid: true, reason: 'valid' });
+      // The owner helper's canonical encoding of the same bytes is NOT a creator pair …
+      writeFileSync(p.provenancePath, canonicalFor(HELPER));
+      expect(validateCreatorPair(p)).toEqual({ valid: false, reason: 'not-canonical' });
+      // … and the creator's encoding is NOT an owner-helper pair.
+      writeFileSync(p.provenancePath, creatorCanonicalFor(HELPER));
+      expect(validateHelperPair(p)).toEqual({ valid: false, reason: 'not-canonical' });
+      // The creator encoding for an OLDER creator source is stale too.
+      writeFileSync(p.provenancePath, encodeCreatorProvenance(sha256Hex(HELPER), 'a'.repeat(64)));
+      expect(validateCreatorPair(p)).toEqual({ valid: false, reason: 'not-canonical' });
+    });
+  });
+
+  it('the two generated modules export distinct bindings and name distinct binaries', () => {
+    const owner = canonicalFor(HELPER);
+    const creator = creatorCanonicalFor(HELPER);
+    expect(owner).toContain('export const OWNER_HELPER_PROVENANCE =');
+    expect(owner).toContain(`filename: ${JSON.stringify(OWNER_HELPER_BASENAME)}`);
+    expect(owner).not.toContain('DESCRIPTOR_CREATOR_PROVENANCE');
+    expect(creator).toContain('export const DESCRIPTOR_CREATOR_PROVENANCE =');
+    expect(creator).toContain(`filename: ${JSON.stringify(DESCRIPTOR_CREATOR_BASENAME)}`);
+    expect(creator).not.toContain('OWNER_HELPER_PROVENANCE');
+  });
 });
 
 /* ---- 2. Coherent launch model (cross-platform, definition-level) ------------- */
@@ -537,13 +631,11 @@ describe('D062 coherent launch model — CONTROL_STARTUP_FAILURE ⇏ COCKPIT_FAI
 
     // Then a REAL control-channel startup that fails closed the way an
     // unprovisioned/unusable helper does at launch: verification is rejected.
-    let descriptorWrites = 0;
+    let descriptorCreations = 0;
     const descriptorDeps: DescriptorFileDeps = {
+      listAnchor: (): readonly string[] => [],
       readFile: (): string => {
         throw new Error('ENOENT');
-      },
-      writeFile: (): void => {
-        descriptorWrites += 1;
       },
       removeFile: (): void => {
         /* no-op */
@@ -555,11 +647,18 @@ describe('D062 coherent launch model — CONTROL_STARTUP_FAILURE ⇏ COCKPIT_FAI
       verify: (): Promise<ControlAnchorVerification> =>
         Promise.resolve({ ok: false, reason: CONTROL_ANCHOR_REJECTION.HELPER_PROVENANCE_MISSING }),
       descriptorDeps,
+      createDescriptor: () => {
+        descriptorCreations += 1;
+        return Promise.resolve({ ok: true });
+      },
+      logger: (): void => {
+        /* silent */
+      },
     });
 
     // Control fails CLOSED (null handle, no descriptor) …
     expect(handle).toBeNull();
-    expect(descriptorWrites).toBe(0);
+    expect(descriptorCreations).toBe(0);
     // … and the Cockpit is still up and serving.
     expect(await getStatus(port)).toBe(200);
   });
@@ -588,20 +687,26 @@ describe.skipIf(process.platform === 'win32')(
 // idempotent skip — never rewrite the shared exe that owner-helper.win.test.ts
 // executes concurrently (a rebuild would lock it, EBUSY). Real absent/torn →
 // rebuild is exercised race-free in the ISOLATED trees below.
-const winReady = process.platform === 'win32' && existsSync(realExe) && existsSync(realProv);
+const winReady =
+  process.platform === 'win32' &&
+  existsSync(realExe) &&
+  existsSync(realProv) &&
+  existsSync(realCreator) &&
+  existsSync(realCreatorProv);
 
-describe.skipIf(!winReady)('D062 canonical provenance — real gate idempotent on a canonical pair', () => {
-  it('the real pair is canonical, and the gate skips it without rebuilding', () => {
-    const bytes = readFileSync(realExe);
-    expect(readFileSync(realProv, 'utf8')).toBe(encodeProvenance(sha256Hex(bytes)));
-    const v = validateHelperPair({ exePath: realExe, provenancePath: realProv });
-    expect(v.valid).toBe(true);
+describe.skipIf(!winReady)('D062 canonical provenance — real gate idempotent on canonical, source-current pairs', () => {
+  it('29. both real pairs are canonical for the current sources, and the gate skips them without rebuilding', () => {
+    expect(readFileSync(realProv, 'utf8')).toBe(canonicalFor(readFileSync(realExe)));
+    expect(readFileSync(realCreatorProv, 'utf8')).toBe(creatorCanonicalFor(readFileSync(realCreator)));
+    expect(validateHelperPair({ exePath: realExe, provenancePath: realProv }).valid).toBe(true);
+    expect(validateCreatorPair({ exePath: realCreator, provenancePath: realCreatorProv }).valid).toBe(true);
 
     const run = runGate();
     expect(run.status).toBe(0);
     expect(String(run.stderr)).toContain('skipping build');
 
     expect(validateHelperPair({ exePath: realExe, provenancePath: realProv }).valid).toBe(true);
+    expect(validateCreatorPair({ exePath: realCreator, provenancePath: realCreatorProv }).valid).toBe(true);
   });
 });
 
@@ -625,7 +730,7 @@ function isolatedGateTree(withSource: boolean): {
     'msvc-toolchain.mjs',
   ];
   if (withSource) {
-    files.push('agentbridge-win-owner.c');
+    files.push('agentbridge-win-owner.c', 'agentbridge-win-descriptor-create.c');
   }
   for (const f of files) {
     cpSync(join(repoRoot, 'tools', 'control-owner', f), join(toolDir, f));
@@ -659,22 +764,60 @@ const vswherePath = vswherePathFor(process.env['ProgramFiles(x86)'] ?? 'C:\\Prog
 const TEST_BUILD_ELIGIBLE = isBuildEligible();
 
 describe.skipIf(!TEST_BUILD_ELIGIBLE)('D062 explicit provisioning — MSVC available + helper missing', () => {
-  it('the gate compiles the helper and publishes a canonical pair (exit 0)', () => {
+  it('the gate compiles BOTH artifacts and publishes two canonical, source-bound pairs (exit 0)', () => {
     const t = isolatedGateTree(true);
     try {
       const run = spawnSync(process.execPath, [t.gateScript], { encoding: 'utf8' });
       expect(run.status, run.stderr).toBe(0);
       const exe = join(t.nativeDir, OWNER_HELPER_BASENAME);
       const prov = join(t.nativeDir, PROVENANCE_BASENAME);
-      expect(existsSync(exe)).toBe(true);
-      expect(validateHelperPair({ exePath: exe, provenancePath: prov })).toEqual({
-        valid: true,
-        reason: 'valid',
-      });
+      const creator = join(t.nativeDir, DESCRIPTOR_CREATOR_BASENAME);
+      const creatorProv = join(t.nativeDir, CREATOR_PROVENANCE_BASENAME);
+      expect(readdirSync(t.nativeDir).sort()).toEqual([...ALL_NATIVE_BASENAMES].sort());
+      // The copied tree's sources are byte-identical to the repo's, so the copied
+      // validators (which hash their own module-relative sources) accept exactly
+      // the same encodings the repo validators compute.
+      expect(readFileSync(prov, 'utf8')).toBe(canonicalFor(readFileSync(exe)));
+      expect(readFileSync(creatorProv, 'utf8')).toBe(creatorCanonicalFor(readFileSync(creator)));
+      expect(validateHelperPair({ exePath: exe, provenancePath: prov })).toEqual({ valid: true, reason: 'valid' });
+      expect(validateCreatorPair({ exePath: creator, provenancePath: creatorProv })).toEqual({ valid: true, reason: 'valid' });
     } finally {
       rmSync(t.root, { recursive: true, force: true });
     }
-  }, 120000);
+  }, 180000);
+
+  it('28. source drift: editing a reviewed C source makes the gate REBUILD (not skip) and republish a matching pair', () => {
+    const t = isolatedGateTree(true);
+    try {
+      const first = spawnSync(process.execPath, [t.gateScript], { encoding: 'utf8' });
+      expect(first.status, first.stderr).toBe(0);
+      const creator = join(t.nativeDir, DESCRIPTOR_CREATOR_BASENAME);
+      const creatorProv = join(t.nativeDir, CREATOR_PROVENANCE_BASENAME);
+      const beforeProv = readFileSync(creatorProv, 'utf8');
+
+      // A second run with nothing changed skips (idempotent).
+      const again = spawnSync(process.execPath, [t.gateScript], { encoding: 'utf8' });
+      expect(again.status).toBe(0);
+      expect(again.stderr).toContain('skipping build');
+      expect(readFileSync(creatorProv, 'utf8')).toBe(beforeProv);
+
+      // Drift the creator's reviewed source by a comment-only edit: the binary may
+      // even be byte-identical, yet the pair is no longer canonical for the current
+      // source and MUST be rebuilt.
+      const sourcePath = join(t.root, 'tools', 'control-owner', 'agentbridge-win-descriptor-create.c');
+      writeFileSync(sourcePath, `${readFileSync(sourcePath, 'utf8')}\n/* reviewed-source drift */\n`);
+      const drifted = spawnSync(process.execPath, [t.gateScript], { encoding: 'utf8' });
+      expect(drifted.status, drifted.stderr).toBe(0);
+      expect(drifted.stderr).toContain('descriptor creator pair not valid (not-canonical); rebuilding');
+      const afterProv = readFileSync(creatorProv, 'utf8');
+      expect(afterProv).not.toBe(beforeProv);
+      expect(afterProv).toBe(
+        encodeCreatorProvenance(sha256Hex(readFileSync(creator)), sha256Hex(readFileSync(sourcePath))),
+      );
+    } finally {
+      rmSync(t.root, { recursive: true, force: true });
+    }
+  }, 300000);
 });
 
 // The root-cause proof: builder and gate share ONE eligibility source, so the
@@ -714,18 +857,29 @@ describe('D062 explicit provisioning — builder and gate share one eligibility 
     expect(CL_LINK_FLAGS).toContain('/SUBSYSTEM:CONSOLE');
   });
 
-  it('the probe exercises the owner helper\'s exact dependency surface', () => {
-    // Every header the helper source includes is included by the probe, and the
-    // probe references the same advapi32 imports so the link needs advapi32.lib.
-    const helperSource = readTool('agentbridge-win-owner.c');
-    const includes = [...helperSource.matchAll(/^#include <([^>]+)>/gm)].map((m) => m[1]);
-    expect(includes.length).toBeGreaterThan(0);
-    for (const header of includes) {
-      expect(PROBE_SOURCE, `probe must include <${String(header)}>`).toContain(`#include <${String(header)}>`);
+  it('the probe exercises BOTH native artifacts\' exact dependency surface', () => {
+    // Every header either source includes is included by the probe, and the probe
+    // references the same imports both need so the link needs the same libraries.
+    for (const source of ['agentbridge-win-owner.c', 'agentbridge-win-descriptor-create.c']) {
+      const includes = [...readTool(source).matchAll(/^#include <([^>]+)>/gm)].map((m) => m[1]);
+      expect(includes.length).toBeGreaterThan(0);
+      for (const header of includes) {
+        expect(PROBE_SOURCE, `probe must include <${String(header)}>`).toContain(`#include <${String(header)}>`);
+      }
     }
-    expect(PROBE_SOURCE).toContain('GetNamedSecurityInfoW(');
-    expect(PROBE_SOURCE).toContain('ConvertSidToStringSidW(');
-    expect(PROBE_SOURCE).toContain('int wmain(');
+    for (const symbol of [
+      'GetNamedSecurityInfoW(',
+      'ConvertSidToStringSidW(',
+      'GetSecurityDescriptorControl(',
+      'SetEntriesInAclW(',
+      'AllocateAndInitializeSid(',
+      'OpenProcessToken(',
+      'GetTokenInformation(',
+      'SetFileInformationByHandle(',
+      'int wmain(',
+    ]) {
+      expect(PROBE_SOURCE, `probe must reference ${symbol}`).toContain(symbol);
+    }
   });
 
   it('this file has exactly ONE eligibility call site and gates every real compilation on it', () => {
@@ -1300,16 +1454,17 @@ describe.skipIf(!TEST_BUILD_ELIGIBLE)('D062 concurrent rebuild — isolated real
       }
       const exe = join(t.nativeDir, OWNER_HELPER_BASENAME);
       const prov = join(t.nativeDir, PROVENANCE_BASENAME);
-      expect(existsSync(exe)).toBe(true);
-      expect(existsSync(prov)).toBe(true);
-      // Final pair canonical.
-      expect(readFileSync(prov, 'utf8')).toBe(encodeProvenance(sha256Hex(readFileSync(exe))));
+      const creator = join(t.nativeDir, DESCRIPTOR_CREATOR_BASENAME);
+      const creatorProv = join(t.nativeDir, CREATOR_PROVENANCE_BASENAME);
+      // Both final pairs canonical and source-bound.
+      expect(readFileSync(prov, 'utf8')).toBe(canonicalFor(readFileSync(exe)));
+      expect(readFileSync(creatorProv, 'utf8')).toBe(creatorCanonicalFor(readFileSync(creator)));
       // No shared object directory and no private workspace leaked into native/.
       expect(existsSync(join(t.nativeDir, 'obj'))).toBe(false);
-      // Every entry under native/ is one of the two authoritative artifacts.
+      // Every entry under native/ is one of the four authoritative artifacts.
       // (A leaked .build-* dir would violate isolation cleanup.)
       const names = readdirSync(t.nativeDir);
-      expect(names.sort()).toEqual([OWNER_HELPER_BASENAME, PROVENANCE_BASENAME].sort());
+      expect(names.sort()).toEqual([...ALL_NATIVE_BASENAMES].sort());
     } finally {
       rmSync(t.root, { recursive: true, force: true });
     }
