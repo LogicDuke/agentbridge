@@ -661,6 +661,97 @@ describe('D062 candidate enumeration — bounded, exact-name, deterministic', ()
     expect(result.ok && result.candidates.length).toBe(MAX_DESCRIPTOR_CANDIDATES);
   });
 
+  /**
+   * A lazily yielded list of `count` distinct identity-named filenames whose
+   * iteration is metered, so a test can prove enumeration stops early rather than
+   * consuming and materializing every matching name. Typed as the array the deps
+   * expect; it is only ever iterated by the function under test.
+   */
+  function countingDescriptorNames(count: number, meter: { consumed: number }): readonly string[] {
+    return {
+      [Symbol.iterator](): Iterator<string> {
+        let index = 0;
+        return {
+          next(): IteratorResult<string> {
+            if (index >= count) {
+              return { done: true, value: undefined };
+            }
+            meter.consumed += 1;
+            const id = index.toString(16).padStart(32, '0');
+            index += 1;
+            return { done: false, value: `runtime-descriptor-${id}.json` };
+          },
+        };
+      },
+    } as unknown as readonly string[];
+  }
+
+  it('EXACT CAP: exactly MAX matching filenames is not truncated and returns them all', () => {
+    const { anchor } = seeded(MAX_DESCRIPTOR_CANDIDATES);
+    const result = enumerateDescriptorCandidates(ANCHOR, anchor.deps);
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+    expect(result.truncated).toBe(false);
+    expect(result.candidates.length).toBe(MAX_DESCRIPTOR_CANDIDATES);
+  });
+
+  it('CAP + 1: truncated with the returned set bounded at MAX', () => {
+    const { anchor } = seeded(MAX_DESCRIPTOR_CANDIDATES + 1);
+    const result = enumerateDescriptorCandidates(ANCHOR, anchor.deps);
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+    expect(result.truncated).toBe(true);
+    expect(result.candidates.length).toBeLessThanOrEqual(MAX_DESCRIPTOR_CANDIDATES);
+  });
+
+  it('bounds the WORK: a very large matching input stops after the truncation witness', () => {
+    const meter = { consumed: 0 };
+    const huge = MAX_DESCRIPTOR_CANDIDATES * 1000;
+    const result = enumerateDescriptorCandidates(ANCHOR, {
+      listAnchor: () => countingDescriptorNames(huge, meter),
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+    expect(result.truncated).toBe(true);
+    expect(result.candidates.length).toBeLessThanOrEqual(MAX_DESCRIPTOR_CANDIDATES);
+    // The collection/sort never touched more than MAX + 1 matching candidates:
+    // iteration stopped at the truncation witness, not at `huge`.
+    expect(meter.consumed).toBeLessThanOrEqual(MAX_DESCRIPTOR_CANDIDATES + 1);
+  });
+
+  it('non-matching noise never consumes candidate capacity', () => {
+    const noise: string[] = [];
+    for (let i = 0; i < MAX_DESCRIPTOR_CANDIDATES * 10; i += 1) {
+      noise.push(`not-a-descriptor-${String(i)}.txt`);
+    }
+    const realIds = ['a'.repeat(32), 'b'.repeat(32), 'c'.repeat(32)];
+    const listed = [...noise, ...realIds.map((id) => descriptorFilenameFor(id))];
+    const result = enumerateDescriptorCandidates(ANCHOR, { listAnchor: () => listed });
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+    expect(result.truncated).toBe(false);
+    expect(result.candidates.map((candidate) => candidate.runtimeId).sort()).toEqual([...realIds].sort());
+  });
+
+  it('DETERMINISTIC ORDER: a within-cap set is returned sorted by runtime id', () => {
+    const { anchor, ids } = seeded(5);
+    const result = enumerateDescriptorCandidates(ANCHOR, anchor.deps);
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+    expect(result.truncated).toBe(false);
+    expect(result.candidates.map((candidate) => candidate.runtimeId)).toEqual([...ids].sort());
+  });
+
   it('an unlistable anchor is a failure, not an empty set', () => {
     expect(enumerateDescriptorCandidates(ANCHOR, { listAnchor: () => { throw new Error('EACCES'); } })).toEqual({ ok: false });
   });

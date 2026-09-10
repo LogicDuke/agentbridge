@@ -1149,16 +1149,27 @@ export function enumerateDescriptorCandidates(
   } catch {
     return { ok: false };
   }
+  // Bound the WORK, not just the returned result: retain at most
+  // MAX_DESCRIPTOR_CANDIDATES + 1 matching candidates. The +1 is the truncation
+  // witness — the moment it exists the cap is exceeded, so we stop collecting and
+  // never sort more than MAX_DESCRIPTOR_CANDIDATES + 1 records. An anchor holding
+  // a huge number of descriptor-shaped filenames therefore costs
+  // O(MAX_DESCRIPTOR_CANDIDATES) candidate memory and sort work, not O(matches).
   const matched: DescriptorCandidate[] = [];
+  let truncated = false;
   for (const name of names) {
     const runtimeId = runtimeIdFromDescriptorFilename(name);
     if (runtimeId === null) {
       continue;
     }
     matched.push({ runtimeId, filename: name, path: join(anchorPath, name) });
+    if (matched.length > MAX_DESCRIPTOR_CANDIDATES) {
+      // The +1 witness proves the cap is exceeded; stop collecting/sorting more.
+      truncated = true;
+      break;
+    }
   }
   matched.sort((a, b) => (a.runtimeId < b.runtimeId ? -1 : a.runtimeId > b.runtimeId ? 1 : 0));
-  const truncated = matched.length > MAX_DESCRIPTOR_CANDIDATES;
   return {
     ok: true,
     candidates: truncated ? matched.slice(0, MAX_DESCRIPTOR_CANDIDATES) : matched,
