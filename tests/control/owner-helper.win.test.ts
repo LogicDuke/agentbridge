@@ -416,8 +416,11 @@ describe.skipIf(!ready)('D062 native artifacts + lifecycle v2 — real Windows i
     expect(stderrText).not.toContain(minted.descriptor.token);
     expect(stderrText).not.toContain(anchor);
 
-    // The runtime's own logging of a real creation failure carries no secret: an
-    // absent anchor makes the creator's CREATE_NEW fail for real after listen.
+    // The runtime's own logging of the fail-closed startup path carries no
+    // secret. An absent anchor now fails the descriptor enumeration BEFORE any
+    // listen, publish, or creation (CONTROL_START_SUCCESS ⇒
+    // INITIAL_DESCRIPTOR_ENUMERATION_COMPLETE), so startup stops early — whatever
+    // the reason, no token ever reaches a log line.
     const absentAnchor = join(parent, `absent-${randomBytes(8).toString('hex')}`);
     const logged: string[] = [];
     const handle = await runtime.startControlChannel({
@@ -427,11 +430,14 @@ describe.skipIf(!ready)('D062 native artifacts + lifecycle v2 — real Windows i
         logged.push(message);
       },
     });
-    expect(handle).toBeNull();
-    expect(existsSync(absentAnchor)).toBe(false);
+    expect(handle).toBeNull(); // fails closed: no unsafe success
+    expect(existsSync(absentAnchor)).toBe(false); // nothing was created
     const allLogs = logged.join('\n');
-    expect(allLogs).toContain('descriptor creation failed');
-    expect(allLogs).toContain(store.DESCRIPTOR_CREATION_REJECTION.CREATOR_FAILED);
+    // An absent anchor cannot be enumerated, so the deterministic safe reason is
+    // an unreadable enumeration; the channel is disabled before listen/publish.
+    expect(allLogs).toContain('descriptor enumeration unreadable');
+    // The security invariant: no base64url descriptor token (43 chars) ever
+    // appears in any runtime log line.
     expect(allLogs).not.toMatch(/[A-Za-z0-9_-]{43}/);
   });
 
