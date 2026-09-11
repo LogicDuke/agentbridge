@@ -1573,7 +1573,15 @@ export const DESCRIPTOR_CREATION_REJECTION = Object.freeze({
   DESCRIPTOR_TOO_LARGE: 'DESCRIPTOR_TOO_LARGE',
   /** The process could not be started at all (spawn/EACCES/ENOENT). */
   CREATOR_SPAWN_FAILED: 'CREATOR_SPAWN_FAILED',
-  /** It did not settle within the finite deadline and was killed. */
+  /**
+   * It did not settle within the finite deadline and was killed, without
+   * reporting a numeric exit status of its own. Whether the kill landed before
+   * or after CREATE_NEW is unknown here and does not need to be: the creator
+   * arms kernel delete-on-close in the same operation as CREATE_NEW and cancels
+   * it only after a complete flushed write, so a kill before completion leaves
+   * no file, and a kill after completion leaves a complete descriptor whose
+   * pipe this runtime then closes (a stale sweep removes it). No cleanup here.
+   */
   CREATOR_TIMEOUT: 'CREATOR_TIMEOUT',
   /**
    * It ran and refused BEFORE creating the file: a pre-create nonzero exit
@@ -1583,10 +1591,12 @@ export const DESCRIPTOR_CREATION_REJECTION = Object.freeze({
    */
   CREATOR_FAILED: 'CREATOR_FAILED',
   /**
-   * CREATE_NEW succeeded, then a write / flush / close failed (creator exit 6).
-   * This invocation DID create the identity-named file; the creator's own
-   * handle-scoped removal is best effort and may leave a residual, so the caller
-   * is authorized to clean up exactly this runtime's minted descriptor path.
+   * CREATE_NEW succeeded, then a write / flush / delete-on-close cancellation /
+   * close failed (creator exit 6). This invocation DID create the identity-named
+   * file. On a write, flush, or cancellation failure the kernel removes it at
+   * handle close; only a close failure after cancellation can leave a (complete)
+   * residual, so the caller is authorized to clean up exactly this runtime's
+   * minted descriptor path (an absent file is not a second failure).
    */
   CREATOR_WROTE_THEN_FAILED: 'CREATOR_WROTE_THEN_FAILED',
 } as const);
@@ -1626,8 +1636,9 @@ export type CreatorRunner = (
 /** Node's error code when a child overruns `maxBuffer` (an output fault, not a timeout). */
 const MAXBUFFER_CODE = 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER';
 /**
- * The creator's exit code for "CREATE_NEW succeeded, then write/flush/close
- * failed" — the ONE nonzero exit that proves this invocation created the file.
+ * The creator's exit code for "CREATE_NEW succeeded, then write / flush /
+ * delete-on-close cancellation / close failed" — the ONE nonzero exit that
+ * proves this invocation created the file.
  * Every other nonzero exit (including 5, a CREATE_NEW collision) is a pre-create
  * refusal. Kept in lockstep with the native creator's documented exit codes.
  */
@@ -1641,11 +1652,20 @@ const CREATOR_EXIT_WROTE_THEN_FAILED = 6;
  * buffer — plus a bounded stdin payload. `execFile` settles exactly once and owns
  * its own timer and listeners, so there is no hand-rolled settlement race.
  *
- * Terminal-cause precedence is explicit: an output overrun is an output fault; a
- * child killed on the deadline is a timeout even though it also exits nonzero; a
- * numeric exit status or a foreign signal is a refusal; anything else (the process
- * never started) is a spawn failure. The child's stdout/stderr are captured only
- * so they can be bounded and discarded: this returns ok/reason and nothing else.
+ * Terminal-cause precedence is explicit, in this order:
+ *   1. an output overrun is an output fault (`execFile` pre-empts every other
+ *      observation with it);
+ *   2. a NUMERIC exit status is the child's own final word and is judged as such
+ *      even when the deadline flag is also set — `execFile` sets `killed` when
+ *      its timer fires, and if this process's event loop was stalled across the
+ *      deadline that timer fires before an exit that already happened is
+ *      observed, so `{ code: 6, killed: true }` is a genuine exit 6 (the file WAS
+ *      created), not a timeout;
+ *   3. otherwise a child killed on the deadline is a timeout;
+ *   4. otherwise a foreign signal is a refusal;
+ *   5. anything else (the process never started) is a spawn failure.
+ * The child's stdout/stderr are captured only so they can be bounded and
+ * discarded: this returns ok/reason and nothing else.
  */
 export function defaultCreatorRunner(systemRoot: string): CreatorRunner {
   const system32 = join(systemRoot, 'System32');
@@ -1675,23 +1695,32 @@ export function defaultCreatorRunner(systemRoot: string): CreatorRunner {
               resolvePromise({ ok: false, reason: DESCRIPTOR_CREATION_REJECTION.CREATOR_FAILED });
               return;
             }
+            if (typeof failure.code === 'number') {
+              // A numeric exit status is the child's own final word, judged BEFORE
+              // the deadline flag: `killed` merely records that the timer fired,
+              // and it fires before an already-completed exit is observed when
+              // this event loop was stalled across the deadline.
+              if (failure.code === CREATOR_EXIT_WROTE_THEN_FAILED) {
+                // The one nonzero exit that proves the file WAS created (then a
+                // write/flush/cancel/close failed); surface it distinctly so the
+                // caller can clean up exactly its own minted descriptor path.
+                resolvePromise({
+                  ok: false,
+                  reason: DESCRIPTOR_CREATION_REJECTION.CREATOR_WROTE_THEN_FAILED,
+                });
+                return;
+              }
+              // Every other nonzero exit (including exit 5, a CREATE_NEW collision)
+              // is a pre-create refusal: the file was not created here.
+              resolvePromise({ ok: false, reason: DESCRIPTOR_CREATION_REJECTION.CREATOR_FAILED });
+              return;
+            }
             if (failure.killed === true) {
               resolvePromise({ ok: false, reason: DESCRIPTOR_CREATION_REJECTION.CREATOR_TIMEOUT });
               return;
             }
-            if (failure.code === CREATOR_EXIT_WROTE_THEN_FAILED) {
-              // The one nonzero exit that proves the file WAS created (then a
-              // write/flush/close failed); surface it distinctly so the caller can
-              // clean up exactly its own minted descriptor path.
-              resolvePromise({
-                ok: false,
-                reason: DESCRIPTOR_CREATION_REJECTION.CREATOR_WROTE_THEN_FAILED,
-              });
-              return;
-            }
-            if (typeof failure.code === 'number' || typeof failure.signal === 'string') {
-              // Every other nonzero exit (including exit 5, a CREATE_NEW collision)
-              // or a signal is a pre-create refusal: the file was not created here.
+            if (typeof failure.signal === 'string') {
+              // A foreign signal proves nothing about creation: no cleanup here.
               resolvePromise({ ok: false, reason: DESCRIPTOR_CREATION_REJECTION.CREATOR_FAILED });
               return;
             }

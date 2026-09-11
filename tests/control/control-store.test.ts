@@ -1,7 +1,7 @@
 import net from 'node:net';
 import { join } from 'node:path';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   CONTROL_ANCHOR_REJECTION,
@@ -12,6 +12,7 @@ import {
   MAX_DESCRIPTOR_CANDIDATES,
   createDescriptorFileNative,
   createRuntimeDescriptor,
+  defaultCreatorRunner,
   defaultPipeProbe,
   descriptorFilenameFor,
   descriptorPathFor,
@@ -1266,5 +1267,163 @@ describe('D062 descriptor creator gate — createDescriptorFileNative (injected)
       runCreator: () => Promise.resolve({ ok: true }),
     });
     expect(result).toEqual({ ok: false, reason: DESCRIPTOR_CREATION_REJECTION.CREATOR_PROVENANCE_MISSING });
+  });
+});
+
+/* ------------------------------------------------------------------------- *
+ * The production creator runner — terminal-cause precedence
+ *
+ * `defaultCreatorRunner` owns the ONE `execFile` call of the create path and
+ * maps its settlement to a fail-closed reason. Only `CREATOR_WROTE_THEN_FAILED`
+ * ever authorizes the runtime to unlink its own minted descriptor path, so the
+ * mapping is security-relevant and is exercised here through the real runner
+ * with `execFile` itself stubbed at the module seam (no production surface is
+ * widened for this). The shapes below are exactly what Node hands the callback.
+ * ------------------------------------------------------------------------- */
+
+type ExecFileCallback = (error: Error | null, stdout: Buffer, stderr: Buffer) => void;
+interface FakeStdin {
+  on(event: string, listener: (error: Error) => void): FakeStdin;
+  end(input: Buffer): void;
+}
+interface FakeChild {
+  readonly stdin: FakeStdin | null;
+}
+type FakeExecFile = (
+  exe: string,
+  args: readonly string[],
+  options: Record<string, unknown>,
+  callback: ExecFileCallback,
+) => FakeChild;
+
+const childProcessSeam = vi.hoisted(() => ({ execFile: null as FakeExecFile | null }));
+
+vi.mock('node:child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:child_process')>();
+  const passthrough = actual.execFile as unknown as (...params: unknown[]) => unknown;
+  return {
+    ...actual,
+    execFile: (...params: unknown[]): unknown => {
+      const override = childProcessSeam.execFile;
+      if (override === null) {
+        return passthrough(...params);
+      }
+      const [exe, args, options, callback] = params as Parameters<FakeExecFile>;
+      return override(exe, args, options, callback);
+    },
+  };
+});
+
+describe('D062 creator runner — terminal-cause precedence (real runner, execFile settlement stubbed)', () => {
+  interface Recorded {
+    exe: string;
+    args: readonly string[];
+    options: Record<string, unknown>;
+    input: Buffer | null;
+  }
+  type Settlement = Record<string, unknown> | null;
+
+  afterEach(() => {
+    childProcessSeam.execFile = null;
+  });
+
+  /**
+   * Install a settlement: the fake child accepts stdin, then settles the callback
+   * asynchronously (as a real child would) with `null` or an Error carrying the
+   * given fields. `throwSync` models Windows rejecting the image synchronously.
+   */
+  const arm = (settlement: Settlement, mode: { throwSync?: boolean; noStdin?: boolean } = {}): Recorded => {
+    const recorded: Recorded = { exe: '', args: [], options: {}, input: null };
+    childProcessSeam.execFile = (exe, args, options, callback) => {
+      recorded.exe = exe;
+      recorded.args = args;
+      recorded.options = options;
+      if (mode.throwSync === true) {
+        throw new Error('spawn EINVAL');
+      }
+      const stdin: FakeStdin = {
+        on: () => stdin,
+        end: (input: Buffer): void => {
+          recorded.input = input;
+        },
+      };
+      queueMicrotask(() => {
+        callback(settlement === null ? null : Object.assign(new Error('settled'), settlement), Buffer.alloc(0), Buffer.alloc(0));
+      });
+      return { stdin: mode.noStdin === true ? null : stdin };
+    };
+    return recorded;
+  };
+
+  const EXE = 'C:\\app\\dist\\control\\native\\agentbridge-win-descriptor-create.exe';
+  const runner = defaultCreatorRunner('C:\\Windows');
+  const minted = createRuntimeDescriptor();
+  const payload = Buffer.from(serializeDescriptor(minted.descriptor), 'utf8');
+  const MAXBUFFER = 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER';
+  const R = DESCRIPTOR_CREATION_REJECTION;
+
+  it('uses the bounded, shell-free transport and delivers the descriptor on stdin only', async () => {
+    const recorded = arm(null);
+    expect(await runner(EXE, [FAKE_ANCHOR, minted.runtimeId], payload)).toEqual({ ok: true });
+    expect(recorded.exe).toBe(EXE);
+    expect(recorded.args).toEqual([FAKE_ANCHOR, minted.runtimeId]);
+    expect(recorded.args.join(' ')).not.toContain(minted.descriptor.token);
+    expect(recorded.input?.equals(payload)).toBe(true);
+    expect(recorded.options['shell']).toBe(false);
+    expect(recorded.options['windowsHide']).toBe(true);
+    expect(recorded.options['encoding']).toBe('buffer');
+    expect(recorded.options['cwd']).toBe(join('C:\\Windows', 'System32'));
+    expect(recorded.options['env']).toEqual({ SystemRoot: 'C:\\Windows', windir: 'C:\\Windows' });
+    const timeout = recorded.options['timeout'];
+    const maxBuffer = recorded.options['maxBuffer'];
+    expect(typeof timeout === 'number' && Number.isFinite(timeout) && timeout > 0).toBe(true);
+    expect(typeof maxBuffer === 'number' && Number.isFinite(maxBuffer) && maxBuffer > 0).toBe(true);
+  });
+
+  it.each<[string, Settlement, string]>([
+    // 1. an output overrun is an output fault, whatever else is set
+    ['maxBuffer overrun', { code: MAXBUFFER }, R.CREATOR_FAILED],
+    ['maxBuffer overrun with the deadline flag also set', { code: MAXBUFFER, killed: true, signal: 'SIGTERM' }, R.CREATOR_FAILED],
+    // 2. a numeric exit is the child's own final word — BEFORE the deadline flag
+    ['exit 6, not killed', { code: 6, killed: false, signal: null }, R.CREATOR_WROTE_THEN_FAILED],
+    ['FINDING — exit 6 with killed=true (exit landed while this loop was stalled across the deadline)', { code: 6, killed: true, signal: null }, R.CREATOR_WROTE_THEN_FAILED],
+    ['exit 5 (CREATE_NEW collision), not killed', { code: 5, killed: false, signal: null }, R.CREATOR_FAILED],
+    ['exit 5 with killed=true', { code: 5, killed: true, signal: null }, R.CREATOR_FAILED],
+    ['exit 1 with killed=true', { code: 1, killed: true, signal: null }, R.CREATOR_FAILED],
+    ['exit 4 (stdin refused)', { code: 4, killed: false, signal: null }, R.CREATOR_FAILED],
+    // 3. killed on the deadline without a numeric exit
+    ['deadline kill (Windows shape)', { code: null, killed: true, signal: 'SIGTERM' }, R.CREATOR_TIMEOUT],
+    ['deadline kill, minimal shape', { killed: true }, R.CREATOR_TIMEOUT],
+    // 4. a foreign signal without a numeric exit proves nothing
+    ['foreign SIGKILL', { code: null, killed: false, signal: 'SIGKILL' }, R.CREATOR_FAILED],
+    // 5. the process never started
+    ['spawn ENOENT', { code: 'ENOENT', syscall: 'spawn', errno: -4058 }, R.CREATOR_SPAWN_FAILED],
+    ['spawn EACCES', { code: 'EACCES', syscall: 'spawn' }, R.CREATOR_SPAWN_FAILED],
+    ['bare error', {}, R.CREATOR_SPAWN_FAILED],
+  ])('%s', async (_label, settlement, expected) => {
+    arm(settlement);
+    expect(await runner(EXE, [FAKE_ANCHOR, minted.runtimeId], payload)).toEqual({ ok: false, reason: expected });
+  });
+
+  it('a synchronous spawn rejection is a spawn failure, never a throw', async () => {
+    arm(null, { throwSync: true });
+    expect(await runner(EXE, [FAKE_ANCHOR, minted.runtimeId], payload)).toEqual({ ok: false, reason: R.CREATOR_SPAWN_FAILED });
+  });
+
+  it('a child without a stdin pipe is still judged by its own settlement', async () => {
+    arm({ code: 4, killed: false, signal: null }, { noStdin: true });
+    expect(await runner(EXE, [FAKE_ANCHOR, minted.runtimeId], payload)).toEqual({ ok: false, reason: R.CREATOR_FAILED });
+  });
+
+  it('only exit 6 maps to the one reason that authorizes cleanup of the minted path', async () => {
+    for (let code = 0; code <= 8; code += 1) {
+      arm({ code, killed: code % 2 === 0, signal: null });
+      const result = await runner(EXE, [FAKE_ANCHOR, minted.runtimeId], payload);
+      if (code === 6) {
+        expect(result).toEqual({ ok: false, reason: R.CREATOR_WROTE_THEN_FAILED });
+      } else {
+        expect(result, `exit ${String(code)}`).toEqual({ ok: false, reason: R.CREATOR_FAILED });
+      }
+    }
   });
 });

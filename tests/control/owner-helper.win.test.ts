@@ -494,6 +494,134 @@ describe.skipIf(!ready)('D062 native artifacts + lifecycle v2 — real Windows i
     expect(Date.now() - started).toBeLessThan(25000);
   }, 40000);
 
+  it('FINDING — a genuine exit 6 that lands while this event loop is stalled across the deadline is still CREATOR_WROTE_THEN_FAILED (real transport)', async () => {
+    const runCreator = store.defaultCreatorRunner(systemRoot);
+    const dir = mkdtempSync(join(tmpdir(), 'abctl-exit-'));
+    tempRoots.push(dir);
+    const script = join(dir, 'exit.mjs');
+    writeFileSync(
+      script,
+      'const mode = process.argv[2];\n' +
+        "if (mode === 'hang') { setInterval(() => {}, 1000); } else { process.exit(Number(mode)); }\n",
+      'utf8',
+    );
+    // All three children start now; the two exits land within milliseconds.
+    const exit6 = runCreator(process.execPath, [script, '6'], Buffer.from('x'));
+    const exit5 = runCreator(process.execPath, [script, '5'], Buffer.from('x'));
+    const hang = runCreator(process.execPath, [script, 'hang'], Buffer.from('x'));
+    // Stall THIS event loop past the runner's fixed 5 s deadline. When the loop
+    // resumes, libuv runs the timers phase before the I/O phase, so execFile's
+    // deadline timer fires — setting `killed` — before the already-completed
+    // exits are observed. A numeric exit code must still win: exit 6 proves the
+    // file was created and authorizes cleanup of exactly this runtime's path;
+    // collapsing it into a timeout would leave that residual in place.
+    const stallUntil = Date.now() + 5500;
+    while (Date.now() < stallUntil) {
+      /* deliberate synchronous stall */
+    }
+    expect(await exit6).toEqual({ ok: false, reason: store.DESCRIPTOR_CREATION_REJECTION.CREATOR_WROTE_THEN_FAILED });
+    expect(await exit5).toEqual({ ok: false, reason: store.DESCRIPTOR_CREATION_REJECTION.CREATOR_FAILED });
+    expect(await hang).toEqual({ ok: false, reason: store.DESCRIPTOR_CREATION_REJECTION.CREATOR_TIMEOUT });
+  }, 30000);
+
+  /* ---- creator lifecycle under forced termination (kernel delete-on-close) ---- */
+
+  /** Spawn the real creator with the descriptor on stdin; resolve with its settlement. */
+  const spawnCreator = (
+    anchor: string,
+    runtimeId: string,
+    payload: Buffer,
+    stdinMode: 'deliver' | 'hold-open',
+  ): { child: ChildProcess; settled: Promise<{ code: number | null; signal: NodeJS.Signals | null }> } => {
+    const child = spawn(creatorPath, [anchor, runtimeId], { windowsHide: true, stdio: ['pipe', 'ignore', 'ignore'] });
+    children.push(child);
+    const settled = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolvePromise) => {
+      child.once('exit', (code, signal) => {
+        resolvePromise({ code, signal });
+      });
+      child.once('error', () => {
+        resolvePromise({ code: null, signal: null });
+      });
+    });
+    child.stdin.on('error', () => {
+      /* a child that never reads (killed) makes the write fail; irrelevant here */
+    });
+    if (stdinMode === 'deliver') {
+      child.stdin.end(payload);
+    } else {
+      child.stdin.write(payload.subarray(0, 8)); // partial, never EOF: the creator waits pre-create
+    }
+    return { child, settled };
+  };
+
+  const sleep = (ms: number): Promise<void> =>
+    new Promise<void>((resolvePromise) => {
+      setTimeout(resolvePromise, ms);
+    });
+
+  it('S0: a creator killed before CREATE_NEW (stdin never reaches EOF) creates nothing', async () => {
+    const { anchor } = await makeAnchor();
+    const minted = store.createRuntimeDescriptor();
+    const payload = Buffer.from(store.serializeDescriptor(minted.descriptor), 'utf8');
+    const { child, settled } = spawnCreator(anchor, minted.runtimeId, payload, 'hold-open');
+    // The creator reads stdin to EOF BEFORE any filesystem mutation; with EOF
+    // withheld it cannot advance past S0 no matter how long it runs.
+    await sleep(500);
+    expect(readdirSync(anchor)).toEqual([]);
+    child.kill();
+    const outcome = await settled;
+    expect(outcome.signal).not.toBeNull();
+    expect(readdirSync(anchor)).toEqual([]);
+  }, 20000);
+
+  it('S1/S2: a creator terminated at any point can never leave an incomplete descriptor — every surviving file is the complete payload', async () => {
+    const { anchor } = await makeAnchor();
+    const payload = Buffer.alloc(4096, 0x7b); // the maximum payload: the widest possible write window
+    const iterations = 120;
+    const spreadMs = 60; // covers process start-up through normal completion on this class of machine
+    const outcomes = { killed: 0, completed: 0, other: 0 };
+    for (let i = 0; i < iterations; i += 1) {
+      const runtimeId = randomBytes(16).toString('hex');
+      const descriptorPath = store.descriptorPathFor(anchor, runtimeId);
+      const { child, settled } = spawnCreator(anchor, runtimeId, payload, 'deliver');
+      // Deterministic stagger (not random): iteration i is killed i/iterations of
+      // the way through the spread, so the kill instants sweep the whole lifecycle.
+      await sleep((i * spreadMs) / iterations);
+      try {
+        child.kill();
+      } catch {
+        /* already gone */
+      }
+      const outcome = await settled;
+      if (outcome.signal !== null) {
+        outcomes.killed += 1;
+        // THE INVARIANT (deterministic regardless of where the kill landed): a file
+        // of this invocation either does not exist (kernel delete-on-close removed
+        // it at handle teardown) or is complete and byte-exact (the disposition was
+        // cancelled only after a full flushed write). Never empty, never partial.
+        if (existsSync(descriptorPath)) {
+          expect(readFileSync(descriptorPath).equals(payload), `iteration ${String(i)}: a surviving file must be complete`).toBe(true);
+        }
+      } else if (outcome.code === 0) {
+        outcomes.completed += 1;
+        // A normal completion leaves exactly the payload (the cancellation took;
+        // delete-on-close did not remove a finished descriptor).
+        expect(readFileSync(descriptorPath).equals(payload), `iteration ${String(i)}: exit 0 must leave the exact payload`).toBe(true);
+      } else {
+        outcomes.other += 1;
+      }
+    }
+    // No iteration may have failed for a reason other than our kill.
+    expect(outcomes.other).toBe(0);
+    // Sweep the anchor once more: nothing but complete, byte-exact descriptors.
+    for (const name of readdirSync(anchor)) {
+      expect(readFileSync(join(anchor, name)).equals(payload), `${name} must be complete`).toBe(true);
+    }
+    // At least one kill landed (a delay of 0 ms is issued before the child can
+    // have completed), so the invariant was exercised, not vacuous.
+    expect(outcomes.killed).toBeGreaterThan(0);
+  }, 120000);
+
   /* ---- 30. end to end: the real flow, the real anchor, the real CLI ------------ */
 
   it('END TO END: real anchor → real runtime (listen, create, verify) → real CLI discovery → APPLIED → orderly close', async () => {

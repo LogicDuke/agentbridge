@@ -44,15 +44,40 @@
  *     runtime id as above; there is no filename input and no path input below
  *     the anchor
  *   - reads the descriptor bytes ONLY from stdin, bounded to 4096 bytes
- *   - creates that one file with CREATE_NEW and an explicit security descriptor
- *   - writes those bytes, flushes, closes
+ *   - creates that one file with CREATE_NEW and an explicit security descriptor,
+ *     with kernel delete-on-close armed in the same operation
+ *   - writes those bytes, flushes, cancels delete-on-close on that same
+ *     handle, closes
+ *
+ * LIFECYCLE (per invocation; the states are those of the file object)
+ *
+ *   S0 NOT_CREATED       argument, token, stdin, and ACL work; exits 1..5.
+ *                        Nothing was created; an existing pathname is untouched.
+ *   S1 CREATED_ARMED     entered atomically by CREATE_NEW success with
+ *                        FILE_FLAG_DELETE_ON_CLOSE. Write + flush happen here.
+ *                        Any exit or forced termination here: the kernel
+ *                        removes the file at handle teardown (exit 6 on a
+ *                        write/flush/cancel failure).
+ *   S2 CREATED_RETAINED  entered when the delete-on-close disposition is
+ *                        cancelled AFTER a complete, flushed write. The file
+ *                        holds exactly the descriptor bytes. A close failure
+ *                        here is exit 6 with a complete file possibly left.
+ *   S3 CLOSED_COMPLETE   exit 0.
+ *
+ *   Invariant: after this process has terminated, a file created by THIS
+ *   invocation that still exists holds the complete, flushed descriptor. No
+ *   empty or partial file of this invocation survives termination. (Windows
+ *   removes the name when the LAST handle to the file object closes; a foreign
+ *   handle opened meanwhile — a filter driver or backup tool — defers removal
+ *   until that handle closes, it does not cancel it.)
  *
  * NO AUTHORITY TO
  *   - create or provision any directory
  *   - open, replace, re-own, or re-ACL an existing file (CREATE_NEW only)
  *   - accept an owner SID, a filename, or any path below the anchor
- *   - delete anything by PATHNAME (failure cleanup is handle-scoped disposition
- *     on the handle this invocation itself created, so no pathname race exists)
+ *   - delete anything by PATHNAME (the only deletion is the kernel's
+ *     delete-on-close bound to the handle this invocation itself created, so
+ *     no pathname race exists)
  *   - run a shell, cmd, PowerShell, or any child process
  *   - read the registry, the network, or environment-selected configuration
  *   - emit descriptor or token bytes anywhere (no stdout at all; stderr carries
@@ -77,11 +102,15 @@
  *   3 security-descriptor construction failed
  *   4 stdin absent, empty, unreadable, or larger than 4096 bytes
  *   5 CREATE_NEW failed (an existing pathname always lands here)
- *   6 write/flush/close failed (the created file is removed via its own handle)
+ *   6 CREATE_NEW succeeded, then write/flush/cancel-delete-on-close/close
+ *     failed. On a write, flush, or cancellation failure the file is still
+ *     delete-armed and the kernel removes it when the handle closes; only a
+ *     close failure after a successful cancellation can leave a (complete)
+ *     file behind, which the caller that minted this identity removes.
  */
 
 #ifndef _WIN32_WINNT
-#define _WIN32_WINNT 0x0A00 /* Windows 10; SetDefaultDllDirectories, FileDispositionInfo */
+#define _WIN32_WINNT 0x0A00 /* Windows 10; SetDefaultDllDirectories, FileDispositionInfoEx */
 #endif
 #define WIN32_LEAN_AND_MEAN
 
@@ -471,11 +500,21 @@ int wmain(int argc, wchar_t **argv) {
   attributes.bInheritHandle = FALSE;
 
   /* CREATE_NEW is the exclusivity boundary: an existing pathname is never
-   * opened, truncated, re-owned, or re-ACL'd — it is an error. DELETE is
-   * requested so a failed write can be undone through THIS handle (see below),
-   * never by deleting a pathname that may since have been replaced. */
+   * opened, truncated, re-owned, or re-ACL'd — it is an error.
+   *
+   * S0 NOT_CREATED -> S1 CREATED_ARMED, atomically. FILE_FLAG_DELETE_ON_CLOSE
+   * arms deletion on the file object this call creates, in the same kernel
+   * operation that creates it, so there is no instant at which the file exists
+   * without being armed. From here until the disposition is cancelled below,
+   * ANY end of this process — normal exit, a failed write, or forced
+   * termination (TerminateProcess, the parent's deadline kill) — makes the
+   * kernel remove the file at handle teardown. No user-mode cleanup code needs
+   * to run for that to happen. DELETE access is required for the flag and for
+   * the cancellation; deletion is bound to THIS handle's file object, never to
+   * the pathname, so a file that has since taken the same name is unaffected. */
   file = CreateFileW(descriptor_path, GENERIC_WRITE | DELETE, 0, &attributes,
-                     CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+                     CREATE_NEW, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE,
+                     NULL);
   if (file == INVALID_HANDLE_VALUE) {
     emit_err("ERR_CREATE");
     exit_code = EXIT_CREATE_FAILED;
@@ -499,9 +538,34 @@ int wmain(int argc, wchar_t **argv) {
     exit_code = EXIT_WRITE_FAILED;
     goto cleanup;
   }
+
+  /* S1 CREATED_ARMED -> S2 CREATED_RETAINED. Only now — after every descriptor
+   * byte has been written AND flushed — is the delete-on-close disposition
+   * cancelled, on the SAME handle. The classic FileDispositionInfo class cannot
+   * clear a flag-armed delete-on-close (it reports success and the file is
+   * still removed), so the FileDispositionInfoEx class with
+   * FILE_DISPOSITION_FLAG_ON_CLOSE is required; it needs Windows 10 1709+ on
+   * NTFS/ReFS. If the cancellation fails for any reason the file stays armed,
+   * this invocation reports the post-create failure class, and the kernel
+   * removes the file when the handle is closed below. */
+  {
+    FILE_DISPOSITION_INFO_EX retain;
+    ZeroMemory(&retain, sizeof(retain));
+    retain.Flags = FILE_DISPOSITION_FLAG_DO_NOT_DELETE | FILE_DISPOSITION_FLAG_ON_CLOSE;
+    if (!SetFileInformationByHandle(file, FileDispositionInfoEx, &retain,
+                                    sizeof(retain))) {
+      emit_err("ERR_WRITE");
+      exit_code = EXIT_WRITE_FAILED;
+      goto cleanup;
+    }
+  }
+
+  /* S2 CREATED_RETAINED -> S3 CLOSED_COMPLETE. */
   if (!CloseHandle(file)) {
     /* The handle is gone or unusable either way; do not close it twice, and do
-     * not delete by pathname. Report failure and let the caller fail closed. */
+     * not delete by pathname. The disposition was already cancelled, so the
+     * complete, flushed file may persist: report exit 6 and let the caller —
+     * which minted this exact identity — remove its own descriptor path. */
     file = INVALID_HANDLE_VALUE;
     emit_err("ERR_WRITE");
     exit_code = EXIT_WRITE_FAILED;
@@ -512,16 +576,13 @@ int wmain(int argc, wchar_t **argv) {
 
 cleanup:
   if (file != INVALID_HANDLE_VALUE) {
-    /* A file was created but not completed. Remove it through its OWN handle:
-     * FileDispositionInfo is bound to the file object this invocation created,
-     * so unlike DeleteFileW it cannot possibly remove a different file that has
-     * since taken the pathname. Best effort — a failure here is not fatal; the
-     * caller fails closed and a later runtime's stale sweep applies. */
-    FILE_DISPOSITION_INFO disposition;
-    ZeroMemory(&disposition, sizeof(disposition));
-    disposition.DeleteFile = TRUE;
-    (void)SetFileInformationByHandle(file, FileDispositionInfo, &disposition,
-                                     sizeof(disposition));
+    /* A file was created but not completed (S1 CREATED_ARMED). Every path that
+     * reaches here with a live handle left the delete-on-close disposition
+     * armed — cancellation is the last step before the success close, and a
+     * failed cancellation leaves it armed — so closing the handle is the
+     * removal: the kernel unlinks the name at teardown of THIS file object,
+     * exactly as it would have on forced termination. Nothing is deleted by
+     * pathname, so a different file that has since taken the name is safe. */
     (void)CloseHandle(file);
     file = INVALID_HANDLE_VALUE;
   }
