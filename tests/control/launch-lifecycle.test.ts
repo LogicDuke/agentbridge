@@ -1529,12 +1529,14 @@ describe.skipIf(!existsSync(distCliMain) || !existsSync(distCliLib))(
         hook,
         [
           "import { registerHooks } from 'node:module';",
-          "import { rmdirSync, symlinkSync } from 'node:fs';",
+          "import { rmdirSync, symlinkSync, unlinkSync } from 'node:fs';",
           `const alias = ${JSON.stringify(alias)};`,
           `const target = ${JSON.stringify(join(aliasRoot, 'decoy'))};`,
           `const kind = ${JSON.stringify(process.platform === 'win32' ? 'junction' : 'dir')};`,
+          // A junction is a directory reparse point (rmdir); a POSIX symlink is a file entry (unlink).
+          "const removeAlias = kind === 'junction' ? rmdirSync : unlinkSync;",
           'registerHooks({ load(url, context, next) {',
-          "  if (url.endsWith('/control/control-auth.js')) { rmdirSync(alias); symlinkSync(target, alias, kind); }",
+          "  if (url.endsWith('/control/control-auth.js')) { removeAlias(alias); symlinkSync(target, alias, kind); }",
           '  return next(url, context);',
           '} });',
           '',
