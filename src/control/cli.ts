@@ -25,7 +25,6 @@
 
 import net from 'node:net';
 import { randomBytes } from 'node:crypto';
-import { pathToFileURL } from 'node:url';
 
 import { computeClientMac, computeServerMac, macEqual, NONCE_BYTES } from './control-auth.js';
 import {
@@ -251,14 +250,15 @@ export async function runControlCli(deps: RunControlCliDeps = {}): Promise<Contr
   };
 }
 
-async function cliMain(): Promise<void> {
+/**
+ * The complete CLI flow with the process exit code applied. Invoked ONLY by the
+ * dedicated entry wrapper `cli-main.ts`; this module never runs it on import, so
+ * it stays a plain library (tests import `runControlCli`). There is deliberately
+ * no entry-identity predicate here: comparing `import.meta.url`, `argv[1]`, or
+ * realpaths is alias-sensitive and racy, and a false "not entry" decision was a
+ * silent exit 0 — violating EXIT 0 ⇒ APPLIED.
+ */
+export async function cliMain(): Promise<void> {
   const outcome = await runControlCli();
   process.exitCode = outcome.exitCode;
-}
-
-const entryArgument = process.argv[1];
-const isEntry =
-  entryArgument !== undefined && import.meta.url === pathToFileURL(entryArgument).href;
-if (isEntry) {
-  void cliMain();
 }

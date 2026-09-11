@@ -66,7 +66,7 @@ import {
 import http from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
@@ -433,7 +433,7 @@ describe('D062 coherent launch model — provisioning gates control only, never 
     const steps = (script ?? '').split('&&').map((s) => s.trim());
     const buildIndex = steps.indexOf('npm run build');
     const gateIndex = steps.indexOf('node tools/control-owner/ensure-helper.mjs');
-    const launchIndex = steps.indexOf('node dist/control/cli.js');
+    const launchIndex = steps.indexOf('node dist/control/cli-main.js');
     expect(buildIndex, 'control must run "npm run build"').toBeGreaterThanOrEqual(0);
     expect(gateIndex, 'control must run the provisioning gate').toBeGreaterThan(buildIndex);
     expect(launchIndex, 'control must launch after provisioning').toBeGreaterThan(gateIndex);
@@ -1398,6 +1398,191 @@ describe('D062 explicit provisioning — the gate runs through a junction/symlin
     expect(gate).toContain("from './helper-pair.mjs'");
   });
 });
+
+/* ---- PR #84 P3: the control CLI entry is a dedicated wrapper, not an entry predicate ---- */
+// Same class as N1, in src/control. cli.ts IS imported as a library
+// (tests/control/support.ts), so the parent guarded its entry with
+// `import.meta.url === pathToFileURL(argv[1])` — which, through a junction,
+// evaluated false and exited 0 with no output (violating EXIT 0 ⇒ APPLIED);
+// canonicalizing both sides (realpath) still left an alias-retarget race. The
+// repair removes the predicate CLASS: `cli-main.ts` is an entry-only wrapper that
+// runs cliMain() unconditionally, and `cli.ts` never executes on import. The
+// process tests run the BUILT wrapper (dist/control/cli-main.js, as
+// `npm run control` does); without LOCALAPPDATA the anchor is deterministically
+// unresolvable on every platform, so a genuine run always prints the unavailable
+// diagnostic and exits 1.
+const srcControlDir = join(repoRoot, 'src', 'control');
+const distCliMain = join(repoRoot, 'dist', 'control', 'cli-main.js');
+const distCliLib = join(repoRoot, 'dist', 'control', 'cli.js');
+const UNAVAILABLE_LINE = 'agentbridge-control: control channel unavailable (ANCHOR_PATH_UNRESOLVED).\n';
+const ENTRY_PREDICATE = /import\.meta|process\.argv|pathToFileURL|realpath|isEntry/;
+
+/** Code only (doc comments may name the rejected mechanisms) — as authority-boundary.test.ts. */
+function controlSourceCode(file: string): string {
+  return readFileSync(join(srcControlDir, file), 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/(^|[^:])\/\/[^\n]*/g, '$1');
+}
+
+function runBuiltCli(
+  script: string,
+  opts: { readonly nodeArgs?: readonly string[]; readonly cwd?: string } = {},
+): ReturnType<typeof spawnSync> {
+  const env: NodeJS.ProcessEnv = Object.fromEntries(
+    Object.entries(process.env).filter(([key]) => key.toLowerCase() !== 'localappdata'),
+  );
+  return spawnSync(process.execPath, [...(opts.nodeArgs ?? []), script], {
+    encoding: 'utf8',
+    env,
+    cwd: opts.cwd ?? repoRoot,
+  });
+}
+
+function expectCliMainRan(run: ReturnType<typeof spawnSync>): void {
+  // Never the pre-fix shape (empty stdout+stderr, exit 0): cliMain() spoke and failed closed.
+  expect(run.stdout).toBe('');
+  expect(run.stderr).toBe(UNAVAILABLE_LINE);
+  expect(run.status).toBe(1);
+}
+
+describe('D062 control CLI — entry-only wrapper, no entry-identity predicate (definition-level)', () => {
+  it('cli-main.ts is an unconditional entry wrapper: no exports, no entry guard, runs cliMain()', () => {
+    const wrapper = controlSourceCode('cli-main.ts');
+    expect(wrapper).toContain("from './cli.js'");
+    expect(wrapper).toMatch(/^void cliMain\(\);\s*$/m);
+    expect(wrapper).not.toMatch(/^export /m);
+    expect(wrapper).not.toMatch(ENTRY_PREDICATE);
+  });
+
+  it('cli.ts is a plain library: exports cliMain, never invokes it, has no entry predicate', () => {
+    const lib = controlSourceCode('cli.ts');
+    expect(lib).toMatch(/^export async function cliMain\(/m);
+    expect(lib).not.toMatch(/^\s*(?:void )?cliMain\(\)/m);
+    expect(lib).not.toMatch(ENTRY_PREDICATE);
+  });
+
+  it('no repository module imports the wrapper — it is a process entry, never a library', () => {
+    const importOfWrapper = new RegExp(`(?:from|import)\\s*\\(?\\s*['"][^'"]*cli-main(?:\\.[cm]?[jt]s)?['"]`);
+    const offenders: string[] = [];
+    for (const dir of ['src', 'tests', 'tools']) {
+      for (const rel of readdirSync(join(repoRoot, dir), { recursive: true, encoding: 'utf8' })) {
+        if (!/\.(?:[cm]?[jt]s)$/.test(rel)) continue;
+        if (importOfWrapper.test(readFileSync(join(repoRoot, dir, rel), 'utf8'))) offenders.push(join(dir, rel));
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+});
+
+describe.skipIf(!existsSync(distCliMain) || !existsSync(distCliLib))(
+  'D062 control CLI — the built wrapper runs through any path shape (never a silent exit 0)',
+  () => {
+    it('invoked by its real path, cliMain() runs: unavailable diagnostic, exit 1', () => {
+      expectCliMainRan(runBuiltCli(distCliMain));
+    });
+
+    it('invoked through a junction/symlink alias, cliMain() runs with the SAME outcome', () => {
+      const aliasRoot = mkdtempSync(join(tmpdir(), 'ab-cli-alias-'));
+      const alias = join(aliasRoot, 'link');
+      try {
+        symlinkSync(join(repoRoot, 'dist'), alias, process.platform === 'win32' ? 'junction' : 'dir');
+        const aliased = join(alias, 'control', 'cli-main.js');
+        expect(existsSync(aliased)).toBe(true);
+        expectCliMainRan(runBuiltCli(aliased));
+        // Relative invocation through the alias, from a foreign cwd.
+        expectCliMainRan(runBuiltCli(join('link', 'control', 'cli-main.js'), { cwd: aliasRoot }));
+      } finally {
+        // Remove the reparse point itself (never its target), then the temp root.
+        try {
+          rmdirSync(alias);
+        } catch {
+          /* already gone */
+        }
+        rmSync(aliasRoot, { recursive: true, force: true });
+      }
+    });
+
+    it('dot segments, drive-letter casing (Windows), and a foreign cwd all run cliMain()', () => {
+      const forms = [
+        join(repoRoot, 'dist', 'control', '..', 'control', '.', 'cli-main.js'),
+        ...(process.platform === 'win32' && /^[A-Z]:/.test(distCliMain)
+          ? [distCliMain.charAt(0).toLowerCase() + distCliMain.slice(1)]
+          : []),
+      ];
+      for (const form of forms) expectCliMainRan(runBuiltCli(form));
+      expectCliMainRan(runBuiltCli(distCliMain, { cwd: tmpdir() }));
+    });
+
+    it('an alias retargeted while the module graph loads cannot skip execution: no predicate exists', () => {
+      // A synchronous module hook, preloaded via --import, swaps the junction to a
+      // decoy tree (whose cli-main.js would print and exit 0) while the wrapper's
+      // dependencies load — after Node resolved the aliased entry, before the
+      // wrapper body runs. V2's realpath guard saw two different canonical paths
+      // here and silently exited 0; with no entry decision at all, cliMain() runs.
+      const aliasRoot = mkdtempSync(join(tmpdir(), 'ab-cli-retarget-'));
+      const alias = join(aliasRoot, 'link');
+      const decoy = join(aliasRoot, 'decoy', 'control');
+      mkdirSync(decoy, { recursive: true });
+      writeFileSync(join(decoy, 'cli-main.js'), "process.stdout.write('DECOY RAN\\n');\n");
+      const hook = join(aliasRoot, 'retarget-hook.mjs');
+      writeFileSync(
+        hook,
+        [
+          "import { registerHooks } from 'node:module';",
+          "import { rmdirSync, symlinkSync, unlinkSync } from 'node:fs';",
+          `const alias = ${JSON.stringify(alias)};`,
+          `const target = ${JSON.stringify(join(aliasRoot, 'decoy'))};`,
+          `const kind = ${JSON.stringify(process.platform === 'win32' ? 'junction' : 'dir')};`,
+          // A junction is a directory reparse point (rmdir); a POSIX symlink is a file entry (unlink).
+          "const removeAlias = kind === 'junction' ? rmdirSync : unlinkSync;",
+          'registerHooks({ load(url, context, next) {',
+          "  if (url.endsWith('/control/control-auth.js')) { removeAlias(alias); symlinkSync(target, alias, kind); }",
+          '  return next(url, context);',
+          '} });',
+          '',
+        ].join('\n'),
+      );
+      try {
+        symlinkSync(join(repoRoot, 'dist'), alias, process.platform === 'win32' ? 'junction' : 'dir');
+        const run = runBuiltCli(join(alias, 'control', 'cli-main.js'), {
+          nodeArgs: ['--import', pathToFileURL(hook).href],
+        });
+        expect(existsSync(join(alias, 'control', 'cli.js')), 'the hook must have retargeted the alias').toBe(false);
+        // The invariant: never a silent exit 0 from an entry decision.
+        expect(run.status === 0 && run.stdout === '' && run.stderr === '').toBe(false);
+        expect(run.stdout).not.toContain('DECOY');
+        // And, having no predicate, the real wrapper simply runs cliMain().
+        expectCliMainRan(run);
+      } finally {
+        try {
+          rmdirSync(alias);
+        } catch {
+          /* already gone */
+        }
+        rmSync(aliasRoot, { recursive: true, force: true });
+      }
+    });
+
+    it('importing the built cli.js as a library is inert: no output, exitCode untouched', () => {
+      const root = mkdtempSync(join(tmpdir(), 'ab-cli-import-'));
+      const importer = join(root, 'importer.mjs');
+      writeFileSync(
+        importer,
+        `const m = await import(${JSON.stringify(pathToFileURL(distCliLib).href)});\n` +
+          "process.stdout.write(`lib runControlCli=${typeof m.runControlCli} cliMain=${typeof m.cliMain} " +
+          'exitCode=${String(process.exitCode)}\\n`);\n',
+      );
+      try {
+        const run = runBuiltCli(importer, { cwd: tmpdir() });
+        expect(run.stderr).toBe('');
+        expect(run.stdout).toBe('lib runControlCli=function cliMain=function exitCode=undefined\n');
+        expect(run.status).toBe(0);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+  },
+);
 
 /* ---- 6. Concurrent helper rebuild — isolation invariant (PR #90/#91) --------- */
 
