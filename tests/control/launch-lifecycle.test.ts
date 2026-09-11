@@ -876,6 +876,13 @@ describe('D062 explicit provisioning — builder and gate share one eligibility 
       'OpenProcessToken(',
       'GetTokenInformation(',
       'SetFileInformationByHandle(',
+      // The creator cancels a flag-armed delete-on-close through the RS1+ extended
+      // disposition surface; an SDK that declares only the legacy class must fail
+      // the probe, not the creator build.
+      'FILE_DISPOSITION_INFO_EX',
+      'FILE_DISPOSITION_FLAG_DO_NOT_DELETE',
+      'FILE_DISPOSITION_FLAG_ON_CLOSE',
+      'FileDispositionInfoEx,',
       'int wmain(',
     ]) {
       expect(PROBE_SOURCE, `probe must reference ${symbol}`).toContain(symbol);
