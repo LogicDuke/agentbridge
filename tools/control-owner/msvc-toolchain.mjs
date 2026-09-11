@@ -230,12 +230,20 @@ export function defaultRunCompiler(cl, args, { cwd, env }) {
 /* ---- Eligibility probe -------------------------------------------------------- */
 
 /**
- * Minimal translation unit exercising exactly the owner helper's dependency
- * surface: the same headers (`agentbridge-win-owner.c` includes) and the same
- * advapi32 imports (GetNamedSecurityInfoW, ConvertSidToStringSidW), so a header
- * missing inside an existing include dir or advapi32.lib missing inside an existing
- * lib dir fails the probe exactly as it would fail the helper build. `wmain` +
- * /SUBSYSTEM:CONSOLE matches the helper's entry/link shape.
+ * Minimal translation unit exercising exactly the dependency surface of EVERY native
+ * artifact the builder publishes: the same headers (the union of what
+ * `agentbridge-win-owner.c` and `agentbridge-win-descriptor-create.c` include) and
+ * the same advapi32/kernel32 imports both need — the read-only probe's
+ * GetNamedSecurityInfoW / ConvertSidToStringSidW / GetSecurityDescriptorControl, and
+ * the creator's SetEntriesInAclW, AllocateAndInitializeSid, OpenProcessToken /
+ * GetTokenInformation, and SetFileInformationByHandle with BOTH the legacy
+ * FileDispositionInfo class and the FileDispositionInfoEx class +
+ * FILE_DISPOSITION_INFO_EX / FILE_DISPOSITION_FLAG_* the creator's delete-on-close
+ * cancellation needs (declared only by Windows SDK 10.0.14393 / RS1 and later, so
+ * an older SDK fails here instead of at the creator build). A header missing inside
+ * an existing include dir, or an import library missing inside an existing lib dir,
+ * fails the probe exactly as it would fail the real build, for both artifacts.
+ * `wmain` + /SUBSYSTEM:CONSOLE matches their entry/link shape.
  */
 export const PROBE_SOURCE =
   '#include <windows.h>\n' +
@@ -249,18 +257,55 @@ export const PROBE_SOURCE =
   'int wmain(int argc, wchar_t **argv) {\n' +
   '  PSECURITY_DESCRIPTOR sd = NULL;\n' +
   '  PSID owner = NULL;\n' +
+  '  PSID system = NULL;\n' +
+  '  PACL acl = NULL;\n' +
+  '  HANDLE token = NULL;\n' +
+  '  DWORD needed = 0;\n' +
   '  LPWSTR sid = NULL;\n' +
+  '  SECURITY_DESCRIPTOR_CONTROL control = 0;\n' +
+  '  DWORD revision = 0;\n' +
+  '  EXPLICIT_ACCESSW entry;\n' +
+  '  SID_IDENTIFIER_AUTHORITY nt = SECURITY_NT_AUTHORITY;\n' +
+  '  FILE_DISPOSITION_INFO disposition;\n' +
+  '  FILE_DISPOSITION_INFO_EX retain;\n' +
   '  wchar_t buf[8];\n' +
   '  (void)_setmode(_fileno(stdout), _O_BINARY);\n' +
   '  memset(buf, 0, sizeof buf);\n' +
+  '  ZeroMemory(&entry, sizeof entry);\n' +
+  '  ZeroMemory(&disposition, sizeof disposition);\n' +
+  '  ZeroMemory(&retain, sizeof retain);\n' +
+  '  retain.Flags = FILE_DISPOSITION_FLAG_DO_NOT_DELETE | FILE_DISPOSITION_FLAG_ON_CLOSE;\n' +
   '  if (argc > 1 && wcslen(argv[1]) > 0 &&\n' +
   '      GetNamedSecurityInfoW(argv[1], SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,\n' +
   '                            &owner, NULL, NULL, NULL, &sd) == ERROR_SUCCESS &&\n' +
+  '      GetSecurityDescriptorControl(sd, &control, &revision) &&\n' +
   '      ConvertSidToStringSidW(owner, &sid)) {\n' +
   '    (void)wprintf(L"%ls\\n", sid);\n' +
   '    LocalFree(sid);\n' +
   '  }\n' +
   '  if (sd != NULL) LocalFree(sd);\n' +
+  '  if (AllocateAndInitializeSid(&nt, 1, SECURITY_LOCAL_SYSTEM_RID, 0, 0, 0, 0, 0,\n' +
+  '                               0, 0, &system)) {\n' +
+  '    entry.grfAccessPermissions = FILE_ALL_ACCESS;\n' +
+  '    entry.grfAccessMode = SET_ACCESS;\n' +
+  '    entry.grfInheritance = NO_INHERITANCE;\n' +
+  '    entry.Trustee.TrusteeForm = TRUSTEE_IS_SID;\n' +
+  '    entry.Trustee.ptstrName = (LPWSTR)system;\n' +
+  '    if (SetEntriesInAclW(1, &entry, NULL, &acl) == ERROR_SUCCESS && acl != NULL) {\n' +
+  '      LocalFree(acl);\n' +
+  '    }\n' +
+  '    FreeSid(system);\n' +
+  '  }\n' +
+  '  if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {\n' +
+  '    (void)GetTokenInformation(token, TokenUser, NULL, 0, &needed);\n' +
+  '    CloseHandle(token);\n' +
+  '  }\n' +
+  '  (void)SetFileInformationByHandle(GetStdHandle(STD_OUTPUT_HANDLE),\n' +
+  '                                   FileDispositionInfo, &disposition,\n' +
+  '                                   sizeof disposition);\n' +
+  '  (void)SetFileInformationByHandle(GetStdHandle(STD_OUTPUT_HANDLE),\n' +
+  '                                   FileDispositionInfoEx, &retain,\n' +
+  '                                   sizeof retain);\n' +
   '  return 0;\n' +
   '}\n';
 

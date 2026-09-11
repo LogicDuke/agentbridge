@@ -6,10 +6,14 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   createLiveCockpitSource,
   createLiveObservation,
+  startControlChannelAfterCockpitBind,
   startLiveCockpit,
   type LiveCockpitConfig,
   type StartLiveCockpitOptions,
 } from '../../src/runtime/live-cockpit.js';
+import { startControlChannel, type ControlChannelHandle } from '../../src/control/control-runtime.js';
+import { CONTROL_ANCHOR_REJECTION, type ControlAnchorVerification } from '../../src/control/control-store.js';
+import { newOrchestrator } from '../control/support.js';
 import {
   createCockpitServer,
   createCockpitServerFromProvider,
@@ -437,5 +441,134 @@ describe('loopback pin (Codex P2 repair)', () => {
     const attempted: StartLiveCockpitOptions = { config: baseConfig(), host: '0.0.0.0', port: 0 };
     // Only the loopback-safe options survive on the typed value.
     expect(attempted.port).toBe(0);
+  });
+});
+
+// --- D062 ordering: control starts only after the Cockpit bind (24/25) -------
+
+function tick(): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, 30);
+  });
+}
+
+const fakeHandle: ControlChannelHandle = {
+  runtimeId: '0'.repeat(32),
+  pipeName: 'agentbridge-control-' + '0'.repeat(32),
+  pipePath: '\\\\.\\pipe\\agentbridge-control-' + '0'.repeat(32),
+  descriptorPath: 'C:\\FakeAnchor\\runtime-descriptor-' + '0'.repeat(32) + '.json',
+  close: (): Promise<void> => Promise.resolve(),
+};
+
+describe('D062 ordering — the control channel starts only after the Cockpit bind succeeds', () => {
+  it('control start is invoked exactly once, from the listening event, with the host already bound', async () => {
+    const server = track(startLiveCockpit({ config: baseConfig(), port: 0 }));
+    const listeningAtStart: boolean[] = [];
+    const gated = startControlChannelAfterCockpitBind(server, (): Promise<ControlChannelHandle | null> => {
+      listeningAtStart.push(server.listening);
+      return Promise.resolve(fakeHandle);
+    });
+    expect(gated.current()).toBeNull();
+    const port = await waitListening(server);
+    await tick();
+    expect(listeningAtStart).toEqual([true]);
+    expect(gated.current()).toBe(fakeHandle);
+    // The Cockpit was serving before control ever ran, and still is.
+    expect((await request(port, 'GET', '/')).status).toBe(200);
+  });
+
+  it('24. a Cockpit bind loser (EADDRINUSE) never starts control, so it can never publish a descriptor', async () => {
+    const winner = track(http.createServer());
+    winner.listen(0, '127.0.0.1');
+    const port = await waitListening(winner);
+
+    const loser = track(http.createServer());
+    let starts = 0;
+    const gated = startControlChannelAfterCockpitBind(loser, (): Promise<ControlChannelHandle | null> => {
+      starts += 1;
+      return Promise.resolve(fakeHandle);
+    });
+    const error = await new Promise<NodeJS.ErrnoException>((resolve) => {
+      loser.once('error', resolve);
+      loser.listen(port, '127.0.0.1');
+    });
+    expect(error.code).toBe('EADDRINUSE');
+    await tick();
+    expect(starts).toBe(0);
+    expect(gated.current()).toBeNull();
+    // Even a later (spurious) listening event cannot start control after a bind failure.
+    loser.emit('listening');
+    await tick();
+    expect(starts).toBe(0);
+  });
+
+  it('25. the Cockpit remains available when control initialization returns null, rejects, or throws', async () => {
+    const logs: string[] = [];
+    const log = (message: string): void => {
+      logs.push(message);
+    };
+    const starters: readonly [string, () => Promise<ControlChannelHandle | null>][] = [
+      ['null handle', (): Promise<ControlChannelHandle | null> => Promise.resolve(null)],
+      ['rejection', (): Promise<ControlChannelHandle | null> => Promise.reject(new Error('anchor exploded'))],
+      ['synchronous throw', (): Promise<ControlChannelHandle | null> => {
+        throw new Error('sync boom');
+      }],
+    ];
+    for (const [label, start] of starters) {
+      const server = track(startLiveCockpit({ config: baseConfig(), port: 0 }));
+      const gated = startControlChannelAfterCockpitBind(server, start, log);
+      const port = await waitListening(server);
+      await tick();
+      expect(gated.current(), label).toBeNull();
+      expect((await request(port, 'GET', '/')).status, label).toBe(200);
+      expect((await request(port, 'GET', '/')).body, label).toContain('LIVE OBSERVATION');
+    }
+    expect(logs.filter((line) => line.includes('disabled (startup error)'))).toHaveLength(2);
+  });
+
+  it('wired to an already-listening host, control starts immediately (once)', async () => {
+    const server = track(startLiveCockpit({ config: baseConfig(), port: 0 }));
+    await waitListening(server);
+    let starts = 0;
+    const gated = startControlChannelAfterCockpitBind(server, (): Promise<ControlChannelHandle | null> => {
+      starts += 1;
+      return Promise.resolve(fakeHandle);
+    });
+    await tick();
+    expect(starts).toBe(1);
+    expect(gated.current()).toBe(fakeHandle);
+    server.emit('listening');
+    await tick();
+    expect(starts).toBe(1);
+  });
+
+  it('the REAL control startup, gated behind the bind, fails closed on an unverified anchor and leaves the Cockpit serving', async () => {
+    const server = track(startLiveCockpit({ config: baseConfig(), port: 0 }));
+    const { orchestrator } = newOrchestrator();
+    let creations = 0;
+    const gated = startControlChannelAfterCockpitBind(
+      server,
+      () =>
+        startControlChannel({
+          orchestrator,
+          verify: (): Promise<ControlAnchorVerification> =>
+            Promise.resolve({ ok: false, reason: CONTROL_ANCHOR_REJECTION.HELPER_PROVENANCE_MISSING }),
+          createDescriptor: () => {
+            creations += 1;
+            return Promise.resolve({ ok: true });
+          },
+          logger: (): void => {
+            /* silent */
+          },
+        }),
+      (): void => {
+        /* silent */
+      },
+    );
+    const port = await waitListening(server);
+    await tick();
+    expect(gated.current()).toBeNull();
+    expect(creations).toBe(0);
+    expect((await request(port, 'GET', '/')).status).toBe(200);
   });
 });

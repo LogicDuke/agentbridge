@@ -3,13 +3,20 @@
  * Decision 062 control channel (direct third-party pipe clients are
  * unsupported).
  *
- * It may only: verify the hardened control anchor, read the current
- * descriptor/token, connect to the current pipe, perform the mutual HMAC
- * handshake, submit **one** `OPEN_HUMAN_GATE`, authenticate the server response,
- * and print a bounded result. It constructs no `WorkflowEvent`, holds no
- * `WorkflowState` authority, accepts no arbitrary event, and takes no
+ * It may only: verify the hardened control anchor, discover the one live
+ * identity-named descriptor, connect to that runtime's pipe, perform the mutual
+ * HMAC handshake, submit **one** `OPEN_HUMAN_GATE`, authenticate the server
+ * response, and print a bounded result. It constructs no `WorkflowEvent`, holds
+ * no `WorkflowState` authority, accepts no arbitrary event, and takes no
  * commit/repository/workflow selector as command authority. It runs no Git,
- * GitHub, shell, or process command.
+ * GitHub, shell, or process command, and never deletes a descriptor.
+ *
+ * Discovery is bounded and deterministic (see `discoverControlRuntime`): every
+ * `runtime-descriptor-<id>.json` in the verified anchor is parsed safely, each
+ * valid candidate's pipe is probed, and the command is sent only when EXACTLY ONE
+ * candidate's pipe is live. Zero live candidates is "unavailable"; two or more is
+ * "ambiguous" and fails closed. Nothing is chosen by mtime, PID, lexicographic
+ * order, or last-writer-wins.
  *
  * Critically, it prints an applied outcome **only** when the server's `macS`
  * verifies: a missing, wrong, or replayed server MAC is treated as an
@@ -37,11 +44,13 @@ import {
   parseResultBody,
 } from './control-channel.js';
 import {
+  defaultPipeProbe,
+  discoverControlRuntime,
   pipePathFromName,
-  readDescriptorFile,
   verifyControlAnchor,
   type ControlAnchorVerification,
   type DescriptorFileDeps,
+  type PipeProbe,
   type VerifyControlAnchorDeps,
 } from './control-store.js';
 
@@ -54,6 +63,7 @@ export interface RunControlCliDeps {
   readonly env?: NodeJS.ProcessEnv;
   readonly verify?: (deps: VerifyControlAnchorDeps) => Promise<ControlAnchorVerification>;
   readonly descriptorDeps?: DescriptorFileDeps;
+  readonly probePipe?: PipeProbe;
   readonly connect?: ConnectFn;
   readonly nonceGen?: () => Buffer;
   readonly timeoutMs?: number;
@@ -179,12 +189,14 @@ function runClientProtocol(args: ClientProtocolArgs): Promise<ClientProtocolOutc
 }
 
 /**
- * Verify the anchor, read the descriptor, run the handshake, and report a
- * bounded outcome. Never prints `APPLIED` unless the server authenticated.
+ * Verify the anchor, discover the one live runtime, run the handshake, and
+ * report a bounded outcome. Never prints `APPLIED` unless the server
+ * authenticated; never sends the command when discovery is ambiguous.
  */
 export async function runControlCli(deps: RunControlCliDeps = {}): Promise<ControlCliOutcome> {
   const env = deps.env ?? process.env;
   const verify = deps.verify ?? verifyControlAnchor;
+  const probePipe = deps.probePipe ?? defaultPipeProbe();
   const connect = deps.connect ?? defaultConnect;
   const nonceGen = deps.nonceGen ?? ((): Buffer => randomBytes(NONCE_BYTES));
   const timeoutMs = deps.timeoutMs ?? DEFAULT_CONNECTION_TIMEOUT_MS;
@@ -201,16 +213,27 @@ export async function runControlCli(deps: RunControlCliDeps = {}): Promise<Contr
     return { exitCode: 1, status: null, authenticated: false };
   }
 
-  const descriptor = readDescriptorFile(verification.anchorPath, deps.descriptorDeps);
-  if (descriptor === null) {
-    err('agentbridge-control: no valid control descriptor found.');
+  const discovery = await discoverControlRuntime(
+    verification.anchorPath,
+    probePipe,
+    deps.descriptorDeps,
+  );
+  if (discovery.kind === 'UNAVAILABLE') {
+    err(`agentbridge-control: no live control runtime found (${discovery.reason}).`);
+    return { exitCode: 1, status: null, authenticated: false };
+  }
+  if (discovery.kind === 'AMBIGUOUS') {
+    err(
+      `agentbridge-control: ambiguous control runtime (${String(discovery.live.length)} live ` +
+        'descriptors); refusing to choose.',
+    );
     return { exitCode: 1, status: null, authenticated: false };
   }
 
   const outcome = await runClientProtocol({
     connect,
-    pipePath: pipePathFromName(descriptor.descriptor.pipeName),
-    token: descriptor.token,
+    pipePath: pipePathFromName(discovery.parsed.descriptor.pipeName),
+    token: discovery.parsed.token,
     nonceGen,
     timeoutMs,
   });

@@ -1,94 +1,146 @@
 /**
- * Bounded live-runtime composition wiring for the Decision 062 control channel.
+ * Bounded live-runtime composition wiring for the Decision 062 control channel
+ * (descriptor lifecycle v2: identity-named, listen-before-publish).
  *
  * This is the composition root that turns the parts into a running channel,
- * invoked **after** the read-only Cockpit host is available (§17). It:
+ * invoked **after** the read-only Cockpit host has bound its loopback port (§17).
+ * The lifecycle is structurally ordered so that a descriptor can only ever
+ * describe a runtime whose pipe is already live, and so that no runtime ever
+ * touches another runtime's descriptor except to remove one proven dead:
  *
- *   1. verifies the hardened control anchor (read-only, fail closed);
- *   2. mints a fresh per-process descriptor + rotating 256-bit token;
- *   3. rotates any stale crash descriptor, then writes the new one — only after
- *      verification succeeds;
- *   4. builds the one narrow dispatcher over the orchestrator writer;
- *   5. listens on the unpredictable per-process pipe; a same-name collision or
- *      any listen error fails the channel **closed**.
+ *   1. verify the hardened control anchor (read-only, fail closed);
+ *   2. sweep foreign descriptors whose pipe the kernel reports ABSENT (best
+ *      effort; nothing PRESENT/UNKNOWN/malformed is ever removed);
+ *   3. mint this runtime's identity: a 128-bit random runtime id, its pipe name,
+ *      and a rotating 256-bit token;
+ *   4. listen on the identity-named pipe — the kernel-owned exclusivity/liveness
+ *      claim; a same-name collision or any listen error fails **closed** and
+ *      nothing has been published;
+ *   5. only after the pipe is live, publish `runtime-descriptor-<id>.json`
+ *      through the build-provenanced create-only native creator (CREATE_NEW,
+ *      exact operator owner, protected operator+SYSTEM DACL, bytes on stdin);
+ *   6. verify the exact file just created: its actual owner + DACL through the
+ *      independent read-only helper, and its contents by read-back — the parsed
+ *      runtime id, pipe name, and token must equal what this runtime minted;
+ *   7. expose the control handle only after every gate above passed.
  *
- * A failure at any step disables the control channel and returns `null`; it never
- * throws into the Cockpit path and never converts the Cockpit into a writer. The
- * Cockpit remains available and read-only. The token is never logged, never put
- * in an environment variable, argv, or an error message.
+ * There is no shared fixed pathname, no rotation, no ownership recheck, no PID,
+ * no lease, and no polling. A failure at any step disables the control channel
+ * and returns `null`; it never throws into the Cockpit path and never converts
+ * the Cockpit into a writer. The token is never logged, never put in an
+ * environment variable, argv, or an error message.
  */
 
+import { timingSafeEqual } from 'node:crypto';
+import type net from 'node:net';
+
 import type { AutoflowOrchestrator } from '../autoflow/orchestrator.js';
+import { CONTROL_RESULT, type ControlCommand, type ControlResultStatus } from './control-command.js';
 import { createControlChannelServer } from './control-channel.js';
-import { createControlDispatcher } from './control-dispatch.js';
+import { createControlDispatcher, type ControlDispatcher } from './control-dispatch.js';
 import {
+  DESCRIPTOR_CREATION_REJECTION,
+  MAX_ANCHOR_ENTRIES,
+  MAX_DESCRIPTOR_CANDIDATES,
+  createDescriptorFileNative,
   createRuntimeDescriptor,
+  defaultPipeProbe,
+  descriptorPathFor,
   pipePathFromName,
   readDescriptorFile,
   removeDescriptorFile,
+  serializeDescriptor,
+  sweepStaleDescriptors,
   verifyControlAnchor,
-  writeDescriptorFile,
+  verifyDescriptorAcl,
   type ControlAnchorVerification,
+  type DescriptorAclVerification,
+  type DescriptorCreation,
+  type DescriptorCreatorDeps,
   type DescriptorFileDeps,
+  type PipeProbe,
   type VerifyControlAnchorDeps,
 } from './control-store.js';
 
-/**
- * Remove the fixed descriptor only while it still identifies THIS runtime
- * instance (exact pipeName match — the per-process 128-bit-random identity; a
- * pid can be reused, a pipeName cannot). If the descriptor is missing,
- * malformed, unreadable, or was replaced by a successor runtime, it is left
- * untouched so the successor stays discoverable. Read-compare-unlink is not
- * atomic; the residual window is the sub-millisecond gap between the match and
- * the unlink, not the successor's whole lifetime.
- */
-function removeOwnDescriptorFile(
-  anchorPath: string,
-  ownPipeName: string,
-  deps?: DescriptorFileDeps,
-): void {
-  const current = readDescriptorFile(anchorPath, deps);
-  if (current === null || current.descriptor.pipeName !== ownPipeName) {
-    return;
-  }
-  removeDescriptorFile(anchorPath, deps);
-}
-
-/** A running control channel; `close()` stops it and removes its own descriptor. */
+/** A running control channel; `close()` removes its own descriptor, then stops it. */
 export interface ControlChannelHandle {
+  readonly runtimeId: string;
   readonly pipeName: string;
   readonly pipePath: string;
+  readonly descriptorPath: string;
   close(): Promise<void>;
 }
+
+/** Create one identity-named descriptor file; the production default is the native creator. */
+export type DescriptorCreatorFn = (
+  anchorPath: string,
+  runtimeId: string,
+  descriptorBytes: Buffer,
+) => Promise<DescriptorCreation>;
 
 export interface StartControlChannelDeps {
   readonly orchestrator: AutoflowOrchestrator;
   readonly env?: NodeJS.ProcessEnv;
-  readonly pid?: number;
   readonly timeoutMs?: number;
   /** Injection seams (tests); production defaults verify and use the real fs/pipe. */
   readonly verify?: (deps: VerifyControlAnchorDeps) => Promise<ControlAnchorVerification>;
+  readonly verifyDescriptor?: (
+    descriptorPath: string,
+    deps: VerifyControlAnchorDeps,
+  ) => Promise<DescriptorAclVerification>;
   readonly descriptorDeps?: DescriptorFileDeps;
+  readonly creatorDeps?: DescriptorCreatorDeps;
+  readonly createDescriptor?: DescriptorCreatorFn;
+  readonly probePipe?: PipeProbe;
   readonly createServer?: typeof createControlChannelServer;
   readonly logger?: (message: string) => void;
 }
 
+/** Close a server, resolving once it has stopped (never rejecting). */
+function closeServer(server: net.Server): Promise<void> {
+  return new Promise<void>((resolvePromise) => {
+    server.close(() => {
+      resolvePromise();
+    });
+  });
+}
+
+/** Listen once; resolve on success, reject on the first listen error. */
+function listen(server: net.Server, pipePath: string): Promise<void> {
+  return new Promise<void>((resolvePromise, rejectPromise) => {
+    const onError = (error: unknown): void => {
+      rejectPromise(error instanceof Error ? error : new Error('listen failed'));
+    };
+    server.once('error', onError);
+    server.listen(pipePath, () => {
+      server.removeListener('error', onError);
+      resolvePromise();
+    });
+  });
+}
+
 /**
  * Start the control channel, or return `null` if it cannot be started safely.
- * Never throws for an expected fail-closed condition (unverified anchor,
- * descriptor write failure, pipe collision).
+ * Never throws for an expected fail-closed condition (unverified anchor, pipe
+ * collision, creation failure, descriptor verification failure).
  */
 export async function startControlChannel(
   deps: StartControlChannelDeps,
 ): Promise<ControlChannelHandle | null> {
   const env = deps.env ?? process.env;
-  const pid = deps.pid ?? process.pid;
   const verify = deps.verify ?? verifyControlAnchor;
+  const verifyDescriptor = deps.verifyDescriptor ?? verifyDescriptorAcl;
+  const createDescriptor: DescriptorCreatorFn =
+    deps.createDescriptor ??
+    ((anchorPath, runtimeId, descriptorBytes): Promise<DescriptorCreation> =>
+      createDescriptorFileNative(anchorPath, runtimeId, descriptorBytes, deps.creatorDeps));
+  const probePipe = deps.probePipe ?? defaultPipeProbe();
   const createServer = deps.createServer ?? createControlChannelServer;
   const log = deps.logger ?? ((message: string): void => {
     console.error(message);
   });
 
+  // 1. Anchor prerequisites.
   const verification = await verify({ env });
   if (!verification.ok) {
     log(`AgentBridge control channel: disabled (anchor not verified: ${verification.reason}).`);
@@ -96,40 +148,75 @@ export async function startControlChannel(
   }
   const anchorPath = verification.anchorPath;
 
-  // Rotate: replace any stale crash descriptor before serving.
-  removeDescriptorFile(anchorPath, deps.descriptorDeps);
-
-  const { descriptor, token } = createRuntimeDescriptor(pid);
-  try {
-    writeDescriptorFile(anchorPath, descriptor, deps.descriptorDeps);
-  } catch {
-    log('AgentBridge control channel: disabled (descriptor write failed).');
+  // 2. Best-effort sweep of foreign descriptors proven dead by the kernel pipe
+  //    namespace. Nothing PRESENT, UNKNOWN, or malformed is ever removed.
+  const sweep = await sweepStaleDescriptors(anchorPath, null, probePipe, deps.descriptorDeps);
+  // Fail closed BEFORE listening or publishing if the initial descriptor
+  // enumeration was not complete. An unreadable anchor or an over-cap candidate
+  // set is exactly what CLI discovery rejects (ANCHOR_UNREADABLE /
+  // TOO_MANY_CANDIDATES), so a channel started here could never be discovered:
+  // CONTROL_START_SUCCESS ⇒ INITIAL_DESCRIPTOR_ENUMERATION_COMPLETE.
+  if (sweep.enumeration !== 'complete') {
+    log(`AgentBridge control channel: disabled (descriptor enumeration ${sweep.enumeration}).`);
     return null;
   }
+  // Reserve a candidate slot for our own descriptor BEFORE listening/publishing.
+  // The candidates that survived the sweep (examined minus those removed) still
+  // occupy identity-named slots; if they already fill the cap, publishing ours
+  // would push the anchor to MAX + 1 and make this runtime undiscoverable (the
+  // CLI would fail closed with TOO_MANY_CANDIDATES). Fail closed here instead:
+  // CONTROL_START_SUCCESS ⇒ POST_PUBLICATION_CANDIDATE_SET_DISCOVERABLE.
+  const survivingCandidates = sweep.examined - sweep.removed.length;
+  if (survivingCandidates >= MAX_DESCRIPTOR_CANDIDATES) {
+    log('AgentBridge control channel: disabled (no descriptor candidate slot available).');
+    return null;
+  }
+  // Reserve a TOTAL directory-entry slot for our own descriptor, using the exact
+  // scanned count carried out of the SAME bounded sweep pass (no re-enumeration).
+  // The entries that survived the sweep (scanned minus removed) still occupy the
+  // directory; if they already reach the entry cap, publishing ours would make
+  // the anchor over-full and fail discovery closed with ANCHOR_OVERFULL:
+  // CONTROL_START_SUCCESS ⇒ POST_PUBLICATION_ANCHOR_REMAINS_WITHIN_TOTAL_ENTRY_BOUND.
+  const survivingEntries = sweep.scanned - sweep.removed.length;
+  if (survivingEntries >= MAX_ANCHOR_ENTRIES) {
+    log('AgentBridge control channel: disabled (no anchor entry slot available).');
+    return null;
+  }
+  if (sweep.removed.length > 0 || sweep.unremovable.length > 0) {
+    log(
+      `AgentBridge control channel: stale descriptor sweep removed ${String(sweep.removed.length)}, ` +
+        `could not remove ${String(sweep.unremovable.length)}.`,
+    );
+  }
 
-  const dispatcher = createControlDispatcher(deps.orchestrator);
+  // 3. Mint this runtime's identity.
+  const minted = createRuntimeDescriptor();
+  const { runtimeId } = minted;
+  const pipePath = pipePathFromName(minted.descriptor.pipeName);
+  const descriptorPath = descriptorPathFor(anchorPath, runtimeId);
+
+  // 4. Kernel-owned exclusivity/liveness: listen BEFORE anything is published.
+  //    The server is armed with an INERT gate dispatcher, never the real one:
+  //    the real dispatcher (the sole write-path capability) is created and
+  //    slotted in only after every descriptor trust gate below has passed. An
+  //    authenticated client that reaches the pipe during the publish→verify
+  //    window therefore gets UNAVAILABLE and the orchestrator is never touched,
+  //    preserving CONTROL_COMMAND_APPLIED ⇒ ALL_TRUST_GATES_PASSED. `live` moves
+  //    NOT_READY(null) → READY(real dispatcher) exactly once and never back.
+  let live: ControlDispatcher | null = null;
+  const gate: ControlDispatcher = Object.freeze({
+    dispatch(command: ControlCommand): ControlResultStatus {
+      return live === null ? CONTROL_RESULT.UNAVAILABLE : live.dispatch(command);
+    },
+  });
   const server = createServer(
     deps.timeoutMs === undefined
-      ? { token, dispatcher }
-      : { token, dispatcher, timeoutMs: deps.timeoutMs },
+      ? { token: minted.token, dispatcher: gate }
+      : { token: minted.token, dispatcher: gate, timeoutMs: deps.timeoutMs },
   );
-  const pipePath = pipePathFromName(descriptor.pipeName);
-
   try {
-    await new Promise<void>((resolvePromise, rejectPromise) => {
-      const onError = (error: unknown): void => {
-        rejectPromise(error instanceof Error ? error : new Error('listen failed'));
-      };
-      server.once('error', onError);
-      server.listen(pipePath, () => {
-        server.removeListener('error', onError);
-        resolvePromise();
-      });
-    });
+    await listen(server, pipePath);
   } catch {
-    // A same-name collision or any listen failure fails closed. Remove only our
-    // own descriptor: a successor may already have replaced it.
-    removeOwnDescriptorFile(anchorPath, descriptor.pipeName, deps.descriptorDeps);
     log('AgentBridge control channel: disabled (pipe unavailable).');
     return null;
   }
@@ -139,18 +226,96 @@ export async function startControlChannel(
     log('AgentBridge control channel: transport error (channel continues).');
   });
 
+  /** Fail closed after listening: remove ONLY this runtime's file (if it published), stop the pipe. */
+  const failAfterListen = async (message: string, published: boolean): Promise<null> => {
+    if (published) {
+      removeDescriptorFile(descriptorPath, deps.descriptorDeps);
+    }
+    await closeServer(server);
+    log(message);
+    return null;
+  };
+
+  // 5. Publish this runtime's identity-named descriptor, only now that the pipe
+  //    is live. CREATE_NEW: an existing pathname for OUR fresh 128-bit id can
+  //    only be a collision or a planted file; either way we did not create it,
+  //    so nothing is removed on this path.
+  const descriptorBytes = Buffer.from(serializeDescriptor(minted.descriptor), 'utf8');
+  let creation: DescriptorCreation;
+  try {
+    creation = await createDescriptor(anchorPath, runtimeId, descriptorBytes);
+  } catch {
+    return failAfterListen(
+      'AgentBridge control channel: disabled (descriptor creation failed).',
+      false,
+    );
+  }
+  if (!creation.ok) {
+    // Clean up ONLY when the creator proved it created our identity-named file
+    // then failed (exit 6). Every other creation failure — including a CREATE_NEW
+    // collision (exit 5) — did NOT create the file here, so its pathname (which
+    // may be foreign or planted) must never be removed.
+    const published = creation.reason === DESCRIPTOR_CREATION_REJECTION.CREATOR_WROTE_THEN_FAILED;
+    return failAfterListen(
+      `AgentBridge control channel: disabled (descriptor creation failed: ${creation.reason}).`,
+      published,
+    );
+  }
+
+  // 6a. Verify the EXACT file just created through the independent read-only
+  //     helper: owner, DACL present + protected, direct operator+SYSTEM only.
+  let acl: DescriptorAclVerification;
+  try {
+    acl = await verifyDescriptor(descriptorPath, { env });
+  } catch {
+    return failAfterListen(
+      'AgentBridge control channel: disabled (descriptor verification failed).',
+      true,
+    );
+  }
+  if (!acl.ok) {
+    return failAfterListen(
+      `AgentBridge control channel: disabled (descriptor not verified: ${acl.reason}).`,
+      true,
+    );
+  }
+
+  // 6b. Read back the exact file and require that it describes THIS runtime:
+  //     the parsed runtime id, pipe name, and token must equal what was minted.
+  const readBack = readDescriptorFile(descriptorPath, deps.descriptorDeps);
+  if (
+    readBack === null ||
+    readBack.runtimeId !== runtimeId ||
+    readBack.descriptor.pipeName !== minted.descriptor.pipeName ||
+    readBack.token.length !== minted.token.length ||
+    !timingSafeEqual(readBack.token, minted.token)
+  ) {
+    return failAfterListen(
+      'AgentBridge control channel: disabled (descriptor contents do not identify this runtime).',
+      true,
+    );
+  }
+
+  // 7. Every trust gate passed. Arm the write path with NO intervening await
+  //    between the final successful read-back check above and this assignment,
+  //    so no command can be dispatched to the real orchestrator until exactly
+  //    here. This is the one and only NOT_READY → READY transition.
+  live = createControlDispatcher(deps.orchestrator);
+
+  // 8. Expose the handle.
   return {
-    pipeName: descriptor.pipeName,
+    runtimeId,
+    pipeName: minted.descriptor.pipeName,
     pipePath,
-    close: (): Promise<void> =>
-      new Promise<void>((resolvePromise) => {
-        // Remove only our own descriptor: a successor runtime may have rotated
-        // the fixed path already, and deleting its descriptor would make the
-        // live successor undiscoverable.
-        removeOwnDescriptorFile(anchorPath, descriptor.pipeName, deps.descriptorDeps);
-        server.close(() => {
-          resolvePromise();
-        });
-      }),
+    descriptorPath,
+    close: async (): Promise<void> => {
+      // Own identity-named file first, so no discoverer can select a runtime
+      // that is shutting down; then the pipe. A client already mid-handshake is
+      // unaffected because the pipe is still up until the descriptor is gone.
+      // If the unlink fails the file is stale by construction (its pipe is about
+      // to be ABSENT) and a later runtime's sweep removes it.
+      removeDescriptorFile(descriptorPath, deps.descriptorDeps);
+      await closeServer(server);
+    },
   };
 }

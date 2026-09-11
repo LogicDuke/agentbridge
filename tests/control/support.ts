@@ -1,12 +1,14 @@
 /**
  * Shared helpers for the D062 control-channel integration tests: an in-memory
- * descriptor store, a passing/injected anchor verifier, real named-pipe server
- * startup, a CLI driver, and a raw-socket client for byte-level adversarial
- * cases. Not a test file (no `.test.ts`), so vitest does not collect it.
+ * identity-named descriptor anchor, a passing/injected anchor verifier, real
+ * named-pipe server startup, a CLI driver, and a raw-socket client for byte-level
+ * adversarial cases. Not a test file (no `.test.ts`), so vitest does not collect
+ * it.
  */
 
 import net from 'node:net';
 import { randomBytes } from 'node:crypto';
+import { join } from 'node:path';
 
 import { AutoflowOrchestrator } from '../../src/autoflow/orchestrator.js';
 import { AutoflowRuntime } from '../../src/autoflow/runtime.js';
@@ -24,13 +26,25 @@ import {
 import { CONTROL_RESULT, type ControlResultStatus } from '../../src/control/control-command.js';
 import { runControlCli, type ControlCliOutcome } from '../../src/control/cli.js';
 import {
+  DESCRIPTOR_CREATION_REJECTION,
+  descriptorFilenameFor,
   parseDescriptor,
   pipePathFromName,
   serializeDescriptor,
   type ControlAnchorVerification,
+  type DescriptorAclVerification,
+  type DescriptorCreation,
   type DescriptorFileDeps,
+  type ParsedDescriptor,
+  type PipeProbe,
+  type RuntimeDescriptor,
 } from '../../src/control/control-store.js';
-import { startControlChannel, type ControlChannelHandle } from '../../src/control/control-runtime.js';
+import {
+  startControlChannel,
+  type ControlChannelHandle,
+  type DescriptorCreatorFn,
+  type StartControlChannelDeps,
+} from '../../src/control/control-runtime.js';
 
 export const REPO = 'repo-agentbridge';
 export const SHA = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678';
@@ -46,36 +60,115 @@ export function passingVerify(): Promise<ControlAnchorVerification> {
   return Promise.resolve({ ok: true, anchorPath: FAKE_ANCHOR });
 }
 
-export interface MemStore {
-  readonly deps: DescriptorFileDeps;
-  get(): string | null;
-  set(value: string | null): void;
+export function passingDescriptorVerify(): Promise<DescriptorAclVerification> {
+  return Promise.resolve({ ok: true });
 }
 
-/** An in-memory descriptor store, so tests touch no real filesystem or anchor. */
-export function memStore(): MemStore {
-  let data: string | null = null;
+/**
+ * An in-memory anchor: a map from absolute descriptor path to file text. Models
+ * exactly the operations the runtime and CLI perform — list the anchor, read one
+ * exact file, remove one exact file, and CREATE_NEW-create one exact file — so
+ * tests touch no real filesystem, anchor, or native creator.
+ */
+export interface MemAnchor {
+  readonly anchorPath: string;
+  readonly deps: DescriptorFileDeps;
+  /** The CREATE_NEW creation seam: refuses an existing path (CREATOR_FAILED). */
+  readonly create: DescriptorCreatorFn;
+  /** All stored descriptor texts keyed by basename. */
+  entries(): ReadonlyMap<string, string>;
+  /** The text stored for a runtime id, or `null`. */
+  get(runtimeId: string): string | null;
+  /** Store a text for a runtime id (test seeding; bypasses CREATE_NEW). */
+  set(runtimeId: string, text: string): void;
+  /** Store raw text under an arbitrary basename (malformed / non-candidate seeding). */
+  setRaw(basename: string, text: string): void;
+  /** Remove a runtime id's file (test seeding). */
+  remove(runtimeId: string): void;
+  /** Number of removeFile calls made through the deps. */
+  removeCalls(): number;
+  /** Number of create calls made through the seam. */
+  createCalls(): number;
+}
+
+export function memAnchor(anchorPath: string = FAKE_ANCHOR): MemAnchor {
+  const files = new Map<string, string>();
+  let removeCalls = 0;
+  let createCalls = 0;
+  const pathOf = (basename: string): string => join(anchorPath, basename);
+  const basenameOf = (path: string): string | null => {
+    for (const name of files.keys()) {
+      if (pathOf(name) === path) {
+        return name;
+      }
+    }
+    return null;
+  };
   return {
+    anchorPath,
     deps: {
-      readFile: (): string => {
-        if (data === null) {
+      listAnchor: (dir: string): readonly string[] => {
+        if (dir !== anchorPath) {
           throw new Error('ENOENT');
         }
-        return data;
+        return [...files.keys()];
       },
-      writeFile: (_path: string, value: string): void => {
-        data = value;
+      readFile: (path: string): string => {
+        const name = basenameOf(path);
+        if (name === null) {
+          throw new Error('ENOENT');
+        }
+        return files.get(name) ?? '';
       },
-      removeFile: (): void => {
-        data = null;
+      removeFile: (path: string): void => {
+        removeCalls += 1;
+        const name = basenameOf(path);
+        if (name === null) {
+          throw new Error('ENOENT');
+        }
+        files.delete(name);
       },
     },
-    get: (): string | null => data,
-    set: (value: string | null): void => {
-      data = value;
+    create: (dir: string, runtimeId: string, bytes: Buffer): Promise<DescriptorCreation> => {
+      createCalls += 1;
+      if (dir !== anchorPath) {
+        return Promise.resolve({ ok: false, reason: DESCRIPTOR_CREATION_REJECTION.CREATOR_FAILED });
+      }
+      const name = descriptorFilenameFor(runtimeId);
+      if (files.has(name)) {
+        // CREATE_NEW: an existing pathname is an error, never an overwrite.
+        return Promise.resolve({ ok: false, reason: DESCRIPTOR_CREATION_REJECTION.CREATOR_FAILED });
+      }
+      files.set(name, bytes.toString('utf8'));
+      return Promise.resolve({ ok: true });
     },
+    entries: (): ReadonlyMap<string, string> => new Map(files),
+    get: (runtimeId: string): string | null => files.get(descriptorFilenameFor(runtimeId)) ?? null,
+    set: (runtimeId: string, text: string): void => {
+      files.set(descriptorFilenameFor(runtimeId), text);
+    },
+    setRaw: (basename: string, text: string): void => {
+      files.set(basename, text);
+    },
+    remove: (runtimeId: string): void => {
+      files.delete(descriptorFilenameFor(runtimeId));
+    },
+    removeCalls: (): number => removeCalls,
+    createCalls: (): number => createCalls,
   };
 }
+
+/** A pipe probe answering from a fixed table (pipe path -> liveness); default UNKNOWN. */
+export function tableProbe(
+  table: Readonly<Record<string, 'ABSENT' | 'PRESENT' | 'UNKNOWN'>>,
+  fallback: 'ABSENT' | 'PRESENT' | 'UNKNOWN' = 'UNKNOWN',
+): PipeProbe {
+  return (pipePath: string): Promise<'ABSENT' | 'PRESENT' | 'UNKNOWN'> =>
+    Promise.resolve(table[pipePath] ?? fallback);
+}
+
+/** A probe that reports every pipe ABSENT (the "everything crashed" world). */
+export const allAbsentProbe: PipeProbe = () => Promise.resolve('ABSENT');
 
 export function newOrchestrator(): { runtime: AutoflowRuntime; orchestrator: AutoflowOrchestrator } {
   const runtime = new AutoflowRuntime();
@@ -84,19 +177,33 @@ export function newOrchestrator(): { runtime: AutoflowRuntime; orchestrator: Aut
 
 export interface StartServerOptions {
   readonly timeoutMs?: number;
+  readonly probePipe?: PipeProbe;
+  readonly overrides?: Partial<StartControlChannelDeps>;
 }
 
-/** Start a real control-channel server backed by the in-memory store. */
+/**
+ * Start a real control-channel server (real named pipe) backed by the in-memory
+ * anchor. Anchor and descriptor ACL verification pass by injection; creation is
+ * the anchor's CREATE_NEW seam; the pipe probe is the REAL one unless injected,
+ * so liveness reflects the real kernel pipe namespace.
+ */
 export async function startServer(
   orchestrator: AutoflowOrchestrator,
-  store: MemStore,
+  anchor: MemAnchor,
   options: StartServerOptions = {},
 ): Promise<ControlChannelHandle> {
   const handle = await startControlChannel({
     orchestrator,
     verify: passingVerify,
-    descriptorDeps: store.deps,
+    verifyDescriptor: passingDescriptorVerify,
+    descriptorDeps: anchor.deps,
+    createDescriptor: anchor.create,
+    logger: (): void => {
+      /* silent */
+    },
     ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+    ...(options.probePipe === undefined ? {} : { probePipe: options.probePipe }),
+    ...options.overrides,
   });
   if (handle === null) {
     throw new Error('control channel failed to start');
@@ -112,67 +219,59 @@ export interface CliRun {
 
 export interface CallCliOptions {
   readonly descriptorDeps?: DescriptorFileDeps;
+  readonly probePipe?: PipeProbe;
   readonly timeoutMs?: number;
 }
 
-/** Drive the official CLI against the in-memory store (real pipe transport). */
-export async function callCli(store: MemStore, options: CallCliOptions = {}): Promise<CliRun> {
+/** Drive the official CLI against the in-memory anchor (real pipe transport, real probe). */
+export async function callCli(anchor: MemAnchor, options: CallCliOptions = {}): Promise<CliRun> {
   const out: string[] = [];
   const err: string[] = [];
   const outcome = await runControlCli({
     verify: passingVerify,
-    descriptorDeps: options.descriptorDeps ?? store.deps,
+    descriptorDeps: options.descriptorDeps ?? anchor.deps,
     out: (message: string): void => {
       out.push(message);
     },
     err: (message: string): void => {
       err.push(message);
     },
+    ...(options.probePipe === undefined ? {} : { probePipe: options.probePipe }),
     ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
   });
   return { outcome, out, err };
 }
 
-/** The token + pipe path for the descriptor currently in the store. */
-export function descriptorFacts(store: MemStore): { token: Buffer; pipePath: string } {
-  const serialized = store.get();
+/** The parsed descriptor a handle published into the anchor (must exist and be valid). */
+export function descriptorOf(anchor: MemAnchor, handle: ControlChannelHandle): ParsedDescriptor {
+  const serialized = anchor.get(handle.runtimeId);
   if (serialized === null) {
-    throw new Error('no descriptor in store');
+    throw new Error('no descriptor in anchor for handle');
   }
   const parsed = parseDescriptor(serialized);
   if (parsed === null) {
-    throw new Error('descriptor in store is invalid');
+    throw new Error('descriptor in anchor is invalid');
   }
+  return parsed;
+}
+
+/** The token + pipe path for a handle's descriptor. */
+export function descriptorFacts(
+  anchor: MemAnchor,
+  handle: ControlChannelHandle,
+): { token: Buffer; pipePath: string } {
+  const parsed = descriptorOf(anchor, handle);
   return { token: parsed.token, pipePath: pipePathFromName(parsed.descriptor.pipeName) };
 }
 
 /** Produce a descriptor JSON with the same pipe name but a different token. */
 export function withTamperedToken(serialized: string): string {
-  const parsed = JSON.parse(serialized) as {
-    version: 1;
-    pid: number;
-    pipeName: string;
-    token: string;
-  };
+  const parsed = JSON.parse(serialized) as RuntimeDescriptor;
   return serializeDescriptor({
-    version: 1,
-    pid: parsed.pid,
+    version: 2,
     pipeName: parsed.pipeName,
     token: randomBytes(32).toString('base64url'),
   });
-}
-
-/** A fixed descriptorDeps that always returns a given descriptor JSON. */
-export function fixedDescriptorDeps(serialized: string): DescriptorFileDeps {
-  return {
-    readFile: (): string => serialized,
-    writeFile: (): void => {
-      /* no-op */
-    },
-    removeFile: (): void => {
-      /* no-op */
-    },
-  };
 }
 
 export type RawOutcome =
@@ -298,6 +397,22 @@ export function startRogueServer(
       socket.end(frameMessage(buildResultBody(status, macS)));
     });
     socket.write(frameMessage(buildHelloBody(nonceS)));
+  });
+  return new Promise<net.Server>((resolvePromise, rejectPromise) => {
+    server.once('error', rejectPromise);
+    server.listen(pipePath, () => {
+      server.removeListener('error', rejectPromise);
+      resolvePromise(server);
+    });
+  });
+}
+
+/** A silent pipe server holding a name open (a live pipe that speaks no protocol). */
+export function startSilentServer(pipePath: string): Promise<net.Server> {
+  const server = net.createServer((socket: net.Socket) => {
+    socket.on('error', () => {
+      /* ignore */
+    });
   });
   return new Promise<net.Server>((resolvePromise, rejectPromise) => {
     server.once('error', rejectPromise);
