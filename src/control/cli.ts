@@ -12,11 +12,13 @@
  * GitHub, shell, or process command, and never deletes a descriptor.
  *
  * Discovery is bounded and deterministic (see `discoverControlRuntime`): every
- * `runtime-descriptor-<id>.json` in the verified anchor is parsed safely, each
- * valid candidate's pipe is probed, and the command is sent only when EXACTLY ONE
- * candidate's pipe is live. Zero live candidates is "unavailable"; two or more is
- * "ambiguous" and fails closed. Nothing is chosen by mtime, PID, lexicographic
- * order, or last-writer-wins.
+ * `runtime-descriptor-<id>.json` in the verified anchor is first security-verified
+ * (non-reparse identity, exact operator owner, protected operator+SYSTEM DACL —
+ * the same gate the runtime applies to its own file) BEFORE its token is read;
+ * each verified candidate is parsed safely, its pipe is probed, and the command
+ * is sent only when EXACTLY ONE candidate's pipe is live. Zero live candidates is
+ * "unavailable"; two or more is "ambiguous" and fails closed. Nothing is chosen
+ * by mtime, PID, lexicographic order, or last-writer-wins.
  *
  * Critically, it prints an applied outcome **only** when the server's `macS`
  * verifies: a missing, wrong, or replayed server MAC is treated as an

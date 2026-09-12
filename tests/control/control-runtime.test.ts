@@ -375,6 +375,9 @@ function realDescriptorGate(
   return (path: string): Promise<DescriptorAclVerification> =>
     verifyDescriptorAcl(path, {
       systemRoot: 'C:\\Windows',
+      // The in-memory anchor has no real file to lstat; the gate's reparse check
+      // is exercised directly in control-store.test.ts.
+      lstat: () => ({ isSymbolicLink: false, isReparsePoint: false }),
       runProcess: runnerFor(snapshotStdout, seen),
       owner: passingOwnerDeps,
     });

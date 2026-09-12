@@ -128,6 +128,9 @@ export function memAnchor(anchorPath: string = FAKE_ANCHOR): MemAnchor {
         }
         files.delete(name);
       },
+      // The in-memory anchor carries no OS security metadata, so every candidate
+      // is treated as verified here; tests of the discovery gate override this.
+      verifyDescriptor: passingDescriptorVerify,
     },
     create: (dir: string, runtimeId: string, bytes: Buffer): Promise<DescriptorCreation> => {
       createCalls += 1;
@@ -365,10 +368,15 @@ export function rawClient(pipePath: string, options: RawClientOptions): Promise<
   });
 }
 
-/** A rogue server that completes the handshake but signs macS with a wrong token. */
+/**
+ * A rogue server that completes the handshake and signs macS with `token` — a
+ * fresh random (wrong) token by default, or a leaked genuine token to model an
+ * attacker who read an unverified descriptor and can therefore authenticate.
+ */
 export function startRogueServer(
   pipePath: string,
   status: ControlResultStatus = CONTROL_RESULT.APPLIED,
+  token: Buffer = randomBytes(32),
 ): Promise<net.Server> {
   const server = net.createServer((socket: net.Socket) => {
     const nonceS = randomBytes(NONCE_BYTES);
@@ -391,9 +399,8 @@ export function startRogueServer(
         socket.destroy();
         return;
       }
-      const wrongToken = randomBytes(32);
       const resultBytes = Buffer.from(status, 'utf8');
-      const macS = computeServerMac(wrongToken, nonceS, parsed.nonceC, parsed.commandBytes, resultBytes);
+      const macS = computeServerMac(token, nonceS, parsed.nonceC, parsed.commandBytes, resultBytes);
       socket.end(frameMessage(buildResultBody(status, macS)));
     });
     socket.write(frameMessage(buildHelloBody(nonceS)));

@@ -24,10 +24,12 @@ import {
   MAX_DESCRIPTOR_CANDIDATES,
   createRuntimeDescriptor,
   descriptorFilenameFor,
+  descriptorPathFor,
   pipeNameForRuntimeId,
   pipePathFromName,
   serializeDescriptor,
   type DescriptorAclVerification,
+  type DescriptorFileDeps,
 } from '../../src/control/control-store.js';
 import {
   BINDING,
@@ -384,5 +386,97 @@ describe('D062 control channel — the write path is inert during the verificati
     expect(anchor.entries().size).toBe(0); // own descriptor cleaned up
     expect(anchor.removeCalls()).toBe(1);
     expect(runtime.current()?.status).toBe(WORKFLOW_STATUS.OPEN);
+  });
+});
+
+describe('D062 F2 — a discovered descriptor is security-verified BEFORE its token is trusted', () => {
+  /**
+   * The attack shape: a protocol-valid identity-named descriptor that predates
+   * anchor hardening keeps an attacker-readable ACL (hardening the parent never
+   * retrofits a child). The attacker reads its token and serves its pipe, so it
+   * can answer a correctly HMAC-signed APPLIED. With no genuine runtime present
+   * the CLI must still fail closed: EXIT 0 ⇒ APPLIED by a runtime identified
+   * through a CURRENTLY verified descriptor.
+   */
+  function plantLeakedDescriptor(anchor: MemAnchor): { path: string; pipePath: string; token: Buffer } {
+    const leaked = createRuntimeDescriptor();
+    anchor.set(leaked.runtimeId, serializeDescriptor(leaked.descriptor));
+    return {
+      path: descriptorPathFor(anchor.anchorPath, leaked.runtimeId),
+      pipePath: pipePathFromName(leaked.descriptor.pipeName),
+      token: leaked.token,
+    };
+  }
+
+  /** Deps whose security gate rejects exactly `badPath`, logging every verify/read in order. */
+  function gatedDeps(anchor: MemAnchor, badPath: string, log: string[]): DescriptorFileDeps {
+    return {
+      ...anchor.deps,
+      readFile: (path: string): string => {
+        log.push(`read:${path}`);
+        return anchor.deps.readFile?.(path) ?? '';
+      },
+      verifyDescriptor: (path: string): Promise<DescriptorAclVerification> => {
+        log.push(`verify:${path}`);
+        return Promise.resolve(
+          path === badPath ? { ok: false, reason: CONTROL_ANCHOR_REJECTION.DACL_UNPROTECTED } : { ok: true },
+        );
+      },
+    };
+  }
+
+  it('negative control: with the gate (wrongly) passing, the attacker pipe DOES produce an authenticated APPLIED', async () => {
+    const anchor = memAnchor();
+    const leaked = plantLeakedDescriptor(anchor);
+    rogues.push(await startRogueServer(leaked.pipePath, CONTROL_RESULT.APPLIED, leaked.token));
+    const run = await callCli(anchor); // memAnchor's default gate passes everything
+    expect(run.outcome.authenticated).toBe(true);
+    expect(run.outcome.status).toBe(CONTROL_RESULT.APPLIED);
+    expect(run.outcome.exitCode).toBe(0);
+  });
+
+  it('F2. bad-ACL descriptor + attacker pipe holding its token → rejected BEFORE the token is read; never APPLIED, never exit 0', async () => {
+    const anchor = memAnchor();
+    const leaked = plantLeakedDescriptor(anchor);
+    rogues.push(await startRogueServer(leaked.pipePath, CONTROL_RESULT.APPLIED, leaked.token));
+    const log: string[] = [];
+    let probes = 0;
+    const run = await callCli(anchor, {
+      descriptorDeps: gatedDeps(anchor, leaked.path, log),
+      probePipe: (pipePath: string) => {
+        probes += 1;
+        return Promise.resolve(pipePath === leaked.pipePath ? 'PRESENT' : 'ABSENT');
+      },
+    });
+    expect(run.outcome.exitCode).toBe(1);
+    expect(run.outcome.status).toBeNull();
+    expect(run.outcome.authenticated).toBe(false);
+    expect(run.out.some((line) => line.includes('APPLIED'))).toBe(false);
+    expect(run.err.some((line) => line.includes('NO_VERIFIED_CANDIDATES'))).toBe(true);
+    // Exactly where it failed closed: the gate ran on the candidate, and its
+    // token was never read, its pipe never probed, no connection ever made.
+    expect(log).toEqual([`verify:${leaked.path}`]);
+    expect(probes).toBe(0);
+    expect(anchor.removeCalls()).toBe(0);
+  });
+
+  it('F2b. genuine runtime beside the leaked descriptor → only the verified runtime is chosen and APPLIED', async () => {
+    const { runtime, orchestrator } = newOrchestrator();
+    orchestrator.open(BINDING);
+    const anchor = memAnchor();
+    const leaked = plantLeakedDescriptor(anchor);
+    rogues.push(await startRogueServer(leaked.pipePath, CONTROL_RESULT.APPLIED, leaked.token));
+    const handle = await startServer(orchestrator, anchor, { probePipe: () => Promise.resolve('PRESENT') });
+    handles.push(handle);
+    expect(anchor.get(handle.runtimeId)).not.toBeNull();
+    const log: string[] = [];
+    const run = await callCli(anchor, { descriptorDeps: gatedDeps(anchor, leaked.path, log) });
+    expect(run.outcome.status).toBe(CONTROL_RESULT.APPLIED);
+    expect(run.outcome.exitCode).toBe(0);
+    expect(runtime.current()?.status).toBe(WORKFLOW_STATUS.AWAITING_HUMAN_DECISION);
+    // Ordering proof per candidate: verify precedes read; the rejected file is never read.
+    const genuinePath = descriptorPathFor(anchor.anchorPath, handle.runtimeId);
+    expect(log.filter((entry) => entry.endsWith(leaked.path))).toEqual([`verify:${leaked.path}`]);
+    expect(log.filter((entry) => entry.endsWith(genuinePath))).toEqual([`verify:${genuinePath}`, `read:${genuinePath}`]);
   });
 });

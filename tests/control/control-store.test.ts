@@ -40,8 +40,11 @@ import {
   verifyDescriptorAcl,
   verifyDescriptorSnapshot,
   type AclSnapshotAce,
+  type ControlAnchorRejection,
   type CreatorRunner,
+  type DescriptorAclVerification,
   type DescriptorCreatorDeps,
+  type DescriptorFileDeps,
   type LstatProbe,
   type OperatorIdentity,
   type OwnerVerifierDeps,
@@ -588,6 +591,7 @@ describe('D062 descriptor ACL gate — verifyDescriptorSnapshot / verifyDescript
     const calls: { exe: string; args: readonly string[] }[] = [];
     const result = await verifyDescriptorAcl(DESCRIPTOR_PATH, {
       systemRoot: 'C:\\Windows',
+      lstat: okLstat,
       runProcess: runnerFor(DESCRIPTOR_SNAPSHOT, calls),
       owner: passingOwnerDeps,
     });
@@ -600,6 +604,7 @@ describe('D062 descriptor ACL gate — verifyDescriptorSnapshot / verifyDescript
     let helperCalls = 0;
     const result = await verifyDescriptorAcl(DESCRIPTOR_PATH, {
       systemRoot: 'C:\\Windows',
+      lstat: okLstat,
       runProcess: (exe) => {
         if (exe.toLowerCase().includes('whoami')) {
           return Promise.resolve({ ok: false });
@@ -616,10 +621,36 @@ describe('D062 descriptor ACL gate — verifyDescriptorSnapshot / verifyDescript
   it('applies the descriptor policy (SYSTEM required), not the anchor policy', async () => {
     const result = await verifyDescriptorAcl(DESCRIPTOR_PATH, {
       systemRoot: 'C:\\Windows',
+      lstat: okLstat,
       runProcess: runnerFor(snapshot(OPERATOR_SID, [{ sid: OPERATOR_SID }])),
       owner: passingOwnerDeps,
     });
     expect(result).toEqual({ ok: false, reason: CONTROL_ANCHOR_REJECTION.SYSTEM_PRINCIPAL_ABSENT });
+  });
+
+  it('F2. rejects a symlink/reparse descriptor before running any subprocess (the helper follows links)', async () => {
+    let processCalls = 0;
+    const result = await verifyDescriptorAcl(DESCRIPTOR_PATH, {
+      systemRoot: 'C:\\Windows',
+      lstat: () => ({ isSymbolicLink: true, isReparsePoint: false }),
+      runProcess: () => {
+        processCalls += 1;
+        return Promise.resolve({ ok: true, stdout: WHOAMI });
+      },
+      owner: passingOwnerDeps,
+    });
+    expect(result).toEqual({ ok: false, reason: CONTROL_ANCHOR_REJECTION.REPARSE_POINT });
+    expect(processCalls).toBe(0);
+  });
+
+  it('F2. fails closed (never open) when the descriptor path cannot be lstat-ed', async () => {
+    const result = await verifyDescriptorAcl(DESCRIPTOR_PATH, {
+      systemRoot: 'C:\\Windows',
+      lstat: () => null,
+      runProcess: runnerFor(DESCRIPTOR_SNAPSHOT),
+      owner: passingOwnerDeps,
+    });
+    expect(result).toEqual({ ok: false, reason: CONTROL_ANCHOR_REJECTION.COMPONENT_UNREADABLE });
   });
 });
 
@@ -994,7 +1025,7 @@ describe('D062 discovery — deterministic selection over bounded candidates', (
   it('zero candidates → UNAVAILABLE NO_CANDIDATES', async () => {
     const anchor = memAnchor(ANCHOR);
     const result = await discoverControlRuntime(ANCHOR, allAbsentProbe, anchor.deps);
-    expect(result).toEqual({ kind: 'UNAVAILABLE', reason: DISCOVERY_UNAVAILABLE.NO_CANDIDATES, counts: { candidates: 0, malformed: 0, live: 0, dead: 0, unknown: 0 } });
+    expect(result).toEqual({ kind: 'UNAVAILABLE', reason: DISCOVERY_UNAVAILABLE.NO_CANDIDATES, counts: { candidates: 0, unverified: 0, malformed: 0, live: 0, dead: 0, unknown: 0 } });
   });
 
   it('exactly one live candidate → FOUND with that descriptor and token', async () => {
@@ -1022,7 +1053,7 @@ describe('D062 discovery — deterministic selection over bounded candidates', (
     expect(result.kind).toBe('FOUND');
     if (result.kind === 'FOUND') {
       expect(result.parsed.runtimeId).toBe(ids[1]);
-      expect(result.counts).toEqual({ candidates: 3, malformed: 0, live: 1, dead: 2, unknown: 0 });
+      expect(result.counts).toEqual({ candidates: 3, unverified: 0, malformed: 0, live: 1, dead: 2, unknown: 0 });
     }
     expect(anchor.removeCalls()).toBe(0);
   });
@@ -1084,7 +1115,7 @@ describe('D062 discovery — deterministic selection over bounded candidates', (
     expect(result.kind).toBe('FOUND');
     if (result.kind === 'FOUND') {
       expect(result.parsed.runtimeId).toBe(ids[1]);
-      expect(result.counts).toEqual({ candidates: 3, malformed: 0, live: 1, dead: 2, unknown: 0 });
+      expect(result.counts).toEqual({ candidates: 3, unverified: 0, malformed: 0, live: 1, dead: 2, unknown: 0 });
     }
   });
 
@@ -1425,5 +1456,217 @@ describe('D062 creator runner — terminal-cause precedence (real runner, execFi
         expect(result, `exit ${String(code)}`).toEqual({ ok: false, reason: R.CREATOR_FAILED });
       }
     }
+  });
+});
+
+/* ---- F2: discovery verifies every candidate BEFORE reading its token ---------- */
+
+describe('D062 F2 — discovery security-verifies each candidate before its token is read', () => {
+  const DESCRIPTOR_OK = snapshot(OPERATOR_SID, [{ sid: OPERATOR_SID }, { sid: SYSTEM_SID }]);
+  type Gate = (path: string) => Promise<DescriptorAclVerification>;
+
+  /** Deps that log every gate call and every read, in order. */
+  function logged(anchor: ReturnType<typeof memAnchor>, gate: Gate, log: string[]): DescriptorFileDeps {
+    return {
+      ...anchor.deps,
+      readFile: (path: string): string => {
+        log.push(`read:${path}`);
+        return anchor.deps.readFile?.(path) ?? '';
+      },
+      verifyDescriptor: (path: string): Promise<DescriptorAclVerification> => {
+        log.push(`verify:${path}`);
+        return gate(path);
+      },
+    };
+  }
+
+  /** The REAL gate (`verifyDescriptorAcl`) fed a fixed helper snapshot. */
+  function realGate(stdout: string, lstat: LstatProbe = okLstat): Gate {
+    return (path: string): Promise<DescriptorAclVerification> =>
+      verifyDescriptorAcl(path, { systemRoot: 'C:\\Windows', lstat, runProcess: runnerFor(stdout), owner: passingOwnerDeps });
+  }
+
+  /** A gate rejecting exactly `badPath` with `reason`, passing everything else. */
+  function rejecting(badPath: string, reason: ControlAnchorRejection): Gate {
+    return (path: string): Promise<DescriptorAclVerification> =>
+      Promise.resolve(path === badPath ? { ok: false, reason } : { ok: true });
+  }
+
+  it('1/7/12. a valid-ACL live descriptor is discovered through the real gate, in the order verify → read → probe', async () => {
+    const { anchor, ids, pipes } = seeded(1);
+    const path = descriptorPathFor(ANCHOR, ids[0] ?? '');
+    const log: string[] = [];
+    const probe = (pipePath: string): Promise<'PRESENT'> => {
+      log.push(`probe:${pipePath}`);
+      return Promise.resolve('PRESENT');
+    };
+    const result = await discoverControlRuntime(ANCHOR, probe, logged(anchor, realGate(DESCRIPTOR_OK), log));
+    expect(result.kind).toBe('FOUND');
+    if (result.kind === 'FOUND') {
+      expect(result.parsed.runtimeId).toBe(ids[0]);
+      expect(result.counts).toEqual({ candidates: 1, unverified: 0, malformed: 0, live: 1, dead: 0, unknown: 0 });
+    }
+    expect(log).toEqual([`verify:${path}`, `read:${path}`, `probe:${pipes[0] ?? ''}`]);
+  });
+
+  it.each([
+    ['2. foreign owner', snapshot('S-1-5-21-999-888-777-2002', [{ sid: OPERATOR_SID }, { sid: SYSTEM_SID }])],
+    ['2b. SYSTEM owner', snapshot(SYSTEM_SID, [{ sid: OPERATOR_SID }, { sid: SYSTEM_SID }])],
+    ['3. unprotected DACL', snapshot(OPERATOR_SID, [{ sid: OPERATOR_SID }, { sid: SYSTEM_SID }], 'PRESENT', false)],
+    ['3b. NULL DACL', snapshot(OPERATOR_SID, [], 'NULL')],
+    ['4. foreign principal', snapshot(OPERATOR_SID, [{ sid: OPERATOR_SID }, { sid: SYSTEM_SID }, { sid: 'S-1-1-0' }])],
+    ['4b. inherited ACE', snapshot(OPERATOR_SID, [{ sid: OPERATOR_SID, flags: 0x10 }, { sid: SYSTEM_SID }])],
+    ['4c. SYSTEM absent (not creator-made)', snapshot(OPERATOR_SID, [{ sid: OPERATOR_SID }])],
+    ['4d. malformed helper output', 'garbage\n'],
+  ])('%s → unverified: never read, never probed, NO_VERIFIED_CANDIDATES', async (_label, stdout) => {
+    const { anchor, ids } = seeded(1);
+    const path = descriptorPathFor(ANCHOR, ids[0] ?? '');
+    const log: string[] = [];
+    let probes = 0;
+    const result = await discoverControlRuntime(
+      ANCHOR,
+      () => {
+        probes += 1;
+        return Promise.resolve('PRESENT'); // the attacker IS serving the pipe
+      },
+      logged(anchor, realGate(stdout), log),
+    );
+    expect(result).toEqual({
+      kind: 'UNAVAILABLE',
+      reason: DISCOVERY_UNAVAILABLE.NO_VERIFIED_CANDIDATES,
+      counts: { candidates: 1, unverified: 1, malformed: 0, live: 0, dead: 0, unknown: 0 },
+    });
+    expect(log).toEqual([`verify:${path}`]); // the gate ran; the token was never read
+    expect(probes).toBe(0);
+    expect(anchor.removeCalls()).toBe(0);
+  });
+
+  it('5. a symlink/reparse descriptor is rejected by the real gate before any subprocess, read, or probe', async () => {
+    const { anchor, ids } = seeded(1);
+    const path = descriptorPathFor(ANCHOR, ids[0] ?? '');
+    const log: string[] = [];
+    let processCalls = 0;
+    const gate: Gate = (candidate: string) =>
+      verifyDescriptorAcl(candidate, {
+        systemRoot: 'C:\\Windows',
+        lstat: () => ({ isSymbolicLink: true, isReparsePoint: false }),
+        runProcess: () => {
+          processCalls += 1;
+          return Promise.resolve({ ok: true, stdout: WHOAMI });
+        },
+        owner: passingOwnerDeps,
+      });
+    const result = await discoverControlRuntime(ANCHOR, () => Promise.resolve('PRESENT'), logged(anchor, gate, log));
+    expect(result.kind).toBe('UNAVAILABLE');
+    if (result.kind === 'UNAVAILABLE') {
+      expect(result.reason).toBe(DISCOVERY_UNAVAILABLE.NO_VERIFIED_CANDIDATES);
+      expect(result.counts.unverified).toBe(1);
+    }
+    expect(log).toEqual([`verify:${path}`]);
+    expect(processCalls).toBe(0);
+  });
+
+  it('6/10. a protocol-valid bad-ACL descriptor with a PRESENT pipe is never a live runtime and never suppresses the verified one', async () => {
+    const { anchor, ids } = seeded(2);
+    const [bad, good] = ids;
+    const badPath = descriptorPathFor(ANCHOR, bad ?? '');
+    const goodPath = descriptorPathFor(ANCHOR, good ?? '');
+    const log: string[] = [];
+    // Both pipes PRESENT: pre-repair this was AMBIGUOUS (attacker DoS) or, alone, FOUND (attacker chosen).
+    const result = await discoverControlRuntime(
+      ANCHOR,
+      () => Promise.resolve('PRESENT'),
+      logged(anchor, rejecting(badPath, CONTROL_ANCHOR_REJECTION.OWNER_MISMATCH), log),
+    );
+    expect(result.kind).toBe('FOUND');
+    if (result.kind === 'FOUND') {
+      expect(result.parsed.runtimeId).toBe(good);
+      expect(result.parsed.token.equals(parseDescriptor(anchor.get(good ?? ''))?.token ?? Buffer.alloc(0))).toBe(true);
+      expect(result.counts).toEqual({ candidates: 2, unverified: 1, malformed: 0, live: 1, dead: 0, unknown: 0 });
+    }
+    expect(log.filter((entry) => entry.endsWith(badPath))).toEqual([`verify:${badPath}`]);
+    expect(log.filter((entry) => entry.endsWith(goodPath))).toEqual([`verify:${goodPath}`, `read:${goodPath}`]);
+  });
+
+  it('8. two verified live candidates remain AMBIGUOUS', async () => {
+    const { anchor, ids } = seeded(2);
+    const result = await discoverControlRuntime(ANCHOR, () => Promise.resolve('PRESENT'), logged(anchor, realGate(DESCRIPTOR_OK), []));
+    expect(result.kind).toBe('AMBIGUOUS');
+    if (result.kind === 'AMBIGUOUS') {
+      expect([...result.live].sort()).toEqual([...ids].sort());
+      expect(result.counts.unverified).toBe(0);
+    }
+  });
+
+  it('9. an unverified candidate beside a verified DEAD one → NO_LIVE_CANDIDATES, nothing removed', async () => {
+    const { anchor, ids } = seeded(2);
+    const badPath = descriptorPathFor(ANCHOR, ids[0] ?? '');
+    const result = await discoverControlRuntime(
+      ANCHOR,
+      allAbsentProbe,
+      logged(anchor, rejecting(badPath, CONTROL_ANCHOR_REJECTION.DACL_UNPROTECTED), []),
+    );
+    expect(result).toEqual({
+      kind: 'UNAVAILABLE',
+      reason: DISCOVERY_UNAVAILABLE.NO_LIVE_CANDIDATES,
+      counts: { candidates: 2, unverified: 1, malformed: 0, live: 0, dead: 1, unknown: 0 },
+    });
+    expect(anchor.removeCalls()).toBe(0);
+  });
+
+  it('11. UNKNOWN stays fail-closed: verified PRESENT + verified UNKNOWN → AMBIGUOUS; unverified + UNKNOWN → UNAVAILABLE', async () => {
+    const { anchor, ids, pipes } = seeded(2);
+    const firstPath = descriptorPathFor(ANCHOR, ids[0] ?? '');
+    const probe = tableProbe({ [pipes[0] ?? '']: 'PRESENT', [pipes[1] ?? '']: 'UNKNOWN' });
+    const allVerified = await discoverControlRuntime(ANCHOR, probe, logged(anchor, realGate(DESCRIPTOR_OK), []));
+    expect(allVerified.kind).toBe('AMBIGUOUS');
+    const mixed = await discoverControlRuntime(
+      ANCHOR,
+      probe,
+      logged(anchor, rejecting(firstPath, CONTROL_ANCHOR_REJECTION.OWNER_MISMATCH), []),
+    );
+    expect(mixed).toEqual({
+      kind: 'UNAVAILABLE',
+      reason: DISCOVERY_UNAVAILABLE.NO_LIVE_CANDIDATES,
+      counts: { candidates: 2, unverified: 1, malformed: 0, live: 0, dead: 0, unknown: 1 },
+    });
+  });
+
+  it('the gate cannot be bypassed by omission: no injected verifier ⇒ the real fail-closed gate runs and nothing is read', async () => {
+    const { anchor } = seeded(1);
+    const { verifyDescriptor: omitted, ...withoutGate } = anchor.deps;
+    void omitted;
+    const reads: string[] = [];
+    let probes = 0;
+    const result = await discoverControlRuntime(
+      ANCHOR,
+      () => {
+        probes += 1;
+        return Promise.resolve('PRESENT');
+      },
+      {
+        ...withoutGate,
+        readFile: (path: string): string => {
+          reads.push(path);
+          return withoutGate.readFile?.(path) ?? '';
+        },
+      },
+    );
+    // No real file exists at the fake path, so the real gate fails closed at lstat.
+    expect(result.kind).toBe('UNAVAILABLE');
+    if (result.kind === 'UNAVAILABLE') {
+      expect(result.reason).toBe(DISCOVERY_UNAVAILABLE.NO_VERIFIED_CANDIDATES);
+    }
+    expect(reads).toEqual([]);
+    expect(probes).toBe(0);
+  });
+
+  it('stale sweep semantics are distinct and unchanged: the sweep never consults the gate and still removes only ABSENT files', async () => {
+    const { anchor, ids } = seeded(2);
+    const log: string[] = [];
+    const gate: Gate = () => Promise.resolve({ ok: false, reason: CONTROL_ANCHOR_REJECTION.OWNER_MISMATCH });
+    const result = await sweepStaleDescriptors(ANCHOR, null, allAbsentProbe, logged(anchor, gate, log));
+    expect(log.some((entry) => entry.startsWith('verify:'))).toBe(false);
+    expect([...result.removed].sort()).toEqual([...ids].sort());
   });
 });

@@ -1042,14 +1042,24 @@ export async function verifyControlAnchor(
 }
 
 /**
- * Resolve the operator and verify one exact identity-named descriptor file's
- * actual owner + DACL read-only, fail-closed. Runs the same two read-only
- * executables as the anchor gate (whoami and the provenanced helper).
+ * Verify one exact identity-named descriptor file's security read-only,
+ * fail-closed: the file itself must not be a symlink/reparse point (`lstat`,
+ * before any subprocess — the helper's `GetNamedSecurityInfoW` follows links, so
+ * a linked descriptor would otherwise present its target's ACL), then the
+ * operator is resolved and the file's actual owner + DACL are evaluated. Runs
+ * the same two read-only executables as the anchor gate (whoami and the
+ * provenanced helper). This is the ONE descriptor security truth source, used
+ * both for the runtime's own just-created file and for every discovered
+ * candidate before its token is read.
  */
 export async function verifyDescriptorAcl(
   descriptorPath: string,
   deps: VerifyControlAnchorDeps = {},
 ): Promise<DescriptorAclVerification> {
+  const pathSafety = evaluatePathSafety([descriptorPath], deps.lstat ?? defaultLstatProbe);
+  if (!pathSafety.ok) {
+    return { ok: false, reason: pathSafety.reason };
+  }
   const env = deps.env ?? process.env;
   const systemRoot = deps.systemRoot ?? env['SystemRoot'] ?? 'C:\\Windows';
   const runProcess = deps.runProcess ?? defaultProcessRunner(systemRoot);
@@ -1064,7 +1074,10 @@ export async function verifyDescriptorAcl(
  * Descriptor store I/O — identity-named files inside the verified anchor
  * ------------------------------------------------------------------ */
 
-/** Injection seams for descriptor reads, removals, and anchor enumeration. */
+/**
+ * Injection seams for descriptor reads, removals, anchor enumeration, and the
+ * per-candidate security gate discovery runs BEFORE reading a candidate.
+ */
 export interface DescriptorFileDeps {
   /**
    * Basenames inside the anchor as an iterable; throws when the anchor cannot be
@@ -1074,6 +1087,14 @@ export interface DescriptorFileDeps {
   readonly listAnchor?: (anchorPath: string) => Iterable<string>;
   readonly readFile?: (path: string) => string;
   readonly removeFile?: (path: string) => void;
+  /**
+   * Security gate for one exact discovered candidate path, consulted by
+   * {@link discoverControlRuntime} before that candidate's contents (its token)
+   * are read. Omitted ⇒ the real {@link verifyDescriptorAcl} (non-reparse
+   * identity, exact operator owner, protected operator+SYSTEM DACL), so a caller
+   * that injects nothing gets the fail-closed gate, never a bypass.
+   */
+  readonly verifyDescriptor?: (descriptorPath: string) => Promise<DescriptorAclVerification>;
 }
 
 /**
@@ -1431,6 +1452,11 @@ export const DISCOVERY_UNAVAILABLE = Object.freeze({
   NO_CANDIDATES: 'NO_CANDIDATES',
   /** Candidates exist but none has a PRESENT pipe. */
   NO_LIVE_CANDIDATES: 'NO_LIVE_CANDIDATES',
+  /**
+   * Candidates exist but none passed the descriptor security gate (owner,
+   * protected DACL, non-reparse identity); no candidate's token was read.
+   */
+  NO_VERIFIED_CANDIDATES: 'NO_VERIFIED_CANDIDATES',
   /** More candidates than the bounded cap — an anomalous anchor; fail closed. */
   TOO_MANY_CANDIDATES: 'TOO_MANY_CANDIDATES',
   /** More total directory entries than the scan bound — an anomalous anchor. */
@@ -1442,6 +1468,8 @@ export type DiscoveryUnavailableReason =
 
 export interface DiscoveryCounts {
   readonly candidates: number;
+  /** Rejected by the security gate; never read, never probed. */
+  readonly unverified: number;
   readonly malformed: number;
   readonly live: number;
   readonly dead: number;
@@ -1463,9 +1491,12 @@ export type DiscoveryOutcome =
     };
 
 /**
- * Discover the one live control runtime. Enumerates the bounded candidate set,
- * parses each deterministically (malformed files are ignored, never a blocker),
- * probes each valid candidate's pipe, and decides:
+ * Discover the one live control runtime. Enumerates the bounded candidate set
+ * and, for each candidate IN THIS ORDER: (1) runs the descriptor security gate
+ * on the exact candidate path — a candidate that fails it is `unverified`: its
+ * contents are never read, so its token is never held, and its pipe is never
+ * probed; (2) parses it deterministically (malformed files are ignored, never a
+ * blocker); (3) probes its pipe. Then it decides:
  *
  * - exactly one PRESENT candidate ⇒ `FOUND` (the caller then runs the mutual-HMAC
  *   handshake with that candidate's token — the protocol's only message is the
@@ -1475,15 +1506,23 @@ export type DiscoveryOutcome =
  * - two or more PRESENT candidates ⇒ `AMBIGUOUS` (fail closed; nothing is chosen
  *   by mtime, PID, order, or last-writer-wins).
  *
- * Dead (ABSENT) candidates are ignored here; removing them is the runtime's job.
+ * The gate runs first because HMAC only proves possession of the token: a
+ * descriptor that predates anchor hardening can keep an attacker-readable ACL
+ * (hardening the parent never retrofits a child), and whoever read it could
+ * serve its pipe and sign an APPLIED. Skipping an unverified candidate can never
+ * hide a genuine runtime, because the runtime proves its own file with the same
+ * gate at startup and fails closed otherwise. Dead (ABSENT) candidates are
+ * ignored here; removing them is the runtime's job.
  */
 export async function discoverControlRuntime(
   anchorPath: string,
   probe: PipeProbe,
   deps: DescriptorFileDeps = {},
 ): Promise<DiscoveryOutcome> {
+  const verifyDescriptor =
+    deps.verifyDescriptor ?? ((path: string): Promise<DescriptorAclVerification> => verifyDescriptorAcl(path));
   const enumeration = enumerateDescriptorCandidates(anchorPath, deps);
-  const zero: DiscoveryCounts = { candidates: 0, malformed: 0, live: 0, dead: 0, unknown: 0 };
+  const zero: DiscoveryCounts = { candidates: 0, unverified: 0, malformed: 0, live: 0, dead: 0, unknown: 0 };
   if (!enumeration.ok) {
     // Both incomplete states fail closed before any probe; distinguish them so
     // an operator sees why (an unreadable anchor vs. an over-full anchor).
@@ -1503,11 +1542,19 @@ export async function discoverControlRuntime(
   if (enumeration.candidates.length === 0) {
     return { kind: 'UNAVAILABLE', reason: DISCOVERY_UNAVAILABLE.NO_CANDIDATES, counts: zero };
   }
+  let unverified = 0;
   let malformed = 0;
   let dead = 0;
   let unknown = 0;
   const live: { readonly runtimeId: string; readonly parsed: ParsedDescriptor }[] = [];
   for (const candidate of enumeration.candidates) {
+    // Security gate FIRST, on the exact path enumerated: no read, no token, no
+    // probe for a candidate that is not currently verified.
+    const verdict = await verifyDescriptor(candidate.path);
+    if (!verdict.ok) {
+      unverified += 1;
+      continue;
+    }
     const read = readDescriptorCandidate(candidate, deps);
     if (read.kind === 'malformed') {
       malformed += 1;
@@ -1524,6 +1571,7 @@ export async function discoverControlRuntime(
   }
   const counts: DiscoveryCounts = {
     candidates: enumeration.candidates.length,
+    unverified,
     malformed,
     live: live.length,
     dead,
@@ -1540,7 +1588,13 @@ export async function discoverControlRuntime(
     return { kind: 'FOUND', parsed: single.parsed, counts };
   }
   if (live.length === 0) {
-    return { kind: 'UNAVAILABLE', reason: DISCOVERY_UNAVAILABLE.NO_LIVE_CANDIDATES, counts };
+    // Name the honest cause: every candidate failed the gate (none was even
+    // read) vs. verified candidates exist but none has a PRESENT pipe.
+    const reason =
+      unverified === enumeration.candidates.length
+        ? DISCOVERY_UNAVAILABLE.NO_VERIFIED_CANDIDATES
+        : DISCOVERY_UNAVAILABLE.NO_LIVE_CANDIDATES;
+    return { kind: 'UNAVAILABLE', reason, counts };
   }
   return { kind: 'AMBIGUOUS', live: live.map((entry) => entry.runtimeId), counts };
 }
