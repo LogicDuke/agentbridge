@@ -210,12 +210,25 @@ export function runtimeIdFromDescriptorFilename(filename: string): string | null
 }
 
 /* ------------------------------------------------------------------ *
- * Descriptor model (v2)
- * ------------------------------------------------------------------ */
+ * Descriptor model (v4 — DDR-D062-B)
+ * ------------------------------------------------------------------ *
+ *
+ * A descriptor is a RENDEZVOUS HINT, not a credential store for the server
+ * direction. It carries exactly three fields and nothing else:
+ *
+ *     { version: 4, pipeName, token }
+ *
+ * In particular it never carries a `verifyKey`. A file is copyable, so a key
+ * read from disk could only ever prove "these bytes existed somewhere", never
+ * "the process now serving this pipe holds the matching private half". The
+ * verify key is obtained ONLY by attesting the live pipe (see
+ * {@link attestPipeServer}), and a descriptor that carries one is rejected here
+ * as a surplus key rather than quietly ignored.
+ */
 
 /** The hardened per-runtime descriptor written into the verified anchor. */
 export interface RuntimeDescriptor {
-  readonly version: 2;
+  readonly version: 4;
   readonly pipeName: string;
   /** base64url of the 256-bit token — hardened storage only, never elsewhere. */
   readonly token: string;
@@ -238,7 +251,7 @@ export function createRuntimeDescriptor(): ParsedDescriptor {
   const token = randomBytesFn(TOKEN_BYTES);
   const runtimeId = randomBytesFn(RUNTIME_ID_BYTES).toString('hex');
   const descriptor: RuntimeDescriptor = {
-    version: 2,
+    version: 4,
     pipeName: pipeNameForRuntimeId(runtimeId),
     token: encodeBase64Url(token),
   };
@@ -277,7 +290,7 @@ export function parseDescriptor(text: unknown): ParsedDescriptor | null {
   const version = record['version'];
   const pipeName = record['pipeName'];
   const token = record['token'];
-  if (version !== 2 || typeof pipeName !== 'string' || typeof token !== 'string') {
+  if (version !== 4 || typeof pipeName !== 'string' || typeof token !== 'string') {
     return null;
   }
   const runtimeId = runtimeIdFromPipeName(pipeName);
@@ -289,7 +302,7 @@ export function parseDescriptor(text: unknown): ParsedDescriptor | null {
     return null;
   }
   return {
-    descriptor: { version: 2, pipeName, token },
+    descriptor: { version: 4, pipeName, token },
     token: rawToken,
     runtimeId,
   };
@@ -805,8 +818,10 @@ export type DescriptorAclVerification =
 const HELPER_SHA256_PATTERN = /^[0-9a-f]{64}$/;
 /** A safe helper basename: no path separators, drive letters, or traversal. */
 const HELPER_FILENAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
-/** A single canonical SID and nothing else. */
+/** A single canonical SID and nothing else, as a native helper emits it. */
 const CANONICAL_SID_PATTERN = /^S-1-\d+(?:-\d+)+$/;
+/** The same shape after {@link normalizePrincipal} (which lowercases the leading S). */
+const NORMALIZED_SID_PATTERN = /^s-1-\d+(?:-\d+)+$/;
 
 /** SHA-256 of bytes as lowercase hex. */
 function sha256Hex(bytes: Buffer): string {
@@ -981,7 +996,17 @@ export interface VerifyControlAnchorDeps {
 }
 
 export type ControlAnchorVerification =
-  | { readonly ok: true; readonly anchorPath: string }
+  | {
+      readonly ok: true;
+      readonly anchorPath: string;
+      /**
+       * The trusted operator SID this gate already resolved and proved is the
+       * anchor's exact owner. Surfaced (not re-derived) so pipe attestation
+       * compares the serving process against the SAME identity the anchor gate
+       * accepted — one operator identity, one resolution, no second source.
+       */
+      readonly operatorSid: string;
+    }
   | { readonly ok: false; readonly reason: ControlAnchorRejection };
 
 /** Resolve the current operator through the bounded `whoami /user` read. */
@@ -1038,7 +1063,7 @@ export async function verifyControlAnchor(
     return { ok: false, reason: snapshot.reason };
   }
 
-  return { ok: true, anchorPath };
+  return { ok: true, anchorPath, operatorSid: operator.operator.sid };
 }
 
 /**
@@ -1058,6 +1083,202 @@ export async function verifyDescriptorAcl(
     return { ok: false, reason: operator.reason };
   }
   return verifyDescriptorSnapshot(operator.operator, descriptorPath, runProcess, deps.owner);
+}
+
+/* ------------------------------------------------------------------ *
+ * Live pipe-server attestation (DDR-D062-B)
+ * ------------------------------------------------------------------ *
+ *
+ * Every gate above answers a question about a FILE. None of them can answer the
+ * only question that decides whether a pipe may be believed: **who owns the
+ * process that is serving it right now?** A descriptor's bytes are copyable and
+ * a freed pipe name is re-creatable, so neither ACL inspection nor token
+ * possession distinguishes the genuine runtime from a squatter holding a perfect
+ * copy of its descriptor.
+ *
+ * A THIRD build-provenanced native artifact closes that gap. It is resolved
+ * module-relative from its OWN generated provenance and SHA-256-verified before
+ * execution exactly like the other two, then run read-only with a single
+ * argument — the candidate pipe path — and it:
+ *
+ *   1. connects to the pipe (GENERIC_READ only; it can never write a byte);
+ *   2. asks the KERNEL which process serves that pipe;
+ *   3. pins that process against PID reuse by its exact creation time;
+ *   4. reads the pinned process's TokenUser SID;
+ *   5. relays exactly one bounded server hello read from the SAME pipe handle.
+ *
+ * It decides nothing. The evidence is parsed totally here and the SERVER SID is
+ * compared against the trusted operator SID the anchor gate already resolved; a
+ * foreign SID, malformed evidence, or any failure of the artifact fails closed
+ * with no fallback. Only then may the relayed hello's announced key be used, by
+ * the CLI, as the ATTESTED verify key.
+ */
+
+/** Why a pipe could not be attested. Every value is fail-closed. */
+export const PIPE_ATTESTATION_REJECTION = Object.freeze({
+  ATTESTOR_PROVENANCE_MISSING: 'ATTESTOR_PROVENANCE_MISSING',
+  ATTESTOR_MISSING: 'ATTESTOR_MISSING',
+  ATTESTOR_HASH_MISMATCH: 'ATTESTOR_HASH_MISMATCH',
+  /** The trusted operator SID could not be resolved for the comparison. */
+  OPERATOR_UNRESOLVED: 'OPERATOR_UNRESOLVED',
+  /** The artifact did not exit 0 (connect, PID-reuse guard, token, or hello read). */
+  ATTESTATION_FAILED: 'ATTESTATION_FAILED',
+  /** Its stdout is not exactly the AGENTBRIDGE-ATTEST-V1 grammar. */
+  EVIDENCE_MALFORMED: 'EVIDENCE_MALFORMED',
+  /** The pipe is served by a process belonging to some OTHER principal. */
+  SERVER_SID_MISMATCH: 'SERVER_SID_MISMATCH',
+} as const);
+
+export type PipeAttestationRejection =
+  (typeof PIPE_ATTESTATION_REJECTION)[keyof typeof PIPE_ATTESTATION_REJECTION];
+
+/** The bounded evidence one attestation produced. */
+export interface PipeAttestationEvidence {
+  /** Canonical, normalized SID of the process actually serving the pipe. */
+  readonly serverSid: string;
+  /** The exact relayed hello frame BODY bytes; nothing here interprets them. */
+  readonly helloBody: Buffer;
+}
+
+export type PipeAttestation =
+  | { readonly ok: true; readonly evidence: PipeAttestationEvidence }
+  | { readonly ok: false; readonly reason: PipeAttestationRejection };
+
+/** Injection seams for the attestation gate; production defaults use the real build output. */
+export interface PipeAttestorDeps {
+  readonly loadProvenance?: () => Promise<OwnerHelperProvenance | null>;
+  readonly resolveAttestorPath?: (filename: string) => string;
+  readonly readAttestorBytes?: (attestorPath: string) => Buffer | null;
+  readonly hashBytes?: (bytes: Buffer) => string;
+}
+
+/** The pipe attestor's generated provenance module (its own trust root). */
+function defaultLoadAttestorProvenance(): Promise<OwnerHelperProvenance | null> {
+  return loadProvenanceModule('pipe-attestor-provenance.js', 'PIPE_ATTESTOR_PROVENANCE');
+}
+
+const ATTEST_MAGIC = 'AGENTBRIDGE-ATTEST-V1';
+const ATTEST_SID_PREFIX = 'SERVERSID ';
+const ATTEST_HELLO_PREFIX = 'HELLO ';
+/** Hard cap on evidence we are willing to parse (the runner also caps output). */
+const MAX_ATTESTATION_BYTES = 32 * 1024;
+/** Lowercase hex of at most MAX_DESCRIPTOR_BYTES-worth of hello body bytes. */
+const ATTEST_HEX_PATTERN = /^(?:[0-9a-f]{2})+$/;
+
+/**
+ * Parse the attestor's stdout as EXACTLY the three-line AGENTBRIDGE-ATTEST-V1
+ * grammar and nothing else, or `null`. Total and bounded: a wrong magic, a
+ * reordered or missing line, a non-canonical SID, non-canonical or odd-length
+ * hex, an absent or extra trailing newline, any surplus line, or over-length
+ * input all fail closed.
+ */
+export function parseAttestationEvidence(stdout: unknown): PipeAttestationEvidence | null {
+  if (typeof stdout !== 'string' || stdout.length === 0 || stdout.length > MAX_ATTESTATION_BYTES) {
+    return null;
+  }
+  // Exactly three LF-terminated lines: splitting yields four parts, the last
+  // empty. A missing trailing newline, a CR, or any extra byte fails here.
+  const parts = stdout.split('\n');
+  if (parts.length !== 4 || parts[3] !== '') {
+    return null;
+  }
+  const [magic, sidLine, helloLine] = parts;
+  if (magic !== ATTEST_MAGIC || sidLine === undefined || helloLine === undefined) {
+    return null;
+  }
+  if (!sidLine.startsWith(ATTEST_SID_PREFIX) || !helloLine.startsWith(ATTEST_HELLO_PREFIX)) {
+    return null;
+  }
+  const sid = sidLine.slice(ATTEST_SID_PREFIX.length);
+  if (!CANONICAL_SID_PATTERN.test(sid)) {
+    return null;
+  }
+  const hex = helloLine.slice(ATTEST_HELLO_PREFIX.length);
+  if (hex.length === 0 || hex.length > MAX_DESCRIPTOR_BYTES * 2 || !ATTEST_HEX_PATTERN.test(hex)) {
+    return null;
+  }
+  const helloBody = Buffer.from(hex, 'hex');
+  // Round-trip: reject anything Buffer.from would have silently truncated.
+  if (helloBody.length * 2 !== hex.length || helloBody.toString('hex') !== hex) {
+    return null;
+  }
+  return { serverSid: normalizePrincipal(sid), helloBody };
+}
+
+/**
+ * Resolve, hash-verify, and run the read-only pipe attestor against one pipe
+ * path, then require that the process serving that pipe belongs to
+ * `operatorSid`. Fail-closed on every fault, with no fallback path: an
+ * unqueryable server (for example an elevated runtime attested by a
+ * non-elevated client) is out of scope and is rejected, never rescued.
+ */
+export async function attestPipeServer(
+  pipePath: string,
+  operatorSid: string,
+  runProcess: ProcessRunner,
+  deps: PipeAttestorDeps = {},
+): Promise<PipeAttestation> {
+  // The operator SID arrives already normalized by the anchor gate (lowercase);
+  // require the canonical SHAPE so an empty or junk identity can never become the
+  // thing an attested server is compared against.
+  const expectedSid = normalizePrincipal(operatorSid);
+  if (!NORMALIZED_SID_PATTERN.test(expectedSid)) {
+    return { ok: false, reason: PIPE_ATTESTATION_REJECTION.OPERATOR_UNRESOLVED };
+  }
+
+  const provenance = await (deps.loadProvenance ?? defaultLoadAttestorProvenance)();
+  if (
+    provenance === null ||
+    !HELPER_SHA256_PATTERN.test(provenance.sha256) ||
+    !HELPER_FILENAME_PATTERN.test(provenance.filename)
+  ) {
+    return { ok: false, reason: PIPE_ATTESTATION_REJECTION.ATTESTOR_PROVENANCE_MISSING };
+  }
+
+  const attestorPath = (deps.resolveAttestorPath ?? defaultResolveNativePath)(provenance.filename);
+  const bytes = (deps.readAttestorBytes ?? defaultReadNativeBytes)(attestorPath);
+  if (bytes === null) {
+    return { ok: false, reason: PIPE_ATTESTATION_REJECTION.ATTESTOR_MISSING };
+  }
+  const actualHash = (deps.hashBytes ?? sha256Hex)(bytes);
+  if (!digestsEqual(actualHash, provenance.sha256)) {
+    return { ok: false, reason: PIPE_ATTESTATION_REJECTION.ATTESTOR_HASH_MISMATCH };
+  }
+
+  const query = await runProcess(attestorPath, [pipePath]);
+  if (!query.ok) {
+    return { ok: false, reason: PIPE_ATTESTATION_REJECTION.ATTESTATION_FAILED };
+  }
+  const evidence = parseAttestationEvidence(query.stdout);
+  if (evidence === null) {
+    return { ok: false, reason: PIPE_ATTESTATION_REJECTION.EVIDENCE_MALFORMED };
+  }
+  if (evidence.serverSid !== expectedSid) {
+    return { ok: false, reason: PIPE_ATTESTATION_REJECTION.SERVER_SID_MISMATCH };
+  }
+  return { ok: true, evidence };
+}
+
+export interface AttestControlPipeDeps {
+  readonly env?: NodeJS.ProcessEnv;
+  readonly systemRoot?: string;
+  readonly runProcess?: ProcessRunner;
+  readonly attestor?: PipeAttestorDeps;
+}
+
+/**
+ * Attest one candidate control pipe against the trusted operator SID, using the
+ * same bounded read-only process runner the other native gates use.
+ */
+export function attestControlPipe(
+  pipePath: string,
+  operatorSid: string,
+  deps: AttestControlPipeDeps = {},
+): Promise<PipeAttestation> {
+  const env = deps.env ?? process.env;
+  const systemRoot = deps.systemRoot ?? env['SystemRoot'] ?? 'C:\\Windows';
+  const runProcess = deps.runProcess ?? defaultProcessRunner(systemRoot);
+  return attestPipeServer(pipePath, operatorSid, runProcess, deps.attestor);
 }
 
 /* ------------------------------------------------------------------ *

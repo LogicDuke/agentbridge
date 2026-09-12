@@ -186,13 +186,13 @@ describe('D062 runtime identity — strict [0-9a-f]{32}', () => {
 
 /* ---- descriptor model v2 ---------------------------------------------------- */
 
-describe('D062 descriptor model v2', () => {
+describe('D062 descriptor model v4', () => {
   it('mints a 256-bit token, a 128-bit runtime id, and a pipe name carrying that id — no PID', () => {
     const { descriptor, token, runtimeId } = createRuntimeDescriptor();
     expect(token.length).toBe(32);
     expect(isRuntimeId(runtimeId)).toBe(true);
     expect(descriptor.pipeName).toBe(`agentbridge-control-${runtimeId}`);
-    expect(descriptor.version).toBe(2);
+    expect(descriptor.version).toBe(4);
     expect(Object.keys(descriptor)).toEqual(['version', 'pipeName', 'token']);
     expect('pid' in descriptor).toBe(false);
   });
@@ -218,7 +218,7 @@ describe('D062 descriptor model v2', () => {
     const { descriptor } = createRuntimeDescriptor();
     expect(parseDescriptor('not json')).toBeNull();
     expect(parseDescriptor('[]')).toBeNull();
-    expect(parseDescriptor(JSON.stringify({ version: 2, pipeName: 'x', token: 'y' }))).toBeNull();
+    expect(parseDescriptor(JSON.stringify({ version: 4, pipeName: 'x', token: 'y' }))).toBeNull();
     // Legacy v1 shape (pid-bearing) is not a v2 descriptor.
     expect(parseDescriptor(JSON.stringify({ version: 1, pid: 1, pipeName: descriptor.pipeName, token: descriptor.token }))).toBeNull();
     // Extra field.
@@ -438,7 +438,7 @@ describe('D062 verifyControlAnchor — end-to-end with injected OS adapters', ()
       lstat: okLstat,
       owner: passingOwnerDeps,
     });
-    expect(result).toEqual({ ok: true, anchorPath: ANCHOR });
+    expect(result).toEqual({ ok: true, anchorPath: ANCHOR, operatorSid: OPERATOR.sid });
   });
 
   it.each([
@@ -936,7 +936,7 @@ describe('D062 stale sweep — only ABSENT pipes authorize removal of exactly th
     // The sweep carries the SAME scanned count out of the one pass (no re-enumeration).
     const anchor = memAnchor(ANCHOR);
     for (const id of realIds) {
-      anchor.set(id, serializeDescriptor({ version: 2, pipeName: pipeNameForRuntimeId(id), token: 'x' }));
+      anchor.set(id, serializeDescriptor({ version: 4, pipeName: pipeNameForRuntimeId(id), token: 'x' }));
     }
     for (const name of noise) {
       anchor.setRaw(name, 'x');

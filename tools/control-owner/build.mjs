@@ -15,7 +15,7 @@
  * the gate and is rebuilt. The source identity function is the ONE shared with the
  * gate (helper-pair.mjs), so producer and acceptor cannot drift.
  *
- * TWO artifacts are built, with SEPARATE identities and SEPARATE provenance modules.
+ * THREE artifacts are built, with SEPARATE identities and SEPARATE provenance modules.
  * Neither can stand in for the other: each generated module exports its own binding
  * name, and each runtime consumer hashes its own binary against its own provenance
  * before executing it.
@@ -26,11 +26,14 @@
  *   agentbridge-win-descriptor-create.c -> agentbridge-win-descriptor-create.exe
  *                                          descriptor-creator-provenance.js
  *                                          (CREATE-ONLY identity-named descriptor)
+ *   agentbridge-win-pipe-attest.c       -> agentbridge-win-pipe-attest.exe
+ *                                          pipe-attestor-provenance.js
+ *                                          (READ-ONLY live pipe-server identity relayer)
  *
  * Every artifact is compiled inside the SAME private, per-invocation workspace but in
  * its OWN object directory and to its OWN private executable path, so no mutable
  * compilation state is shared — neither between concurrent builders nor between the
- * two artifacts of one builder. Publication stays atomic and idempotent per artifact.
+ * artifacts of one builder. Publication stays atomic and idempotent per artifact.
  *
  * This build script is not part of the runtime trust path; it is a build tool.
  * It uses no shell: every external program is invoked by absolute path with an
@@ -52,10 +55,13 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
+  ATTESTOR_PROVENANCE_BASENAME,
   CREATOR_PROVENANCE_BASENAME,
   DESCRIPTOR_CREATOR_BASENAME,
   OWNER_HELPER_BASENAME,
+  PIPE_ATTESTOR_BASENAME,
   PROVENANCE_BASENAME,
+  encodeAttestorProvenance,
   encodeCreatorProvenance,
   encodeProvenance,
 } from './provenance-format.mjs';
@@ -64,6 +70,7 @@ import {
 import {
   DESCRIPTOR_CREATOR_SOURCE_PATH,
   OWNER_HELPER_SOURCE_PATH,
+  PIPE_ATTESTOR_SOURCE_PATH,
   sourceIdFor,
 } from './helper-pair.mjs';
 import { compileArgsFor, compileEnvFor, resolveBuildToolchain } from './msvc-toolchain.mjs';
@@ -96,6 +103,14 @@ const ARTIFACTS = [
     basename: DESCRIPTOR_CREATOR_BASENAME,
     provenanceBasename: CREATOR_PROVENANCE_BASENAME,
     encode: encodeCreatorProvenance,
+  },
+  {
+    key: 'attestor',
+    label: 'pipe attestor',
+    source: PIPE_ATTESTOR_SOURCE_PATH,
+    basename: PIPE_ATTESTOR_BASENAME,
+    provenanceBasename: ATTESTOR_PROVENANCE_BASENAME,
+    encode: encodeAttestorProvenance,
   },
 ];
 

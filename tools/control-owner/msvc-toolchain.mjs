@@ -240,9 +240,11 @@ export function defaultRunCompiler(cl, args, { cwd, env }) {
  * FileDispositionInfo class and the FileDispositionInfoEx class +
  * FILE_DISPOSITION_INFO_EX / FILE_DISPOSITION_FLAG_* the creator's delete-on-close
  * cancellation needs (declared only by Windows SDK 10.0.14393 / RS1 and later, so
- * an older SDK fails here instead of at the creator build). A header missing inside
- * an existing include dir, or an import library missing inside an existing lib dir,
- * fails the probe exactly as it would fail the real build, for both artifacts.
+ * an older SDK fails here instead of at the creator build). It also references the
+ * named-pipe server-process resolution and process creation-time pinning the pipe
+ * attestor's PID-reuse guard needs. A header missing inside an existing include dir,
+ * or an import library missing inside an existing lib dir, fails the probe exactly as
+ * it would fail the real build, for EVERY artifact.
  * `wmain` + /SUBSYSTEM:CONSOLE matches their entry/link shape.
  */
 export const PROBE_SOURCE =
@@ -268,6 +270,9 @@ export const PROBE_SOURCE =
   '  SID_IDENTIFIER_AUTHORITY nt = SECURITY_NT_AUTHORITY;\n' +
   '  FILE_DISPOSITION_INFO disposition;\n' +
   '  FILE_DISPOSITION_INFO_EX retain;\n' +
+  '  DWORD server_pid = 0;\n' +
+  '  FILETIME created, exited, kernel_time, user_time;\n' +
+  '  HANDLE proc = NULL;\n' +
   '  wchar_t buf[8];\n' +
   '  (void)_setmode(_fileno(stdout), _O_BINARY);\n' +
   '  memset(buf, 0, sizeof buf);\n' +
@@ -306,6 +311,18 @@ export const PROBE_SOURCE =
   '  (void)SetFileInformationByHandle(GetStdHandle(STD_OUTPUT_HANDLE),\n' +
   '                                   FileDispositionInfoEx, &retain,\n' +
   '                                   sizeof retain);\n' +
+  '  if (GetNamedPipeServerProcessId(GetStdHandle(STD_INPUT_HANDLE), &server_pid) &&\n' +
+  '      server_pid != 0) {\n' +
+  '    proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE,\n' +
+  '                       server_pid);\n' +
+  '    if (proc != NULL) {\n' +
+  '      if (GetProcessTimes(proc, &created, &exited, &kernel_time, &user_time) &&\n' +
+  '          WaitForSingleObject(proc, 0) == WAIT_TIMEOUT) {\n' +
+  '        (void)created.dwLowDateTime;\n' +
+  '      }\n' +
+  '      CloseHandle(proc);\n' +
+  '    }\n' +
+  '  }\n' +
   '  return 0;\n' +
   '}\n';
 

@@ -16,6 +16,7 @@ import {
   BINDING,
   delay,
   descriptorFacts,
+  identityOf,
   memAnchor,
   newOrchestrator,
   rawClient,
@@ -39,10 +40,10 @@ describe('D062 control channel — server-level adversarial (real named pipe)', 
     const { token, pipePath } = descriptorFacts(store, handle);
 
     const outcome = await rawClient(pipePath, {
-      onHello: (): Buffer => {
+      onHello: (_nonceS: Buffer, verifyKey: Buffer): Buffer => {
         const staleNonceS = randomBytes(NONCE_BYTES);
         const nonceC = randomBytes(NONCE_BYTES);
-        const mac = computeClientMac(token, staleNonceS, nonceC, CMD);
+        const mac = computeClientMac(token, identityOf(handle, verifyKey), staleNonceS, nonceC, CMD);
         return frameMessage(buildRequestBody(nonceC, CONTROL_COMMAND.OPEN_HUMAN_GATE, mac));
       },
     });
@@ -62,10 +63,16 @@ describe('D062 control channel — server-level adversarial (real named pipe)', 
     const { pipePath } = descriptorFacts(store, handle);
 
     const outcome = await rawClient(pipePath, {
-      onHello: (nonceS: Buffer): Buffer => {
+      onHello: (nonceS: Buffer, verifyKey: Buffer): Buffer => {
         const nonceC = randomBytes(NONCE_BYTES);
         // MAC with a random wrong token.
-        const mac = computeClientMac(randomBytes(32), nonceS, nonceC, CMD);
+        const mac = computeClientMac(
+          randomBytes(32),
+          identityOf(handle, verifyKey),
+          nonceS,
+          nonceC,
+          CMD,
+        );
         return frameMessage(buildRequestBody(nonceC, CONTROL_COMMAND.OPEN_HUMAN_GATE, mac));
       },
     });
@@ -85,10 +92,10 @@ describe('D062 control channel — server-level adversarial (real named pipe)', 
     const { token, pipePath } = descriptorFacts(store, handle);
 
     const outcome = await rawClient(pipePath, {
-      onHello: (nonceS: Buffer): Buffer => {
+      onHello: (nonceS: Buffer, verifyKey: Buffer): Buffer => {
         const nonceC = randomBytes(NONCE_BYTES);
         const badCmd = Buffer.from('CLOSE_REQUESTED', 'utf8');
-        const mac = computeClientMac(token, nonceS, nonceC, badCmd);
+        const mac = computeClientMac(token, identityOf(handle, verifyKey), nonceS, nonceC, badCmd);
         return frameMessage(buildRequestBody(nonceC, 'CLOSE_REQUESTED', mac));
       },
     });
@@ -188,9 +195,15 @@ describe('D062 control channel — server-level adversarial (real named pipe)', 
     // The server is still alive and correctly rejects a stale-nonce replay.
     const { token } = descriptorFacts(store, handle);
     const followUp = await rawClient(pipePath, {
-      onHello: (): Buffer => {
+      onHello: (_nonceS: Buffer, verifyKey: Buffer): Buffer => {
         const nonceC = randomBytes(NONCE_BYTES);
-        const mac = computeClientMac(token, randomBytes(NONCE_BYTES), nonceC, CMD);
+        const mac = computeClientMac(
+          token,
+          identityOf(handle, verifyKey),
+          randomBytes(NONCE_BYTES),
+          nonceC,
+          CMD,
+        );
         return frameMessage(buildRequestBody(nonceC, CONTROL_COMMAND.OPEN_HUMAN_GATE, mac));
       },
     });
@@ -220,14 +233,20 @@ describe('D062 control channel — server-level adversarial (real named pipe)', 
         if (carry.length < 4 + length) {
           return;
         }
-        const nonceS = parseHelloBody(carry.subarray(4, 4 + length));
-        if (nonceS === null) {
+        const hello = parseHelloBody(carry.subarray(4, 4 + length));
+        if (hello === null) {
           socket.destroy();
           resolvePromise();
           return;
         }
         const nonceC = randomBytes(NONCE_BYTES);
-        const mac = computeClientMac(token, nonceS, nonceC, CMD);
+        const mac = computeClientMac(
+          token,
+          identityOf(handle, hello.verifyKey),
+          hello.nonceS,
+          nonceC,
+          CMD,
+        );
         socket.write(frameMessage(buildRequestBody(nonceC, CONTROL_COMMAND.OPEN_HUMAN_GATE, mac)));
         // Give the server time to receive + dispatch, then vanish before result.
         setTimeout(() => {

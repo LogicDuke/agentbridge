@@ -4,12 +4,13 @@
  * unsupported).
  *
  * It may only: verify the hardened control anchor, discover the one live
- * identity-named descriptor, connect to that runtime's pipe, perform the mutual
- * HMAC handshake, submit **one** `OPEN_HUMAN_GATE`, authenticate the server
- * response, and print a bounded result. It constructs no `WorkflowEvent`, holds
- * no `WorkflowState` authority, accepts no arbitrary event, and takes no
- * commit/repository/workflow selector as command authority. It runs no Git,
- * GitHub, shell, or process command, and never deletes a descriptor.
+ * identity-named descriptor, ATTEST the pipe that descriptor points at, connect
+ * to that same pipe, perform the handshake, submit **one** `OPEN_HUMAN_GATE`,
+ * authenticate the server response, and print a bounded result. It constructs no
+ * `WorkflowEvent`, holds no `WorkflowState` authority, accepts no arbitrary
+ * event, and takes no commit/repository/workflow selector as command authority.
+ * It runs no Git, GitHub, shell, or process command other than the two
+ * build-provenanced read-only native artifacts, and never deletes a descriptor.
  *
  * Discovery is bounded and deterministic (see `discoverControlRuntime`): every
  * `runtime-descriptor-<id>.json` in the verified anchor is parsed safely, each
@@ -18,15 +19,59 @@
  * "ambiguous" and fails closed. Nothing is chosen by mtime, PID, lexicographic
  * order, or last-writer-wins.
  *
- * Critically, it prints an applied outcome **only** when the server's `macS`
- * verifies: a missing, wrong, or replayed server MAC is treated as an
- * authentication failure and never reported as `APPLIED`.
+ * ## The descriptor is a hint; the pipe is the evidence (DDR-D062-B)
+ *
+ * Nothing in a descriptor is treated as a credential for the SERVER direction.
+ * A descriptor supplies a pipe name to rendezvous at and a token to authorize
+ * this client's command with — that is all it may do, and it carries no
+ * `verifyKey` to trust even if someone plants one.
+ *
+ * Before any command is sent, the native pipe attestor is run against the
+ * discovered pipe path. It asks the KERNEL which process serves that pipe, pins
+ * that process against PID reuse by its creation time, reads its TokenUser SID,
+ * and relays exactly one bounded hello read from the SAME pipe handle. This CLI
+ * then requires:
+ *
+ *   1. the attested SERVER SID to equal the trusted operator SID the anchor gate
+ *      already resolved and proved owns the anchor; and
+ *   2. the command session's own hello to announce the VERY SAME `verifyKey`
+ *      bytes the attested hello announced.
+ *
+ * (2) is what binds the second connection to the first: whether the kernel
+ * routes a later connect to the same pipe instance or a different one, either
+ * outcome must present the attested key or the session is abandoned. A runtime
+ * that restarted between attestation and the command session mints a fresh
+ * keypair and therefore fails (2).
+ *
+ * Only then is `OPEN_HUMAN_GATE` sent, MAC'd with the token (client-to-server
+ * only), and the result is believed **only** when its Ed25519 `sigS` verifies
+ * against the ATTESTED key over a transcript binding that runtime's id, pipe
+ * name and key, both nonces, and the exact command and result bytes. A missing,
+ * wrong, cross-runtime, or replayed signature is an authentication failure and
+ * is never reported as `APPLIED`. There is no path by which a token-authenticated
+ * result could be accepted, because no such primitive exists any more.
+ *
+ * Because the signing key is ephemeral and lives only in the genuine runtime's
+ * memory, a party serving a squatted pipe with a byte-identical copy of a genuine
+ * descriptor can neither pass attestation (wrong SID) nor produce `sigS`, and can
+ * never make this CLI exit 0. The CLI's own `nonceC` is fresh per connection, so
+ * a signature harvested from a live runtime is useless here once that runtime is
+ * gone.
+ *
+ * Every attestation, session, key, or signature failure is a nonzero exit with no
+ * fallback to a weaker check.
  */
 
 import net from 'node:net';
 import { randomBytes } from 'node:crypto';
 
-import { computeClientMac, computeServerMac, macEqual, NONCE_BYTES } from './control-auth.js';
+import {
+  computeClientMac,
+  macEqual,
+  verifyServerResult,
+  NONCE_BYTES,
+  type ChannelIdentity,
+} from './control-auth.js';
 import {
   CONTROL_COMMAND,
   CONTROL_RESULT,
@@ -43,12 +88,15 @@ import {
   parseResultBody,
 } from './control-channel.js';
 import {
+  attestControlPipe,
   defaultPipeProbe,
   discoverControlRuntime,
   pipePathFromName,
   verifyControlAnchor,
+  type AttestControlPipeDeps,
   type ControlAnchorVerification,
   type DescriptorFileDeps,
+  type PipeAttestation,
   type PipeProbe,
   type VerifyControlAnchorDeps,
 } from './control-store.js';
@@ -58,11 +106,16 @@ export type ConnectFn = (pipePath: string) => net.Socket;
 
 const defaultConnect: ConnectFn = (pipePath: string): net.Socket => net.connect(pipePath);
 
+/** Attest one live pipe against the trusted operator SID. Injectable for tests. */
+export type AttestFn = (pipePath: string, operatorSid: string) => Promise<PipeAttestation>;
+
 export interface RunControlCliDeps {
   readonly env?: NodeJS.ProcessEnv;
   readonly verify?: (deps: VerifyControlAnchorDeps) => Promise<ControlAnchorVerification>;
   readonly descriptorDeps?: DescriptorFileDeps;
   readonly probePipe?: PipeProbe;
+  readonly attest?: AttestFn;
+  readonly attestDeps?: AttestControlPipeDeps;
   readonly connect?: ConnectFn;
   readonly nonceGen?: () => Buffer;
   readonly timeoutMs?: number;
@@ -85,6 +138,8 @@ interface ClientProtocolOutcome {
 interface ClientProtocolArgs {
   readonly connect: ConnectFn;
   readonly pipePath: string;
+  /** Carries the ATTESTED verify key; the session hello must match it exactly. */
+  readonly identity: ChannelIdentity;
   readonly token: Buffer;
   readonly nonceGen: () => Buffer;
   readonly timeoutMs: number;
@@ -114,13 +169,29 @@ function runClientProtocol(args: ClientProtocolArgs): Promise<ClientProtocolOutc
 
     const handleFrame = (body: Buffer): void => {
       if (phase === 'hello') {
-        nonceS = parseHelloBody(body);
-        if (nonceS === null) {
+        const hello = parseHelloBody(body);
+        if (hello === null) {
           finish({ authenticated: false, status: null, errorMessage: 'bad server hello' });
           return;
         }
+        // KEY BINDING. This session must be served by the same runtime identity
+        // attestation proved, whichever pipe instance the kernel routed us to.
+        // A takeover of the freed pipe name, or a restarted runtime that minted
+        // a fresh keypair, announces different bytes and is abandoned here —
+        // before the command is ever sent. (`macEqual` is a length-guarded
+        // constant-time buffer compare; the key is public, but there is no
+        // reason to compare it any less carefully.)
+        if (!macEqual(hello.verifyKey, args.identity.verifyKey)) {
+          finish({
+            authenticated: false,
+            status: null,
+            errorMessage: 'server identity does not match the attested runtime',
+          });
+          return;
+        }
+        nonceS = hello.nonceS;
         nonceC = args.nonceGen();
-        const macC = computeClientMac(args.token, nonceS, nonceC, commandBytes);
+        const macC = computeClientMac(args.token, args.identity, nonceS, nonceC, commandBytes);
         phase = 'result';
         socket.write(frameMessage(buildRequestBody(nonceC, CONTROL_COMMAND.OPEN_HUMAN_GATE, macC)));
         return;
@@ -130,14 +201,15 @@ function runClientProtocol(args: ClientProtocolArgs): Promise<ClientProtocolOutc
         finish({ authenticated: false, status: null, errorMessage: 'bad server result' });
         return;
       }
-      const expected = computeServerMac(
-        args.token,
+      const verified = verifyServerResult(
+        args.identity,
         nonceS,
         nonceC,
         commandBytes,
         Buffer.from(parsed.result, 'utf8'),
+        parsed.sig,
       );
-      if (!macEqual(expected, parsed.mac)) {
+      if (!verified) {
         finish({ authenticated: false, status: null, errorMessage: 'server authentication failed' });
         return;
       }
@@ -188,14 +260,20 @@ function runClientProtocol(args: ClientProtocolArgs): Promise<ClientProtocolOutc
 }
 
 /**
- * Verify the anchor, discover the one live runtime, run the handshake, and
- * report a bounded outcome. Never prints `APPLIED` unless the server
- * authenticated; never sends the command when discovery is ambiguous.
+ * Verify the anchor, discover the one live runtime, attest the process serving
+ * its pipe, run the handshake against the attested identity, and report a
+ * bounded outcome. Never prints `APPLIED` unless the server authenticated with a
+ * signature under the attested key; never sends the command when discovery is
+ * ambiguous or attestation fails.
  */
 export async function runControlCli(deps: RunControlCliDeps = {}): Promise<ControlCliOutcome> {
   const env = deps.env ?? process.env;
   const verify = deps.verify ?? verifyControlAnchor;
   const probePipe = deps.probePipe ?? defaultPipeProbe();
+  const attest: AttestFn =
+    deps.attest ??
+    ((pipePath: string, operatorSid: string): Promise<PipeAttestation> =>
+      attestControlPipe(pipePath, operatorSid, deps.attestDeps ?? { env }));
   const connect = deps.connect ?? defaultConnect;
   const nonceGen = deps.nonceGen ?? ((): Buffer => randomBytes(NONCE_BYTES));
   const timeoutMs = deps.timeoutMs ?? DEFAULT_CONNECTION_TIMEOUT_MS;
@@ -229,9 +307,32 @@ export async function runControlCli(deps: RunControlCliDeps = {}): Promise<Contr
     return { exitCode: 1, status: null, authenticated: false };
   }
 
+  const pipePath = pipePathFromName(discovery.parsed.descriptor.pipeName);
+
+  // Attest the LIVE pipe before anything is sent to it. The descriptor got us
+  // here; it grants nothing beyond that.
+  const attestation = await attest(pipePath, verification.operatorSid);
+  if (!attestation.ok) {
+    err(`agentbridge-control: pipe attestation failed (${attestation.reason}).`);
+    return { exitCode: 1, status: null, authenticated: false };
+  }
+  // The relayed hello is parsed by the SAME total parser the session hello uses,
+  // so malformed, truncated, extra-keyed, or non-canonical relayed bytes fail
+  // closed here rather than yielding a half-trusted key.
+  const attestedHello = parseHelloBody(attestation.evidence.helloBody);
+  if (attestedHello === null) {
+    err('agentbridge-control: pipe attestation failed (ATTESTED_HELLO_MALFORMED).');
+    return { exitCode: 1, status: null, authenticated: false };
+  }
+
   const outcome = await runClientProtocol({
     connect,
-    pipePath: pipePathFromName(discovery.parsed.descriptor.pipeName),
+    pipePath,
+    identity: {
+      runtimeId: discovery.parsed.runtimeId,
+      pipeName: discovery.parsed.descriptor.pipeName,
+      verifyKey: attestedHello.verifyKey,
+    },
     token: discovery.parsed.token,
     nonceGen,
     timeoutMs,

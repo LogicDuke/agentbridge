@@ -31,6 +31,8 @@ import {
 } from '../../src/control/control-store.js';
 import {
   BINDING,
+  FOREIGN_OPERATOR_SID,
+  attestDouble,
   callCli,
   closeServer,
   descriptorFacts,
@@ -111,7 +113,7 @@ describe('D062 control channel — end-to-end via the official CLI', () => {
     }
   });
 
-  it('a wrong client token → server rejects; the CLI never reports APPLIED; state unchanged', async () => {
+  it('a wrong client token → the GENUINE runtime answers AUTH_FAILED, authentically; state unchanged', async () => {
     const { runtime, orchestrator } = newOrchestrator();
     orchestrator.open(BINDING);
     const anchor = memAnchor();
@@ -123,14 +125,19 @@ describe('D062 control channel — end-to-end via the official CLI', () => {
     tampered.set(handle.runtimeId, withTamperedToken(anchor.get(handle.runtimeId) ?? ''));
     const run = await callCli(anchor, { descriptorDeps: tampered.deps });
 
-    expect(run.outcome.authenticated).toBe(false);
-    expect(run.outcome.status).toBeNull();
+    // The result direction no longer depends on the token, so a bad token now
+    // yields a genuine, SIGNED refusal rather than an unverifiable answer: the
+    // operator learns the true outcome. It is still never APPLIED and still
+    // exits nonzero.
+    expect(run.outcome.authenticated).toBe(true);
+    expect(run.outcome.status).toBe(CONTROL_RESULT.AUTH_FAILED);
+    expect(run.outcome.exitCode).toBe(1);
     expect(run.out.some((line) => line.includes('APPLIED'))).toBe(false);
     // Domain state must be untouched by a rejected control attempt.
     expect(runtime.current()?.status).toBe(WORKFLOW_STATUS.OPEN);
   });
 
-  it('a rogue server returning APPLIED with a bad server MAC → the CLI refuses to trust it', async () => {
+  it('a rogue server on a FOREIGN SID that returns APPLIED is rejected at attestation', async () => {
     const anchor = memAnchor();
     const { orchestrator } = newOrchestrator();
     const handle = await startServer(orchestrator, anchor);
@@ -141,14 +148,19 @@ describe('D062 control channel — end-to-end via the official CLI', () => {
     preserved.set(handle.runtimeId, anchor.get(handle.runtimeId) ?? '');
     // Stop the genuine server so the rogue can claim the pipe name.
     await handle.close();
-    const rogue = await startRogueServer(facts.pipePath, CONTROL_RESULT.APPLIED);
+    const rogue = await startRogueServer(facts.pipePath, { status: CONTROL_RESULT.APPLIED });
     rogues.push(rogue);
 
-    const run = await callCli(anchor, { descriptorDeps: preserved.deps });
+    // The squatter runs as another account: the attested SERVER SID is not the
+    // trusted operator's, so no command is ever sent.
+    const run = await callCli(anchor, {
+      descriptorDeps: preserved.deps,
+      attest: attestDouble({ serverSid: FOREIGN_OPERATOR_SID }),
+    });
     expect(run.outcome.authenticated).toBe(false);
     expect(run.outcome.status).toBeNull();
     expect(run.out.some((line) => line.includes('APPLIED'))).toBe(false);
-    expect(run.err.some((line) => line.toLowerCase().includes('authentication'))).toBe(true);
+    expect(run.err.some((line) => line.includes('SERVER_SID_MISMATCH'))).toBe(true);
   });
 });
 
@@ -258,7 +270,7 @@ describe('D062 discovery — identity-named candidates over real pipes (19–23)
     handles.push(await startServer(orchestrator, anchor));
     for (let index = 0; index < MAX_DESCRIPTOR_CANDIDATES; index += 1) {
       const id = index.toString(16).padStart(32, '0');
-      anchor.set(id, serializeDescriptor({ version: 2, pipeName: pipeNameForRuntimeId(id), token: 'x' }));
+      anchor.set(id, serializeDescriptor({ version: 4, pipeName: pipeNameForRuntimeId(id), token: 'x' }));
     }
     const run = await callCli(anchor);
     expect(run.outcome.status).toBeNull();

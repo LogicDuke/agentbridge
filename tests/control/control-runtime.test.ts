@@ -458,10 +458,10 @@ describe('D062 lifecycle v2 — descriptor verification fails closed (real evalu
   it('11. a malformed / foreign-content descriptor read back after creation fails closed', async () => {
     const cases: readonly [string, (id: string, bytes: Buffer) => string][] = [
       ['not JSON', (): string => '{ not json'],
-      ['different token', (id): string => serializeDescriptor({ version: 2, pipeName: pipeNameForRuntimeId(id), token: Buffer.alloc(32, 7).toString('base64url') })],
+      ['different token', (id): string => serializeDescriptor({ version: 4, pipeName: pipeNameForRuntimeId(id), token: Buffer.alloc(32, 7).toString('base64url') })],
       ['different pipe name', (_id, bytes): string => {
         const parsed = JSON.parse(bytes.toString('utf8')) as { token: string };
-        return serializeDescriptor({ version: 2, pipeName: pipeNameForRuntimeId('f'.repeat(32)), token: parsed.token });
+        return serializeDescriptor({ version: 4, pipeName: pipeNameForRuntimeId('f'.repeat(32)), token: parsed.token });
       }],
       ['legacy v1 shape with pid', (_id, bytes): string => {
         const parsed = JSON.parse(bytes.toString('utf8')) as { pipeName: string; token: string };
@@ -983,7 +983,7 @@ describe('D062 lifecycle v2 — startup sweep of foreign descriptors', () => {
       anchor.set(
         id,
         serializeDescriptor({
-          version: 2,
+          version: 4,
           pipeName: pipeNameForRuntimeId(id),
           token: Buffer.alloc(32, index % 251).toString('base64url'),
         }),

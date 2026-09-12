@@ -27,6 +27,7 @@ import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 
 import type {
   AclSnapshot,
+  ControlAnchorVerification,
   OperatorIdentity,
   ProcessRunner,
 } from '../../src/control/control-store.js';
@@ -63,7 +64,15 @@ const EVERYONE_SID = 's-1-1-0';
 const HEX32 = '0123456789abcdef0123456789abcdef';
 const INHERITED_ACE = 0x10;
 
-describe.skipIf(!ready)('D062 native artifacts + lifecycle v2 — real Windows integration', () => {
+// Every test in this block is dominated by REAL process spawns (icacls, whoami,
+// the provenanced owner helper, the creator, the pipe attestor), so its latency is
+// owned by the Windows scheduler, not by this code. Vitest's 5 s default is
+// calibrated for pure unit tests and is not a meaningful budget here. ONE
+// suite-level deadline governs the whole class: do NOT add a per-test override for
+// a timeout flake — raise this policy instead. The per-test deadlines that remain
+// below are INTRINSIC (a 30 s child, a stalled event loop, a full termination
+// sweep): each needs longer than 20 s because of what it exercises, not host load.
+describe.skipIf(!ready)('D062 native artifacts + lifecycle v2 — real Windows integration', { timeout: 20000 }, () => {
   const systemRoot = process.env['SystemRoot'] ?? 'C:\\Windows';
   const icacls = join(systemRoot, 'System32', 'icacls.exe');
   let store!: StoreModule;
@@ -255,7 +264,11 @@ describe.skipIf(!ready)('D062 native artifacts + lifecycle v2 — real Windows i
     const { parent, anchor } = await makeAnchor();
     const before = await snapshotOf(anchor);
     expect(await store.verifyAnchorSnapshot(operator, anchor, runner)).toEqual({ ok: true, ownerSid: operator.sid });
-    expect(await store.verifyControlAnchor({ anchorPath: anchor })).toEqual({ ok: true, anchorPath: anchor });
+    expect(await store.verifyControlAnchor({ anchorPath: anchor })).toEqual({
+      ok: true,
+      anchorPath: anchor,
+      operatorSid: operator.sid,
+    });
     // Widen the parent: SE_DACL_PROTECTED keeps the new inheritable ACE out.
     expect((await runner(icacls, [parent, '/grant', '*S-1-1-0:(OI)(CI)R'])).ok).toBe(true);
     expect(await snapshotOf(anchor)).toEqual(before);
@@ -314,7 +327,7 @@ describe.skipIf(!ready)('D062 native artifacts + lifecycle v2 — real Windows i
     expect(runCreatorRaw([anchor, HEX32], body).status).toBe(0);
     expect(readdirSync(anchor)).toEqual([`runtime-descriptor-${HEX32}.json`]);
     expect(readFileSync(join(anchor, `runtime-descriptor-${HEX32}.json`)).equals(body)).toBe(true);
-  }, 20000);
+  });
 
   it('the creator makes a descriptor owned by the EXACT operator with a PROTECTED two-principal DACL, immune to anchor widening', async () => {
     const { anchor } = await makeAnchor(true);
@@ -369,7 +382,7 @@ describe.skipIf(!ready)('D062 native artifacts + lifecycle v2 — real Windows i
     // A second descriptor for the SAME id (a different token) must fail.
     const second = store.createRuntimeDescriptor();
     const secondBytes = Buffer.from(
-      store.serializeDescriptor({ version: 2, pipeName: first.descriptor.pipeName, token: second.descriptor.token }),
+      store.serializeDescriptor({ version: 4, pipeName: first.descriptor.pipeName, token: second.descriptor.token }),
       'utf8',
     );
     expect(await store.createDescriptorFileNative(anchor, first.runtimeId, secondBytes)).toEqual({
@@ -425,7 +438,8 @@ describe.skipIf(!ready)('D062 native artifacts + lifecycle v2 — real Windows i
     const logged: string[] = [];
     const handle = await runtime.startControlChannel({
       orchestrator: newOrchestrator().orchestrator,
-      verify: () => Promise.resolve({ ok: true, anchorPath: absentAnchor }),
+      verify: () =>
+        Promise.resolve({ ok: true, anchorPath: absentAnchor, operatorSid: operator.sid }),
       logger: (message: string): void => {
         logged.push(message);
       },
@@ -572,7 +586,7 @@ describe.skipIf(!ready)('D062 native artifacts + lifecycle v2 — real Windows i
     const outcome = await settled;
     expect(outcome.signal).not.toBeNull();
     expect(readdirSync(anchor)).toEqual([]);
-  }, 20000);
+  });
 
   it('S1/S2: a creator terminated at any point can never leave an incomplete descriptor — every surviving file is the complete payload', async () => {
     const { anchor } = await makeAnchor();
@@ -628,8 +642,10 @@ describe.skipIf(!ready)('D062 native artifacts + lifecycle v2 — real Windows i
     const { anchor } = await makeAnchor();
     const { runtime: autoflow, orchestrator } = newOrchestrator();
     orchestrator.open(BINDING);
-    const verify = (): Promise<{ readonly ok: true; readonly anchorPath: string }> =>
-      Promise.resolve({ ok: true, anchorPath: anchor });
+    // The REAL operator SID: the CLI's default (REAL, build-provenanced) pipe
+    // attestor must find the live pipe served by a process owned by exactly it.
+    const verify = (): Promise<ControlAnchorVerification> =>
+      Promise.resolve({ ok: true, anchorPath: anchor, operatorSid: operator.sid });
 
     // Nothing injected but the anchor location: real sweep, real pipe, real
     // creator, real read-only verification, real read-back.
@@ -673,8 +689,10 @@ describe.skipIf(!ready)('D062 native artifacts + lifecycle v2 — real Windows i
     const { anchor } = await makeAnchor();
     const a = newOrchestrator();
     const b = newOrchestrator();
-    const verify = (): Promise<{ readonly ok: true; readonly anchorPath: string }> =>
-      Promise.resolve({ ok: true, anchorPath: anchor });
+    // The REAL operator SID: the CLI's default (REAL, build-provenanced) pipe
+    // attestor must find the live pipe served by a process owned by exactly it.
+    const verify = (): Promise<ControlAnchorVerification> =>
+      Promise.resolve({ ok: true, anchorPath: anchor, operatorSid: operator.sid });
     const first = await runtime.startControlChannel({ orchestrator: a.orchestrator, verify, logger: silent });
     const second = await runtime.startControlChannel({ orchestrator: b.orchestrator, verify, logger: silent });
     expect(first).not.toBeNull();
@@ -709,8 +727,10 @@ describe.skipIf(!ready)('D062 native artifacts + lifecycle v2 — real Windows i
       await store.createDescriptorFileNative(anchor, crashed.runtimeId, Buffer.from(store.serializeDescriptor(crashed.descriptor), 'utf8')),
     ).toEqual({ ok: true });
     const crashedFile = `runtime-descriptor-${crashed.runtimeId}.json`;
-    const verify = (): Promise<{ readonly ok: true; readonly anchorPath: string }> =>
-      Promise.resolve({ ok: true, anchorPath: anchor });
+    // The REAL operator SID: the CLI's default (REAL, build-provenanced) pipe
+    // attestor must find the live pipe served by a process owned by exactly it.
+    const verify = (): Promise<ControlAnchorVerification> =>
+      Promise.resolve({ ok: true, anchorPath: anchor, operatorSid: operator.sid });
 
     // Alive: a new runtime keeps the peer's file.
     const first = await runtime.startControlChannel({ orchestrator: newOrchestrator().orchestrator, verify, logger: silent });
