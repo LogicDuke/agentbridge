@@ -12,7 +12,9 @@
  * - the current operator identity comes from `whoami /user` (the trusted operator
  *   SID);
  * - one build-provenanced native helper reads a single OWNER + DACL
- *   security-descriptor snapshot (Decision 062 Amendment B, grammar V2). Its bytes
+ *   security-descriptor snapshot (ratification R-1 of
+ *   AGENTBRIDGE_DECISION_062_AMENDMENT_RUNTIME_AUTHENTICATION_2026-09-12,
+ *   grammar V2). Its bytes
  *   are SHA-256-verified against generated build metadata before it is ever run;
  *   the snapshot is emitted as **canonical SIDs only** (never localized account
  *   names) and carries the DACL's PROTECTED state and each ACE's exact flags.
@@ -32,9 +34,15 @@
  * provisions the production directory. It also makes **no atomic pathname
  * proof** — the snapshot is a single read (a sub-millisecond check-to-use TOCTOU
  * window remains), and Node's `lstat` distinguishes a symlink but not every
- * reparse tag. These limitations are preserved deliberately; authorization never
- * depends on them alone — token possession (mutual HMAC) is the actual
- * authenticator.
+ * reparse tag. These limitations are preserved deliberately.
+ *
+ * This gate IS THE AUTHORITY. It, together with the held-handle read below, is
+ * the only thing that decides which descriptor — and therefore which runtime
+ * `verifyKey` — may be trusted against a cross-principal adversary. It is NOT
+ * defence-in-depth and must never be demoted to it: a public key published in a
+ * file an adversary can write is self-signed and proves nothing. The ephemeral
+ * keypair (see `control-auth.ts`) supplies FRESHNESS and NON-EXPORTABILITY; it
+ * supplies no authority of its own.
  *
  * ## Runtime identity and identity-named descriptors (lifecycle v2)
  *
@@ -52,37 +60,44 @@
  * A runtime removes only its own identity-named file; no runtime ever overwrites
  * or rotates another runtime's file.
  *
- * ## Token / descriptor lifecycle
+ * ## Descriptor v3: the runtime's published identity
+ *
+ * A descriptor is exactly `{ version: 3, pipeName, token, verifyKey }` — four
+ * keys, no more, no fewer. A version-2 descriptor is malformed and can never be
+ * a live candidate; there is no dual-accept, negotiation, compatibility window,
+ * or downgrade path, because a single attacker-supplied v2 artifact would erase
+ * the whole guarantee. No migration is needed: descriptors and tokens are
+ * process-lifetime only, and both peers ship from one build.
  *
  * The runtime token is 256 bits from {@link crypto.randomBytes}, process-lifetime
  * only, rotated every start, and represented base64url **only** inside the
  * hardened descriptor file. It is never an environment variable, argv, Scheduled
  * Task field, log line, error message, and is never sent raw over the pipe (it is
- * an HMAC key). The descriptor carries no PID: liveness is decided by the kernel
- * pipe namespace, never by process identity, so PID reuse is irrelevant.
+ * an HMAC key). Its scope is now exactly ONE thing: client-to-server command
+ * authorization. It no longer authenticates the server's result.
  *
- * ## Descriptor binding to the anchor secret (trusted origin)
+ * `verifyKey` is the raw 32-byte Ed25519 public half of a keypair minted fresh at
+ * every start. The PRIVATE half exists only in that process's memory and is
+ * never serialized, so the descriptor — which is what a copier can take — carries
+ * no signing capability at all. This is why replay is dead by construction here
+ * rather than by inspection: a descriptor's CURRENT owner and DACL prove nothing
+ * about its HISTORY (a file once attacker-readable can be repaired via WRITE_DAC
+ * into a snapshot byte-identical to a creator-born one), and no predicate over
+ * file state at time t can decide "were these bytes ever observed by someone
+ * else?". Removing the secret from the serialized state dissolves that question
+ * instead of answering it. The descriptor carries no PID: liveness is decided by
+ * the kernel pipe namespace, never by process identity, so PID reuse is
+ * irrelevant.
  *
- * A descriptor's CURRENT owner and DACL prove nothing about its history: a file
- * that was once attacker-readable can be repaired (WRITE_DAC) into a snapshot
- * byte-identical to a creator-born one, with its already-leaked token intact.
- * Discovery therefore never trusts a token on the strength of the file alone.
- * Every anchor holds ONE reserved secret file — `runtime-descriptor-<reserved
- * id>.json`, a name no runtime ever mints and no candidate ever carries — created
- * exactly like a descriptor (the provenanced creator, CREATE_NEW, born protected)
- * and never rotated, replaced, swept, or deleted by any runtime. Each descriptor
- * carries a `proof` = HMAC-SHA256(secret, runtime id ‖ token). A discoverer reads
- * the secret through the same gate and held-handle path as a candidate and trusts
- * a candidate only when its proof verifies. A legacy descriptor has no proof and
- * cannot acquire one: forging it needs the secret, which was born operator+SYSTEM
- * only inside a hardened anchor, where no other principal can create, rename, or
- * link a file and no one can re-own a file to the operator. An existing secret is
- * accepted when it passes the descriptor gate — the reserved name predates no
- * legacy code, so an operator-owned file at it can only have been created by an
- * operator process. A secret that is absent, unverified, or malformed fails
- * discovery closed; recovery is an operator action, never automatic.
+ * A descriptor rewritten with an ADVERSARY'S OWN `verifyKey` is not prevented by
+ * the protocol — the descriptor is the trust root, and anchor write access is the
+ * adversary's defining capability. It is prevented for cross-principal
+ * adversaries by the anchor DACL above, and it is explicitly OUT OF SCOPE for
+ * same-SID, Administrator and SYSTEM principals, whether the genuine runtime is
+ * alive or dead. Windows provides no intra-SID isolation; claiming otherwise
+ * would be a claim the mechanism cannot support.
  *
- * ## Descriptor creation (Decision 062 Amendment C)
+ * ## Descriptor creation (ratification R-2 of the runtime-authentication amendment)
  *
  * The descriptor's own security is chosen by **Windows**, not by whoever calls a
  * file write: a newly created file's OWNER comes from the creating token's DEFAULT
@@ -114,7 +129,7 @@
  */
 
 import { execFile } from 'node:child_process';
-import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import {
   closeSync,
   constants as fsConstants,
@@ -129,6 +144,7 @@ import net from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { VERIFY_KEY_BYTES } from './control-auth.js';
 import { decodeBase64UrlExact, encodeBase64Url } from './control-codec.js';
 
 const randomBytesFn = randomBytes;
@@ -202,15 +218,6 @@ export function isRuntimeId(value: unknown): value is string {
   return typeof value === 'string' && RUNTIME_ID_PATTERN.test(value);
 }
 
-/**
- * The ONE reserved runtime id: it names the per-anchor secret file (see the
- * header, "Descriptor binding"). It is never minted, never a pipe, and never a
- * discovery/sweep candidate. It is a valid id shape so the existing creator
- * (which accepts only `[0-9a-f]{32}`) creates the secret exactly like a
- * descriptor — born protected, CREATE_NEW — with no native change.
- */
-export const ANCHOR_SECRET_RUNTIME_ID = '000000000000000000000000a5ec2e70';
-
 /** The runtime id carried by a pipe name, or `null` if the name is malformed. */
 export function runtimeIdFromPipeName(pipeName: string): string | null {
   const match = PIPE_NAME_PATTERN.exec(pipeName);
@@ -249,54 +256,58 @@ export function runtimeIdFromDescriptorFilename(filename: string): string | null
 }
 
 /* ------------------------------------------------------------------ *
- * Descriptor model (v2)
+ * Descriptor model (v3)
  * ------------------------------------------------------------------ */
 
 /** The hardened per-runtime descriptor written into the verified anchor. */
 export interface RuntimeDescriptor {
-  readonly version: 2;
+  readonly version: 3;
   readonly pipeName: string;
-  /** base64url of the 256-bit token — hardened storage only, never elsewhere. */
+  /**
+   * base64url of the 256-bit token — hardened storage only, never elsewhere.
+   * Scope: client-to-server command authorization ONLY. It does not authenticate
+   * the server's result.
+   */
   readonly token: string;
   /**
-   * base64url of {@link descriptorProof}: HMAC-SHA256(anchor secret, runtime id ‖
-   * token). Absent only on an UNBOUND descriptor (a legacy file, or a freshly
-   * minted one before {@link bindDescriptor}); discovery never trusts one.
+   * base64url of the raw 32-byte Ed25519 public key whose private half lives only
+   * in the publishing runtime's memory. Public by design: it is an identity to
+   * check against, never a credential to hold.
    */
-  readonly proof?: string;
+  readonly verifyKey: string;
 }
 
-/** A parsed descriptor with its raw token, derived runtime id, and raw proof (or `null` if unbound). */
+/** A parsed descriptor with its raw token, raw verify key, and derived runtime id. */
 export interface ParsedDescriptor {
   readonly descriptor: RuntimeDescriptor;
   readonly token: Buffer;
   readonly runtimeId: string;
-  readonly proof: Buffer | null;
-}
-
-/** A descriptor bound to an anchor secret: its proof is present by construction. */
-export interface BoundDescriptor extends ParsedDescriptor {
-  readonly proof: Buffer;
+  readonly verifyKey: Buffer;
 }
 
 /**
- * Mint a fresh descriptor, its raw token, and its runtime id. The token rotates
- * every call (fresh `randomBytes`), the runtime id is per-process unpredictable
- * (128-bit) and is the pipe name's suffix, and the raw token is returned
- * separately so the caller can key HMAC without re-decoding it.
+ * Mint a fresh descriptor, its raw token, and its runtime id around the caller's
+ * already-generated `verifyKey`. The token rotates every call (fresh
+ * `randomBytes`), the runtime id is per-process unpredictable (128-bit) and is
+ * the pipe name's suffix, and the raw token is returned separately so the caller
+ * can key HMAC without re-decoding it.
+ *
+ * The keypair is generated by the caller, not here, so that this module never
+ * holds — and can never accidentally serialize — a private key.
  */
-export function createRuntimeDescriptor(): ParsedDescriptor {
+export function createRuntimeDescriptor(verifyKey: Buffer): ParsedDescriptor {
+  if (verifyKey.length !== VERIFY_KEY_BYTES) {
+    throw new TypeError('control-store: malformed runtime verify key.');
+  }
   const token = randomBytesFn(TOKEN_BYTES);
-  let runtimeId: string;
-  do {
-    runtimeId = randomBytesFn(RUNTIME_ID_BYTES).toString('hex');
-  } while (runtimeId === ANCHOR_SECRET_RUNTIME_ID); // the reserved secret name is never a runtime
+  const runtimeId = randomBytesFn(RUNTIME_ID_BYTES).toString('hex');
   const descriptor: RuntimeDescriptor = {
-    version: 2,
+    version: 3,
     pipeName: pipeNameForRuntimeId(runtimeId),
     token: encodeBase64Url(token),
+    verifyKey: encodeBase64Url(verifyKey),
   };
-  return { descriptor, token, runtimeId, proof: null };
+  return { descriptor, token, runtimeId, verifyKey };
 }
 
 /** Serialize a descriptor to its on-disk JSON form. */
@@ -324,120 +335,41 @@ export function parseDescriptor(text: unknown): ParsedDescriptor | null {
     return null;
   }
   const keys = Object.keys(parsed);
-  // Exactly the three v2 keys, plus at most the `proof` binding (see the header,
-  // "Descriptor binding"). Any other key or count is malformed.
-  if (keys.length !== 3 && !(keys.length === 4 && keys.includes('proof'))) {
+  // EXACTLY the four v3 keys. Any other key, any missing key, and any other
+  // count is malformed. A version-2 descriptor lands here with three keys and no
+  // `verifyKey`, so it is structurally rejected: there is deliberately no
+  // dual-accept branch, no negotiation, and no downgrade path.
+  if (keys.length !== 4) {
     return null;
   }
   const record = parsed as Record<string, unknown>;
   const version = record['version'];
   const pipeName = record['pipeName'];
   const token = record['token'];
-  if (version !== 2 || typeof pipeName !== 'string' || typeof token !== 'string') {
+  const verifyKey = record['verifyKey'];
+  if (
+    version !== 3 ||
+    typeof pipeName !== 'string' ||
+    typeof token !== 'string' ||
+    typeof verifyKey !== 'string'
+  ) {
     return null;
   }
   const runtimeId = runtimeIdFromPipeName(pipeName);
-  if (runtimeId === null || runtimeId === ANCHOR_SECRET_RUNTIME_ID) {
+  if (runtimeId === null) {
     return null;
   }
   const rawToken = decodeBase64UrlExact(token, TOKEN_BYTES);
-  if (rawToken === null) {
-    return null;
-  }
-  if (keys.length === 3) {
-    return { descriptor: { version: 2, pipeName, token }, token: rawToken, runtimeId, proof: null };
-  }
-  const proof = record['proof'];
-  const rawProof = typeof proof === 'string' ? decodeBase64UrlExact(proof, PROOF_BYTES) : null;
-  if (typeof proof !== 'string' || rawProof === null) {
+  const rawVerifyKey = decodeBase64UrlExact(verifyKey, VERIFY_KEY_BYTES);
+  if (rawToken === null || rawVerifyKey === null) {
     return null;
   }
   return {
-    descriptor: { version: 2, pipeName, token, proof },
+    descriptor: { version: 3, pipeName, token, verifyKey },
     token: rawToken,
     runtimeId,
-    proof: rawProof,
+    verifyKey: rawVerifyKey,
   };
-}
-
-/* ------------------------------------------------------------------ *
- * Anchor secret + descriptor binding (pure)
- * ------------------------------------------------------------------ */
-
-/** 256-bit per-anchor secret; the HMAC-SHA256 proof it keys is the same width. */
-const ANCHOR_SECRET_BYTES = 32;
-const PROOF_BYTES = 32;
-
-/** The reserved secret file's path inside an anchor. */
-export function anchorSecretPathFor(anchorPath: string): string {
-  return descriptorPathFor(anchorPath, ANCHOR_SECRET_RUNTIME_ID);
-}
-
-/** The secret file's fixed on-disk form: exactly these two keys, nothing else. */
-export function serializeAnchorSecret(secret: Buffer): string {
-  if (secret.length !== ANCHOR_SECRET_BYTES) {
-    throw new TypeError('control-store: malformed anchor secret.');
-  }
-  return JSON.stringify({ version: 1, anchorSecret: encodeBase64Url(secret) });
-}
-
-/** Mint a fresh anchor secret and its serialized file body. */
-export function createAnchorSecret(): { readonly secret: Buffer; readonly text: string } {
-  const secret = randomBytesFn(ANCHOR_SECRET_BYTES);
-  return { secret, text: serializeAnchorSecret(secret) };
-}
-
-/**
- * Parse the secret file body, or `null` (fail closed): bounded, exactly the two
- * fixed keys, version 1, and a base64url secret of exactly 32 bytes.
- */
-export function parseAnchorSecret(text: unknown): Buffer | null {
-  if (typeof text !== 'string' || text.length === 0 || text.length > MAX_DESCRIPTOR_BYTES) {
-    return null;
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    return null;
-  }
-  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-    return null;
-  }
-  const keys = Object.keys(parsed);
-  if (keys.length !== 2) {
-    return null;
-  }
-  const record = parsed as Record<string, unknown>;
-  const encoded = record['anchorSecret'];
-  if (record['version'] !== 1 || typeof encoded !== 'string') {
-    return null;
-  }
-  return decodeBase64UrlExact(encoded, ANCHOR_SECRET_BYTES);
-}
-
-/** HMAC-SHA256(secret, runtime id ‖ raw token): the descriptor's binding to its anchor. */
-export function descriptorProof(secret: Buffer, runtimeId: string, token: Buffer): Buffer {
-  return createHmac('sha256', secret).update(runtimeId, 'utf8').update(token).digest();
-}
-
-/** Bind a minted descriptor to an anchor secret (a new value; the input is not mutated). */
-export function bindDescriptor(minted: ParsedDescriptor, secret: Buffer): BoundDescriptor {
-  const proof = descriptorProof(secret, minted.runtimeId, minted.token);
-  return {
-    descriptor: { ...minted.descriptor, proof: encodeBase64Url(proof) },
-    token: minted.token,
-    runtimeId: minted.runtimeId,
-    proof,
-  };
-}
-
-/** Whether a parsed descriptor's proof is the correct binding under `secret` (constant-time). */
-export function verifyDescriptorProof(secret: Buffer, parsed: ParsedDescriptor): boolean {
-  if (parsed.proof === null || parsed.proof.length !== PROOF_BYTES) {
-    return false;
-  }
-  return timingSafeEqual(parsed.proof, descriptorProof(secret, parsed.runtimeId, parsed.token));
 }
 
 /* ------------------------------------------------------------------ *
@@ -482,7 +414,8 @@ export const CONTROL_ANCHOR_REJECTION = Object.freeze({
   REPARSE_POINT: 'REPARSE_POINT',
   WHOAMI_FAILED: 'WHOAMI_FAILED',
   OPERATOR_UNREADABLE: 'OPERATOR_UNREADABLE',
-  // Owner + DACL snapshot gate (Decision 062 Amendment B): one build-provenanced
+  // Owner + DACL snapshot gate (ratification R-1 of
+  // AGENTBRIDGE_DECISION_062_AMENDMENT_RUNTIME_AUTHENTICATION_2026-09-12): one build-provenanced
   // native helper reads a canonical-SID OWNER + DACL snapshot; every invariant
   // below is proven over SIDs, never localized account names.
   HELPER_PROVENANCE_MISSING: 'HELPER_PROVENANCE_MISSING',
@@ -541,7 +474,7 @@ export function parseWhoamiUser(stdout: string): OperatorIdentity | null {
 }
 
 /* ------------------------------------------------------------------ *
- * Canonical OWNER + DACL snapshot (Amendment B, grammar V2)
+ * Canonical OWNER + DACL snapshot (ratification R-1, grammar V2)
  * ------------------------------------------------------------------ *
  *
  * The native helper's `--acl <path>` mode emits a bounded, deterministic,
@@ -907,7 +840,7 @@ function whoamiPath(systemRoot: string): string {
  * ------------------------------------------------------------------ *
  *
  * The path scan proves the anchor is reached without a symlink/reparse; it does
- * not prove who owns or may access the anchor. Decision 062 Amendment B closes
+ * not prove who owns or may access the anchor. Ratification R-1 closes
  * that gap with ONE snapshot: the anchor OWNER SID must equal the exact runtime
  * operator SID (SYSTEM is an allowed DACL principal but never an allowed owner,
  * because an owner can rewrite the DACL), and the protected DACL principals must
@@ -1437,9 +1370,7 @@ export function enumerateDescriptorCandidates(
         return { ok: false, reason: 'overfull' };
       }
       const runtimeId = runtimeIdFromDescriptorFilename(name);
-      // The reserved secret file shares the descriptor name shape but is never a
-      // candidate: it is not probed, not trusted as a runtime, and never swept.
-      if (runtimeId === null || runtimeId === ANCHOR_SECRET_RUNTIME_ID) {
+      if (runtimeId === null) {
         continue;
       }
       matched.push({ runtimeId, filename: name, path: join(anchorPath, name) });
@@ -1676,16 +1607,6 @@ export const DISCOVERY_UNAVAILABLE = Object.freeze({
    * protected DACL, non-reparse identity); no candidate's token was read.
    */
   NO_VERIFIED_CANDIDATES: 'NO_VERIFIED_CANDIDATES',
-  /**
-   * The reserved anchor secret file does not exist, so no candidate's binding
-   * can be verified; no candidate's token was read.
-   */
-  ANCHOR_SECRET_ABSENT: 'ANCHOR_SECRET_ABSENT',
-  /**
-   * The reserved anchor secret file exists but failed the descriptor security
-   * gate, could not be held, or is malformed; no candidate's token was read.
-   */
-  ANCHOR_SECRET_UNVERIFIED: 'ANCHOR_SECRET_UNVERIFIED',
   /** More candidates than the bounded cap — an anomalous anchor; fail closed. */
   TOO_MANY_CANDIDATES: 'TOO_MANY_CANDIDATES',
   /** More total directory entries than the scan bound — an anomalous anchor. */
@@ -1728,12 +1649,9 @@ export type DiscoveryOutcome =
  * exist in between — a candidate that fails it is `unverified`: its contents
  * are never read, so its token is never held, and its pipe is never probed;
  * (3) reads the contents through the held handle (never a second pathname
- * lookup), parses them deterministically, and requires the descriptor's proof to
- * verify under the anchor secret (an unbound or wrongly bound file is malformed,
- * never a live runtime); (4) releases the handle and probes the pipe. The anchor
- * secret itself is read FIRST, through the same gate and held-handle path, and
- * an absent, unverified, or malformed secret fails closed before any candidate's
- * token is read. Then it decides:
+ * lookup) and parses them deterministically as a v3 descriptor — a version-2
+ * file has no `verifyKey`, fails to parse, and is malformed, never a live
+ * runtime; (4) releases the handle and probes the pipe. Then it decides:
  *
  * - exactly one PRESENT candidate ⇒ `FOUND` (the caller then runs the mutual-HMAC
  *   handshake with that candidate's token — the protocol's only message is the
@@ -1743,10 +1661,10 @@ export type DiscoveryOutcome =
  * - two or more PRESENT candidates ⇒ `AMBIGUOUS` (fail closed; nothing is chosen
  *   by mtime, PID, order, or last-writer-wins).
  *
- * The gate runs first because HMAC only proves possession of the token: a
- * descriptor that predates anchor hardening can keep an attacker-readable ACL
- * (hardening the parent never retrofits a child), and whoever read it could
- * serve its pipe and sign an APPLIED. Skipping an unverified candidate can never
+ * The gate runs first because it, not the file's contents, is the authority:
+ * a descriptor that predates anchor hardening can keep an attacker-readable ACL
+ * (hardening the parent never retrofits a child), and whoever could write it
+ * could publish their own `verifyKey`. Skipping an unverified candidate can never
  * hide a genuine runtime, because the runtime proves its own file with the same
  * gate at startup and fails closed otherwise. Dead (ABSENT) candidates are
  * ignored here; removing them is the runtime's job.
@@ -1780,24 +1698,13 @@ export async function discoverControlRuntime(
   if (enumeration.candidates.length === 0) {
     return { kind: 'UNAVAILABLE', reason: DISCOVERY_UNAVAILABLE.NO_CANDIDATES, counts: zero };
   }
-  // The anchor secret comes FIRST, through the same gate and held-handle path as
-  // a candidate: without a trusted secret no candidate's binding can be proven,
-  // so no candidate's token is read at all.
-  const secretRead = await readAnchorSecret(anchorPath, openDescriptor, verifyDescriptor);
-  if (secretRead.kind !== 'ok') {
-    const reason =
-      secretRead.kind === 'absent'
-        ? DISCOVERY_UNAVAILABLE.ANCHOR_SECRET_ABSENT
-        : DISCOVERY_UNAVAILABLE.ANCHOR_SECRET_UNVERIFIED;
-    return { kind: 'UNAVAILABLE', reason, counts: { ...zero, candidates: enumeration.candidates.length } };
-  }
   let unverified = 0;
   let malformed = 0;
   let dead = 0;
   let unknown = 0;
   const live: { readonly runtimeId: string; readonly parsed: ParsedDescriptor }[] = [];
   for (const candidate of enumeration.candidates) {
-    const read = await gateAndReadHeld(candidate, openDescriptor, verifyDescriptor, secretRead.secret);
+    const read = await gateAndReadHeld(candidate, openDescriptor, verifyDescriptor);
     if (read.kind === 'unverified') {
       unverified += 1;
       continue;
@@ -1856,7 +1763,6 @@ async function gateAndReadHeld(
   candidate: DescriptorCandidate,
   openDescriptor: (path: string) => DescriptorHandle,
   verifyDescriptor: (path: string) => Promise<DescriptorAclVerification>,
-  secret: Buffer,
 ): Promise<CandidateRead | { readonly kind: 'unverified' }> {
   let handle: DescriptorHandle;
   try {
@@ -1875,65 +1781,9 @@ async function gateAndReadHeld(
     } catch {
       return { kind: 'malformed' };
     }
-    const read = validateCandidate(candidate, parseDescriptor(text));
-    // Trusted origin: the token is used only when the descriptor is bound to
-    // THIS anchor's secret. A legacy (unbound) or wrongly bound file is
-    // malformed here — never a live runtime — whatever its current ACL says.
-    if (read.kind === 'valid' && !verifyDescriptorProof(secret, read.parsed)) {
-      return { kind: 'malformed' };
-    }
-    return read;
-  } finally {
-    handle.close();
-  }
-}
-
-/** Outcome of reading the reserved anchor secret through the gate. */
-export type AnchorSecretRead =
-  | { readonly kind: 'ok'; readonly secret: Buffer }
-  /** No file at the reserved path (ENOENT on open). */
-  | { readonly kind: 'absent' }
-  /** The file exists but could not be held or failed the descriptor security gate. */
-  | { readonly kind: 'unverified' }
-  /** Held and verified, but its contents are not a well-formed secret body. */
-  | { readonly kind: 'malformed' };
-
-function isEnoent(error: unknown): boolean {
-  return typeof error === 'object' && error !== null && (error as { code?: unknown }).code === 'ENOENT';
-}
-
-/**
- * Read the reserved anchor secret exactly as a candidate is read: held
- * exclusively across the descriptor security gate, then read through the same
- * handle and parsed totally. Never creates, replaces, or removes anything.
- */
-export async function readAnchorSecret(
-  anchorPath: string,
-  openDescriptor: (path: string) => DescriptorHandle,
-  verifyDescriptor: (path: string) => Promise<DescriptorAclVerification>,
-): Promise<AnchorSecretRead> {
-  const path = anchorSecretPathFor(anchorPath);
-  let handle: DescriptorHandle;
-  try {
-    handle = openDescriptor(path);
-  } catch (error: unknown) {
-    return { kind: isEnoent(error) ? 'absent' : 'unverified' };
-  }
-  try {
-    const verdict = await verifyDescriptor(path);
-    if (!verdict.ok) {
-      return { kind: 'unverified' };
-    }
-    let text: string;
-    try {
-      text = handle.read();
-    } catch (error: unknown) {
-      // A store that only surfaces absence at read time (no OS handle to hold)
-      // still reports the same fact: there is no secret file.
-      return { kind: isEnoent(error) ? 'absent' : 'malformed' };
-    }
-    const secret = parseAnchorSecret(text);
-    return secret === null ? { kind: 'malformed' } : { kind: 'ok', secret };
+    // A version-2 descriptor (no `verifyKey`) parses to null here and is
+    // therefore malformed — never a live runtime — whatever its current ACL says.
+    return validateCandidate(candidate, parseDescriptor(text));
   } finally {
     handle.close();
   }
@@ -1955,7 +1805,9 @@ export function descriptorAccessFor(deps: DescriptorFileDeps): {
  * Descriptor creation — the build-provenanced create-only executable
  * ------------------------------------------------------------------ *
  *
- * Decision 062 Amendment C. This gate mirrors the read-only owner gate exactly —
+ * Ratification R-2 of
+ * AGENTBRIDGE_DECISION_062_AMENDMENT_RUNTIME_AUTHENTICATION_2026-09-12.
+ * This gate mirrors the read-only owner gate exactly —
  * generated provenance, module-relative resolution, SHA-256 of the exact bytes
  * before execution — but for a SEPARATE binary with a SEPARATE provenance module
  * and a SEPARATE exported binding, so neither artifact's trust root can ever

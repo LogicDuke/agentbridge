@@ -6,22 +6,19 @@ import { basename, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
-  ANCHOR_SECRET_RUNTIME_ID,
+  publicKeyFromVerifyKey,
+  signServerResult,
+  verifyServerResult,
+} from '../../src/control/control-auth.js';
+import {
   CONTROL_ANCHOR_REJECTION,
   DESCRIPTOR_CREATION_REJECTION,
   DISCOVERY_UNAVAILABLE,
   MAX_ANCHOR_ENTRIES,
   MAX_DESCRIPTOR_BYTES,
   MAX_DESCRIPTOR_CANDIDATES,
-  anchorSecretPathFor,
-  bindDescriptor,
-  createAnchorSecret,
   createDescriptorFileNative,
   createRuntimeDescriptor,
-  descriptorProof,
-  parseAnchorSecret,
-  serializeAnchorSecret,
-  verifyDescriptorProof,
   defaultCreatorRunner,
   defaultOpenDescriptor,
   defaultPipeProbe,
@@ -65,12 +62,10 @@ import {
 } from '../../src/control/control-store.js';
 import {
   FAKE_ANCHOR,
-  TEST_ANCHOR_SECRET,
-  TEST_ANCHOR_SECRET_FILENAME,
   allAbsentProbe,
   closeServer,
   memAnchor,
-  mintBound,
+  mintRuntime,
   tableProbe,
 } from './support.js';
 
@@ -210,49 +205,106 @@ describe('D062 runtime identity — strict [0-9a-f]{32}', () => {
 
 /* ---- descriptor model v2 ---------------------------------------------------- */
 
-describe('D062 descriptor model v2', () => {
-  it('mints a 256-bit token, a 128-bit runtime id, and a pipe name carrying that id — no PID', () => {
-    const { descriptor, token, runtimeId } = createRuntimeDescriptor();
+describe('D062 descriptor model v3', () => {
+  const mint = (): ReturnType<typeof mintRuntime> => mintRuntime();
+
+  it('mints a 256-bit token, a 128-bit runtime id, a pipe name carrying that id, and a verify key — no PID', () => {
+    const { parsed, keyPair } = mint();
+    const { descriptor, token, runtimeId, verifyKey } = parsed;
     expect(token.length).toBe(32);
     expect(isRuntimeId(runtimeId)).toBe(true);
     expect(descriptor.pipeName).toBe(`agentbridge-control-${runtimeId}`);
-    expect(descriptor.version).toBe(2);
-    expect(Object.keys(descriptor)).toEqual(['version', 'pipeName', 'token']);
+    expect(descriptor.version).toBe(3);
+    expect(Object.keys(descriptor)).toEqual(['version', 'pipeName', 'token', 'verifyKey']);
     expect('pid' in descriptor).toBe(false);
+    expect('proof' in descriptor).toBe(false);
+    expect(verifyKey.equals(keyPair.verifyKey)).toBe(true);
+  });
+
+  it('refuses to mint around a malformed verify key', () => {
+    expect(() => createRuntimeDescriptor(Buffer.alloc(31))).toThrow(TypeError);
+    expect(() => createRuntimeDescriptor(Buffer.alloc(33))).toThrow(TypeError);
   });
 
   it('rotates the token and runtime id every mint', () => {
-    const a = createRuntimeDescriptor();
-    const b = createRuntimeDescriptor();
+    const a = mint().parsed;
+    const b = mint().parsed;
     expect(a.token.equals(b.token)).toBe(false);
     expect(a.runtimeId).not.toBe(b.runtimeId);
     expect(a.descriptor.token).not.toBe(b.descriptor.token);
   });
 
-  it('round-trips through serialize/parse with the same token and derived id', () => {
-    const { descriptor, token, runtimeId } = createRuntimeDescriptor();
+  it('round-trips through serialize/parse with the same token, verify key and derived id', () => {
+    const { descriptor, token, runtimeId, verifyKey } = mint().parsed;
     const parsed = parseDescriptor(serializeDescriptor(descriptor));
     expect(parsed).not.toBeNull();
     expect(parsed?.token.equals(token)).toBe(true);
+    expect(parsed?.verifyKey.equals(verifyKey)).toBe(true);
     expect(parsed?.descriptor.pipeName).toBe(descriptor.pipeName);
     expect(parsed?.runtimeId).toBe(runtimeId);
   });
 
+  it('REJECTS a version-2 descriptor — no downgrade, no dual-accept', () => {
+    const { descriptor } = mint().parsed;
+    // The exact pre-amendment shape.
+    expect(
+      parseDescriptor(
+        JSON.stringify({
+          version: 2,
+          pipeName: descriptor.pipeName,
+          token: descriptor.token,
+        }),
+      ),
+    ).toBeNull();
+    // v2 carrying the withdrawn anchor-secret proof binding.
+    expect(
+      parseDescriptor(
+        JSON.stringify({
+          version: 2,
+          pipeName: descriptor.pipeName,
+          token: descriptor.token,
+          proof: Buffer.alloc(32, 3).toString('base64url'),
+        }),
+      ),
+    ).toBeNull();
+    // A v3-shaped body whose version is anything but 3.
+    for (const version of [1, 2, 4, '3', null, true]) {
+      expect(parseDescriptor(JSON.stringify({ ...descriptor, version }))).toBeNull();
+    }
+  });
+
   it('rejects malformed / legacy / oversized descriptors', () => {
-    const { descriptor } = createRuntimeDescriptor();
+    const { descriptor } = mint().parsed;
     expect(parseDescriptor('not json')).toBeNull();
     expect(parseDescriptor('[]')).toBeNull();
-    expect(parseDescriptor(JSON.stringify({ version: 2, pipeName: 'x', token: 'y' }))).toBeNull();
-    // Legacy v1 shape (pid-bearing) is not a v2 descriptor.
-    expect(parseDescriptor(JSON.stringify({ version: 1, pid: 1, pipeName: descriptor.pipeName, token: descriptor.token }))).toBeNull();
-    // Extra field.
+    expect(parseDescriptor(JSON.stringify({ version: 3, pipeName: 'x', token: 'y', verifyKey: 'z' }))).toBeNull();
+    // Legacy v1 shape (pid-bearing).
+    expect(
+      parseDescriptor(
+        JSON.stringify({ version: 1, pid: 1, pipeName: descriptor.pipeName, token: descriptor.token }),
+      ),
+    ).toBeNull();
+    // Extra field / missing field.
     expect(parseDescriptor(JSON.stringify({ ...descriptor, pid: 7 }))).toBeNull();
-    // Wrong version.
-    expect(parseDescriptor(JSON.stringify({ ...descriptor, version: 1 }))).toBeNull();
+    expect(parseDescriptor(JSON.stringify({ ...descriptor, proof: 'x' }))).toBeNull();
+    const withoutKey: Record<string, unknown> = { ...descriptor };
+    delete withoutKey['verifyKey'];
+    expect(parseDescriptor(JSON.stringify(withoutKey))).toBeNull();
     // Malformed pipe name (uppercase id).
-    expect(parseDescriptor(JSON.stringify({ ...descriptor, pipeName: descriptor.pipeName.toUpperCase() }))).toBeNull();
-    // Short token (16 bytes).
-    expect(parseDescriptor(JSON.stringify({ ...descriptor, token: Buffer.alloc(16, 1).toString('base64url') }))).toBeNull();
+    expect(
+      parseDescriptor(JSON.stringify({ ...descriptor, pipeName: descriptor.pipeName.toUpperCase() })),
+    ).toBeNull();
+    // Short token (16 bytes) and wrong-width verify key.
+    expect(
+      parseDescriptor(JSON.stringify({ ...descriptor, token: Buffer.alloc(16, 1).toString('base64url') })),
+    ).toBeNull();
+    for (const width of [0, 16, 31, 33, 64]) {
+      expect(
+        parseDescriptor(
+          JSON.stringify({ ...descriptor, verifyKey: Buffer.alloc(width, 1).toString('base64url') }),
+        ),
+      ).toBeNull();
+    }
     expect(parseDescriptor('x'.repeat(5000))).toBeNull();
   });
 
@@ -682,16 +734,13 @@ function seeded(count: number): { anchor: ReturnType<typeof memAnchor>; ids: str
   const ids: string[] = [];
   const pipes: string[] = [];
   for (let index = 0; index < count; index += 1) {
-    const minted = mintBound(); // bound to the anchor's secret, as a genuine runtime publishes
+    const minted = mintRuntime().parsed;
     anchor.set(minted.runtimeId, serializeDescriptor(minted.descriptor));
     ids.push(minted.runtimeId);
     pipes.push(pipePathFromName(minted.descriptor.pipeName));
   }
   return { anchor, ids, pipes };
 }
-
-/** The reserved secret's path in the test anchor. */
-const SECRET_PATH = anchorSecretPathFor(ANCHOR);
 
 describe('D062 candidate enumeration — bounded, exact-name, deterministic', () => {
   it('lists only identity-named files, sorted by id, and reports the cap as truncation', () => {
@@ -991,14 +1040,22 @@ describe('D062 stale sweep — only ABSENT pipes authorize removal of exactly th
     // The sweep carries the SAME scanned count out of the one pass (no re-enumeration).
     const anchor = memAnchor(ANCHOR);
     for (const id of realIds) {
-      anchor.set(id, serializeDescriptor({ version: 2, pipeName: pipeNameForRuntimeId(id), token: 'x' }));
+      anchor.set(
+        id,
+        serializeDescriptor({
+          version: 3,
+          pipeName: pipeNameForRuntimeId(id),
+          token: 'x',
+          verifyKey: 'y',
+        }),
+      );
     }
     for (const name of noise) {
       anchor.setRaw(name, 'x');
     }
     const sweep = await sweepStaleDescriptors(ANCHOR, null, allAbsentProbe, anchor.deps);
     expect(sweep.enumeration).toBe('complete');
-    expect(sweep.scanned).toBe(listed.length + 1); // + the reserved anchor secret entry (never a candidate)
+    expect(sweep.scanned).toBe(listed.length); // + the reserved anchor secret entry (never a candidate)
     // Incomplete branches report scanned = 0; callers never rely on it there.
     const unreadable = await sweepStaleDescriptors(ANCHOR, null, allAbsentProbe, { listAnchor: () => { throw new Error('EACCES'); } });
     expect(unreadable.scanned).toBe(0);
@@ -1206,7 +1263,7 @@ afterEach(async () => {
 describe('D062 defaultPipeProbe — kernel pipe namespace liveness', () => {
   it('answers ABSENT for a pipe nobody serves and PRESENT for a real listener', async () => {
     const probe = defaultPipeProbe(1500);
-    const minted = createRuntimeDescriptor();
+    const minted = mintRuntime().parsed;
     const pipePath = pipePathFromName(minted.descriptor.pipeName);
     expect(await probe(pipePath)).toBe('ABSENT');
     const server = net.createServer((socket) => {
@@ -1250,7 +1307,7 @@ describe('D062 descriptor creator gate — createDescriptorFileNative (injected)
       ...overrides,
     };
   }
-  const minted = createRuntimeDescriptor();
+  const minted = mintRuntime().parsed;
   const payload = Buffer.from(serializeDescriptor(minted.descriptor), 'utf8');
 
   it('runs the hash-verified creator with exactly [anchor, runtimeId] and the bytes on stdin — the token is never an argument', async () => {
@@ -1412,7 +1469,7 @@ describe('D062 creator runner — terminal-cause precedence (real runner, execFi
 
   const EXE = 'C:\\app\\dist\\control\\native\\agentbridge-win-descriptor-create.exe';
   const runner = defaultCreatorRunner('C:\\Windows');
-  const minted = createRuntimeDescriptor();
+  const minted = mintRuntime().parsed;
   const payload = Buffer.from(serializeDescriptor(minted.descriptor), 'utf8');
   const MAXBUFFER = 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER';
   const R = DESCRIPTOR_CREATION_REJECTION;
@@ -1483,8 +1540,6 @@ describe('D062 creator runner — terminal-cause precedence (real runner, execFi
   });
 });
 
-/* ---- F2: discovery verifies every candidate BEFORE reading its token ---------- */
-
 describe('D062 F2 — discovery security-verifies each candidate before its token is read', () => {
   const DESCRIPTOR_OK = snapshot(OPERATOR_SID, [{ sid: OPERATOR_SID }, { sid: SYSTEM_SID }]);
   type Gate = (path: string) => Promise<DescriptorAclVerification>;
@@ -1493,21 +1548,15 @@ describe('D062 F2 — discovery security-verifies each candidate before its toke
    * Deps that log every CANDIDATE gate call and read, in order. The reserved
    * anchor secret (a genuine creator-born file in every fixture here) passes the
    * gate and is not logged, so each assertion below is about the candidate only;
-   * the secret's own gate/read path is covered by the binding describe.
    */
   function logged(anchor: ReturnType<typeof memAnchor>, gate: Gate, log: string[]): DescriptorFileDeps {
     return {
       ...anchor.deps,
       readFile: (path: string): string => {
-        if (path !== SECRET_PATH) {
-          log.push(`read:${path}`);
-        }
+        log.push(`read:${path}`);
         return anchor.deps.readFile?.(path) ?? '';
       },
       verifyDescriptor: (path: string): Promise<DescriptorAclVerification> => {
-        if (path === SECRET_PATH) {
-          return Promise.resolve({ ok: true });
-        }
         log.push(`verify:${path}`);
         return gate(path);
       },
@@ -1690,7 +1739,7 @@ describe('D062 F2 — discovery security-verifies each candidate before its toke
     // lstat — first on the anchor secret, before any candidate is even gated.
     expect(result.kind).toBe('UNAVAILABLE');
     if (result.kind === 'UNAVAILABLE') {
-      expect(result.reason).toBe(DISCOVERY_UNAVAILABLE.ANCHOR_SECRET_UNVERIFIED);
+      expect(result.reason).toBe(DISCOVERY_UNAVAILABLE.NO_VERIFIED_CANDIDATES);
     }
     expect(reads).toEqual([]);
     expect(probes).toBe(0);
@@ -1771,7 +1820,6 @@ describe('D062 F2 stable object — the gate and the read share ONE held descrip
 
   const pass: Gate = () => Promise.resolve({ ok: true });
   /** The anchor secret is held → gated → read → released FIRST, before any candidate. */
-  const SECRET_HELD = [`open:${SECRET_PATH}`, `verify:${SECRET_PATH}`, `read:${SECRET_PATH}`, `close:${SECRET_PATH}`];
   /** A gate applying `verdict` to exactly one candidate path and passing the secret. */
   const only = (path: string, verdict: () => Promise<DescriptorAclVerification>): Gate => (p: string) =>
     p === path ? verdict() : Promise.resolve({ ok: true });
@@ -1789,18 +1837,16 @@ describe('D062 F2 stable object — the gate and the read share ONE held descrip
       store.deps,
     );
     expect(result.kind).toBe('FOUND');
-    expect(store.log).toEqual([...SECRET_HELD, `open:${path}`, `verify:${path}`, `read:${path}`, `close:${path}`, `probe:${pipes[0] ?? ''}`]);
+    expect(store.log).toEqual([`open:${path}`, `verify:${path}`, `read:${path}`, `close:${path}`, `probe:${pipes[0] ?? ''}`]);
     expect(store.openCount(path)).toBe(1);
     expect(store.closeCount(path)).toBe(1);
-    expect(store.openCount(SECRET_PATH)).toBe(1);
-    expect(store.closeCount(SECRET_PATH)).toBe(1);
   });
 
   it('the token used is the held object\'s, not a later pathname lookup: an overwrite after the ACL check is never trusted', async () => {
     const { anchor, ids } = seeded(1);
     const path = descriptorPathFor(ANCHOR, ids[0] ?? '');
     const genuine = parseDescriptor(anchor.get(ids[0] ?? ''));
-    const forged = createRuntimeDescriptor();
+    const forged = mintRuntime().parsed;
     // A forged descriptor under the SAME runtime id / pipe name but a different token.
     const forgedText = serializeDescriptor({ ...forged.descriptor, pipeName: genuine?.descriptor.pipeName ?? '' });
     let store: HeldStore | null = null;
@@ -1836,7 +1882,7 @@ describe('D062 F2 stable object — the gate and the read share ONE held descrip
     });
     expect(result.kind).toBe('FOUND');
     expect(pathReads).toBe(0);
-    expect(store.log).toEqual([...SECRET_HELD, `open:${path}`, `verify:${path}`, `read:${path}`, `close:${path}`]);
+    expect(store.log).toEqual([`open:${path}`, `verify:${path}`, `read:${path}`, `close:${path}`]);
   });
 
   it('a candidate that cannot be held (EBUSY) is unverified: no gate, no read, no probe, NO_VERIFIED_CANDIDATES', async () => {
@@ -1857,7 +1903,7 @@ describe('D062 F2 stable object — the gate and the read share ONE held descrip
       reason: DISCOVERY_UNAVAILABLE.NO_VERIFIED_CANDIDATES,
       counts: { candidates: 1, unverified: 1, malformed: 0, live: 0, dead: 0, unknown: 0 },
     });
-    expect(store.log).toEqual(SECRET_HELD); // the candidate itself: no gate, no read, no close
+    expect(store.log).toEqual([]); // the candidate itself: no gate, no read, no close
     expect(probes).toBe(0);
     expect(anchor.removeCalls()).toBe(0);
   });
@@ -1871,7 +1917,7 @@ describe('D062 F2 stable object — the gate and the read share ONE held descrip
     if (result.kind === 'UNAVAILABLE') {
       expect(result.reason).toBe(DISCOVERY_UNAVAILABLE.NO_VERIFIED_CANDIDATES);
     }
-    expect(store.log).toEqual([...SECRET_HELD, `open:${path}`, `verify:${path}`, `close:${path}`]);
+    expect(store.log).toEqual([`open:${path}`, `verify:${path}`, `close:${path}`]);
   });
 
   it('a gate that throws still releases the handle (finally), and the error propagates as before', async () => {
@@ -1891,10 +1937,8 @@ describe('D062 F2 stable object — the gate and the read share ONE held descrip
     const heldOpener = store.deps.openDescriptor;
     const result = await discoverControlRuntime(ANCHOR, () => Promise.resolve('PRESENT'), {
       ...store.deps,
-      openDescriptor: (path: string): DescriptorHandle => {
-        if (path === SECRET_PATH && heldOpener !== undefined) {
-          return heldOpener(path); // the secret itself is fine; only the candidate's read fails
-        }
+      openDescriptor: (): DescriptorHandle => {
+        void heldOpener;
         return {
           read: (): string => {
             throw new Error('EIO');
@@ -1971,8 +2015,8 @@ describe('D062 F2 stable object — the gate and the read share ONE held descrip
     // anchor secret first, so discovery fails closed before any candidate is held.
     expect(result).toEqual({
       kind: 'UNAVAILABLE',
-      reason: DISCOVERY_UNAVAILABLE.ANCHOR_SECRET_ABSENT,
-      counts: { candidates: 1, unverified: 0, malformed: 0, live: 0, dead: 0, unknown: 0 },
+      reason: DISCOVERY_UNAVAILABLE.NO_VERIFIED_CANDIDATES,
+      counts: { candidates: 1, unverified: 1, malformed: 0, live: 0, dead: 0, unknown: 0 },
     });
     expect(gateCalls).toBe(0);
   });
@@ -2068,258 +2112,63 @@ describe('D062 F2 stable object — the gate and the read share ONE held descrip
   });
 });
 
-describe('D062 trusted origin — a candidate is trusted only when bound to the reserved anchor secret', () => {
-  const present = (): Promise<'PRESENT'> => Promise.resolve('PRESENT');
+/* ---- runtime authentication: the descriptor publishes an identity, not a proof ---- */
 
-  it('secret body: fixed two-key form round-trips; anything else is null (fail closed)', () => {
-    const { secret, text } = createAnchorSecret();
-    expect(secret).toHaveLength(32);
-    expect(parseAnchorSecret(text)?.equals(secret)).toBe(true);
-    expect(parseAnchorSecret(serializeAnchorSecret(TEST_ANCHOR_SECRET))?.equals(TEST_ANCHOR_SECRET)).toBe(true);
-    expect(parseAnchorSecret('not json')).toBeNull();
-    expect(parseAnchorSecret('[]')).toBeNull();
-    expect(parseAnchorSecret(JSON.stringify({ version: 1 }))).toBeNull();
-    expect(parseAnchorSecret(JSON.stringify({ version: 2, anchorSecret: Buffer.alloc(32, 1).toString('base64url') }))).toBeNull();
-    expect(parseAnchorSecret(JSON.stringify({ version: 1, anchorSecret: Buffer.alloc(16, 1).toString('base64url') }))).toBeNull();
-    expect(parseAnchorSecret(JSON.stringify({ version: 1, anchorSecret: Buffer.alloc(32, 1).toString('base64url'), x: 1 }))).toBeNull();
-    // A descriptor is never a secret, and the secret is never a descriptor.
-    expect(parseAnchorSecret(serializeDescriptor(mintBound().descriptor))).toBeNull();
-    expect(parseDescriptor(text)).toBeNull();
-    expect(() => serializeAnchorSecret(Buffer.alloc(16))).toThrow(TypeError);
+describe('D062 runtime authentication — the descriptor carries a public identity only', () => {
+  it('a descriptor is a hint, not a credential: everything in it is safe to read', () => {
+    const { parsed, keyPair } = mintRuntime();
+    const text = serializeDescriptor(parsed.descriptor);
+    // The only secret in the file is the token (client-to-server authorization).
+    // The verify key is public by construction and the private key is absent.
+    expect(text).toContain(parsed.descriptor.verifyKey);
+    expect(text).not.toContain('PRIVATE');
+    const exported = keyPair.privateKey.export({ format: 'der', type: 'pkcs8' }).toString('base64url');
+    expect(text).not.toContain(exported);
   });
 
-  it('the reserved id is never minted, never parses as a runtime, and names exactly the secret path', () => {
-    expect(isRuntimeId(ANCHOR_SECRET_RUNTIME_ID)).toBe(true); // creator-acceptable shape
-    for (let index = 0; index < 64; index += 1) {
-      expect(createRuntimeDescriptor().runtimeId).not.toBe(ANCHOR_SECRET_RUNTIME_ID);
-    }
-    const claimed = serializeDescriptor({ version: 2, pipeName: pipeNameForRuntimeId(ANCHOR_SECRET_RUNTIME_ID), token: Buffer.alloc(32, 1).toString('base64url') });
-    expect(parseDescriptor(claimed)).toBeNull();
-    expect(anchorSecretPathFor(ANCHOR)).toBe(descriptorPathFor(ANCHOR, ANCHOR_SECRET_RUNTIME_ID));
-    expect(TEST_ANCHOR_SECRET_FILENAME).toBe(descriptorFilenameFor(ANCHOR_SECRET_RUNTIME_ID));
-  });
-
-  it('binding: proof = HMAC(secret, id ‖ token); bind is pure; verify is exact and rejects unbound / other-secret / tampered', () => {
-    const minted = createRuntimeDescriptor();
-    expect(minted.proof).toBeNull();
-    const bound = bindDescriptor(minted, TEST_ANCHOR_SECRET);
-    expect(minted.descriptor.proof).toBeUndefined(); // input untouched
-    expect(bound.proof.equals(descriptorProof(TEST_ANCHOR_SECRET, minted.runtimeId, minted.token))).toBe(true);
-    expect(bound.descriptor.proof).toBe(bound.proof.toString('base64url'));
-    expect(verifyDescriptorProof(TEST_ANCHOR_SECRET, bound)).toBe(true);
-    expect(verifyDescriptorProof(TEST_ANCHOR_SECRET, minted)).toBe(false); // unbound
-    expect(verifyDescriptorProof(Buffer.alloc(32, 9), bound)).toBe(false); // another anchor's secret
-    // Tampering with any bound field breaks the binding.
-    const reparsed = parseDescriptor(serializeDescriptor(bound.descriptor));
-    expect(reparsed).not.toBeNull();
-    expect(reparsed !== null && verifyDescriptorProof(TEST_ANCHOR_SECRET, reparsed)).toBe(true);
-    const otherToken = createRuntimeDescriptor();
-    expect(verifyDescriptorProof(TEST_ANCHOR_SECRET, { ...bound, token: otherToken.token })).toBe(false);
-    expect(verifyDescriptorProof(TEST_ANCHOR_SECRET, { ...bound, runtimeId: otherToken.runtimeId })).toBe(false);
-    expect(verifyDescriptorProof(TEST_ANCHOR_SECRET, { ...bound, proof: Buffer.alloc(32, 0) })).toBe(false);
-    expect(verifyDescriptorProof(TEST_ANCHOR_SECRET, { ...bound, proof: bound.proof.subarray(0, 31) })).toBe(false);
-    // Serialized: exactly four keys; a fifth or a malformed proof is malformed.
-    expect(Object.keys(JSON.parse(serializeDescriptor(bound.descriptor)) as object)).toEqual(['version', 'pipeName', 'token', 'proof']);
-    expect(parseDescriptor(JSON.stringify({ ...bound.descriptor, proof: 'nope' }))).toBeNull();
-    expect(parseDescriptor(JSON.stringify({ ...bound.descriptor, extra: 1 }))).toBeNull();
-  });
-
-  it('genuine bound descriptor, single live runtime → FOUND with its token (the secret is read through the gate first)', async () => {
-    const { anchor, ids } = seeded(1);
-    const log: string[] = [];
-    const deps: DescriptorFileDeps = {
-      ...anchor.deps,
-      verifyDescriptor: (path: string): Promise<DescriptorAclVerification> => {
-        log.push(path);
-        return Promise.resolve({ ok: true });
-      },
+  it('a COPIED descriptor yields no signing capability — CI-2, unconditional', () => {
+    const { parsed, keyPair } = mintRuntime();
+    // Exactly what a copier gets: the serialized bytes, re-parsed.
+    const copy = parseDescriptor(serializeDescriptor(parsed.descriptor));
+    expect(copy).not.toBeNull();
+    expect(copy?.verifyKey.equals(keyPair.verifyKey)).toBe(true);
+    const identity = {
+      runtimeId: parsed.runtimeId,
+      pipeName: parsed.descriptor.pipeName,
     };
-    const result = await discoverControlRuntime(ANCHOR, present, deps);
-    expect(result.kind).toBe('FOUND');
-    if (result.kind === 'FOUND') {
-      expect(result.parsed.runtimeId).toBe(ids[0]);
-      expect(result.parsed.token.equals(parseDescriptor(anchor.get(ids[0] ?? ''))?.token ?? Buffer.alloc(0))).toBe(true);
-      expect(result.counts).toEqual({ candidates: 1, unverified: 0, malformed: 0, live: 1, dead: 0, unknown: 0 });
-    }
-    expect(log).toEqual([SECRET_PATH, descriptorPathFor(ANCHOR, ids[0] ?? '')]);
+    const nonceS = Buffer.alloc(32, 1);
+    const nonceC = Buffer.alloc(32, 2);
+    const command = Buffer.from('OPEN_HUMAN_GATE', 'utf8');
+    const result = Buffer.from('APPLIED', 'utf8');
+    // The genuine holder can sign; the copy can only verify.
+    const genuine = signServerResult(keyPair.privateKey, identity, nonceS, nonceC, command, result);
+    expect(
+      verifyServerResult(copy?.verifyKey ?? Buffer.alloc(0), identity, nonceS, nonceC, command, result, genuine),
+    ).toBe(true);
+    // Nothing derivable from the copy produces a second valid signature.
+    const asPublic = publicKeyFromVerifyKey(copy?.verifyKey ?? Buffer.alloc(0));
+    expect(asPublic?.type).toBe('public');
+    expect(() =>
+      signServerResult(asPublic as never, identity, nonceS, nonceC, command, result),
+    ).toThrow();
   });
 
-  it('two valid bound live runtimes remain AMBIGUOUS', async () => {
-    const { anchor, ids } = seeded(2);
-    const result = await discoverControlRuntime(ANCHOR, present, anchor.deps);
-    expect(result.kind).toBe('AMBIGUOUS');
-    if (result.kind === 'AMBIGUOUS') {
-      expect([...result.live].sort()).toEqual([...ids].sort());
-    }
+  it('two runtimes in one anchor publish independent identities', () => {
+    const a = mintRuntime().parsed;
+    const b = mintRuntime().parsed;
+    expect(a.verifyKey.equals(b.verifyKey)).toBe(false);
+    expect(a.token.equals(b.token)).toBe(false);
+    expect(a.runtimeId).not.toBe(b.runtimeId);
   });
 
-  it('LEGACY: an unbound descriptor with a perfect current ACL and a PRESENT pipe is never trusted; its pipe is never probed', async () => {
-    const { anchor, ids, pipes } = seeded(1);
-    const legacy = createRuntimeDescriptor(); // three-key v2 file: exactly what pre-binding code wrote
-    anchor.set(legacy.runtimeId, serializeDescriptor(legacy.descriptor));
-    const probed: string[] = [];
-    const result = await discoverControlRuntime(
-      ANCHOR,
-      (pipePath: string) => {
-        probed.push(pipePath);
-        return Promise.resolve('PRESENT'); // the attacker serves the legacy pipe
-      },
-      anchor.deps, // the gate PASSES the legacy file: its repaired ACL is indistinguishable
-    );
-    // Alone with a genuine runtime: the genuine one is FOUND, the legacy one is malformed, not live.
-    expect(result.kind).toBe('FOUND');
-    if (result.kind === 'FOUND') {
-      expect(result.parsed.runtimeId).toBe(ids[0]);
-      expect(result.counts).toEqual({ candidates: 2, unverified: 0, malformed: 1, live: 1, dead: 0, unknown: 0 });
-    }
-    expect(probed).toEqual([pipes[0]]);
-    // Alone, with no genuine runtime: nothing is trusted, exit path is NO_LIVE_CANDIDATES.
-    anchor.remove(ids[0] ?? '');
-    const alone = await discoverControlRuntime(ANCHOR, present, anchor.deps);
-    expect(alone).toEqual({
-      kind: 'UNAVAILABLE',
-      reason: DISCOVERY_UNAVAILABLE.NO_LIVE_CANDIDATES,
-      counts: { candidates: 1, unverified: 0, malformed: 1, live: 0, dead: 0, unknown: 0 },
-    });
-  });
-
-  it('FORGED: a proof under another secret, a proof from another descriptor, or a rewritten token is malformed, never live', async () => {
-    const { anchor, ids } = seeded(1);
-    const forgedUnderOtherSecret = bindDescriptor(createRuntimeDescriptor(), Buffer.alloc(32, 0xee));
-    anchor.set(forgedUnderOtherSecret.runtimeId, serializeDescriptor(forgedUnderOtherSecret.descriptor));
-    const genuine = parseDescriptor(anchor.get(ids[0] ?? '') ?? '');
-    const transplanted = createRuntimeDescriptor();
-    anchor.set(
-      transplanted.runtimeId,
-      serializeDescriptor({ ...transplanted.descriptor, proof: genuine?.descriptor.proof ?? '' }),
-    );
-    const rewritten = { ...(genuine?.descriptor ?? transplanted.descriptor), token: createRuntimeDescriptor().descriptor.token };
-    anchor.set(ids[0] ?? '', serializeDescriptor(rewritten)); // genuine file, token swapped in place
-    const result = await discoverControlRuntime(ANCHOR, present, anchor.deps);
-    expect(result).toEqual({
-      kind: 'UNAVAILABLE',
-      reason: DISCOVERY_UNAVAILABLE.NO_LIVE_CANDIDATES,
-      counts: { candidates: 3, unverified: 0, malformed: 3, live: 0, dead: 0, unknown: 0 },
-    });
-  });
-
-  it('ABSENT secret: fail closed before any candidate is gated, read, or probed', async () => {
-    const anchor = memAnchor(ANCHOR, false);
-    const minted = mintBound();
-    anchor.set(minted.runtimeId, serializeDescriptor(minted.descriptor));
-    const gated: string[] = [];
-    let probes = 0;
-    const result = await discoverControlRuntime(
-      ANCHOR,
-      () => {
-        probes += 1;
-        return Promise.resolve('PRESENT');
-      },
-      {
-        ...anchor.deps,
-        verifyDescriptor: (path: string): Promise<DescriptorAclVerification> => {
-          gated.push(path);
-          return Promise.resolve({ ok: true });
-        },
-      },
-    );
-    expect(result).toEqual({
-      kind: 'UNAVAILABLE',
-      reason: DISCOVERY_UNAVAILABLE.ANCHOR_SECRET_ABSENT,
-      counts: { candidates: 1, unverified: 0, malformed: 0, live: 0, dead: 0, unknown: 0 },
-    });
-    // The in-memory store surfaces absence only at read, so the secret's own
-    // gate ran; the CANDIDATE was never gated, read, or probed.
-    expect(gated).toEqual([SECRET_PATH]);
-    expect(probes).toBe(0);
-    expect(anchor.removeCalls()).toBe(0);
-  });
-
-  it.each([
-    ['unverified (fails the descriptor gate)', (anchor: ReturnType<typeof memAnchor>): DescriptorFileDeps => ({
-      ...anchor.deps,
-      verifyDescriptor: (path: string): Promise<DescriptorAclVerification> =>
-        Promise.resolve(path === SECRET_PATH ? { ok: false, reason: CONTROL_ANCHOR_REJECTION.FOREIGN_PRINCIPAL } : { ok: true }),
-    })],
-    ['unholdable (EBUSY on open)', (anchor: ReturnType<typeof memAnchor>): DescriptorFileDeps => ({
-      ...anchor.deps,
-      openDescriptor: (path: string): DescriptorHandle => {
-        if (path === SECRET_PATH) {
-          throw Object.assign(new Error('EBUSY'), { code: 'EBUSY' });
-        }
-        return { read: (): string => anchor.deps.readFile?.(path) ?? '', close: (): void => {} };
-      },
-    })],
-    ['malformed body', (anchor: ReturnType<typeof memAnchor>): DescriptorFileDeps => {
-      anchor.setRaw(TEST_ANCHOR_SECRET_FILENAME, '{ nope');
-      return anchor.deps;
-    }],
-    ['a descriptor planted at the secret path', (anchor: ReturnType<typeof memAnchor>): DescriptorFileDeps => {
-      anchor.setRaw(TEST_ANCHOR_SECRET_FILENAME, serializeDescriptor(mintBound().descriptor));
-      return anchor.deps;
-    }],
-  ])('INVALID secret — %s: ANCHOR_SECRET_UNVERIFIED, no candidate gated, read, or probed', async (_label, mkDeps) => {
-    const { anchor, ids } = seeded(1);
-    const candidatePath = descriptorPathFor(ANCHOR, ids[0] ?? '');
-    const base = mkDeps(anchor);
-    const touched: string[] = [];
-    let probes = 0;
-    const result = await discoverControlRuntime(
-      ANCHOR,
-      () => {
-        probes += 1;
-        return Promise.resolve('PRESENT');
-      },
-      {
-        ...base,
-        readFile: (path: string): string => {
-          touched.push(path);
-          return base.readFile?.(path) ?? '';
-        },
-      },
-    );
-    expect(result).toEqual({
-      kind: 'UNAVAILABLE',
-      reason: DISCOVERY_UNAVAILABLE.ANCHOR_SECRET_UNVERIFIED,
-      counts: { candidates: 1, unverified: 0, malformed: 0, live: 0, dead: 0, unknown: 0 },
-    });
-    expect(touched).not.toContain(candidatePath);
-    expect(probes).toBe(0);
-    expect(anchor.removeCalls()).toBe(0);
-    expect(anchor.entries().has(TEST_ANCHOR_SECRET_FILENAME)).toBe(true); // never removed or replaced
-  });
-
-  it('the reserved secret file is never a candidate: excluded from enumeration, never probed, never swept', async () => {
-    const { anchor, ids } = seeded(2);
-    const enumeration = enumerateDescriptorCandidates(ANCHOR, anchor.deps);
-    expect(enumeration.ok && enumeration.candidates.map((c) => c.runtimeId)).toEqual([...ids].sort());
-    expect(enumeration.ok && enumeration.scanned).toBe(3); // two candidates + the secret entry
-    const probed: string[] = [];
-    const sweep = await sweepStaleDescriptors(
-      ANCHOR,
-      null,
-      (pipePath: string) => {
-        probed.push(pipePath);
-        return Promise.resolve('ABSENT');
-      },
-      anchor.deps,
-    );
-    expect([...sweep.removed].sort()).toEqual([...ids].sort());
-    expect(sweep.examined).toBe(2);
-    expect(probed).not.toContain(pipePathFromName(pipeNameForRuntimeId(ANCHOR_SECRET_RUNTIME_ID)));
-    expect(anchor.entries().has(TEST_ANCHOR_SECRET_FILENAME)).toBe(true);
-    // Even an all-ABSENT world with the secret alone leaves it untouched and discovery honest.
-    const alone = await discoverControlRuntime(ANCHOR, allAbsentProbe, anchor.deps);
-    expect(alone).toEqual({ kind: 'UNAVAILABLE', reason: DISCOVERY_UNAVAILABLE.NO_CANDIDATES, counts: { candidates: 0, unverified: 0, malformed: 0, live: 0, dead: 0, unknown: 0 } });
-    expect(anchor.entries().has(TEST_ANCHOR_SECRET_FILENAME)).toBe(true);
-  });
-
-  it('a legacy (unbound) stale descriptor is still swept when its pipe is ABSENT — cleanup is not narrowed', async () => {
-    const anchor = memAnchor(ANCHOR);
-    const legacy = createRuntimeDescriptor();
-    anchor.set(legacy.runtimeId, serializeDescriptor(legacy.descriptor));
-    const sweep = await sweepStaleDescriptors(ANCHOR, null, allAbsentProbe, anchor.deps);
-    expect(sweep.removed).toEqual([legacy.runtimeId]);
-    expect(sweep.malformed).toEqual([]);
+  it('discovery has no anchor-secret failure mode left', () => {
+    expect(Object.keys(DISCOVERY_UNAVAILABLE)).toEqual([
+      'ANCHOR_UNREADABLE',
+      'NO_CANDIDATES',
+      'NO_LIVE_CANDIDATES',
+      'NO_VERIFIED_CANDIDATES',
+      'TOO_MANY_CANDIDATES',
+      'ANCHOR_OVERFULL',
+    ]);
   });
 });

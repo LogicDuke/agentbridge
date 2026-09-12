@@ -13,7 +13,13 @@ import { join } from 'node:path';
 import { AutoflowOrchestrator } from '../../src/autoflow/orchestrator.js';
 import { AutoflowRuntime } from '../../src/autoflow/runtime.js';
 import type { WorkflowBinding } from '../../src/domain/index.js';
-import { NONCE_BYTES, computeServerMac } from '../../src/control/control-auth.js';
+import {
+  NONCE_BYTES,
+  generateRuntimeKeyPair,
+  signServerResult,
+  type ChannelIdentity,
+  type RuntimeKeyPair,
+} from '../../src/control/control-auth.js';
 import {
   buildHelloBody,
   buildResultBody,
@@ -26,14 +32,11 @@ import {
 import { CONTROL_RESULT, type ControlResultStatus } from '../../src/control/control-command.js';
 import { runControlCli, type ControlCliOutcome } from '../../src/control/cli.js';
 import {
-  ANCHOR_SECRET_RUNTIME_ID,
   DESCRIPTOR_CREATION_REJECTION,
-  bindDescriptor,
   createRuntimeDescriptor,
   descriptorFilenameFor,
   parseDescriptor,
   pipePathFromName,
-  serializeAnchorSecret,
   serializeDescriptor,
   type ControlAnchorVerification,
   type DescriptorAclVerification,
@@ -59,18 +62,31 @@ export const BINDING: WorkflowBinding = {
 
 export const FAKE_ANCHOR = 'C:\\FakeAnchor';
 
-/**
- * The fixed anchor secret every in-memory anchor is born with (see memAnchor),
- * so bound descriptors minted by tests verify against any memAnchor. Real
- * anchors mint a random one through the creator; only the in-memory fixture
- * shares a constant.
- */
-export const TEST_ANCHOR_SECRET: Buffer = Buffer.alloc(32, 0x5a);
-export const TEST_ANCHOR_SECRET_FILENAME = descriptorFilenameFor(ANCHOR_SECRET_RUNTIME_ID);
+/** One runtime's minted v3 identity plus the ephemeral keypair behind it. */
+export interface MintedRuntime {
+  readonly parsed: ParsedDescriptor;
+  readonly keyPair: RuntimeKeyPair;
+  readonly identity: ChannelIdentity;
+}
 
-/** Mint a descriptor already bound to {@link TEST_ANCHOR_SECRET}. */
-export function mintBound(): ParsedDescriptor {
-  return bindDescriptor(createRuntimeDescriptor(), TEST_ANCHOR_SECRET);
+/**
+ * Mint a v3 descriptor around a fresh ephemeral keypair. The private key is
+ * returned ONLY to the test that minted it, exactly as a live runtime keeps it
+ * in its own memory — nothing here writes it anywhere.
+ */
+export function mintRuntime(): MintedRuntime {
+  const keyPair = generateRuntimeKeyPair();
+  const parsed = createRuntimeDescriptor(keyPair.verifyKey);
+  return {
+    parsed,
+    keyPair,
+    identity: { runtimeId: parsed.runtimeId, pipeName: parsed.descriptor.pipeName },
+  };
+}
+
+/** Mint a v3 descriptor when the test does not need the signing key. */
+export function mintDescriptor(): ParsedDescriptor {
+  return mintRuntime().parsed;
 }
 
 export function passingVerify(): Promise<ControlAnchorVerification> {
@@ -89,8 +105,6 @@ export function passingDescriptorVerify(): Promise<DescriptorAclVerification> {
  */
 export interface MemAnchor {
   readonly anchorPath: string;
-  /** The anchor secret this anchor was born with (TEST_ANCHOR_SECRET unless seeded without one). */
-  readonly secret: Buffer;
   readonly deps: DescriptorFileDeps;
   /** The CREATE_NEW creation seam: refuses an existing path (CREATOR_FAILED). */
   readonly create: DescriptorCreatorFn;
@@ -116,15 +130,11 @@ function enoent(): Error {
 }
 
 /**
- * @param withSecret Seed the reserved anchor secret file (TEST_ANCHOR_SECRET) —
- * the state every provisioned anchor reaches after its first runtime start.
- * `false` models an anchor no bound runtime has ever started in.
+ * An anchor holds nothing but identity-named descriptors. There is no reserved
+ * secret file any more: the anchor carries no durable secret of its own.
  */
-export function memAnchor(anchorPath: string = FAKE_ANCHOR, withSecret = true): MemAnchor {
+export function memAnchor(anchorPath: string = FAKE_ANCHOR): MemAnchor {
   const files = new Map<string, string>();
-  if (withSecret) {
-    files.set(TEST_ANCHOR_SECRET_FILENAME, serializeAnchorSecret(TEST_ANCHOR_SECRET));
-  }
   let removeCalls = 0;
   let createCalls = 0;
   const pathOf = (basename: string): string => join(anchorPath, basename);
@@ -138,7 +148,6 @@ export function memAnchor(anchorPath: string = FAKE_ANCHOR, withSecret = true): 
   };
   return {
     anchorPath,
-    secret: TEST_ANCHOR_SECRET,
     deps: {
       listAnchor: (dir: string): readonly string[] => {
         if (dir !== anchorPath) {
@@ -291,29 +300,49 @@ export function descriptorOf(anchor: MemAnchor, handle: ControlChannelHandle): P
   return parsed;
 }
 
-/** The token + pipe path for a handle's descriptor. */
+/** The token, verify key, channel identity and pipe path for a handle's descriptor. */
 export function descriptorFacts(
   anchor: MemAnchor,
   handle: ControlChannelHandle,
-): { token: Buffer; pipePath: string } {
+): { token: Buffer; verifyKey: Buffer; identity: ChannelIdentity; pipePath: string } {
   const parsed = descriptorOf(anchor, handle);
-  return { token: parsed.token, pipePath: pipePathFromName(parsed.descriptor.pipeName) };
+  return {
+    token: parsed.token,
+    verifyKey: parsed.verifyKey,
+    identity: { runtimeId: parsed.runtimeId, pipeName: parsed.descriptor.pipeName },
+    pipePath: pipePathFromName(parsed.descriptor.pipeName),
+  };
 }
 
-/** Produce a descriptor JSON with the same pipe name but a different token. */
+/**
+ * A well-formed v3 descriptor with the same pipe name and verifyKey but a
+ * DIFFERENT token, so the rejection under test is the server's macC check and
+ * nothing else.
+ */
 export function withTamperedToken(serialized: string): string {
   const parsed = parseDescriptor(serialized);
   if (parsed === null) {
     throw new Error('withTamperedToken: input is not a descriptor');
   }
-  const token = randomBytes(32);
-  // Correctly BOUND to the test anchor secret, so only the token is wrong: the
-  // rejection under test is the server's (HMAC), not discovery's binding check.
-  const tampered = bindDescriptor(
-    { descriptor: { version: 2, pipeName: parsed.descriptor.pipeName, token: token.toString('base64url') }, token, runtimeId: parsed.runtimeId, proof: null },
-    TEST_ANCHOR_SECRET,
-  );
-  return serializeDescriptor(tampered.descriptor);
+  return serializeDescriptor({
+    version: 3,
+    pipeName: parsed.descriptor.pipeName,
+    token: randomBytes(32).toString('base64url'),
+    verifyKey: parsed.descriptor.verifyKey,
+  });
+}
+
+/** A legacy v2 descriptor body for the exact same runtime identity. */
+export function asLegacyV2(serialized: string): string {
+  const parsed = parseDescriptor(serialized);
+  if (parsed === null) {
+    throw new Error('asLegacyV2: input is not a descriptor');
+  }
+  return JSON.stringify({
+    version: 2,
+    pipeName: parsed.descriptor.pipeName,
+    token: parsed.descriptor.token,
+  });
 }
 
 export type RawOutcome =
@@ -408,14 +437,31 @@ export function rawClient(pipePath: string, options: RawClientOptions): Promise<
 }
 
 /**
- * A rogue server that completes the handshake and signs macS with `token` — a
- * fresh random (wrong) token by default, or a leaked genuine token to model an
- * attacker who read an unverified descriptor and can therefore authenticate.
+ * How a squatter tries to forge the server result. Every variant models a party
+ * that holds a byte-identical COPY of a genuine descriptor — so it has the token
+ * and the public verifyKey — but has never held the ephemeral private key.
+ */
+export type RogueForgery =
+  /** Emit 64 random bytes where the signature belongs. */
+  | { readonly kind: 'random' }
+  /** Sign correctly, but with a keypair the squatter generated itself. */
+  | { readonly kind: 'ownKey'; readonly identity: ChannelIdentity }
+  /** Replay a signature harvested from the genuine runtime on an earlier exchange. */
+  | { readonly kind: 'harvested'; readonly signature: Buffer }
+  /**
+   * The ONLY variant that can succeed: the genuine runtime itself, holding the
+   * real private key. Used as the positive control.
+   */
+  | { readonly kind: 'genuine'; readonly keyPair: RuntimeKeyPair; readonly identity: ChannelIdentity };
+
+/**
+ * A rogue server holding a squatted pipe name. It completes framing and the
+ * hello, then answers with whatever the chosen forgery produces.
  */
 export function startRogueServer(
   pipePath: string,
   status: ControlResultStatus = CONTROL_RESULT.APPLIED,
-  token: Buffer = randomBytes(32),
+  forgery: RogueForgery = { kind: 'random' },
 ): Promise<net.Server> {
   const server = net.createServer((socket: net.Socket) => {
     const nonceS = randomBytes(NONCE_BYTES);
@@ -439,8 +485,31 @@ export function startRogueServer(
         return;
       }
       const resultBytes = Buffer.from(status, 'utf8');
-      const macS = computeServerMac(token, nonceS, parsed.nonceC, parsed.commandBytes, resultBytes);
-      socket.end(frameMessage(buildResultBody(status, macS)));
+      let signature: Buffer;
+      if (forgery.kind === 'harvested') {
+        signature = forgery.signature;
+      } else if (forgery.kind === 'ownKey') {
+        signature = signServerResult(
+          generateRuntimeKeyPair().privateKey,
+          forgery.identity,
+          nonceS,
+          parsed.nonceC,
+          parsed.commandBytes,
+          resultBytes,
+        );
+      } else if (forgery.kind === 'genuine') {
+        signature = signServerResult(
+          forgery.keyPair.privateKey,
+          forgery.identity,
+          nonceS,
+          parsed.nonceC,
+          parsed.commandBytes,
+          resultBytes,
+        );
+      } else {
+        signature = randomBytes(64);
+      }
+      socket.end(frameMessage(buildResultBody(status, signature)));
     });
     socket.write(frameMessage(buildHelloBody(nonceS)));
   });

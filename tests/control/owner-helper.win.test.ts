@@ -18,6 +18,12 @@
 
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
+
+import {
+  generateRuntimeKeyPair,
+  publicKeyFromVerifyKey,
+  VERIFY_KEY_BYTES,
+} from '../../src/control/control-auth.js';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -173,9 +179,12 @@ describe.skipIf(!ready)('D062 native artifacts + lifecycle v2 — real Windows i
   const silent = (): void => {
     /* silent */
   };
-  /** The reserved anchor secret file every started runtime leaves (and never removes). */
-  const secretFile = (): string => store.descriptorFilenameFor(store.ANCHOR_SECRET_RUNTIME_ID);
-
+  /**
+   * Mint a real v3 descriptor around a genuine ephemeral keypair. The private
+   * key stays in this test's scope, exactly as a live runtime keeps its own.
+   */
+  const mint = (): ReturnType<StoreModule['createRuntimeDescriptor']> =>
+    store.createRuntimeDescriptor(generateRuntimeKeyPair().verifyKey);
   beforeAll(async () => {
     store = (await import(pathToFileURL(distStore).href)) as StoreModule;
     runtime = (await import(pathToFileURL(distRuntime).href)) as RuntimeModule;
@@ -320,7 +329,7 @@ describe.skipIf(!ready)('D062 native artifacts + lifecycle v2 — real Windows i
 
   it('the creator makes a descriptor owned by the EXACT operator with a PROTECTED two-principal DACL, immune to anchor widening', async () => {
     const { anchor } = await makeAnchor(true);
-    const minted = store.createRuntimeDescriptor();
+    const minted = mint();
     const bytes = Buffer.from(store.serializeDescriptor(minted.descriptor), 'utf8');
     expect(await store.createDescriptorFileNative(anchor, minted.runtimeId, bytes)).toEqual({ ok: true });
 
@@ -343,7 +352,7 @@ describe.skipIf(!ready)('D062 native artifacts + lifecycle v2 — real Windows i
 
   it('the OS — not the caller — picks a plainly written file\'s security: unprotected + inherited, rejected by the real gate', async () => {
     const { anchor } = await makeAnchor(true);
-    const minted = store.createRuntimeDescriptor();
+    const minted = mint();
     const legacyPath = store.descriptorPathFor(anchor, minted.runtimeId);
     writeFileSync(legacyPath, store.serializeDescriptor(minted.descriptor), { encoding: 'utf8', flag: 'wx' });
     const snapshot = await snapshotOf(legacyPath);
@@ -362,16 +371,21 @@ describe.skipIf(!ready)('D062 native artifacts + lifecycle v2 — real Windows i
 
   it('6. CREATE_NEW: an existing identity-named file is never opened, overwritten, re-owned, or re-ACLd', async () => {
     const { anchor } = await makeAnchor();
-    const first = store.createRuntimeDescriptor();
+    const first = mint();
     const firstBytes = Buffer.from(store.serializeDescriptor(first.descriptor), 'utf8');
     expect(await store.createDescriptorFileNative(anchor, first.runtimeId, firstBytes)).toEqual({ ok: true });
     const descriptorPath = store.descriptorPathFor(anchor, first.runtimeId);
     const beforeAcl = await snapshotOf(descriptorPath);
 
     // A second descriptor for the SAME id (a different token) must fail.
-    const second = store.createRuntimeDescriptor();
+    const second = mint();
     const secondBytes = Buffer.from(
-      store.serializeDescriptor({ version: 2, pipeName: first.descriptor.pipeName, token: second.descriptor.token }),
+      store.serializeDescriptor({
+        version: 3,
+        pipeName: first.descriptor.pipeName,
+        token: second.descriptor.token,
+        verifyKey: second.descriptor.verifyKey,
+      }),
       'utf8',
     );
     expect(await store.createDescriptorFileNative(anchor, first.runtimeId, secondBytes)).toEqual({
@@ -400,7 +414,7 @@ describe.skipIf(!ready)('D062 native artifacts + lifecycle v2 — real Windows i
 
   it('the descriptor token never appears in argv, stdout, stderr, or any runtime log line', async () => {
     const { parent, anchor } = await makeAnchor();
-    const minted = store.createRuntimeDescriptor();
+    const minted = mint();
     const payload = Buffer.from(store.serializeDescriptor(minted.descriptor), 'utf8');
 
     const run = runCreatorRaw([anchor, minted.runtimeId], payload);
@@ -447,7 +461,7 @@ describe.skipIf(!ready)('D062 native artifacts + lifecycle v2 — real Windows i
     const { anchor } = await makeAnchor();
     const scratch = mkdtempSync(join(tmpdir(), 'abctl-creator-neg-'));
     tempRoots.push(scratch);
-    const minted = store.createRuntimeDescriptor();
+    const minted = mint();
     const bytes = Buffer.from(store.serializeDescriptor(minted.descriptor), 'utf8');
     const rejection = store.DESCRIPTOR_CREATION_REJECTION;
 
@@ -478,7 +492,7 @@ describe.skipIf(!ready)('D062 native artifacts + lifecycle v2 — real Windows i
 
   it('a nonzero creator exit fails closed through the real transport', async () => {
     const missing = join(tmpdir(), `abctl-absent-${randomBytes(8).toString('hex')}`);
-    const minted = store.createRuntimeDescriptor();
+    const minted = mint();
     const bytes = Buffer.from(store.serializeDescriptor(minted.descriptor), 'utf8');
     expect(await store.createDescriptorFileNative(missing, minted.runtimeId, bytes)).toEqual({
       ok: false,
@@ -563,7 +577,7 @@ describe.skipIf(!ready)('D062 native artifacts + lifecycle v2 — real Windows i
 
   it('S0: a creator killed before CREATE_NEW (stdin never reaches EOF) creates nothing', async () => {
     const { anchor } = await makeAnchor();
-    const minted = store.createRuntimeDescriptor();
+    const minted = mint();
     const payload = Buffer.from(store.serializeDescriptor(minted.descriptor), 'utf8');
     const { child, settled } = spawnCreator(anchor, minted.runtimeId, payload, 'hold-open');
     // The creator reads stdin to EOF BEFORE any filesystem mutation; with EOF
@@ -642,15 +656,9 @@ describe.skipIf(!ready)('D062 native artifacts + lifecycle v2 — real Windows i
     }
     handles.push(handle);
 
-    // The real creator made the anchor secret (born protected) and this runtime's descriptor.
-    expect(readdirSync(anchor).sort()).toEqual([secretFile(), `runtime-descriptor-${handle.runtimeId}.json`].sort());
-    const secretSnapshot = await snapshotOf(store.anchorSecretPathFor(anchor));
-    expect(secretSnapshot.ownerSid).toBe(operator.sid);
-    expect(secretSnapshot.daclProtected).toBe(true);
-    expect(new Set(secretSnapshot.aces.map((ace) => ace.sid))).toEqual(new Set([operator.sid, SYSTEM_SID]));
-    expect(await store.verifyDescriptorAcl(store.anchorSecretPathFor(anchor))).toEqual({ ok: true });
-    const anchorSecret = store.parseAnchorSecret(readFileSync(store.anchorSecretPathFor(anchor), 'utf8'));
-    expect(anchorSecret).not.toBeNull();
+    // The real creator made exactly one file: this runtime's descriptor. The
+    // anchor holds no reserved file and no durable secret of any kind.
+    expect(readdirSync(anchor)).toEqual([`runtime-descriptor-${handle.runtimeId}.json`]);
     const snapshot = await snapshotOf(handle.descriptorPath);
     expect(snapshot.ownerSid).toBe(operator.sid);
     expect(snapshot.daclProtected).toBe(true);
@@ -672,7 +680,7 @@ describe.skipIf(!ready)('D062 native artifacts + lifecycle v2 — real Windows i
 
     handles.splice(handles.indexOf(handle), 1);
     await handle.close();
-    expect(readdirSync(anchor)).toEqual([secretFile()]); // own file removed; the secret is never removed
+    expect(readdirSync(anchor)).toEqual([]); // own file removed; the anchor holds nothing else
     expect(await store.defaultPipeProbe()(handle.pipePath)).toBe('ABSENT');
     const after = await cli.runControlCli({ verify, out: silent, err: (m) => err.push(m) });
     expect(after.status).toBeNull();
@@ -694,7 +702,7 @@ describe.skipIf(!ready)('D062 native artifacts + lifecycle v2 — real Windows i
     }
     handles.push(second);
     expect(readdirSync(anchor).sort()).toEqual(
-      [secretFile(), `runtime-descriptor-${first.runtimeId}.json`, `runtime-descriptor-${second.runtimeId}.json`].sort(),
+      [`runtime-descriptor-${first.runtimeId}.json`, `runtime-descriptor-${second.runtimeId}.json`].sort(),
     );
     const err: string[] = [];
     const ambiguous = await cli.runControlCli({ verify, out: silent, err: (m) => err.push(m) });
@@ -704,7 +712,7 @@ describe.skipIf(!ready)('D062 native artifacts + lifecycle v2 — real Windows i
     expect(b.runtime.current()).toBeNull();
 
     await first.close();
-    expect(readdirSync(anchor).sort()).toEqual([secretFile(), `runtime-descriptor-${second.runtimeId}.json`].sort());
+    expect(readdirSync(anchor)).toEqual([`runtime-descriptor-${second.runtimeId}.json`]);
     const found = await cli.runControlCli({ verify, out: silent, err: silent });
     expect(found.authenticated).toBe(true);
     expect(found.status).toBe('NO_WORKFLOW');
@@ -712,7 +720,7 @@ describe.skipIf(!ready)('D062 native artifacts + lifecycle v2 — real Windows i
 
   it('15/16. a crashed runtime leaves its real descriptor; the next real runtime sweeps exactly that file', async () => {
     const { anchor } = await makeAnchor();
-    const crashed = store.createRuntimeDescriptor();
+    const crashed = mint();
     const crashedPipe = store.pipePathFromName(crashed.descriptor.pipeName);
     const holder = await spawnPipeHolder(crashedPipe);
     expect(
@@ -749,56 +757,71 @@ describe.skipIf(!ready)('D062 native artifacts + lifecycle v2 — real Windows i
     }
     handles.push(next);
     expect(readdirSync(anchor).sort()).toEqual(
-      [secretFile(), `runtime-descriptor-${first.runtimeId}.json`, `runtime-descriptor-${next.runtimeId}.json`].sort(),
+      [`runtime-descriptor-${first.runtimeId}.json`, `runtime-descriptor-${next.runtimeId}.json`].sort(),
     );
   }, 30000);
 
-  it('TRUSTED ORIGIN: a legacy (unbound) descriptor with a perfect real ACL and a live pipe is never trusted by the real CLI; a genuine bound runtime is', async () => {
+  it('CI-2 ON REAL WINDOWS: a squatter serving a real gate-passing descriptor it did not mint cannot make the CLI exit 0', async () => {
     const { anchor } = await makeAnchor();
     const verify = (): Promise<{ readonly ok: true; readonly anchorPath: string }> =>
       Promise.resolve({ ok: true, anchorPath: anchor });
-    // A first runtime provisions the anchor secret for real (then leaves).
-    const provisioner = await runtime.startControlChannel({ orchestrator: newOrchestrator().orchestrator, verify, logger: silent });
-    expect(provisioner).not.toBeNull();
-    if (provisioner === null) {
-      return;
-    }
-    await provisioner.close();
-    expect(readdirSync(anchor)).toEqual([secretFile()]);
 
-    // The legacy file: three-key v2 content, created by the REAL creator, so its
-    // owner + protected operator+SYSTEM DACL are exactly what the gate wants —
-    // and an attacker serves its pipe (a holder that answers the probe PRESENT).
-    const legacy = store.createRuntimeDescriptor();
+    // The squatter's file is created by the REAL creator, so its owner and
+    // PROTECTED operator+SYSTEM DACL are exactly what the gate wants, and it is
+    // a perfectly well-formed v3 descriptor. It is PRESENT on a real pipe. The
+    // one thing its holder does not have is the ephemeral private key.
+    const squatted = mint();
     expect(
-      await store.createDescriptorFileNative(anchor, legacy.runtimeId, Buffer.from(store.serializeDescriptor(legacy.descriptor), 'utf8')),
+      await store.createDescriptorFileNative(
+        anchor,
+        squatted.runtimeId,
+        Buffer.from(store.serializeDescriptor(squatted.descriptor), 'utf8'),
+      ),
     ).toEqual({ ok: true });
-    expect(await store.verifyDescriptorAcl(store.descriptorPathFor(anchor, legacy.runtimeId))).toEqual({ ok: true });
-    const legacyPipe = store.pipePathFromName(legacy.descriptor.pipeName);
-    await spawnPipeHolder(legacyPipe);
-    expect(await store.defaultPipeProbe()(legacyPipe)).toBe('PRESENT');
+    expect(await store.verifyDescriptorAcl(store.descriptorPathFor(anchor, squatted.runtimeId))).toEqual({
+      ok: true,
+    });
+    const squattedPipe = store.pipePathFromName(squatted.descriptor.pipeName);
+    await spawnPipeHolder(squattedPipe);
+    expect(await store.defaultPipeProbe()(squattedPipe)).toBe('PRESENT');
 
+    // Discovery legitimately FINDS it — nothing about the file or its ACL is
+    // wrong. Authentication is what refuses it, and the CLI never reports
+    // APPLIED and never exits 0.
     const err: string[] = [];
-    const alone = await cli.runControlCli({ verify, out: silent, err: (m) => err.push(m) });
+    const alone = await cli.runControlCli({
+      verify,
+      out: silent,
+      err: (m) => err.push(m),
+      timeoutMs: 2000,
+    });
     expect(alone.authenticated).toBe(false);
     expect(alone.status).toBeNull();
     expect(alone.exitCode).toBe(1);
-    expect(err.some((line) => line.includes('NO_LIVE_CANDIDATES'))).toBe(true);
 
-    // Beside a genuine runtime the legacy file is still ignored: the genuine one is FOUND, not AMBIGUOUS.
-    const genuine = await runtime.startControlChannel({ orchestrator: newOrchestrator().orchestrator, verify, logger: silent });
+    // Beside a genuine runtime, two live pipes are AMBIGUOUS: still fail closed.
+    const genuine = await runtime.startControlChannel({
+      orchestrator: newOrchestrator().orchestrator,
+      verify,
+      logger: silent,
+    });
     expect(genuine).not.toBeNull();
     if (genuine === null) {
       return;
     }
     handles.push(genuine);
-    const found = await cli.runControlCli({ verify, out: silent, err: silent });
-    expect(found.authenticated).toBe(true);
-    expect(found.status).toBe('NO_WORKFLOW');
+    const both = await cli.runControlCli({ verify, out: silent, err: silent, timeoutMs: 2000 });
+    expect(both.exitCode).toBe(1);
+    expect(both.status).toBeNull();
+
+    // The genuine runtime published a real public identity and no private key.
     const published = store.parseDescriptor(readFileSync(genuine.descriptorPath, 'utf8'));
-    const secret = store.parseAnchorSecret(readFileSync(store.anchorSecretPathFor(anchor), 'utf8'));
-    expect(published !== null && secret !== null && store.verifyDescriptorProof(secret, published)).toBe(true);
-    expect(readdirSync(anchor)).toContain(`runtime-descriptor-${legacy.runtimeId}.json`); // never swept: its pipe is PRESENT
+    expect(published).not.toBeNull();
+    expect(published?.verifyKey.length).toBe(VERIFY_KEY_BYTES);
+    expect(publicKeyFromVerifyKey(published?.verifyKey ?? Buffer.alloc(0))).not.toBeNull();
+    expect(readFileSync(genuine.descriptorPath, 'utf8')).not.toContain('PRIVATE');
+    // The squatted file is never swept while its pipe answers PRESENT.
+    expect(readdirSync(anchor)).toContain(`runtime-descriptor-${squatted.runtimeId}.json`);
   }, 30000);
 
   it('a non-compliant anchor (inheritable Everyone) fails the real anchor gate, so no runtime ever publishes there', async () => {
