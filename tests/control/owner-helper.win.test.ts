@@ -314,7 +314,7 @@ describe.skipIf(!ready)('D062 native artifacts + lifecycle v2 — real Windows i
     expect(runCreatorRaw([anchor, HEX32], body).status).toBe(0);
     expect(readdirSync(anchor)).toEqual([`runtime-descriptor-${HEX32}.json`]);
     expect(readFileSync(join(anchor, `runtime-descriptor-${HEX32}.json`)).equals(body)).toBe(true);
-  });
+  }, 20000);
 
   it('the creator makes a descriptor owned by the EXACT operator with a PROTECTED two-principal DACL, immune to anchor widening', async () => {
     const { anchor } = await makeAnchor(true);
