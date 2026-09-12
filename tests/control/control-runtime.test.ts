@@ -19,6 +19,10 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { WORKFLOW_STATUS } from '../../src/domain/index.js';
+import {
+  publicKeyFromVerifyKey,
+  VERIFY_KEY_BYTES,
+} from '../../src/control/control-auth.js';
 import { createControlChannelServer } from '../../src/control/control-channel.js';
 import {
   CONTROL_COMMAND,
@@ -31,7 +35,6 @@ import {
   DESCRIPTOR_CREATION_REJECTION,
   MAX_ANCHOR_ENTRIES,
   MAX_DESCRIPTOR_CANDIDATES,
-  createRuntimeDescriptor,
   defaultPipeProbe,
   descriptorFilenameFor,
   descriptorPathFor,
@@ -57,6 +60,7 @@ import {
 import {
   BINDING,
   FAKE_ANCHOR,
+  mintRuntime,
   allAbsentProbe,
   closeServer,
   memAnchor,
@@ -89,6 +93,7 @@ const silent = (): void => {
 const realProbe = defaultPipeProbe(1500);
 
 /** Every identity-named file currently in the anchor. */
+/** Descriptor files in the anchor. The reserved anchor secret is a fixed fixture entry, not a descriptor. */
 function filesIn(anchor: MemAnchor): string[] {
   return [...anchor.entries().keys()].sort();
 }
@@ -129,7 +134,7 @@ function failingServerFactory(beforeFailure: () => void = silent): typeof create
 
 /** A valid foreign descriptor text for a fresh runtime id. */
 function foreignDescriptor(): { runtimeId: string; text: string; pipePath: string } {
-  const minted = createRuntimeDescriptor();
+  const minted = mintRuntime().parsed;
   return {
     runtimeId: minted.runtimeId,
     text: serializeDescriptor(minted.descriptor),
@@ -375,6 +380,9 @@ function realDescriptorGate(
   return (path: string): Promise<DescriptorAclVerification> =>
     verifyDescriptorAcl(path, {
       systemRoot: 'C:\\Windows',
+      // The in-memory anchor has no real file to lstat; the gate's reparse check
+      // is exercised directly in control-store.test.ts.
+      lstat: () => ({ isSymbolicLink: false, isReparsePoint: false }),
       runProcess: runnerFor(snapshotStdout, seen),
       owner: passingOwnerDeps,
     });
@@ -458,11 +466,45 @@ describe('D062 lifecycle v2 — descriptor verification fails closed (real evalu
   it('11. a malformed / foreign-content descriptor read back after creation fails closed', async () => {
     const cases: readonly [string, (id: string, bytes: Buffer) => string][] = [
       ['not JSON', (): string => '{ not json'],
-      ['different token', (id): string => serializeDescriptor({ version: 2, pipeName: pipeNameForRuntimeId(id), token: Buffer.alloc(32, 7).toString('base64url') })],
-      ['different pipe name', (_id, bytes): string => {
-        const parsed = JSON.parse(bytes.toString('utf8')) as { token: string };
-        return serializeDescriptor({ version: 2, pipeName: pipeNameForRuntimeId('f'.repeat(32)), token: parsed.token });
-      }],
+      [
+        'different token',
+        (id, bytes): string => {
+          const parsed = JSON.parse(bytes.toString('utf8')) as { verifyKey: string };
+          return serializeDescriptor({
+            version: 3,
+            pipeName: pipeNameForRuntimeId(id),
+            token: Buffer.alloc(32, 7).toString('base64url'),
+            verifyKey: parsed.verifyKey,
+          });
+        },
+      ],
+      [
+        'different verify key',
+        (id, bytes): string => {
+          const parsed = JSON.parse(bytes.toString('utf8')) as { token: string };
+          return serializeDescriptor({
+            version: 3,
+            pipeName: pipeNameForRuntimeId(id),
+            token: parsed.token,
+            verifyKey: mintRuntime().parsed.descriptor.verifyKey,
+          });
+        },
+      ],
+      [
+        'different pipe name',
+        (_id, bytes): string => {
+          const parsed = JSON.parse(bytes.toString('utf8')) as {
+            token: string;
+            verifyKey: string;
+          };
+          return serializeDescriptor({
+            version: 3,
+            pipeName: pipeNameForRuntimeId('f'.repeat(32)),
+            token: parsed.token,
+            verifyKey: parsed.verifyKey,
+          });
+        },
+      ],
       ['legacy v1 shape with pid', (_id, bytes): string => {
         const parsed = JSON.parse(bytes.toString('utf8')) as { pipeName: string; token: string };
         return JSON.stringify({ version: 1, pid: 4242, pipeName: parsed.pipeName, token: parsed.token });
@@ -925,11 +967,25 @@ describe('D062 lifecycle v2 — startup sweep of foreign descriptors', () => {
     const { orchestrator } = newOrchestrator();
     const anchor = memAnchor();
     const dead = foreignDescriptor();
-    expect(Object.keys(JSON.parse(dead.text) as object)).toEqual(['version', 'pipeName', 'token']);
-    // A descriptor claiming THIS live process's pid (legacy shape) is malformed, not a liveness claim.
-    const legacy = JSON.stringify({ version: 1, pid: process.pid, pipeName: pipeNameForRuntimeId('b'.repeat(32)), token: Buffer.alloc(32, 1).toString('base64url') });
+    expect(Object.keys(JSON.parse(dead.text) as object)).toEqual([
+      'version',
+      'pipeName',
+      'token',
+      'verifyKey',
+    ]);
+    // A legacy pid-bearing descriptor claiming THIS live process's pid. It is not
+    // a v3 descriptor and can never be discovered or authenticated — but it is
+    // NAME-CONSISTENT, so the cleanup path can still identify its own pipe.
+    const legacyId = 'b'.repeat(32);
+    const legacyPipe = pipeNameForRuntimeId(legacyId);
+    const legacy = JSON.stringify({
+      version: 1,
+      pid: process.pid,
+      pipeName: legacyPipe,
+      token: Buffer.alloc(32, 1).toString('base64url'),
+    });
     anchor.set(dead.runtimeId, dead.text);
-    anchor.set('b'.repeat(32), legacy);
+    anchor.set(legacyId, legacy);
     const probed: string[] = [];
     const probe: PipeProbe = (path) => {
       probed.push(path);
@@ -937,11 +993,14 @@ describe('D062 lifecycle v2 — startup sweep of foreign descriptors', () => {
     };
     const handle = await startServer(orchestrator, anchor, { probePipe: probe });
     handles.push(handle);
-    // The dead file was removed purely because its PIPE was absent …
-    expect(probed).toEqual([dead.pipePath]);
+    // Both files were decided by their OWN pipe and nothing else. The pid names
+    // a process that is demonstrably alive (this one), and it changed nothing:
+    // the probe said ABSENT, so the artifact was reclaimed.
+    expect(probed.sort()).toEqual([dead.pipePath, pipePathFromName(legacyPipe)].sort());
     expect(anchor.get(dead.runtimeId)).toBeNull();
-    // … and the legacy pid-bearing file was never probed nor removed.
-    expect(anchor.get('b'.repeat(32))).toBe(legacy);
+    expect(anchor.get(legacyId)).toBeNull();
+    // The legacy file is still not a descriptor: it can be cleaned up, never trusted.
+    expect(parseDescriptor(legacy)).toBeNull();
   });
 
   it('an unreadable anchor enumeration fails startup closed before listen or publish', async () => {
@@ -983,8 +1042,9 @@ describe('D062 lifecycle v2 — startup sweep of foreign descriptors', () => {
       anchor.set(
         id,
         serializeDescriptor({
-          version: 2,
+          version: 3,
           pipeName: pipeNameForRuntimeId(id),
+          verifyKey: mintRuntime().parsed.descriptor.verifyKey,
           token: Buffer.alloc(32, index % 251).toString('base64url'),
         }),
       );
@@ -1062,7 +1122,7 @@ describe('D062 lifecycle v2 — startup sweep of foreign descriptors', () => {
   function seedSurvivors(anchor: MemAnchor, count: number): string[] {
     const pipePaths: string[] = [];
     for (let index = 0; index < count; index += 1) {
-      const minted = createRuntimeDescriptor();
+      const minted = mintRuntime().parsed;
       anchor.set(minted.runtimeId, serializeDescriptor(minted.descriptor));
       pipePaths.push(pipePathFromName(minted.descriptor.pipeName));
     }
@@ -1194,6 +1254,7 @@ describe('D062 lifecycle v2 — startup sweep of foreign descriptors', () => {
   it('FINDING 2 — exactly MAX_ANCHOR_ENTRIES entries leaves no entry slot: startup fails closed before listen/publish', async () => {
     const { orchestrator } = newOrchestrator();
     const anchor = memAnchor();
+    // MAX junk entries fill the anchor to exactly the cap, leaving no slot.
     for (let index = 0; index < MAX_ANCHOR_ENTRIES; index += 1) {
       anchor.setRaw(`junk-${String(index)}.txt`, 'x');
     }
@@ -1241,7 +1302,7 @@ describe('D062 lifecycle v2 — startup sweep of foreign descriptors', () => {
     expect(handle).not.toBeNull();
     if (handle !== null) {
       handles.push(handle);
-      expect(anchor.entries().size).toBe(MAX_ANCHOR_ENTRIES); // (MAX-1 junk) + own = MAX
+      expect(anchor.entries().size).toBe(MAX_ANCHOR_ENTRIES); // secret + (MAX-2 junk) + own = MAX
       await expectDiscoverableNotOverfull(anchor.deps, handle.runtimeId);
     }
   });
@@ -1252,7 +1313,7 @@ describe('D062 lifecycle v2 — startup sweep of foreign descriptors', () => {
     for (let index = 0; index < MAX_ANCHOR_ENTRIES - 1; index += 1) {
       anchor.setRaw(`junk-${String(index)}.txt`, 'x');
     }
-    const dead = foreignDescriptor(); // valid foreign descriptor; +1 → exactly MAX total
+    const dead = foreignDescriptor(); // valid foreign descriptor; secret + junk + dead = exactly MAX total
     anchor.set(dead.runtimeId, dead.text);
     const handle = await startControlChannel({
       orchestrator,
@@ -1267,7 +1328,7 @@ describe('D062 lifecycle v2 — startup sweep of foreign descriptors', () => {
     if (handle !== null) {
       handles.push(handle);
       expect(anchor.removeCalls()).toBe(1); // the ABSENT foreign descriptor was removed
-      expect(anchor.entries().size).toBe(MAX_ANCHOR_ENTRIES); // (MAX-1 junk) + own = MAX
+      expect(anchor.entries().size).toBe(MAX_ANCHOR_ENTRIES); // secret + (MAX-2 junk) + own = MAX
       await expectDiscoverableNotOverfull(anchor.deps, handle.runtimeId);
     }
   });
@@ -1388,7 +1449,7 @@ async function legacyFixedPathStart(
   anchor: MemAnchor,
   listenSucceeds: boolean,
 ): Promise<{ pipeName: string; close: () => Promise<void> } | null> {
-  const minted = createRuntimeDescriptor();
+  const minted = mintRuntime().parsed;
   const legacyText = JSON.stringify({ version: 1, pid: process.pid, pipeName: minted.descriptor.pipeName, token: minted.descriptor.token });
   // Rotate then write — BEFORE the pipe exists.
   anchor.setRaw('runtime-descriptor.json', legacyText);
@@ -1442,5 +1503,118 @@ describe('D062 lifecycle v2 — negative controls against the reconstructed fixe
 
   it('NC-1. the legacy fixed name is not an identity-named candidate and can never be discovered or swept', () => {
     expect(runtimeIdFromDescriptorFilename('runtime-descriptor.json')).toBeNull();
+  });
+});
+
+/* ---- ephemeral runtime identity: the keypair lifecycle at runtime start ---- */
+
+describe('D062 runtime authentication — ephemeral keypair lifecycle at start', () => {
+  it('publishes a verifyKey that is a well-formed 32-byte Ed25519 public key', async () => {
+    const anchor = memAnchor();
+    const handle = await startServer(newOrchestrator().orchestrator, anchor);
+    handles.push(handle);
+    const parsed = parseDescriptor(anchor.get(handle.runtimeId) ?? '');
+    expect(parsed).not.toBeNull();
+    expect(parsed?.verifyKey.length).toBe(VERIFY_KEY_BYTES);
+    expect(publicKeyFromVerifyKey(parsed?.verifyKey ?? Buffer.alloc(0))).not.toBeNull();
+  });
+
+  it('the anchor holds ONLY identity-named descriptors: no reserved file, no durable secret', async () => {
+    const anchor = memAnchor();
+    const handle = await startServer(newOrchestrator().orchestrator, anchor);
+    handles.push(handle);
+    expect([...anchor.entries().keys()]).toEqual([descriptorFilenameFor(handle.runtimeId)]);
+    expect(anchor.createCalls()).toBe(1); // exactly one create: this runtime's descriptor
+  });
+
+  it('NO PRIVATE KEY IS SERIALIZED: every published byte is exactly the four v3 fields', async () => {
+    const anchor = memAnchor();
+    const handle = await startServer(newOrchestrator().orchestrator, anchor);
+    handles.push(handle);
+    const text = anchor.get(handle.runtimeId) ?? '';
+    const record = JSON.parse(text) as Record<string, unknown>;
+    expect(Object.keys(record).sort()).toEqual(['pipeName', 'token', 'verifyKey', 'version']);
+    // A serialized Ed25519 private key would show up as PEM, PKCS#8 DER, or a
+    // 48/64-byte blob. The only key-shaped field is verifyKey, and it is exactly
+    // the 32-byte PUBLIC half.
+    expect(text).not.toContain('PRIVATE KEY');
+    expect(text).not.toContain('BEGIN');
+    expect(Buffer.from(String(record['verifyKey']), 'base64url').length).toBe(VERIFY_KEY_BYTES);
+    expect(Buffer.from(String(record['token']), 'base64url').length).toBe(32);
+    // The published verifyKey is a public key, and nothing in the file can sign.
+    expect(publicKeyFromVerifyKey(Buffer.from(String(record['verifyKey']), 'base64url'))?.type).toBe(
+      'public',
+    );
+  });
+
+  it('rotates the keypair every start: two runtimes never share a verifyKey', async () => {
+    const anchor = memAnchor();
+    const a = await startServer(newOrchestrator().orchestrator, anchor);
+    const b = await startServer(newOrchestrator().orchestrator, anchor);
+    handles.push(a, b);
+    const parsedA = parseDescriptor(anchor.get(a.runtimeId) ?? '');
+    const parsedB = parseDescriptor(anchor.get(b.runtimeId) ?? '');
+    expect(parsedA?.verifyKey.equals(parsedB?.verifyKey ?? Buffer.alloc(0))).toBe(false);
+  });
+
+  it('a restart in the same anchor mints a fresh verifyKey (no reuse across lifetimes)', async () => {
+    const anchor = memAnchor();
+    const first = await startServer(newOrchestrator().orchestrator, anchor);
+    const firstKey = parseDescriptor(anchor.get(first.runtimeId) ?? '')?.verifyKey;
+    await first.close();
+    const second = await startServer(newOrchestrator().orchestrator, anchor);
+    handles.push(second);
+    const secondKey = parseDescriptor(anchor.get(second.runtimeId) ?? '')?.verifyKey;
+    expect(firstKey).toBeDefined();
+    expect(secondKey).toBeDefined();
+    expect(firstKey?.equals(secondKey ?? Buffer.alloc(0))).toBe(false);
+  });
+
+  it('fails closed when the published verifyKey does not match what was minted', async () => {
+    const anchor = memAnchor();
+    // A creator that swaps in a foreign verifyKey: the runtime would then be
+    // advertising a key it cannot sign with, so start must fail closed.
+    const create: DescriptorCreatorFn = (_dir, id, bytes) => {
+      const parsed = JSON.parse(bytes.toString('utf8')) as { pipeName: string; token: string };
+      anchor.set(
+        id,
+        serializeDescriptor({
+          version: 3,
+          pipeName: parsed.pipeName,
+          token: parsed.token,
+          verifyKey: mintRuntime().parsed.descriptor.verifyKey,
+        }),
+      );
+      return Promise.resolve({ ok: true });
+    };
+    const handle = await startControlChannel({
+      orchestrator: newOrchestrator().orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: passingDescriptorVerify,
+      descriptorDeps: anchor.deps,
+      createDescriptor: create,
+      logger: (): void => {
+        /* silent */
+      },
+    });
+    expect(handle).toBeNull();
+    expect(anchor.entries().size).toBe(0); // its own file was removed on failure
+  });
+
+  it('MULTI-RUNTIME unchanged: two runtimes coexist; AMBIGUOUS; one closes -> the other FOUND', async () => {
+    const anchor = memAnchor();
+    const a = await startServer(newOrchestrator().orchestrator, anchor);
+    const b = await startServer(newOrchestrator().orchestrator, anchor);
+    handles.push(a, b);
+    expect(anchor.createCalls()).toBe(2);
+    const both = await discoverControlRuntime(FAKE_ANCHOR, realProbe, anchor.deps);
+    expect(both.kind).toBe('AMBIGUOUS');
+    handles.splice(handles.indexOf(a), 1);
+    await a.close();
+    const one = await discoverControlRuntime(FAKE_ANCHOR, realProbe, anchor.deps);
+    expect(one.kind).toBe('FOUND');
+    if (one.kind === 'FOUND') {
+      expect(one.parsed.runtimeId).toBe(b.runtimeId);
+    }
   });
 });

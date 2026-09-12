@@ -4,29 +4,45 @@
  * unsupported).
  *
  * It may only: verify the hardened control anchor, discover the one live
- * identity-named descriptor, connect to that runtime's pipe, perform the mutual
- * HMAC handshake, submit **one** `OPEN_HUMAN_GATE`, authenticate the server
+ * identity-named descriptor, connect to that runtime's pipe, perform the
+ * handshake, submit **one** `OPEN_HUMAN_GATE`, authenticate the server
  * response, and print a bounded result. It constructs no `WorkflowEvent`, holds
  * no `WorkflowState` authority, accepts no arbitrary event, and takes no
  * commit/repository/workflow selector as command authority. It runs no Git,
  * GitHub, shell, or process command, and never deletes a descriptor.
  *
  * Discovery is bounded and deterministic (see `discoverControlRuntime`): every
- * `runtime-descriptor-<id>.json` in the verified anchor is parsed safely, each
- * valid candidate's pipe is probed, and the command is sent only when EXACTLY ONE
- * candidate's pipe is live. Zero live candidates is "unavailable"; two or more is
- * "ambiguous" and fails closed. Nothing is chosen by mtime, PID, lexicographic
- * order, or last-writer-wins.
+ * `runtime-descriptor-<id>.json` in the verified anchor is first security-verified
+ * (non-reparse identity, exact operator owner, protected operator+SYSTEM DACL —
+ * the same gate the runtime applies to its own file) BEFORE its token is read;
+ * each verified candidate is parsed safely, its pipe is probed, and the command
+ * is sent only when EXACTLY ONE candidate's pipe is live. Zero live candidates is
+ * "unavailable"; two or more is "ambiguous" and fails closed. Nothing is chosen
+ * by mtime, PID, lexicographic order, or last-writer-wins.
  *
- * Critically, it prints an applied outcome **only** when the server's `macS`
- * verifies: a missing, wrong, or replayed server MAC is treated as an
- * authentication failure and never reported as `APPLIED`.
+ * Critically, it prints an applied outcome **only** when the server's Ed25519
+ * `sigS` verifies against the `verifyKey` of the SAME descriptor discovery
+ * selected, over a transcript binding that runtime's id and pipe name, both
+ * nonces, and the exact command and result bytes. A missing, wrong, cross-runtime,
+ * or replayed signature is an authentication failure and is never reported as
+ * `APPLIED`.
+ *
+ * Because the signing key is ephemeral and lives only in the genuine runtime's
+ * memory, a party serving a squatted pipe with a byte-identical copy of a
+ * genuine descriptor cannot produce `sigS` and can never make this CLI exit 0.
+ * The CLI's own `nonceC` is fresh per connection, so a signature harvested from
+ * a live runtime is useless here once that runtime is gone.
  */
 
 import net from 'node:net';
 import { randomBytes } from 'node:crypto';
 
-import { computeClientMac, computeServerMac, macEqual, NONCE_BYTES } from './control-auth.js';
+import {
+  computeClientMac,
+  verifyServerResult,
+  NONCE_BYTES,
+  type ChannelIdentity,
+} from './control-auth.js';
 import {
   CONTROL_COMMAND,
   CONTROL_RESULT,
@@ -85,7 +101,10 @@ interface ClientProtocolOutcome {
 interface ClientProtocolArgs {
   readonly connect: ConnectFn;
   readonly pipePath: string;
+  readonly identity: ChannelIdentity;
   readonly token: Buffer;
+  /** Raw Ed25519 public key from the discovered descriptor. */
+  readonly verifyKey: Buffer;
   readonly nonceGen: () => Buffer;
   readonly timeoutMs: number;
 }
@@ -120,7 +139,7 @@ function runClientProtocol(args: ClientProtocolArgs): Promise<ClientProtocolOutc
           return;
         }
         nonceC = args.nonceGen();
-        const macC = computeClientMac(args.token, nonceS, nonceC, commandBytes);
+        const macC = computeClientMac(args.token, args.identity, nonceS, nonceC, commandBytes);
         phase = 'result';
         socket.write(frameMessage(buildRequestBody(nonceC, CONTROL_COMMAND.OPEN_HUMAN_GATE, macC)));
         return;
@@ -130,14 +149,16 @@ function runClientProtocol(args: ClientProtocolArgs): Promise<ClientProtocolOutc
         finish({ authenticated: false, status: null, errorMessage: 'bad server result' });
         return;
       }
-      const expected = computeServerMac(
-        args.token,
+      const verified = verifyServerResult(
+        args.verifyKey,
+        args.identity,
         nonceS,
         nonceC,
         commandBytes,
         Buffer.from(parsed.result, 'utf8'),
+        parsed.sig,
       );
-      if (!macEqual(expected, parsed.mac)) {
+      if (!verified) {
         finish({ authenticated: false, status: null, errorMessage: 'server authentication failed' });
         return;
       }
@@ -232,7 +253,12 @@ export async function runControlCli(deps: RunControlCliDeps = {}): Promise<Contr
   const outcome = await runClientProtocol({
     connect,
     pipePath: pipePathFromName(discovery.parsed.descriptor.pipeName),
+    identity: {
+      runtimeId: discovery.parsed.runtimeId,
+      pipeName: discovery.parsed.descriptor.pipeName,
+    },
     token: discovery.parsed.token,
+    verifyKey: discovery.parsed.verifyKey,
     nonceGen,
     timeoutMs,
   });

@@ -8,7 +8,8 @@ import { describe, expect, it } from 'vitest';
  * D062 authority-boundary source scans over `src/control/` (and the one wiring
  * edit in `src/runtime/live-cockpit.ts`). These pin the frozen product boundary:
  * exactly one command, no generic event surface, no Git/GitHub/provider/Policy,
- * no shell, and strict token discipline. Decision 062 Amendment B (PR #85 F3)
+ * no shell, and strict token discipline. Ratification R-1 of
+ * AGENTBRIDGE_DECISION_062_AMENDMENT_RUNTIME_AUTHENTICATION_2026-09-12 (PR #85 F3)
  * reads a single canonical OWNER + DACL snapshot from the build-provenanced native
  * helper and removes the localized `icacls` read entirely — leaving exactly two
  * read-only executables (whoami and the owner+DACL helper) and no more; the
@@ -118,7 +119,7 @@ describe('D062 authority boundary — no shell, two read-only executables', () =
   it('the only hardcoded executable is whoami.exe under System32, shell:false', () => {
     const store = textOf('control-store.ts');
     expect(store).toMatch(/whoami\.exe/);
-    // Amendment B removed the localized icacls read from the authorization path.
+    // Ratification R-1 removed the localized icacls read from the authorization path.
     expect(store).not.toMatch(/icacls/i);
     expect(store).toMatch(/System32/);
     expect(store).toMatch(/shell:\s*false/);

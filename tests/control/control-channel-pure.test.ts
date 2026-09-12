@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto';
 
 import { describe, expect, it } from 'vitest';
 
-import { NONCE_BYTES, MAC_BYTES } from '../../src/control/control-auth.js';
+import { NONCE_BYTES, MAC_BYTES, SIG_BYTES } from '../../src/control/control-auth.js';
 import { encodeBase64Url } from '../../src/control/control-codec.js';
 import {
   buildHelloBody,
@@ -192,11 +192,37 @@ describe('D062 wire bodies round-trip', () => {
     expect(parsed?.equals(nonceS)).toBe(true);
   });
 
-  it('result body round-trips status + mac', () => {
-    const mac = randomBytes(MAC_BYTES);
-    const parsed = parseResultBody(buildResultBody(CONTROL_RESULT.APPLIED, mac));
+  it('result body round-trips status + Ed25519 signature', () => {
+    const sig = randomBytes(SIG_BYTES);
+    const parsed = parseResultBody(buildResultBody(CONTROL_RESULT.APPLIED, sig));
     expect(parsed?.result).toBe('APPLIED');
-    expect(parsed?.mac.equals(mac)).toBe(true);
+    expect(parsed?.sig.equals(sig)).toBe(true);
+  });
+
+  it('REJECTS a protocol-v1 result body (carries mac, not sig) — no downgrade path', () => {
+    const v1 = Buffer.from(
+      JSON.stringify({ v: 1, result: 'APPLIED', mac: randomBytes(MAC_BYTES).toString('base64url') }),
+      'utf8',
+    );
+    expect(parseResultBody(v1)).toBeNull();
+  });
+
+  it('REJECTS a v2-versioned body that still carries mac instead of sig', () => {
+    const shaped = Buffer.from(
+      JSON.stringify({ v: 2, result: 'APPLIED', mac: randomBytes(SIG_BYTES).toString('base64url') }),
+      'utf8',
+    );
+    expect(parseResultBody(shaped)).toBeNull();
+  });
+
+  it('REJECTS a signature of the wrong width', () => {
+    for (const width of [0, 32, 63, 65]) {
+      const body = Buffer.from(
+        JSON.stringify({ v: 2, result: 'APPLIED', sig: randomBytes(width).toString('base64url') }),
+        'utf8',
+      );
+      expect(parseResultBody(body)).toBeNull();
+    }
   });
 
   it('a built request body parses back', () => {

@@ -11,8 +11,11 @@
  *   1. verify the hardened control anchor (read-only, fail closed);
  *   2. sweep foreign descriptors whose pipe the kernel reports ABSENT (best
  *      effort; nothing PRESENT/UNKNOWN/malformed is ever removed);
- *   3. mint this runtime's identity: a 128-bit random runtime id, its pipe name,
- *      and a rotating 256-bit token;
+ *   3. mint this runtime's ephemeral Ed25519 keypair and its identity: a 128-bit
+ *      random runtime id, its pipe name, a rotating 256-bit token, and the raw
+ *      public `verifyKey`. The PRIVATE key is held in this function's scope and
+ *      handed only to the channel; it is never written to the descriptor, a log,
+ *      argv, an environment variable, or a subprocess;
  *   4. listen on the identity-named pipe — the kernel-owned exclusivity/liveness
  *      claim; a same-name collision or any listen error fails **closed** and
  *      nothing has been published;
@@ -21,18 +24,23 @@
  *      exact operator owner, protected operator+SYSTEM DACL, bytes on stdin);
  *   6. verify the exact file just created: its actual owner + DACL through the
  *      independent read-only helper, and its contents by read-back — the parsed
- *      runtime id, pipe name, and token must equal what this runtime minted;
+ *      runtime id, pipe name, token, and verifyKey must equal what this runtime
+ *      minted;
  *   7. expose the control handle only after every gate above passed.
  *
  * There is no shared fixed pathname, no rotation, no ownership recheck, no PID,
- * no lease, and no polling. A failure at any step disables the control channel
- * and returns `null`; it never throws into the Cockpit path and never converts
- * the Cockpit into a writer. The token is never logged, never put in an
- * environment variable, argv, or an error message.
+ * no lease, no polling, and no persistent secret of any kind in the anchor
+ * beyond each runtime's own process-lifetime descriptor. A failure at any step
+ * disables the control channel and returns `null`; it never throws into the
+ * Cockpit path and never converts the Cockpit into a writer. Neither the token
+ * nor the private key is ever logged, put in an environment variable, argv, or
+ * an error message.
  */
 
 import { timingSafeEqual } from 'node:crypto';
 import type net from 'node:net';
+
+import { generateRuntimeKeyPair } from './control-auth.js';
 
 import type { AutoflowOrchestrator } from '../autoflow/orchestrator.js';
 import { CONTROL_RESULT, type ControlCommand, type ControlResultStatus } from './control-command.js';
@@ -178,7 +186,7 @@ export async function startControlChannel(
   // the anchor over-full and fail discovery closed with ANCHOR_OVERFULL:
   // CONTROL_START_SUCCESS ⇒ POST_PUBLICATION_ANCHOR_REMAINS_WITHIN_TOTAL_ENTRY_BOUND.
   const survivingEntries = sweep.scanned - sweep.removed.length;
-  if (survivingEntries >= MAX_ANCHOR_ENTRIES) {
+  if (survivingEntries + 1 > MAX_ANCHOR_ENTRIES) {
     log('AgentBridge control channel: disabled (no anchor entry slot available).');
     return null;
   }
@@ -189,9 +197,15 @@ export async function startControlChannel(
     );
   }
 
-  // 3. Mint this runtime's identity.
-  const minted = createRuntimeDescriptor();
+  // 3. Mint this runtime's ephemeral identity. The private key never leaves this
+  //    scope except into the channel's in-memory context: it is not written to
+  //    the descriptor, a log, argv, an environment variable, or a subprocess, so
+  //    a party holding only the published descriptor bytes can never answer for
+  //    this runtime — during its life or after it exits.
+  const keyPair = generateRuntimeKeyPair();
+  const minted = createRuntimeDescriptor(keyPair.verifyKey);
   const { runtimeId } = minted;
+  const identity = { runtimeId, pipeName: minted.descriptor.pipeName };
   const pipePath = pipePathFromName(minted.descriptor.pipeName);
   const descriptorPath = descriptorPathFor(anchorPath, runtimeId);
 
@@ -209,10 +223,16 @@ export async function startControlChannel(
       return live === null ? CONTROL_RESULT.UNAVAILABLE : live.dispatch(command);
     },
   });
+  const serverOptions = {
+    identity,
+    token: minted.token,
+    privateKey: keyPair.privateKey,
+    dispatcher: gate,
+  };
   const server = createServer(
     deps.timeoutMs === undefined
-      ? { token: minted.token, dispatcher: gate }
-      : { token: minted.token, dispatcher: gate, timeoutMs: deps.timeoutMs },
+      ? serverOptions
+      : { ...serverOptions, timeoutMs: deps.timeoutMs },
   );
   try {
     await listen(server, pipePath);
@@ -281,14 +301,18 @@ export async function startControlChannel(
   }
 
   // 6b. Read back the exact file and require that it describes THIS runtime:
-  //     the parsed runtime id, pipe name, and token must equal what was minted.
+  //     the parsed runtime id, pipe name, token, and verifyKey must equal what
+  //     was minted. A wrong verifyKey here would mean clients verify signatures
+  //     against a key this runtime cannot sign with, so it fails closed.
   const readBack = readDescriptorFile(descriptorPath, deps.descriptorDeps);
   if (
     readBack === null ||
     readBack.runtimeId !== runtimeId ||
     readBack.descriptor.pipeName !== minted.descriptor.pipeName ||
     readBack.token.length !== minted.token.length ||
-    !timingSafeEqual(readBack.token, minted.token)
+    !timingSafeEqual(readBack.token, minted.token) ||
+    readBack.verifyKey.length !== minted.verifyKey.length ||
+    !timingSafeEqual(readBack.verifyKey, minted.verifyKey)
   ) {
     return failAfterListen(
       'AgentBridge control channel: disabled (descriptor contents do not identify this runtime).',

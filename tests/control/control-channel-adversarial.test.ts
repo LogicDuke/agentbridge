@@ -36,13 +36,13 @@ describe('D062 control channel — server-level adversarial (real named pipe)', 
     const store = memAnchor();
     const handle = await startServer(orchestrator, store);
     handles.push(handle);
-    const { token, pipePath } = descriptorFacts(store, handle);
+    const { token, identity, pipePath } = descriptorFacts(store, handle);
 
     const outcome = await rawClient(pipePath, {
       onHello: (): Buffer => {
         const staleNonceS = randomBytes(NONCE_BYTES);
         const nonceC = randomBytes(NONCE_BYTES);
-        const mac = computeClientMac(token, staleNonceS, nonceC, CMD);
+        const mac = computeClientMac(token, identity, staleNonceS, nonceC, CMD);
         return frameMessage(buildRequestBody(nonceC, CONTROL_COMMAND.OPEN_HUMAN_GATE, mac));
       },
     });
@@ -59,13 +59,13 @@ describe('D062 control channel — server-level adversarial (real named pipe)', 
     const store = memAnchor();
     const handle = await startServer(orchestrator, store);
     handles.push(handle);
-    const { pipePath } = descriptorFacts(store, handle);
+    const { identity, pipePath } = descriptorFacts(store, handle);
 
     const outcome = await rawClient(pipePath, {
       onHello: (nonceS: Buffer): Buffer => {
         const nonceC = randomBytes(NONCE_BYTES);
         // MAC with a random wrong token.
-        const mac = computeClientMac(randomBytes(32), nonceS, nonceC, CMD);
+        const mac = computeClientMac(randomBytes(32), identity, nonceS, nonceC, CMD);
         return frameMessage(buildRequestBody(nonceC, CONTROL_COMMAND.OPEN_HUMAN_GATE, mac));
       },
     });
@@ -82,13 +82,13 @@ describe('D062 control channel — server-level adversarial (real named pipe)', 
     const store = memAnchor();
     const handle = await startServer(orchestrator, store);
     handles.push(handle);
-    const { token, pipePath } = descriptorFacts(store, handle);
+    const { token, identity, pipePath } = descriptorFacts(store, handle);
 
     const outcome = await rawClient(pipePath, {
       onHello: (nonceS: Buffer): Buffer => {
         const nonceC = randomBytes(NONCE_BYTES);
         const badCmd = Buffer.from('CLOSE_REQUESTED', 'utf8');
-        const mac = computeClientMac(token, nonceS, nonceC, badCmd);
+        const mac = computeClientMac(token, identity, nonceS, nonceC, badCmd);
         return frameMessage(buildRequestBody(nonceC, 'CLOSE_REQUESTED', mac));
       },
     });
@@ -155,7 +155,7 @@ describe('D062 control channel — server-level adversarial (real named pipe)', 
     const store = memAnchor();
     const handle = await startServer(orchestrator, store);
     handles.push(handle);
-    const { pipePath } = descriptorFacts(store, handle);
+    const { identity, pipePath } = descriptorFacts(store, handle);
 
     await new Promise<void>((resolvePromise) => {
       const socket = net.connect(pipePath);
@@ -190,7 +190,7 @@ describe('D062 control channel — server-level adversarial (real named pipe)', 
     const followUp = await rawClient(pipePath, {
       onHello: (): Buffer => {
         const nonceC = randomBytes(NONCE_BYTES);
-        const mac = computeClientMac(token, randomBytes(NONCE_BYTES), nonceC, CMD);
+        const mac = computeClientMac(token, identity, randomBytes(NONCE_BYTES), nonceC, CMD);
         return frameMessage(buildRequestBody(nonceC, CONTROL_COMMAND.OPEN_HUMAN_GATE, mac));
       },
     });
@@ -203,7 +203,7 @@ describe('D062 control channel — server-level adversarial (real named pipe)', 
     const store = memAnchor();
     const handle = await startServer(orchestrator, store);
     handles.push(handle);
-    const { token, pipePath } = descriptorFacts(store, handle);
+    const { token, identity, pipePath } = descriptorFacts(store, handle);
 
     await new Promise<void>((resolvePromise) => {
       const socket = net.connect(pipePath);
@@ -227,7 +227,7 @@ describe('D062 control channel — server-level adversarial (real named pipe)', 
           return;
         }
         const nonceC = randomBytes(NONCE_BYTES);
-        const mac = computeClientMac(token, nonceS, nonceC, CMD);
+        const mac = computeClientMac(token, identity, nonceS, nonceC, CMD);
         socket.write(frameMessage(buildRequestBody(nonceC, CONTROL_COMMAND.OPEN_HUMAN_GATE, mac)));
         // Give the server time to receive + dispatch, then vanish before result.
         setTimeout(() => {

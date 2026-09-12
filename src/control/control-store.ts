@@ -12,7 +12,9 @@
  * - the current operator identity comes from `whoami /user` (the trusted operator
  *   SID);
  * - one build-provenanced native helper reads a single OWNER + DACL
- *   security-descriptor snapshot (Decision 062 Amendment B, grammar V2). Its bytes
+ *   security-descriptor snapshot (ratification R-1 of
+ *   AGENTBRIDGE_DECISION_062_AMENDMENT_RUNTIME_AUTHENTICATION_2026-09-12,
+ *   grammar V2). Its bytes
  *   are SHA-256-verified against generated build metadata before it is ever run;
  *   the snapshot is emitted as **canonical SIDs only** (never localized account
  *   names) and carries the DACL's PROTECTED state and each ACE's exact flags.
@@ -32,9 +34,15 @@
  * provisions the production directory. It also makes **no atomic pathname
  * proof** — the snapshot is a single read (a sub-millisecond check-to-use TOCTOU
  * window remains), and Node's `lstat` distinguishes a symlink but not every
- * reparse tag. These limitations are preserved deliberately; authorization never
- * depends on them alone — token possession (mutual HMAC) is the actual
- * authenticator.
+ * reparse tag. These limitations are preserved deliberately.
+ *
+ * This gate IS THE AUTHORITY. It, together with the held-handle read below, is
+ * the only thing that decides which descriptor — and therefore which runtime
+ * `verifyKey` — may be trusted against a cross-principal adversary. It is NOT
+ * defence-in-depth and must never be demoted to it: a public key published in a
+ * file an adversary can write is self-signed and proves nothing. The ephemeral
+ * keypair (see `control-auth.ts`) supplies FRESHNESS and NON-EXPORTABILITY; it
+ * supplies no authority of its own.
  *
  * ## Runtime identity and identity-named descriptors (lifecycle v2)
  *
@@ -52,16 +60,44 @@
  * A runtime removes only its own identity-named file; no runtime ever overwrites
  * or rotates another runtime's file.
  *
- * ## Token / descriptor lifecycle
+ * ## Descriptor v3: the runtime's published identity
+ *
+ * A descriptor is exactly `{ version: 3, pipeName, token, verifyKey }` — four
+ * keys, no more, no fewer. A version-2 descriptor is malformed and can never be
+ * a live candidate; there is no dual-accept, negotiation, compatibility window,
+ * or downgrade path, because a single attacker-supplied v2 artifact would erase
+ * the whole guarantee. No migration is needed: descriptors and tokens are
+ * process-lifetime only, and both peers ship from one build.
  *
  * The runtime token is 256 bits from {@link crypto.randomBytes}, process-lifetime
  * only, rotated every start, and represented base64url **only** inside the
  * hardened descriptor file. It is never an environment variable, argv, Scheduled
  * Task field, log line, error message, and is never sent raw over the pipe (it is
- * an HMAC key). The descriptor carries no PID: liveness is decided by the kernel
- * pipe namespace, never by process identity, so PID reuse is irrelevant.
+ * an HMAC key). Its scope is now exactly ONE thing: client-to-server command
+ * authorization. It no longer authenticates the server's result.
  *
- * ## Descriptor creation (Decision 062 Amendment C)
+ * `verifyKey` is the raw 32-byte Ed25519 public half of a keypair minted fresh at
+ * every start. The PRIVATE half exists only in that process's memory and is
+ * never serialized, so the descriptor — which is what a copier can take — carries
+ * no signing capability at all. This is why replay is dead by construction here
+ * rather than by inspection: a descriptor's CURRENT owner and DACL prove nothing
+ * about its HISTORY (a file once attacker-readable can be repaired via WRITE_DAC
+ * into a snapshot byte-identical to a creator-born one), and no predicate over
+ * file state at time t can decide "were these bytes ever observed by someone
+ * else?". Removing the secret from the serialized state dissolves that question
+ * instead of answering it. The descriptor carries no PID: liveness is decided by
+ * the kernel pipe namespace, never by process identity, so PID reuse is
+ * irrelevant.
+ *
+ * A descriptor rewritten with an ADVERSARY'S OWN `verifyKey` is not prevented by
+ * the protocol — the descriptor is the trust root, and anchor write access is the
+ * adversary's defining capability. It is prevented for cross-principal
+ * adversaries by the anchor DACL above, and it is explicitly OUT OF SCOPE for
+ * same-SID, Administrator and SYSTEM principals, whether the genuine runtime is
+ * alive or dead. Windows provides no intra-SID isolation; claiming otherwise
+ * would be a claim the mechanism cannot support.
+ *
+ * ## Descriptor creation (ratification R-2 of the runtime-authentication amendment)
  *
  * The descriptor's own security is chosen by **Windows**, not by whoever calls a
  * file write: a newly created file's OWNER comes from the creating token's DEFAULT
@@ -94,11 +130,21 @@
 
 import { execFile } from 'node:child_process';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import { closeSync, lstatSync, openSync, opendirSync, readFileSync, readSync, unlinkSync } from 'node:fs';
+import {
+  closeSync,
+  constants as fsConstants,
+  lstatSync,
+  openSync,
+  opendirSync,
+  readFileSync,
+  readSync,
+  unlinkSync,
+} from 'node:fs';
 import net from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { VERIFY_KEY_BYTES } from './control-auth.js';
 import { decodeBase64UrlExact, encodeBase64Url } from './control-codec.js';
 
 const randomBytesFn = randomBytes;
@@ -210,39 +256,58 @@ export function runtimeIdFromDescriptorFilename(filename: string): string | null
 }
 
 /* ------------------------------------------------------------------ *
- * Descriptor model (v2)
+ * Descriptor model (v3)
  * ------------------------------------------------------------------ */
 
 /** The hardened per-runtime descriptor written into the verified anchor. */
 export interface RuntimeDescriptor {
-  readonly version: 2;
+  readonly version: 3;
   readonly pipeName: string;
-  /** base64url of the 256-bit token — hardened storage only, never elsewhere. */
+  /**
+   * base64url of the 256-bit token — hardened storage only, never elsewhere.
+   * Scope: client-to-server command authorization ONLY. It does not authenticate
+   * the server's result.
+   */
   readonly token: string;
+  /**
+   * base64url of the raw 32-byte Ed25519 public key whose private half lives only
+   * in the publishing runtime's memory. Public by design: it is an identity to
+   * check against, never a credential to hold.
+   */
+  readonly verifyKey: string;
 }
 
-/** A parsed, trusted descriptor with its raw token and derived runtime id. */
+/** A parsed descriptor with its raw token, raw verify key, and derived runtime id. */
 export interface ParsedDescriptor {
   readonly descriptor: RuntimeDescriptor;
   readonly token: Buffer;
   readonly runtimeId: string;
+  readonly verifyKey: Buffer;
 }
 
 /**
- * Mint a fresh descriptor, its raw token, and its runtime id. The token rotates
- * every call (fresh `randomBytes`), the runtime id is per-process unpredictable
- * (128-bit) and is the pipe name's suffix, and the raw token is returned
- * separately so the caller can key HMAC without re-decoding it.
+ * Mint a fresh descriptor, its raw token, and its runtime id around the caller's
+ * already-generated `verifyKey`. The token rotates every call (fresh
+ * `randomBytes`), the runtime id is per-process unpredictable (128-bit) and is
+ * the pipe name's suffix, and the raw token is returned separately so the caller
+ * can key HMAC without re-decoding it.
+ *
+ * The keypair is generated by the caller, not here, so that this module never
+ * holds — and can never accidentally serialize — a private key.
  */
-export function createRuntimeDescriptor(): ParsedDescriptor {
+export function createRuntimeDescriptor(verifyKey: Buffer): ParsedDescriptor {
+  if (verifyKey.length !== VERIFY_KEY_BYTES) {
+    throw new TypeError('control-store: malformed runtime verify key.');
+  }
   const token = randomBytesFn(TOKEN_BYTES);
   const runtimeId = randomBytesFn(RUNTIME_ID_BYTES).toString('hex');
   const descriptor: RuntimeDescriptor = {
-    version: 2,
+    version: 3,
     pipeName: pipeNameForRuntimeId(runtimeId),
     token: encodeBase64Url(token),
+    verifyKey: encodeBase64Url(verifyKey),
   };
-  return { descriptor, token, runtimeId };
+  return { descriptor, token, runtimeId, verifyKey };
 }
 
 /** Serialize a descriptor to its on-disk JSON form. */
@@ -270,14 +335,24 @@ export function parseDescriptor(text: unknown): ParsedDescriptor | null {
     return null;
   }
   const keys = Object.keys(parsed);
-  if (keys.length !== 3) {
+  // EXACTLY the four v3 keys. Any other key, any missing key, and any other
+  // count is malformed. A version-2 descriptor lands here with three keys and no
+  // `verifyKey`, so it is structurally rejected: there is deliberately no
+  // dual-accept branch, no negotiation, and no downgrade path.
+  if (keys.length !== 4) {
     return null;
   }
   const record = parsed as Record<string, unknown>;
   const version = record['version'];
   const pipeName = record['pipeName'];
   const token = record['token'];
-  if (version !== 2 || typeof pipeName !== 'string' || typeof token !== 'string') {
+  const verifyKey = record['verifyKey'];
+  if (
+    version !== 3 ||
+    typeof pipeName !== 'string' ||
+    typeof token !== 'string' ||
+    typeof verifyKey !== 'string'
+  ) {
     return null;
   }
   const runtimeId = runtimeIdFromPipeName(pipeName);
@@ -285,13 +360,15 @@ export function parseDescriptor(text: unknown): ParsedDescriptor | null {
     return null;
   }
   const rawToken = decodeBase64UrlExact(token, TOKEN_BYTES);
-  if (rawToken === null) {
+  const rawVerifyKey = decodeBase64UrlExact(verifyKey, VERIFY_KEY_BYTES);
+  if (rawToken === null || rawVerifyKey === null) {
     return null;
   }
   return {
-    descriptor: { version: 2, pipeName, token },
+    descriptor: { version: 3, pipeName, token, verifyKey },
     token: rawToken,
     runtimeId,
+    verifyKey: rawVerifyKey,
   };
 }
 
@@ -337,7 +414,8 @@ export const CONTROL_ANCHOR_REJECTION = Object.freeze({
   REPARSE_POINT: 'REPARSE_POINT',
   WHOAMI_FAILED: 'WHOAMI_FAILED',
   OPERATOR_UNREADABLE: 'OPERATOR_UNREADABLE',
-  // Owner + DACL snapshot gate (Decision 062 Amendment B): one build-provenanced
+  // Owner + DACL snapshot gate (ratification R-1 of
+  // AGENTBRIDGE_DECISION_062_AMENDMENT_RUNTIME_AUTHENTICATION_2026-09-12): one build-provenanced
   // native helper reads a canonical-SID OWNER + DACL snapshot; every invariant
   // below is proven over SIDs, never localized account names.
   HELPER_PROVENANCE_MISSING: 'HELPER_PROVENANCE_MISSING',
@@ -396,7 +474,7 @@ export function parseWhoamiUser(stdout: string): OperatorIdentity | null {
 }
 
 /* ------------------------------------------------------------------ *
- * Canonical OWNER + DACL snapshot (Amendment B, grammar V2)
+ * Canonical OWNER + DACL snapshot (ratification R-1, grammar V2)
  * ------------------------------------------------------------------ *
  *
  * The native helper's `--acl <path>` mode emits a bounded, deterministic,
@@ -762,7 +840,7 @@ function whoamiPath(systemRoot: string): string {
  * ------------------------------------------------------------------ *
  *
  * The path scan proves the anchor is reached without a symlink/reparse; it does
- * not prove who owns or may access the anchor. Decision 062 Amendment B closes
+ * not prove who owns or may access the anchor. Ratification R-1 closes
  * that gap with ONE snapshot: the anchor OWNER SID must equal the exact runtime
  * operator SID (SYSTEM is an allowed DACL principal but never an allowed owner,
  * because an owner can rewrite the DACL), and the protected DACL principals must
@@ -1042,14 +1120,24 @@ export async function verifyControlAnchor(
 }
 
 /**
- * Resolve the operator and verify one exact identity-named descriptor file's
- * actual owner + DACL read-only, fail-closed. Runs the same two read-only
- * executables as the anchor gate (whoami and the provenanced helper).
+ * Verify one exact identity-named descriptor file's security read-only,
+ * fail-closed: the file itself must not be a symlink/reparse point (`lstat`,
+ * before any subprocess — the helper's `GetNamedSecurityInfoW` follows links, so
+ * a linked descriptor would otherwise present its target's ACL), then the
+ * operator is resolved and the file's actual owner + DACL are evaluated. Runs
+ * the same two read-only executables as the anchor gate (whoami and the
+ * provenanced helper). This is the ONE descriptor security truth source, used
+ * both for the runtime's own just-created file and for every discovered
+ * candidate before its token is read.
  */
 export async function verifyDescriptorAcl(
   descriptorPath: string,
   deps: VerifyControlAnchorDeps = {},
 ): Promise<DescriptorAclVerification> {
+  const pathSafety = evaluatePathSafety([descriptorPath], deps.lstat ?? defaultLstatProbe);
+  if (!pathSafety.ok) {
+    return { ok: false, reason: pathSafety.reason };
+  }
   const env = deps.env ?? process.env;
   const systemRoot = deps.systemRoot ?? env['SystemRoot'] ?? 'C:\\Windows';
   const runProcess = deps.runProcess ?? defaultProcessRunner(systemRoot);
@@ -1064,7 +1152,10 @@ export async function verifyDescriptorAcl(
  * Descriptor store I/O — identity-named files inside the verified anchor
  * ------------------------------------------------------------------ */
 
-/** Injection seams for descriptor reads, removals, and anchor enumeration. */
+/**
+ * Injection seams for descriptor reads, removals, anchor enumeration, and the
+ * per-candidate security gate discovery runs BEFORE reading a candidate.
+ */
 export interface DescriptorFileDeps {
   /**
    * Basenames inside the anchor as an iterable; throws when the anchor cannot be
@@ -1074,6 +1165,33 @@ export interface DescriptorFileDeps {
   readonly listAnchor?: (anchorPath: string) => Iterable<string>;
   readonly readFile?: (path: string) => string;
   readonly removeFile?: (path: string) => void;
+  /**
+   * Security gate for one exact discovered candidate path, consulted by
+   * {@link discoverControlRuntime} before that candidate's contents (its token)
+   * are read. Omitted ⇒ the real {@link verifyDescriptorAcl} (non-reparse
+   * identity, exact operator owner, protected operator+SYSTEM DACL), so a caller
+   * that injects nothing gets the fail-closed gate, never a bypass.
+   */
+  readonly verifyDescriptor?: (descriptorPath: string) => Promise<DescriptorAclVerification>;
+  /**
+   * Open one exact discovered candidate as a held {@link DescriptorHandle} that
+   * {@link discoverControlRuntime} keeps open ACROSS the security gate and the
+   * content read, so both refer to one file object. Throws when the candidate
+   * cannot be held. Omitted ⇒ the real exclusive-share opener
+   * ({@link defaultOpenDescriptor}); an injected `readFile` without an opener is
+   * honored as a plain (non-exclusive) store for in-memory tests.
+   */
+  readonly openDescriptor?: (descriptorPath: string) => DescriptorHandle;
+}
+
+/**
+ * One held descriptor file object: `read` returns its bounded contents from the
+ * held handle (never a fresh pathname lookup); `close` releases it. Every
+ * successful open is closed by the discoverer in `finally`.
+ */
+export interface DescriptorHandle {
+  readonly read: () => string;
+  readonly close: () => void;
 }
 
 /**
@@ -1102,15 +1220,70 @@ function* defaultListAnchor(anchorPath: string): IterableIterator<string> {
 function defaultReadFile(path: string): string {
   const fd = openSync(path, 'r');
   try {
-    const buffer = Buffer.alloc(MAX_DESCRIPTOR_BYTES + 1);
-    const bytesRead = readSync(fd, buffer, 0, buffer.length, 0);
-    return buffer.subarray(0, bytesRead).toString('utf8');
+    return readBoundedDescriptor(fd);
   } finally {
     closeSync(fd);
   }
 }
+function readBoundedDescriptor(fd: number): string {
+  const buffer = Buffer.alloc(MAX_DESCRIPTOR_BYTES + 1);
+  const bytesRead = readSync(fd, buffer, 0, buffer.length, 0);
+  return buffer.subarray(0, bytesRead).toString('utf8');
+}
+
+/**
+ * libuv's `UV_FS_O_EXLOCK` open flag. On win32 libuv implements it as
+ * `CreateFileW(..., dwShareMode = 0)`: the open FAILS (EBUSY) while any other
+ * handle with data access is open on the file, and while it is held no one can
+ * open the file for read, write, or delete — so the pathname stays bound to this
+ * one file object and its bytes cannot change until the handle closes. Node does
+ * not export the constant on win32, so the libuv value is spelled here; it is 0
+ * elsewhere because the descriptor security model (owner + DACL) is Windows-only.
+ */
+const EXCLUSIVE_OPEN_FLAG = process.platform === 'win32' ? 0x10000000 : 0;
+
+/**
+ * The production descriptor opener: hold the exact file exclusively (see
+ * {@link EXCLUSIVE_OPEN_FLAG}) for the whole verify-then-read window. A retained
+ * writer handle — the legacy-ACL attack: keep a writable handle, present the
+ * expected ACL for the check, then overwrite before the read — makes this open
+ * fail instead, and a writer arriving after it is refused by the kernel. Throws
+ * (EBUSY/ENOENT/...) when the file cannot be held; never falls back to a shared
+ * open.
+ */
+export function defaultOpenDescriptor(path: string): DescriptorHandle {
+  const fd = openSync(path, fsConstants.O_RDONLY | EXCLUSIVE_OPEN_FLAG);
+  return {
+    read: (): string => readBoundedDescriptor(fd),
+    close: (): void => {
+      closeSync(fd);
+    },
+  };
+}
+function resolveDescriptorOpener(deps: DescriptorFileDeps): (path: string) => DescriptorHandle {
+  if (deps.openDescriptor !== undefined) {
+    return deps.openDescriptor;
+  }
+  const readFile = deps.readFile;
+  if (readFile !== undefined) {
+    // An injected in-memory store has no OS handle to hold; read through it
+    // (lazily, so a store's read is observed only after the gate, as on disk).
+    return (path: string): DescriptorHandle => ({ read: (): string => readFile(path), close: (): void => {} });
+  }
+  return defaultOpenDescriptor;
+}
 function defaultRemoveFile(path: string): void {
   unlinkSync(path);
+}
+
+/** The raw bounded text of one descriptor file, or `null` if it cannot be read. */
+function readDescriptorText(descriptorPath: string, deps: DescriptorFileDeps): string | null {
+  const read = deps.readFile ?? defaultReadFile;
+  try {
+    return read(descriptorPath);
+  } catch {
+    return null;
+  }
 }
 
 /** Read and validate one descriptor file by exact path, or `null` if absent/malformed. */
@@ -1118,14 +1291,7 @@ export function readDescriptorFile(
   descriptorPath: string,
   deps: DescriptorFileDeps = {},
 ): ParsedDescriptor | null {
-  const read = deps.readFile ?? defaultReadFile;
-  let text: string;
-  try {
-    text = read(descriptorPath);
-  } catch {
-    return null;
-  }
-  return parseDescriptor(text);
+  return parseDescriptor(readDescriptorText(descriptorPath, deps));
 }
 
 /**
@@ -1239,12 +1405,72 @@ export function enumerateDescriptorCandidates(
 export function readDescriptorCandidate(
   candidate: DescriptorCandidate,
   deps: DescriptorFileDeps = {},
-): { readonly kind: 'valid'; readonly parsed: ParsedDescriptor } | { readonly kind: 'malformed' } {
-  const parsed = readDescriptorFile(candidate.path, deps);
+): CandidateRead {
+  return validateCandidate(candidate, readDescriptorFile(candidate.path, deps));
+}
+
+export type CandidateRead =
+  | { readonly kind: 'valid'; readonly parsed: ParsedDescriptor }
+  | { readonly kind: 'malformed' };
+
+/** The validity rule of {@link readDescriptorCandidate}, applied to an already-parsed read. */
+function validateCandidate(candidate: DescriptorCandidate, parsed: ParsedDescriptor | null): CandidateRead {
   if (parsed === null || parsed.runtimeId !== candidate.runtimeId) {
     return { kind: 'malformed' };
   }
   return { kind: 'valid', parsed };
+}
+
+/**
+ * CLEANUP PATH ONLY. The pipe name a **pre-v3** candidate claims, when — and only
+ * when — that claim is NAME-CONSISTENT: the runtime id embedded in the file's
+ * `pipeName` equals the runtime id in its own filename. Returns `null` otherwise.
+ *
+ * Why this exists. A descriptor written by an older build (`{version, pipeName,
+ * token}`, or the v1 pid-bearing shape) is correctly rejected by
+ * {@link parseDescriptor}, so {@link readDescriptorCandidate} reports `malformed`.
+ * Malformed candidates are never probed and never removed — the right rule when
+ * nothing can be proven about a file, but for these it meant a dead artifact left
+ * by an unclean shutdown persisted forever, consuming a candidate slot and an
+ * anchor entry on every discovery until the anchor hit its caps and discovery
+ * failed closed.
+ *
+ * What this deliberately does NOT do. It returns a PIPE NAME and nothing else —
+ * no token, no verify key, no {@link ParsedDescriptor}. There is therefore no
+ * path by which a pre-v3 file can reach discovery, the handshake, or any
+ * authentication decision: {@link parseDescriptor} remains the single v3-only
+ * gate for everything that grants trust, with no dual-accept and no downgrade.
+ * The only authority this grants is the same authority any candidate has — to be
+ * PROBED, and to be unlinked if and only if the kernel reports its own pipe
+ * ABSENT.
+ *
+ * Name-consistency is what makes the probe sound: the pipe probed is exactly the
+ * one the filename claims, so a file can never authorize deleting some other
+ * runtime's evidence, and a name-inconsistent or unparseable file stays
+ * `malformed` and is never touched.
+ */
+export function legacyCleanupPipeName(
+  candidate: DescriptorCandidate,
+  text: string | null,
+): string | null {
+  if (typeof text !== 'string' || text.length === 0 || text.length > MAX_DESCRIPTOR_BYTES) {
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return null;
+  }
+  const pipeName = (parsed as Record<string, unknown>)['pipeName'];
+  if (typeof pipeName !== 'string') {
+    return null;
+  }
+  // The file's own claim must match its own name, or nothing about it is usable.
+  return runtimeIdFromPipeName(pipeName) === candidate.runtimeId ? pipeName : null;
 }
 
 /* ------------------------------------------------------------------ *
@@ -1395,12 +1621,21 @@ export async function sweepStaleDescriptors(
       continue;
     }
     examined += 1;
-    const read = readDescriptorCandidate(candidate, deps);
-    if (read.kind === 'malformed') {
+    const text = readDescriptorText(candidate.path, deps);
+    const read = validateCandidate(candidate, parseDescriptor(text));
+    // A v3 candidate is probed on its own pipe. A pre-v3 candidate is NOT valid
+    // and never becomes valid — but if its own filename and its own `pipeName`
+    // agree, its pipe is still identifiable, so it can be proven dead and
+    // reclaimed like any other. Anything else stays malformed and untouched.
+    const pipeName =
+      read.kind === 'valid'
+        ? read.parsed.descriptor.pipeName
+        : legacyCleanupPipeName(candidate, text);
+    if (pipeName === null) {
       malformed.push(candidate.runtimeId);
       continue;
     }
-    const liveness = await probe(pipePathFromName(read.parsed.descriptor.pipeName));
+    const liveness = await probe(pipePathFromName(pipeName));
     if (liveness !== 'ABSENT') {
       retained.push(candidate.runtimeId);
       continue;
@@ -1431,6 +1666,11 @@ export const DISCOVERY_UNAVAILABLE = Object.freeze({
   NO_CANDIDATES: 'NO_CANDIDATES',
   /** Candidates exist but none has a PRESENT pipe. */
   NO_LIVE_CANDIDATES: 'NO_LIVE_CANDIDATES',
+  /**
+   * Candidates exist but none passed the descriptor security gate (owner,
+   * protected DACL, non-reparse identity); no candidate's token was read.
+   */
+  NO_VERIFIED_CANDIDATES: 'NO_VERIFIED_CANDIDATES',
   /** More candidates than the bounded cap — an anomalous anchor; fail closed. */
   TOO_MANY_CANDIDATES: 'TOO_MANY_CANDIDATES',
   /** More total directory entries than the scan bound — an anomalous anchor. */
@@ -1442,6 +1682,8 @@ export type DiscoveryUnavailableReason =
 
 export interface DiscoveryCounts {
   readonly candidates: number;
+  /** Rejected by the security gate; never read, never probed. */
+  readonly unverified: number;
   readonly malformed: number;
   readonly live: number;
   readonly dead: number;
@@ -1463,9 +1705,17 @@ export type DiscoveryOutcome =
     };
 
 /**
- * Discover the one live control runtime. Enumerates the bounded candidate set,
- * parses each deterministically (malformed files are ignored, never a blocker),
- * probes each valid candidate's pipe, and decides:
+ * Discover the one live control runtime. Enumerates the bounded candidate set
+ * and, for each candidate IN THIS ORDER: (1) opens the exact candidate path as a
+ * held exclusive handle — one that cannot be held is `unverified`; (2) runs the
+ * descriptor security gate on that path WHILE the handle is held, so the gate
+ * and the read below see one and the same file object with no writer able to
+ * exist in between — a candidate that fails it is `unverified`: its contents
+ * are never read, so its token is never held, and its pipe is never probed;
+ * (3) reads the contents through the held handle (never a second pathname
+ * lookup) and parses them deterministically as a v3 descriptor — a version-2
+ * file has no `verifyKey`, fails to parse, and is malformed, never a live
+ * runtime; (4) releases the handle and probes the pipe. Then it decides:
  *
  * - exactly one PRESENT candidate ⇒ `FOUND` (the caller then runs the mutual-HMAC
  *   handshake with that candidate's token — the protocol's only message is the
@@ -1475,15 +1725,24 @@ export type DiscoveryOutcome =
  * - two or more PRESENT candidates ⇒ `AMBIGUOUS` (fail closed; nothing is chosen
  *   by mtime, PID, order, or last-writer-wins).
  *
- * Dead (ABSENT) candidates are ignored here; removing them is the runtime's job.
+ * The gate runs first because it, not the file's contents, is the authority:
+ * a descriptor that predates anchor hardening can keep an attacker-readable ACL
+ * (hardening the parent never retrofits a child), and whoever could write it
+ * could publish their own `verifyKey`. Skipping an unverified candidate can never
+ * hide a genuine runtime, because the runtime proves its own file with the same
+ * gate at startup and fails closed otherwise. Dead (ABSENT) candidates are
+ * ignored here; removing them is the runtime's job.
  */
 export async function discoverControlRuntime(
   anchorPath: string,
   probe: PipeProbe,
   deps: DescriptorFileDeps = {},
 ): Promise<DiscoveryOutcome> {
+  const verifyDescriptor =
+    deps.verifyDescriptor ?? ((path: string): Promise<DescriptorAclVerification> => verifyDescriptorAcl(path));
+  const openDescriptor = resolveDescriptorOpener(deps);
   const enumeration = enumerateDescriptorCandidates(anchorPath, deps);
-  const zero: DiscoveryCounts = { candidates: 0, malformed: 0, live: 0, dead: 0, unknown: 0 };
+  const zero: DiscoveryCounts = { candidates: 0, unverified: 0, malformed: 0, live: 0, dead: 0, unknown: 0 };
   if (!enumeration.ok) {
     // Both incomplete states fail closed before any probe; distinguish them so
     // an operator sees why (an unreadable anchor vs. an over-full anchor).
@@ -1503,12 +1762,17 @@ export async function discoverControlRuntime(
   if (enumeration.candidates.length === 0) {
     return { kind: 'UNAVAILABLE', reason: DISCOVERY_UNAVAILABLE.NO_CANDIDATES, counts: zero };
   }
+  let unverified = 0;
   let malformed = 0;
   let dead = 0;
   let unknown = 0;
   const live: { readonly runtimeId: string; readonly parsed: ParsedDescriptor }[] = [];
   for (const candidate of enumeration.candidates) {
-    const read = readDescriptorCandidate(candidate, deps);
+    const read = await gateAndReadHeld(candidate, openDescriptor, verifyDescriptor);
+    if (read.kind === 'unverified') {
+      unverified += 1;
+      continue;
+    }
     if (read.kind === 'malformed') {
       malformed += 1;
       continue;
@@ -1524,6 +1788,7 @@ export async function discoverControlRuntime(
   }
   const counts: DiscoveryCounts = {
     candidates: enumeration.candidates.length,
+    unverified,
     malformed,
     live: live.length,
     dead,
@@ -1540,16 +1805,73 @@ export async function discoverControlRuntime(
     return { kind: 'FOUND', parsed: single.parsed, counts };
   }
   if (live.length === 0) {
-    return { kind: 'UNAVAILABLE', reason: DISCOVERY_UNAVAILABLE.NO_LIVE_CANDIDATES, counts };
+    // Name the honest cause: every candidate failed the gate (none was even
+    // read) vs. verified candidates exist but none has a PRESENT pipe.
+    const reason =
+      unverified === enumeration.candidates.length
+        ? DISCOVERY_UNAVAILABLE.NO_VERIFIED_CANDIDATES
+        : DISCOVERY_UNAVAILABLE.NO_LIVE_CANDIDATES;
+    return { kind: 'UNAVAILABLE', reason, counts };
   }
   return { kind: 'AMBIGUOUS', live: live.map((entry) => entry.runtimeId), counts };
+}
+
+/**
+ * The stable-object step of discovery: hold the candidate, gate it, read it
+ * through the SAME held handle, release it. The handle spans the gate, so the
+ * contents returned are those of the very file object whose security was
+ * verified — never a later pathname lookup, and never a token from a file that
+ * failed the gate or could not be held.
+ */
+async function gateAndReadHeld(
+  candidate: DescriptorCandidate,
+  openDescriptor: (path: string) => DescriptorHandle,
+  verifyDescriptor: (path: string) => Promise<DescriptorAclVerification>,
+): Promise<CandidateRead | { readonly kind: 'unverified' }> {
+  let handle: DescriptorHandle;
+  try {
+    handle = openDescriptor(candidate.path);
+  } catch {
+    return { kind: 'unverified' };
+  }
+  try {
+    const verdict = await verifyDescriptor(candidate.path);
+    if (!verdict.ok) {
+      return { kind: 'unverified' };
+    }
+    let text: string;
+    try {
+      text = handle.read();
+    } catch {
+      return { kind: 'malformed' };
+    }
+    // A version-2 descriptor (no `verifyKey`) parses to null here and is
+    // therefore malformed — never a live runtime — whatever its current ACL says.
+    return validateCandidate(candidate, parseDescriptor(text));
+  } finally {
+    handle.close();
+  }
+}
+
+/** The injected-or-default opener and gate for one {@link DescriptorFileDeps}. */
+export function descriptorAccessFor(deps: DescriptorFileDeps): {
+  readonly openDescriptor: (path: string) => DescriptorHandle;
+  readonly verifyDescriptor: (path: string) => Promise<DescriptorAclVerification>;
+} {
+  return {
+    openDescriptor: resolveDescriptorOpener(deps),
+    verifyDescriptor:
+      deps.verifyDescriptor ?? ((path: string): Promise<DescriptorAclVerification> => verifyDescriptorAcl(path)),
+  };
 }
 
 /* ------------------------------------------------------------------ *
  * Descriptor creation — the build-provenanced create-only executable
  * ------------------------------------------------------------------ *
  *
- * Decision 062 Amendment C. This gate mirrors the read-only owner gate exactly —
+ * Ratification R-2 of
+ * AGENTBRIDGE_DECISION_062_AMENDMENT_RUNTIME_AUTHENTICATION_2026-09-12.
+ * This gate mirrors the read-only owner gate exactly —
  * generated provenance, module-relative resolution, SHA-256 of the exact bytes
  * before execution — but for a SEPARATE binary with a SEPARATE provenance module
  * and a SEPARATE exported binding, so neither artifact's trust root can ever

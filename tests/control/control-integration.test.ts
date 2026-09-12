@@ -13,21 +13,28 @@ import net from 'node:net';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
+import {
+  signServerResult,
+  type ChannelIdentity,
+  type RuntimeKeyPair,
+} from '../../src/control/control-auth.js';
+
 import { WORKFLOW_STATUS } from '../../src/domain/index.js';
 import { CONTROL_ANCHOR_REJECTION } from '../../src/control/control-store.js';
-import { CONTROL_RESULT } from '../../src/control/control-command.js';
+import { CONTROL_COMMAND, CONTROL_RESULT } from '../../src/control/control-command.js';
 import {
   startControlChannel,
   type ControlChannelHandle,
 } from '../../src/control/control-runtime.js';
 import {
   MAX_DESCRIPTOR_CANDIDATES,
-  createRuntimeDescriptor,
   descriptorFilenameFor,
+  descriptorPathFor,
   pipeNameForRuntimeId,
   pipePathFromName,
   serializeDescriptor,
   type DescriptorAclVerification,
+  type DescriptorFileDeps,
 } from '../../src/control/control-store.js';
 import {
   BINDING,
@@ -35,6 +42,7 @@ import {
   closeServer,
   descriptorFacts,
   memAnchor,
+  mintRuntime,
   newOrchestrator,
   passingVerify,
   startRogueServer,
@@ -53,7 +61,7 @@ afterEach(async () => {
 
 /** Seed a valid descriptor whose runtime never existed (its pipe is ABSENT). */
 function seedStale(anchor: MemAnchor): string {
-  const minted = createRuntimeDescriptor();
+  const minted = mintRuntime().parsed;
   anchor.set(minted.runtimeId, serializeDescriptor(minted.descriptor));
   return minted.runtimeId;
 }
@@ -123,8 +131,11 @@ describe('D062 control channel — end-to-end via the official CLI', () => {
     tampered.set(handle.runtimeId, withTamperedToken(anchor.get(handle.runtimeId) ?? ''));
     const run = await callCli(anchor, { descriptorDeps: tampered.deps });
 
-    expect(run.outcome.authenticated).toBe(false);
-    expect(run.outcome.status).toBeNull();
+    // The genuine runtime rejects the wrong token and SIGNS that rejection, so the
+    // CLI authenticates a truthful AUTH_FAILED rather than a generic failure. The
+    // guarantee under test is unchanged: never APPLIED, never exit 0, no mutation.
+    expect(run.outcome.status).toBe(CONTROL_RESULT.AUTH_FAILED);
+    expect(run.outcome.exitCode).not.toBe(0);
     expect(run.out.some((line) => line.includes('APPLIED'))).toBe(false);
     // Domain state must be untouched by a rejected control attempt.
     expect(runtime.current()?.status).toBe(WORKFLOW_STATUS.OPEN);
@@ -245,7 +256,7 @@ describe('D062 discovery — identity-named candidates over real pipes (19–23)
     handles.push(handle);
     // Point the CLI at a valid-shaped descriptor whose pipe nobody serves.
     const other = memAnchor();
-    const minted = createRuntimeDescriptor();
+    const minted = mintRuntime().parsed;
     other.set(minted.runtimeId, serializeDescriptor(minted.descriptor));
     const run = await callCli(anchor, { descriptorDeps: other.deps, timeoutMs: 1000 });
     expect(run.outcome.status).toBeNull();
@@ -258,7 +269,15 @@ describe('D062 discovery — identity-named candidates over real pipes (19–23)
     handles.push(await startServer(orchestrator, anchor));
     for (let index = 0; index < MAX_DESCRIPTOR_CANDIDATES; index += 1) {
       const id = index.toString(16).padStart(32, '0');
-      anchor.set(id, serializeDescriptor({ version: 2, pipeName: pipeNameForRuntimeId(id), token: 'x' }));
+      anchor.set(
+        id,
+        serializeDescriptor({
+          version: 3,
+          pipeName: pipeNameForRuntimeId(id),
+          token: 'x',
+          verifyKey: 'y',
+        }),
+      );
     }
     const run = await callCli(anchor);
     expect(run.outcome.status).toBeNull();
@@ -370,7 +389,7 @@ describe('D062 control channel — the write path is inert during the verificati
     const anchor = memAnchor();
     const started = startWithHeldVerification(orchestrator, anchor);
     await started.reached;
-    expect(anchor.entries().size).toBe(1); // published during the window
+    expect(anchor.entries().size).toBe(1); // own descriptor published during the window
 
     // A CLI in the window is denied and mutates nothing.
     const during = await callCli(anchor);
@@ -381,8 +400,168 @@ describe('D062 control channel — the write path is inert during the verificati
     started.release({ ok: false, reason: CONTROL_ANCHOR_REJECTION.DACL_UNPROTECTED });
     const handle = await started.handlePromise;
     expect(handle).toBeNull();
-    expect(anchor.entries().size).toBe(0); // own descriptor cleaned up
+    expect(anchor.entries().size).toBe(0); // own descriptor cleaned up; nothing else is kept
     expect(anchor.removeCalls()).toBe(1);
     expect(runtime.current()?.status).toBe(WORKFLOW_STATUS.OPEN);
+  });
+});
+
+describe('D062 F2 — a discovered descriptor is security-verified BEFORE its token is trusted', () => {
+  /**
+   * The attack shape: a protocol-valid identity-named descriptor that predates
+   * anchor hardening keeps an attacker-readable ACL (hardening the parent never
+   * retrofits a child). The attacker reads it and serves its pipe. Under
+   * descriptor v3 the attacker holds the token and the PUBLIC verifyKey but has
+   * never held the ephemeral private key, so it cannot sign a result at all —
+   * yet the security gate must still reject the candidate before its token is
+   * ever read: EXIT 0 ⇒ APPLIED by a runtime identified through a CURRENTLY
+   * verified descriptor.
+   */
+  function plantLeakedDescriptor(anchor: MemAnchor): {
+    path: string;
+    pipePath: string;
+    token: Buffer;
+    identity: ChannelIdentity;
+    keyPair: RuntimeKeyPair;
+  } {
+    const leaked = mintRuntime();
+    anchor.set(leaked.parsed.runtimeId, serializeDescriptor(leaked.parsed.descriptor));
+    return {
+      path: descriptorPathFor(anchor.anchorPath, leaked.parsed.runtimeId),
+      pipePath: pipePathFromName(leaked.parsed.descriptor.pipeName),
+      token: leaked.parsed.token,
+      identity: leaked.identity,
+      keyPair: leaked.keyPair,
+    };
+  }
+
+  /**
+   * Deps whose security gate rejects exactly `badPath`, logging every CANDIDATE
+   * verify/read in order.
+   */
+  function gatedDeps(anchor: MemAnchor, badPath: string, log: string[]): DescriptorFileDeps {
+    return {
+      ...anchor.deps,
+      readFile: (path: string): string => {
+        log.push(`read:${path}`);
+        return anchor.deps.readFile?.(path) ?? '';
+      },
+      verifyDescriptor: (path: string): Promise<DescriptorAclVerification> => {
+        log.push(`verify:${path}`);
+        return Promise.resolve(
+          path === badPath ? { ok: false, reason: CONTROL_ANCHOR_REJECTION.DACL_UNPROTECTED } : { ok: true },
+        );
+      },
+    };
+  }
+
+  it('NEGATIVE CONTROL: a party that can WRITE the anchor publishes its own verifyKey and, with the gate passing, does get APPLIED — which is why the ACL gate is the authority', async () => {
+    // This is the frozen out-of-scope adversary: same-SID / Administrator /
+    // SYSTEM, who can rewrite the descriptor itself. The protocol cannot stop it
+    // and does not claim to; only the kernel-enforced anchor DACL does, and that
+    // is exactly what the F2 test below exercises.
+    const anchor = memAnchor();
+    const attacker = plantLeakedDescriptor(anchor);
+    rogues.push(
+      await startRogueServer(attacker.pipePath, CONTROL_RESULT.APPLIED, {
+        kind: 'genuine',
+        keyPair: attacker.keyPair,
+        identity: attacker.identity,
+      }),
+    );
+    const run = await callCli(anchor); // memAnchor's default gate passes everything
+    expect(run.outcome.authenticated).toBe(true);
+    expect(run.outcome.status).toBe(CONTROL_RESULT.APPLIED);
+    expect(run.outcome.exitCode).toBe(0);
+  });
+
+  it('CI-2: a party holding only a COPY of a genuine descriptor gets nothing, even with the gate passing', async () => {
+    // The in-scope adversary. It squats the freed pipe with a byte-identical
+    // copy: it has the token and the public verifyKey, never the private key.
+    for (const forgery of [
+      { kind: 'random' } as const,
+      { kind: 'ownKey' as const, identity: { runtimeId: 'z'.repeat(32), pipeName: 'x' } },
+    ]) {
+      const anchor = memAnchor();
+      const copied = plantLeakedDescriptor(anchor);
+      const forged =
+        forgery.kind === 'ownKey'
+          ? { kind: 'ownKey' as const, identity: copied.identity }
+          : forgery;
+      rogues.push(await startRogueServer(copied.pipePath, CONTROL_RESULT.APPLIED, forged));
+      const run = await callCli(anchor); // the gate passes: only the signature stands
+      expect(run.outcome.exitCode).not.toBe(0);
+      expect(run.outcome.status).toBeNull();
+      expect(run.outcome.authenticated).toBe(false);
+      expect(run.out.some((line) => line.includes('APPLIED'))).toBe(false);
+    }
+  });
+
+  it('CI-2: a harvested genuine signature replayed by a squatter is refused (fresh client nonce)', async () => {
+    const anchor = memAnchor();
+    const copied = plantLeakedDescriptor(anchor);
+    const harvested = signServerResult(
+      copied.keyPair.privateKey,
+      copied.identity,
+      Buffer.alloc(32, 1),
+      Buffer.alloc(32, 2),
+      Buffer.from(CONTROL_COMMAND.OPEN_HUMAN_GATE, 'utf8'),
+      Buffer.from(CONTROL_RESULT.APPLIED, 'utf8'),
+    );
+    rogues.push(
+      await startRogueServer(copied.pipePath, CONTROL_RESULT.APPLIED, {
+        kind: 'harvested',
+        signature: harvested,
+      }),
+    );
+    const run = await callCli(anchor);
+    expect(run.outcome.exitCode).not.toBe(0);
+    expect(run.outcome.status).toBeNull();
+    expect(run.outcome.authenticated).toBe(false);
+  });
+
+  it('F2. bad-ACL descriptor + attacker pipe holding its token → rejected BEFORE the token is read; never APPLIED, never exit 0', async () => {
+    const anchor = memAnchor();
+    const leaked = plantLeakedDescriptor(anchor);
+    rogues.push(await startRogueServer(leaked.pipePath, CONTROL_RESULT.APPLIED));
+    const log: string[] = [];
+    let probes = 0;
+    const run = await callCli(anchor, {
+      descriptorDeps: gatedDeps(anchor, leaked.path, log),
+      probePipe: (pipePath: string) => {
+        probes += 1;
+        return Promise.resolve(pipePath === leaked.pipePath ? 'PRESENT' : 'ABSENT');
+      },
+    });
+    expect(run.outcome.exitCode).toBe(1);
+    expect(run.outcome.status).toBeNull();
+    expect(run.outcome.authenticated).toBe(false);
+    expect(run.out.some((line) => line.includes('APPLIED'))).toBe(false);
+    expect(run.err.some((line) => line.includes('NO_VERIFIED_CANDIDATES'))).toBe(true);
+    // Exactly where it failed closed: the gate ran on the candidate, and its
+    // token was never read, its pipe never probed, no connection ever made.
+    expect(log).toEqual([`verify:${leaked.path}`]);
+    expect(probes).toBe(0);
+    expect(anchor.removeCalls()).toBe(0);
+  });
+
+  it('F2b. genuine runtime beside the leaked descriptor → only the verified runtime is chosen and APPLIED', async () => {
+    const { runtime, orchestrator } = newOrchestrator();
+    orchestrator.open(BINDING);
+    const anchor = memAnchor();
+    const leaked = plantLeakedDescriptor(anchor);
+    rogues.push(await startRogueServer(leaked.pipePath, CONTROL_RESULT.APPLIED));
+    const handle = await startServer(orchestrator, anchor, { probePipe: () => Promise.resolve('PRESENT') });
+    handles.push(handle);
+    expect(anchor.get(handle.runtimeId)).not.toBeNull();
+    const log: string[] = [];
+    const run = await callCli(anchor, { descriptorDeps: gatedDeps(anchor, leaked.path, log) });
+    expect(run.outcome.status).toBe(CONTROL_RESULT.APPLIED);
+    expect(run.outcome.exitCode).toBe(0);
+    expect(runtime.current()?.status).toBe(WORKFLOW_STATUS.AWAITING_HUMAN_DECISION);
+    // Ordering proof per candidate: verify precedes read; the rejected file is never read.
+    const genuinePath = descriptorPathFor(anchor.anchorPath, handle.runtimeId);
+    expect(log.filter((entry) => entry.endsWith(leaked.path))).toEqual([`verify:${leaked.path}`]);
+    expect(log.filter((entry) => entry.endsWith(genuinePath))).toEqual([`verify:${genuinePath}`, `read:${genuinePath}`]);
   });
 });

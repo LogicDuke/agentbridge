@@ -172,9 +172,11 @@ Details, so the table is read exactly as the code behaves. SYSTEM is
 *permitted*, not *required*, on the anchor: an operator-only DACL that meets
 every other requirement is accepted. The allow/deny type and the access mask are
 carried in the snapshot but do **not** gate authorization — a DENY operator ACE
-still counts as the operator being present — because token possession (mutual
-HMAC) remains the actual authenticator; this policy governs anchor trust, not
-per-call permission. No file-inheritance (`OBJECT_INHERIT_ACE`) requirement is
+still counts as the operator being present — because this policy governs anchor
+trust, not per-call permission. The anchor owner/DACL gate, together with the
+held-handle descriptor read, **is** the authority: it is what decides which
+descriptor, and therefore which runtime `verifyKey`, may be believed against a
+cross-principal adversary. It is not defence-in-depth. No file-inheritance (`OBJECT_INHERIT_ACE`) requirement is
 placed on the anchor's ACEs: nothing relies on a descriptor inheriting the
 anchor's entries, because every descriptor is created with its own explicit
 protected DACL (below).
@@ -225,7 +227,7 @@ launching or serving (`CONTROL_PROVISION_FAILURE ⇏ COCKPIT_FAILURE`,
 `cockpit:live`, and control is started from the Cockpit's `listening` event with
 every failure contained.
 
-### Descriptor lifecycle v2 (identity-named, listen-before-publish)
+### Descriptor lifecycle (identity-named, listen-before-publish)
 
 There is **no shared fixed descriptor pathname**. Each runtime mints a 128-bit
 random runtime id — the hex suffix of its unpredictable pipe name
@@ -235,8 +237,30 @@ random runtime id — the hex suffix of its unpredictable pipe name
 
 The id is whitelisted character-by-character everywhere it enters a filename (the
 runtime, the CLI, and the native creator), so no caller-controlled path,
-separator, or traversal can reach the filesystem. The descriptor holds only
-`{ version: 2, pipeName, token }` — no PID.
+separator, or traversal can reach the filesystem. The descriptor holds exactly
+
+    { version: 3, pipeName, token, verifyKey }
+
+and no PID. `token` is the 256-bit client-to-server command authorizer. `verifyKey`
+is the raw 32-byte Ed25519 **public** key whose private half is generated fresh at
+every start and lives only in that runtime's process memory — it is never written
+to the descriptor, a log, argv, an environment variable, or a subprocess.
+
+A version-2 descriptor (`{ version, pipeName, token }`, or one carrying the
+withdrawn anchor-secret `proof` field) is **malformed** and can never be a live
+candidate. There is no dual-accept, no negotiation, no compatibility window, and
+no downgrade path: a single attacker-supplied v2 artifact would otherwise erase
+the guarantee. No migration is required, because descriptors and tokens are
+process-lifetime only and both peers ship from one build.
+
+The per-anchor reserved secret file and the descriptor `proof` binding are
+**removed**. They were an attempt to prove a descriptor's trusted origin from its
+contents, and that cannot work: a descriptor's current owner and DACL say nothing
+about its history, so no predicate over file state at time *t* can decide whether
+those bytes were copied earlier. The v3 schema check subsumes the only thing the
+proof actually achieved — rejecting pre-hardening files — at zero cost, and the
+anchor no longer holds any durable secret beyond each runtime's own
+process-lifetime descriptor.
 
 Startup order, structurally: verify the anchor → sweep foreign descriptors whose
 pipe the kernel reports absent → mint the identity → **listen** on the pipe (the
@@ -260,10 +284,49 @@ failure; it never overwrites or rotates another runtime's file.
 Discovery (`npm run control`) enumerates a bounded set of identity-named
 candidates, parses each safely (a file whose name and contents disagree is
 malformed and ignored, never deleted), probes each valid candidate's pipe, and
-proceeds only with **exactly one** live candidate — the mutual-HMAC handshake is
-then attempted against that runtime alone, because the protocol's only message is
-the authoritative command. Zero live candidates is unavailable; two or more is
+proceeds only with **exactly one** live candidate — the handshake is then
+attempted against that runtime alone, because the protocol's only message is the
+authoritative command. Zero live candidates is unavailable; two or more is
 ambiguous and fails closed. The CLI never deletes.
+
+### Wire protocol v2 and server-result authentication
+
+    S->C  hello    { v: 2, nonceS }
+    C->S  request  { v: 2, nonceC, command, mac }
+            mac = HMAC(token, T("C", runtimeId, pipeName, nonceS, nonceC, command))
+    S->C  result   { v: 2, result, sig }
+            sig = Ed25519(sk, T("S", runtimeId, pipeName, nonceS, nonceC, command, result))
+
+The two directions use different primitives because they answer different
+questions. The client proves it could read the descriptor inside the hardened
+anchor (command authorization). The server proves it is a process **alive right
+now** holding the ephemeral private key matching the `verifyKey` the client read
+(runtime authentication). A protocol-version-1 result body carries `mac`, not
+`sig`, and is rejected outright — again with no downgrade branch.
+
+Both transcripts are the canonical length-framed form, and both bind `runtimeId`
+and `pipeName`, so one runtime's signature can never be relayed as another's. The
+result signature also covers the exact command and result bytes, so it is never a
+reusable coupon for an arbitrary outcome. Freshness rests on `nonceC`:
+client-generated, 256-bit, CSPRNG, fresh per connection.
+
+The property this buys, exactly: **copying or replaying serialized descriptor
+bytes alone is never sufficient to authenticate an `APPLIED` result.** A party
+serving a squatted pipe with a byte-identical copy of a genuine descriptor holds
+`verifyKey` but no signing capability, so the CLI exits non-zero. That holds
+unconditionally, because no signing capability exists anywhere in the serialized
+state.
+
+What it does **not** buy: a descriptor rewritten with an adversary's *own*
+`verifyKey` is not defeated by the protocol — the descriptor is the trust root and
+anchor write access is the adversary's defining capability. That is defeated for
+cross-principal adversaries by the anchor DACL above, and it is explicitly **out
+of scope** for same-SID, Administrator and SYSTEM principals, whether the genuine
+runtime is alive or dead. Windows provides no intra-SID isolation, so a same-SID
+process can equally read a live runtime's key out of process memory; claiming
+protection there would be a claim the mechanism cannot support. A post-crash pipe
+squatter can still degrade availability — discovery may return a candidate whose
+handshake then fails loudly — but never integrity.
 
 ## Tests
 

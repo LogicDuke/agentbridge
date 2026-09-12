@@ -13,7 +13,13 @@ import { join } from 'node:path';
 import { AutoflowOrchestrator } from '../../src/autoflow/orchestrator.js';
 import { AutoflowRuntime } from '../../src/autoflow/runtime.js';
 import type { WorkflowBinding } from '../../src/domain/index.js';
-import { NONCE_BYTES, computeServerMac } from '../../src/control/control-auth.js';
+import {
+  NONCE_BYTES,
+  generateRuntimeKeyPair,
+  signServerResult,
+  type ChannelIdentity,
+  type RuntimeKeyPair,
+} from '../../src/control/control-auth.js';
 import {
   buildHelloBody,
   buildResultBody,
@@ -27,6 +33,7 @@ import { CONTROL_RESULT, type ControlResultStatus } from '../../src/control/cont
 import { runControlCli, type ControlCliOutcome } from '../../src/control/cli.js';
 import {
   DESCRIPTOR_CREATION_REJECTION,
+  createRuntimeDescriptor,
   descriptorFilenameFor,
   parseDescriptor,
   pipePathFromName,
@@ -37,7 +44,6 @@ import {
   type DescriptorFileDeps,
   type ParsedDescriptor,
   type PipeProbe,
-  type RuntimeDescriptor,
 } from '../../src/control/control-store.js';
 import {
   startControlChannel,
@@ -55,6 +61,33 @@ export const BINDING: WorkflowBinding = {
 };
 
 export const FAKE_ANCHOR = 'C:\\FakeAnchor';
+
+/** One runtime's minted v3 identity plus the ephemeral keypair behind it. */
+export interface MintedRuntime {
+  readonly parsed: ParsedDescriptor;
+  readonly keyPair: RuntimeKeyPair;
+  readonly identity: ChannelIdentity;
+}
+
+/**
+ * Mint a v3 descriptor around a fresh ephemeral keypair. The private key is
+ * returned ONLY to the test that minted it, exactly as a live runtime keeps it
+ * in its own memory — nothing here writes it anywhere.
+ */
+export function mintRuntime(): MintedRuntime {
+  const keyPair = generateRuntimeKeyPair();
+  const parsed = createRuntimeDescriptor(keyPair.verifyKey);
+  return {
+    parsed,
+    keyPair,
+    identity: { runtimeId: parsed.runtimeId, pipeName: parsed.descriptor.pipeName },
+  };
+}
+
+/** Mint a v3 descriptor when the test does not need the signing key. */
+export function mintDescriptor(): ParsedDescriptor {
+  return mintRuntime().parsed;
+}
 
 export function passingVerify(): Promise<ControlAnchorVerification> {
   return Promise.resolve({ ok: true, anchorPath: FAKE_ANCHOR });
@@ -91,6 +124,15 @@ export interface MemAnchor {
   createCalls(): number;
 }
 
+/** An in-memory `ENOENT`, shaped like the fs error (`code`) the real opener throws. */
+function enoent(): Error {
+  return Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+}
+
+/**
+ * An anchor holds nothing but identity-named descriptors. There is no reserved
+ * secret file any more: the anchor carries no durable secret of its own.
+ */
 export function memAnchor(anchorPath: string = FAKE_ANCHOR): MemAnchor {
   const files = new Map<string, string>();
   let removeCalls = 0;
@@ -109,14 +151,14 @@ export function memAnchor(anchorPath: string = FAKE_ANCHOR): MemAnchor {
     deps: {
       listAnchor: (dir: string): readonly string[] => {
         if (dir !== anchorPath) {
-          throw new Error('ENOENT');
+          throw enoent();
         }
         return [...files.keys()];
       },
       readFile: (path: string): string => {
         const name = basenameOf(path);
         if (name === null) {
-          throw new Error('ENOENT');
+          throw enoent();
         }
         return files.get(name) ?? '';
       },
@@ -124,10 +166,13 @@ export function memAnchor(anchorPath: string = FAKE_ANCHOR): MemAnchor {
         removeCalls += 1;
         const name = basenameOf(path);
         if (name === null) {
-          throw new Error('ENOENT');
+          throw enoent();
         }
         files.delete(name);
       },
+      // The in-memory anchor carries no OS security metadata, so every candidate
+      // is treated as verified here; tests of the discovery gate override this.
+      verifyDescriptor: passingDescriptorVerify,
     },
     create: (dir: string, runtimeId: string, bytes: Buffer): Promise<DescriptorCreation> => {
       createCalls += 1;
@@ -255,22 +300,48 @@ export function descriptorOf(anchor: MemAnchor, handle: ControlChannelHandle): P
   return parsed;
 }
 
-/** The token + pipe path for a handle's descriptor. */
+/** The token, verify key, channel identity and pipe path for a handle's descriptor. */
 export function descriptorFacts(
   anchor: MemAnchor,
   handle: ControlChannelHandle,
-): { token: Buffer; pipePath: string } {
+): { token: Buffer; verifyKey: Buffer; identity: ChannelIdentity; pipePath: string } {
   const parsed = descriptorOf(anchor, handle);
-  return { token: parsed.token, pipePath: pipePathFromName(parsed.descriptor.pipeName) };
+  return {
+    token: parsed.token,
+    verifyKey: parsed.verifyKey,
+    identity: { runtimeId: parsed.runtimeId, pipeName: parsed.descriptor.pipeName },
+    pipePath: pipePathFromName(parsed.descriptor.pipeName),
+  };
 }
 
-/** Produce a descriptor JSON with the same pipe name but a different token. */
+/**
+ * A well-formed v3 descriptor with the same pipe name and verifyKey but a
+ * DIFFERENT token, so the rejection under test is the server's macC check and
+ * nothing else.
+ */
 export function withTamperedToken(serialized: string): string {
-  const parsed = JSON.parse(serialized) as RuntimeDescriptor;
+  const parsed = parseDescriptor(serialized);
+  if (parsed === null) {
+    throw new Error('withTamperedToken: input is not a descriptor');
+  }
   return serializeDescriptor({
-    version: 2,
-    pipeName: parsed.pipeName,
+    version: 3,
+    pipeName: parsed.descriptor.pipeName,
     token: randomBytes(32).toString('base64url'),
+    verifyKey: parsed.descriptor.verifyKey,
+  });
+}
+
+/** A legacy v2 descriptor body for the exact same runtime identity. */
+export function asLegacyV2(serialized: string): string {
+  const parsed = parseDescriptor(serialized);
+  if (parsed === null) {
+    throw new Error('asLegacyV2: input is not a descriptor');
+  }
+  return JSON.stringify({
+    version: 2,
+    pipeName: parsed.descriptor.pipeName,
+    token: parsed.descriptor.token,
   });
 }
 
@@ -365,10 +436,32 @@ export function rawClient(pipePath: string, options: RawClientOptions): Promise<
   });
 }
 
-/** A rogue server that completes the handshake but signs macS with a wrong token. */
+/**
+ * How a squatter tries to forge the server result. Every variant models a party
+ * that holds a byte-identical COPY of a genuine descriptor — so it has the token
+ * and the public verifyKey — but has never held the ephemeral private key.
+ */
+export type RogueForgery =
+  /** Emit 64 random bytes where the signature belongs. */
+  | { readonly kind: 'random' }
+  /** Sign correctly, but with a keypair the squatter generated itself. */
+  | { readonly kind: 'ownKey'; readonly identity: ChannelIdentity }
+  /** Replay a signature harvested from the genuine runtime on an earlier exchange. */
+  | { readonly kind: 'harvested'; readonly signature: Buffer }
+  /**
+   * The ONLY variant that can succeed: the genuine runtime itself, holding the
+   * real private key. Used as the positive control.
+   */
+  | { readonly kind: 'genuine'; readonly keyPair: RuntimeKeyPair; readonly identity: ChannelIdentity };
+
+/**
+ * A rogue server holding a squatted pipe name. It completes framing and the
+ * hello, then answers with whatever the chosen forgery produces.
+ */
 export function startRogueServer(
   pipePath: string,
   status: ControlResultStatus = CONTROL_RESULT.APPLIED,
+  forgery: RogueForgery = { kind: 'random' },
 ): Promise<net.Server> {
   const server = net.createServer((socket: net.Socket) => {
     const nonceS = randomBytes(NONCE_BYTES);
@@ -391,10 +484,32 @@ export function startRogueServer(
         socket.destroy();
         return;
       }
-      const wrongToken = randomBytes(32);
       const resultBytes = Buffer.from(status, 'utf8');
-      const macS = computeServerMac(wrongToken, nonceS, parsed.nonceC, parsed.commandBytes, resultBytes);
-      socket.end(frameMessage(buildResultBody(status, macS)));
+      let signature: Buffer;
+      if (forgery.kind === 'harvested') {
+        signature = forgery.signature;
+      } else if (forgery.kind === 'ownKey') {
+        signature = signServerResult(
+          generateRuntimeKeyPair().privateKey,
+          forgery.identity,
+          nonceS,
+          parsed.nonceC,
+          parsed.commandBytes,
+          resultBytes,
+        );
+      } else if (forgery.kind === 'genuine') {
+        signature = signServerResult(
+          forgery.keyPair.privateKey,
+          forgery.identity,
+          nonceS,
+          parsed.nonceC,
+          parsed.commandBytes,
+          resultBytes,
+        );
+      } else {
+        signature = randomBytes(64);
+      }
+      socket.end(frameMessage(buildResultBody(status, signature)));
     });
     socket.write(frameMessage(buildHelloBody(nonceS)));
   });
