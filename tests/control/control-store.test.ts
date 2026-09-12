@@ -31,6 +31,7 @@ import {
   evaluateDescriptorSnapshot,
   evaluatePathSafety,
   isRuntimeId,
+  legacyCleanupPipeName,
   parseAclSnapshot,
   parseDescriptor,
   parseOwnerHelperSid,
@@ -1099,6 +1100,191 @@ describe('D062 stale sweep — only ABSENT pipes authorize removal of exactly th
     expect(result.malformed).toEqual([a]);
     expect(result.removed).toEqual([b]);
     expect(anchor.get(a)).not.toBeNull();
+  });
+});
+
+/* ---- pre-v3 artifacts: reclaimable by the cleanup path, never trusted ---- */
+
+describe('D062 stale sweep — a pre-v3 descriptor is reclaimable but never trusted', () => {
+  /** A name-consistent legacy v2 body for `id`: the shape an older build wrote. */
+  const legacyV2 = (id: string): string =>
+    JSON.stringify({
+      version: 2,
+      pipeName: pipeNameForRuntimeId(id),
+      token: Buffer.alloc(32, 7).toString('base64url'),
+    });
+
+  /** A name-consistent legacy v1 body (pid-bearing) for `id`. */
+  const legacyV1 = (id: string): string =>
+    JSON.stringify({
+      version: 1,
+      pid: 4242,
+      pipeName: pipeNameForRuntimeId(id),
+      token: Buffer.alloc(32, 9).toString('base64url'),
+    });
+
+  const LEGACY = 'a'.repeat(32);
+
+  it('PRE-REPAIR WITNESS: a legacy v2 body is not a descriptor and yields no trusted read', () => {
+    // This is the property that made the artifact unreclaimable before the
+    // cleanup path learned to identify its pipe — and it must NOT change.
+    expect(parseDescriptor(legacyV2(LEGACY))).toBeNull();
+    expect(parseDescriptor(legacyV1(LEGACY))).toBeNull();
+    expect(
+      readDescriptorCandidate({
+        runtimeId: LEGACY,
+        filename: descriptorFilenameFor(LEGACY),
+        path: descriptorPathFor(ANCHOR, LEGACY),
+      }, { readFile: () => legacyV2(LEGACY) }),
+    ).toEqual({ kind: 'malformed' });
+  });
+
+  it('the sweep removes a legacy descriptor ONLY when its own pipe is ABSENT', async () => {
+    const anchor = memAnchor(ANCHOR);
+    anchor.set(LEGACY, legacyV2(LEGACY));
+    const probed: string[] = [];
+    const result = await sweepStaleDescriptors(
+      ANCHOR,
+      null,
+      (path) => {
+        probed.push(path);
+        return Promise.resolve('ABSENT');
+      },
+      anchor.deps,
+    );
+    // Probed on exactly the pipe its own filename claims, then reclaimed.
+    expect(probed).toEqual([pipePathFromName(pipeNameForRuntimeId(LEGACY))]);
+    expect(result.removed).toEqual([LEGACY]);
+    expect(result.malformed).toEqual([]);
+    expect(anchor.get(LEGACY)).toBeNull();
+  });
+
+  it('a legacy descriptor whose pipe is PRESENT or UNKNOWN is RETAINED, never removed', async () => {
+    for (const liveness of ['PRESENT', 'UNKNOWN'] as const) {
+      const anchor = memAnchor(ANCHOR);
+      anchor.set(LEGACY, legacyV2(LEGACY));
+      const result = await sweepStaleDescriptors(
+        ANCHOR,
+        null,
+        () => Promise.resolve(liveness),
+        anchor.deps,
+      );
+      expect(result.retained).toEqual([LEGACY]);
+      expect(result.removed).toEqual([]);
+      expect(anchor.get(LEGACY)).not.toBeNull();
+      expect(anchor.removeCalls()).toBe(0);
+    }
+  });
+
+  it('a legacy v1 (pid-bearing) descriptor is reclaimed by the same rule — the PID is never consulted', async () => {
+    const anchor = memAnchor(ANCHOR);
+    anchor.set(LEGACY, legacyV1(LEGACY));
+    const probed: string[] = [];
+    const result = await sweepStaleDescriptors(
+      ANCHOR,
+      null,
+      (path) => {
+        probed.push(path);
+        return Promise.resolve('ABSENT');
+      },
+      anchor.deps,
+    );
+    expect(probed).toEqual([pipePathFromName(pipeNameForRuntimeId(LEGACY))]);
+    expect(result.removed).toEqual([LEGACY]);
+  });
+
+  it('NAME-INCONSISTENT and malformed legacy files are NEVER probed and NEVER deleted', async () => {
+    const other = 'b'.repeat(32);
+    const cases: readonly [string, string][] = [
+      ['pipeName names a different runtime', legacyV2(other)],
+      ['pipeName is not a pipe name at all', JSON.stringify({ version: 2, pipeName: 'nope', token: 'x' })],
+      ['pipeName is not a string', JSON.stringify({ version: 2, pipeName: 42, token: 'x' })],
+      ['no pipeName at all', JSON.stringify({ version: 2, token: 'x' })],
+      ['not an object', JSON.stringify(['runtime-descriptor'])],
+      ['not JSON', '{ not json'],
+      ['empty', ''],
+      ['oversized', `{"pipeName":"${'x'.repeat(MAX_DESCRIPTOR_BYTES)}"}`],
+    ];
+    for (const [label, body] of cases) {
+      const anchor = memAnchor(ANCHOR);
+      anchor.set(LEGACY, body);
+      const probed: string[] = [];
+      const result = await sweepStaleDescriptors(
+        ANCHOR,
+        null,
+        (path) => {
+          probed.push(path);
+          return Promise.resolve('ABSENT');
+        },
+        anchor.deps,
+      );
+      expect(probed, label).toEqual([]);
+      expect(result.malformed, label).toEqual([LEGACY]);
+      expect(result.removed, label).toEqual([]);
+      expect(anchor.get(LEGACY), label).not.toBeNull();
+      expect(anchor.removeCalls(), label).toBe(0);
+    }
+  });
+
+  it('a legacy file can never authorize deleting ANOTHER runtime: only its own pipe is probed', async () => {
+    const anchor = memAnchor(ANCHOR);
+    const live = mintRuntime().parsed;
+    anchor.set(live.runtimeId, serializeDescriptor(live.descriptor));
+    // A legacy file that CLAIMS the live runtime's pipe under its own name.
+    anchor.set(LEGACY, JSON.stringify({ version: 2, pipeName: live.descriptor.pipeName, token: 'x' }));
+    const result = await sweepStaleDescriptors(
+      ANCHOR,
+      null,
+      (path) => Promise.resolve(path === pipePathFromName(live.descriptor.pipeName) ? 'PRESENT' : 'ABSENT'),
+      anchor.deps,
+    );
+    // The impostor is name-inconsistent, so it is malformed — not a lever.
+    expect(result.malformed).toEqual([LEGACY]);
+    expect(result.removed).toEqual([]);
+    expect(anchor.get(live.runtimeId)).not.toBeNull();
+    expect(anchor.get(LEGACY)).not.toBeNull();
+  });
+
+  it('legacyCleanupPipeName yields a pipe name ONLY, and nothing that could authenticate', () => {
+    const candidate = {
+      runtimeId: LEGACY,
+      filename: descriptorFilenameFor(LEGACY),
+      path: descriptorPathFor(ANCHOR, LEGACY),
+    };
+    const name = legacyCleanupPipeName(candidate, legacyV2(LEGACY));
+    expect(name).toBe(pipeNameForRuntimeId(LEGACY));
+    expect(typeof name).toBe('string'); // not a ParsedDescriptor, no token, no verifyKey
+    // Name-inconsistent input yields nothing.
+    expect(legacyCleanupPipeName(candidate, legacyV2('b'.repeat(32)))).toBeNull();
+    expect(legacyCleanupPipeName(candidate, null)).toBeNull();
+  });
+
+  it('DISCOVERY AND AUTHENTICATION STILL REJECT v2: a legacy descriptor is never FOUND', async () => {
+    const anchor = memAnchor(ANCHOR);
+    anchor.set(LEGACY, legacyV2(LEGACY));
+    // Its pipe answers PRESENT — the most favourable case for an attacker.
+    const outcome = await discoverControlRuntime(ANCHOR, () => Promise.resolve('PRESENT'), anchor.deps);
+    expect(outcome.kind).toBe('UNAVAILABLE');
+    if (outcome.kind === 'UNAVAILABLE') {
+      expect(outcome.reason).toBe(DISCOVERY_UNAVAILABLE.NO_LIVE_CANDIDATES);
+      expect(outcome.counts.malformed).toBe(1);
+      expect(outcome.counts.live).toBe(0);
+    }
+  });
+
+  it('DISCOVERY AND AUTHENTICATION STILL REJECT v2: a legacy peer never shadows a genuine v3 runtime', async () => {
+    const anchor = memAnchor(ANCHOR);
+    const genuine = mintRuntime().parsed;
+    anchor.set(genuine.runtimeId, serializeDescriptor(genuine.descriptor));
+    anchor.set(LEGACY, legacyV2(LEGACY));
+    const outcome = await discoverControlRuntime(ANCHOR, () => Promise.resolve('PRESENT'), anchor.deps);
+    // Exactly one LIVE candidate — the v3 one. The legacy file is malformed, so
+    // it is not a second live candidate and does not force AMBIGUOUS.
+    expect(outcome.kind).toBe('FOUND');
+    if (outcome.kind === 'FOUND') {
+      expect(outcome.parsed.runtimeId).toBe(genuine.runtimeId);
+      expect(outcome.counts.malformed).toBe(1);
+    }
   });
 });
 

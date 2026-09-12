@@ -973,10 +973,19 @@ describe('D062 lifecycle v2 — startup sweep of foreign descriptors', () => {
       'token',
       'verifyKey',
     ]);
-    // A descriptor claiming THIS live process's pid (legacy shape) is malformed, not a liveness claim.
-    const legacy = JSON.stringify({ version: 1, pid: process.pid, pipeName: pipeNameForRuntimeId('b'.repeat(32)), token: Buffer.alloc(32, 1).toString('base64url') });
+    // A legacy pid-bearing descriptor claiming THIS live process's pid. It is not
+    // a v3 descriptor and can never be discovered or authenticated — but it is
+    // NAME-CONSISTENT, so the cleanup path can still identify its own pipe.
+    const legacyId = 'b'.repeat(32);
+    const legacyPipe = pipeNameForRuntimeId(legacyId);
+    const legacy = JSON.stringify({
+      version: 1,
+      pid: process.pid,
+      pipeName: legacyPipe,
+      token: Buffer.alloc(32, 1).toString('base64url'),
+    });
     anchor.set(dead.runtimeId, dead.text);
-    anchor.set('b'.repeat(32), legacy);
+    anchor.set(legacyId, legacy);
     const probed: string[] = [];
     const probe: PipeProbe = (path) => {
       probed.push(path);
@@ -984,11 +993,14 @@ describe('D062 lifecycle v2 — startup sweep of foreign descriptors', () => {
     };
     const handle = await startServer(orchestrator, anchor, { probePipe: probe });
     handles.push(handle);
-    // The dead file was removed purely because its PIPE was absent …
-    expect(probed).toEqual([dead.pipePath]);
+    // Both files were decided by their OWN pipe and nothing else. The pid names
+    // a process that is demonstrably alive (this one), and it changed nothing:
+    // the probe said ABSENT, so the artifact was reclaimed.
+    expect(probed.sort()).toEqual([dead.pipePath, pipePathFromName(legacyPipe)].sort());
     expect(anchor.get(dead.runtimeId)).toBeNull();
-    // … and the legacy pid-bearing file was never probed nor removed.
-    expect(anchor.get('b'.repeat(32))).toBe(legacy);
+    expect(anchor.get(legacyId)).toBeNull();
+    // The legacy file is still not a descriptor: it can be cleaned up, never trusted.
+    expect(parseDescriptor(legacy)).toBeNull();
   });
 
   it('an unreadable anchor enumeration fails startup closed before listen or publish', async () => {

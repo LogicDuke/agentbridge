@@ -1276,19 +1276,22 @@ function defaultRemoveFile(path: string): void {
   unlinkSync(path);
 }
 
+/** The raw bounded text of one descriptor file, or `null` if it cannot be read. */
+function readDescriptorText(descriptorPath: string, deps: DescriptorFileDeps): string | null {
+  const read = deps.readFile ?? defaultReadFile;
+  try {
+    return read(descriptorPath);
+  } catch {
+    return null;
+  }
+}
+
 /** Read and validate one descriptor file by exact path, or `null` if absent/malformed. */
 export function readDescriptorFile(
   descriptorPath: string,
   deps: DescriptorFileDeps = {},
 ): ParsedDescriptor | null {
-  const read = deps.readFile ?? defaultReadFile;
-  let text: string;
-  try {
-    text = read(descriptorPath);
-  } catch {
-    return null;
-  }
-  return parseDescriptor(text);
+  return parseDescriptor(readDescriptorText(descriptorPath, deps));
 }
 
 /**
@@ -1416,6 +1419,58 @@ function validateCandidate(candidate: DescriptorCandidate, parsed: ParsedDescrip
     return { kind: 'malformed' };
   }
   return { kind: 'valid', parsed };
+}
+
+/**
+ * CLEANUP PATH ONLY. The pipe name a **pre-v3** candidate claims, when — and only
+ * when — that claim is NAME-CONSISTENT: the runtime id embedded in the file's
+ * `pipeName` equals the runtime id in its own filename. Returns `null` otherwise.
+ *
+ * Why this exists. A descriptor written by an older build (`{version, pipeName,
+ * token}`, or the v1 pid-bearing shape) is correctly rejected by
+ * {@link parseDescriptor}, so {@link readDescriptorCandidate} reports `malformed`.
+ * Malformed candidates are never probed and never removed — the right rule when
+ * nothing can be proven about a file, but for these it meant a dead artifact left
+ * by an unclean shutdown persisted forever, consuming a candidate slot and an
+ * anchor entry on every discovery until the anchor hit its caps and discovery
+ * failed closed.
+ *
+ * What this deliberately does NOT do. It returns a PIPE NAME and nothing else —
+ * no token, no verify key, no {@link ParsedDescriptor}. There is therefore no
+ * path by which a pre-v3 file can reach discovery, the handshake, or any
+ * authentication decision: {@link parseDescriptor} remains the single v3-only
+ * gate for everything that grants trust, with no dual-accept and no downgrade.
+ * The only authority this grants is the same authority any candidate has — to be
+ * PROBED, and to be unlinked if and only if the kernel reports its own pipe
+ * ABSENT.
+ *
+ * Name-consistency is what makes the probe sound: the pipe probed is exactly the
+ * one the filename claims, so a file can never authorize deleting some other
+ * runtime's evidence, and a name-inconsistent or unparseable file stays
+ * `malformed` and is never touched.
+ */
+export function legacyCleanupPipeName(
+  candidate: DescriptorCandidate,
+  text: string | null,
+): string | null {
+  if (typeof text !== 'string' || text.length === 0 || text.length > MAX_DESCRIPTOR_BYTES) {
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return null;
+  }
+  const pipeName = (parsed as Record<string, unknown>)['pipeName'];
+  if (typeof pipeName !== 'string') {
+    return null;
+  }
+  // The file's own claim must match its own name, or nothing about it is usable.
+  return runtimeIdFromPipeName(pipeName) === candidate.runtimeId ? pipeName : null;
 }
 
 /* ------------------------------------------------------------------ *
@@ -1566,12 +1621,21 @@ export async function sweepStaleDescriptors(
       continue;
     }
     examined += 1;
-    const read = readDescriptorCandidate(candidate, deps);
-    if (read.kind === 'malformed') {
+    const text = readDescriptorText(candidate.path, deps);
+    const read = validateCandidate(candidate, parseDescriptor(text));
+    // A v3 candidate is probed on its own pipe. A pre-v3 candidate is NOT valid
+    // and never becomes valid — but if its own filename and its own `pipeName`
+    // agree, its pipe is still identifiable, so it can be proven dead and
+    // reclaimed like any other. Anything else stays malformed and untouched.
+    const pipeName =
+      read.kind === 'valid'
+        ? read.parsed.descriptor.pipeName
+        : legacyCleanupPipeName(candidate, text);
+    if (pipeName === null) {
       malformed.push(candidate.runtimeId);
       continue;
     }
-    const liveness = await probe(pipePathFromName(read.parsed.descriptor.pipeName));
+    const liveness = await probe(pipePathFromName(pipeName));
     if (liveness !== 'ABSENT') {
       retained.push(candidate.runtimeId);
       continue;
