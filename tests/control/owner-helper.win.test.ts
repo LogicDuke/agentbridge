@@ -173,6 +173,8 @@ describe.skipIf(!ready)('D062 native artifacts + lifecycle v2 — real Windows i
   const silent = (): void => {
     /* silent */
   };
+  /** The reserved anchor secret file every started runtime leaves (and never removes). */
+  const secretFile = (): string => store.descriptorFilenameFor(store.ANCHOR_SECRET_RUNTIME_ID);
 
   beforeAll(async () => {
     store = (await import(pathToFileURL(distStore).href)) as StoreModule;
@@ -640,7 +642,15 @@ describe.skipIf(!ready)('D062 native artifacts + lifecycle v2 — real Windows i
     }
     handles.push(handle);
 
-    expect(readdirSync(anchor)).toEqual([`runtime-descriptor-${handle.runtimeId}.json`]);
+    // The real creator made the anchor secret (born protected) and this runtime's descriptor.
+    expect(readdirSync(anchor).sort()).toEqual([secretFile(), `runtime-descriptor-${handle.runtimeId}.json`].sort());
+    const secretSnapshot = await snapshotOf(store.anchorSecretPathFor(anchor));
+    expect(secretSnapshot.ownerSid).toBe(operator.sid);
+    expect(secretSnapshot.daclProtected).toBe(true);
+    expect(new Set(secretSnapshot.aces.map((ace) => ace.sid))).toEqual(new Set([operator.sid, SYSTEM_SID]));
+    expect(await store.verifyDescriptorAcl(store.anchorSecretPathFor(anchor))).toEqual({ ok: true });
+    const anchorSecret = store.parseAnchorSecret(readFileSync(store.anchorSecretPathFor(anchor), 'utf8'));
+    expect(anchorSecret).not.toBeNull();
     const snapshot = await snapshotOf(handle.descriptorPath);
     expect(snapshot.ownerSid).toBe(operator.sid);
     expect(snapshot.daclProtected).toBe(true);
@@ -662,7 +672,7 @@ describe.skipIf(!ready)('D062 native artifacts + lifecycle v2 — real Windows i
 
     handles.splice(handles.indexOf(handle), 1);
     await handle.close();
-    expect(readdirSync(anchor)).toEqual([]);
+    expect(readdirSync(anchor)).toEqual([secretFile()]); // own file removed; the secret is never removed
     expect(await store.defaultPipeProbe()(handle.pipePath)).toBe('ABSENT');
     const after = await cli.runControlCli({ verify, out: silent, err: (m) => err.push(m) });
     expect(after.status).toBeNull();
@@ -684,7 +694,7 @@ describe.skipIf(!ready)('D062 native artifacts + lifecycle v2 — real Windows i
     }
     handles.push(second);
     expect(readdirSync(anchor).sort()).toEqual(
-      [`runtime-descriptor-${first.runtimeId}.json`, `runtime-descriptor-${second.runtimeId}.json`].sort(),
+      [secretFile(), `runtime-descriptor-${first.runtimeId}.json`, `runtime-descriptor-${second.runtimeId}.json`].sort(),
     );
     const err: string[] = [];
     const ambiguous = await cli.runControlCli({ verify, out: silent, err: (m) => err.push(m) });
@@ -694,7 +704,7 @@ describe.skipIf(!ready)('D062 native artifacts + lifecycle v2 — real Windows i
     expect(b.runtime.current()).toBeNull();
 
     await first.close();
-    expect(readdirSync(anchor)).toEqual([`runtime-descriptor-${second.runtimeId}.json`]);
+    expect(readdirSync(anchor).sort()).toEqual([secretFile(), `runtime-descriptor-${second.runtimeId}.json`].sort());
     const found = await cli.runControlCli({ verify, out: silent, err: silent });
     expect(found.authenticated).toBe(true);
     expect(found.status).toBe('NO_WORKFLOW');
@@ -739,8 +749,56 @@ describe.skipIf(!ready)('D062 native artifacts + lifecycle v2 — real Windows i
     }
     handles.push(next);
     expect(readdirSync(anchor).sort()).toEqual(
-      [`runtime-descriptor-${first.runtimeId}.json`, `runtime-descriptor-${next.runtimeId}.json`].sort(),
+      [secretFile(), `runtime-descriptor-${first.runtimeId}.json`, `runtime-descriptor-${next.runtimeId}.json`].sort(),
     );
+  }, 30000);
+
+  it('TRUSTED ORIGIN: a legacy (unbound) descriptor with a perfect real ACL and a live pipe is never trusted by the real CLI; a genuine bound runtime is', async () => {
+    const { anchor } = await makeAnchor();
+    const verify = (): Promise<{ readonly ok: true; readonly anchorPath: string }> =>
+      Promise.resolve({ ok: true, anchorPath: anchor });
+    // A first runtime provisions the anchor secret for real (then leaves).
+    const provisioner = await runtime.startControlChannel({ orchestrator: newOrchestrator().orchestrator, verify, logger: silent });
+    expect(provisioner).not.toBeNull();
+    if (provisioner === null) {
+      return;
+    }
+    await provisioner.close();
+    expect(readdirSync(anchor)).toEqual([secretFile()]);
+
+    // The legacy file: three-key v2 content, created by the REAL creator, so its
+    // owner + protected operator+SYSTEM DACL are exactly what the gate wants —
+    // and an attacker serves its pipe (a holder that answers the probe PRESENT).
+    const legacy = store.createRuntimeDescriptor();
+    expect(
+      await store.createDescriptorFileNative(anchor, legacy.runtimeId, Buffer.from(store.serializeDescriptor(legacy.descriptor), 'utf8')),
+    ).toEqual({ ok: true });
+    expect(await store.verifyDescriptorAcl(store.descriptorPathFor(anchor, legacy.runtimeId))).toEqual({ ok: true });
+    const legacyPipe = store.pipePathFromName(legacy.descriptor.pipeName);
+    await spawnPipeHolder(legacyPipe);
+    expect(await store.defaultPipeProbe()(legacyPipe)).toBe('PRESENT');
+
+    const err: string[] = [];
+    const alone = await cli.runControlCli({ verify, out: silent, err: (m) => err.push(m) });
+    expect(alone.authenticated).toBe(false);
+    expect(alone.status).toBeNull();
+    expect(alone.exitCode).toBe(1);
+    expect(err.some((line) => line.includes('NO_LIVE_CANDIDATES'))).toBe(true);
+
+    // Beside a genuine runtime the legacy file is still ignored: the genuine one is FOUND, not AMBIGUOUS.
+    const genuine = await runtime.startControlChannel({ orchestrator: newOrchestrator().orchestrator, verify, logger: silent });
+    expect(genuine).not.toBeNull();
+    if (genuine === null) {
+      return;
+    }
+    handles.push(genuine);
+    const found = await cli.runControlCli({ verify, out: silent, err: silent });
+    expect(found.authenticated).toBe(true);
+    expect(found.status).toBe('NO_WORKFLOW');
+    const published = store.parseDescriptor(readFileSync(genuine.descriptorPath, 'utf8'));
+    const secret = store.parseAnchorSecret(readFileSync(store.anchorSecretPathFor(anchor), 'utf8'));
+    expect(published !== null && secret !== null && store.verifyDescriptorProof(secret, published)).toBe(true);
+    expect(readdirSync(anchor)).toContain(`runtime-descriptor-${legacy.runtimeId}.json`); // never swept: its pipe is PRESENT
   }, 30000);
 
   it('a non-compliant anchor (inheritable Everyone) fails the real anchor gate, so no runtime ever publishes there', async () => {

@@ -22,6 +22,7 @@ import {
 } from '../../src/control/control-runtime.js';
 import {
   MAX_DESCRIPTOR_CANDIDATES,
+  anchorSecretPathFor,
   createRuntimeDescriptor,
   descriptorFilenameFor,
   descriptorPathFor,
@@ -37,6 +38,7 @@ import {
   closeServer,
   descriptorFacts,
   memAnchor,
+  mintBound,
   newOrchestrator,
   passingVerify,
   startRogueServer,
@@ -372,7 +374,7 @@ describe('D062 control channel — the write path is inert during the verificati
     const anchor = memAnchor();
     const started = startWithHeldVerification(orchestrator, anchor);
     await started.reached;
-    expect(anchor.entries().size).toBe(1); // published during the window
+    expect(anchor.entries().size).toBe(2); // the anchor secret + own descriptor published during the window
 
     // A CLI in the window is denied and mutates nothing.
     const during = await callCli(anchor);
@@ -383,7 +385,7 @@ describe('D062 control channel — the write path is inert during the verificati
     started.release({ ok: false, reason: CONTROL_ANCHOR_REJECTION.DACL_UNPROTECTED });
     const handle = await started.handlePromise;
     expect(handle).toBeNull();
-    expect(anchor.entries().size).toBe(0); // own descriptor cleaned up
+    expect(anchor.entries().size).toBe(1); // own descriptor cleaned up; the anchor secret stays
     expect(anchor.removeCalls()).toBe(1);
     expect(runtime.current()?.status).toBe(WORKFLOW_STATUS.OPEN);
   });
@@ -399,7 +401,10 @@ describe('D062 F2 — a discovered descriptor is security-verified BEFORE its to
    * through a CURRENTLY verified descriptor.
    */
   function plantLeakedDescriptor(anchor: MemAnchor): { path: string; pipePath: string; token: Buffer } {
-    const leaked = createRuntimeDescriptor();
+    // Bound to the anchor secret: models a genuine creator-born descriptor whose
+    // ACL the operator later widened, so ONLY the security gate stands between
+    // its leaked token and the CLI (the unbound/legacy case is covered elsewhere).
+    const leaked = mintBound();
     anchor.set(leaked.runtimeId, serializeDescriptor(leaked.descriptor));
     return {
       path: descriptorPathFor(anchor.anchorPath, leaked.runtimeId),
@@ -408,15 +413,25 @@ describe('D062 F2 — a discovered descriptor is security-verified BEFORE its to
     };
   }
 
-  /** Deps whose security gate rejects exactly `badPath`, logging every verify/read in order. */
+  /**
+   * Deps whose security gate rejects exactly `badPath`, logging every CANDIDATE
+   * verify/read in order. The reserved anchor secret passes and is not logged
+   * (its own gate path is proven in control-store.test.ts).
+   */
   function gatedDeps(anchor: MemAnchor, badPath: string, log: string[]): DescriptorFileDeps {
+    const secretPath = anchorSecretPathFor(anchor.anchorPath);
     return {
       ...anchor.deps,
       readFile: (path: string): string => {
-        log.push(`read:${path}`);
+        if (path !== secretPath) {
+          log.push(`read:${path}`);
+        }
         return anchor.deps.readFile?.(path) ?? '';
       },
       verifyDescriptor: (path: string): Promise<DescriptorAclVerification> => {
+        if (path === secretPath) {
+          return Promise.resolve({ ok: true });
+        }
         log.push(`verify:${path}`);
         return Promise.resolve(
           path === badPath ? { ok: false, reason: CONTROL_ANCHOR_REJECTION.DACL_UNPROTECTED } : { ok: true },

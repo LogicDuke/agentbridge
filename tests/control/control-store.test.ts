@@ -6,14 +6,22 @@ import { basename, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  ANCHOR_SECRET_RUNTIME_ID,
   CONTROL_ANCHOR_REJECTION,
   DESCRIPTOR_CREATION_REJECTION,
   DISCOVERY_UNAVAILABLE,
   MAX_ANCHOR_ENTRIES,
   MAX_DESCRIPTOR_BYTES,
   MAX_DESCRIPTOR_CANDIDATES,
+  anchorSecretPathFor,
+  bindDescriptor,
+  createAnchorSecret,
   createDescriptorFileNative,
   createRuntimeDescriptor,
+  descriptorProof,
+  parseAnchorSecret,
+  serializeAnchorSecret,
+  verifyDescriptorProof,
   defaultCreatorRunner,
   defaultOpenDescriptor,
   defaultPipeProbe,
@@ -55,7 +63,16 @@ import {
   type ProcessResult,
   type ProcessRunner,
 } from '../../src/control/control-store.js';
-import { FAKE_ANCHOR, allAbsentProbe, closeServer, memAnchor, tableProbe } from './support.js';
+import {
+  FAKE_ANCHOR,
+  TEST_ANCHOR_SECRET,
+  TEST_ANCHOR_SECRET_FILENAME,
+  allAbsentProbe,
+  closeServer,
+  memAnchor,
+  mintBound,
+  tableProbe,
+} from './support.js';
 
 const WHOAMI = [
   '',
@@ -665,13 +682,16 @@ function seeded(count: number): { anchor: ReturnType<typeof memAnchor>; ids: str
   const ids: string[] = [];
   const pipes: string[] = [];
   for (let index = 0; index < count; index += 1) {
-    const minted = createRuntimeDescriptor();
+    const minted = mintBound(); // bound to the anchor's secret, as a genuine runtime publishes
     anchor.set(minted.runtimeId, serializeDescriptor(minted.descriptor));
     ids.push(minted.runtimeId);
     pipes.push(pipePathFromName(minted.descriptor.pipeName));
   }
   return { anchor, ids, pipes };
 }
+
+/** The reserved secret's path in the test anchor. */
+const SECRET_PATH = anchorSecretPathFor(ANCHOR);
 
 describe('D062 candidate enumeration — bounded, exact-name, deterministic', () => {
   it('lists only identity-named files, sorted by id, and reports the cap as truncation', () => {
@@ -978,7 +998,7 @@ describe('D062 stale sweep — only ABSENT pipes authorize removal of exactly th
     }
     const sweep = await sweepStaleDescriptors(ANCHOR, null, allAbsentProbe, anchor.deps);
     expect(sweep.enumeration).toBe('complete');
-    expect(sweep.scanned).toBe(listed.length);
+    expect(sweep.scanned).toBe(listed.length + 1); // + the reserved anchor secret entry (never a candidate)
     // Incomplete branches report scanned = 0; callers never rely on it there.
     const unreadable = await sweepStaleDescriptors(ANCHOR, null, allAbsentProbe, { listAnchor: () => { throw new Error('EACCES'); } });
     expect(unreadable.scanned).toBe(0);
@@ -1469,15 +1489,25 @@ describe('D062 F2 — discovery security-verifies each candidate before its toke
   const DESCRIPTOR_OK = snapshot(OPERATOR_SID, [{ sid: OPERATOR_SID }, { sid: SYSTEM_SID }]);
   type Gate = (path: string) => Promise<DescriptorAclVerification>;
 
-  /** Deps that log every gate call and every read, in order. */
+  /**
+   * Deps that log every CANDIDATE gate call and read, in order. The reserved
+   * anchor secret (a genuine creator-born file in every fixture here) passes the
+   * gate and is not logged, so each assertion below is about the candidate only;
+   * the secret's own gate/read path is covered by the binding describe.
+   */
   function logged(anchor: ReturnType<typeof memAnchor>, gate: Gate, log: string[]): DescriptorFileDeps {
     return {
       ...anchor.deps,
       readFile: (path: string): string => {
-        log.push(`read:${path}`);
+        if (path !== SECRET_PATH) {
+          log.push(`read:${path}`);
+        }
         return anchor.deps.readFile?.(path) ?? '';
       },
       verifyDescriptor: (path: string): Promise<DescriptorAclVerification> => {
+        if (path === SECRET_PATH) {
+          return Promise.resolve({ ok: true });
+        }
         log.push(`verify:${path}`);
         return gate(path);
       },
@@ -1656,10 +1686,11 @@ describe('D062 F2 — discovery security-verifies each candidate before its toke
         },
       },
     );
-    // No real file exists at the fake path, so the real gate fails closed at lstat.
+    // No real file exists at the fake paths, so the real gate fails closed at
+    // lstat — first on the anchor secret, before any candidate is even gated.
     expect(result.kind).toBe('UNAVAILABLE');
     if (result.kind === 'UNAVAILABLE') {
-      expect(result.reason).toBe(DISCOVERY_UNAVAILABLE.NO_VERIFIED_CANDIDATES);
+      expect(result.reason).toBe(DISCOVERY_UNAVAILABLE.ANCHOR_SECRET_UNVERIFIED);
     }
     expect(reads).toEqual([]);
     expect(probes).toBe(0);
@@ -1739,6 +1770,11 @@ describe('D062 F2 stable object — the gate and the read share ONE held descrip
   }
 
   const pass: Gate = () => Promise.resolve({ ok: true });
+  /** The anchor secret is held → gated → read → released FIRST, before any candidate. */
+  const SECRET_HELD = [`open:${SECRET_PATH}`, `verify:${SECRET_PATH}`, `read:${SECRET_PATH}`, `close:${SECRET_PATH}`];
+  /** A gate applying `verdict` to exactly one candidate path and passing the secret. */
+  const only = (path: string, verdict: () => Promise<DescriptorAclVerification>): Gate => (p: string) =>
+    p === path ? verdict() : Promise.resolve({ ok: true });
 
   it('holds the candidate across the gate: open → verify → read → close, exactly once, then probe', async () => {
     const { anchor, ids, pipes } = seeded(1);
@@ -1753,9 +1789,11 @@ describe('D062 F2 stable object — the gate and the read share ONE held descrip
       store.deps,
     );
     expect(result.kind).toBe('FOUND');
-    expect(store.log).toEqual([`open:${path}`, `verify:${path}`, `read:${path}`, `close:${path}`, `probe:${pipes[0] ?? ''}`]);
+    expect(store.log).toEqual([...SECRET_HELD, `open:${path}`, `verify:${path}`, `read:${path}`, `close:${path}`, `probe:${pipes[0] ?? ''}`]);
     expect(store.openCount(path)).toBe(1);
     expect(store.closeCount(path)).toBe(1);
+    expect(store.openCount(SECRET_PATH)).toBe(1);
+    expect(store.closeCount(SECRET_PATH)).toBe(1);
   });
 
   it('the token used is the held object\'s, not a later pathname lookup: an overwrite after the ACL check is never trusted', async () => {
@@ -1766,9 +1804,11 @@ describe('D062 F2 stable object — the gate and the read share ONE held descrip
     // A forged descriptor under the SAME runtime id / pipe name but a different token.
     const forgedText = serializeDescriptor({ ...forged.descriptor, pipeName: genuine?.descriptor.pipeName ?? '' });
     let store: HeldStore | null = null;
-    const gate: Gate = () => {
-      // The attacker "passes" the check, then rewrites the pathname's contents.
-      store?.overwrite(path, forgedText);
+    const gate: Gate = (gatedPath: string) => {
+      // The attacker "passes" the check on the candidate, then rewrites the pathname's contents.
+      if (gatedPath === path) {
+        store?.overwrite(path, forgedText);
+      }
       return Promise.resolve({ ok: true });
     };
     store = heldStore(anchor, gate);
@@ -1796,7 +1836,7 @@ describe('D062 F2 stable object — the gate and the read share ONE held descrip
     });
     expect(result.kind).toBe('FOUND');
     expect(pathReads).toBe(0);
-    expect(store.log).toEqual([`open:${path}`, `verify:${path}`, `read:${path}`, `close:${path}`]);
+    expect(store.log).toEqual([...SECRET_HELD, `open:${path}`, `verify:${path}`, `read:${path}`, `close:${path}`]);
   });
 
   it('a candidate that cannot be held (EBUSY) is unverified: no gate, no read, no probe, NO_VERIFIED_CANDIDATES', async () => {
@@ -1817,7 +1857,7 @@ describe('D062 F2 stable object — the gate and the read share ONE held descrip
       reason: DISCOVERY_UNAVAILABLE.NO_VERIFIED_CANDIDATES,
       counts: { candidates: 1, unverified: 1, malformed: 0, live: 0, dead: 0, unknown: 0 },
     });
-    expect(store.log).toEqual([]);
+    expect(store.log).toEqual(SECRET_HELD); // the candidate itself: no gate, no read, no close
     expect(probes).toBe(0);
     expect(anchor.removeCalls()).toBe(0);
   });
@@ -1825,19 +1865,19 @@ describe('D062 F2 stable object — the gate and the read share ONE held descrip
   it('a failed gate closes the held handle without reading it: the token is never taken from an unverified object', async () => {
     const { anchor, ids } = seeded(1);
     const path = descriptorPathFor(ANCHOR, ids[0] ?? '');
-    const store = heldStore(anchor, () => Promise.resolve({ ok: false, reason: CONTROL_ANCHOR_REJECTION.OWNER_MISMATCH }));
+    const store = heldStore(anchor, only(path, () => Promise.resolve({ ok: false, reason: CONTROL_ANCHOR_REJECTION.OWNER_MISMATCH })));
     const result = await discoverControlRuntime(ANCHOR, () => Promise.resolve('PRESENT'), store.deps);
     expect(result.kind).toBe('UNAVAILABLE');
     if (result.kind === 'UNAVAILABLE') {
       expect(result.reason).toBe(DISCOVERY_UNAVAILABLE.NO_VERIFIED_CANDIDATES);
     }
-    expect(store.log).toEqual([`open:${path}`, `verify:${path}`, `close:${path}`]);
+    expect(store.log).toEqual([...SECRET_HELD, `open:${path}`, `verify:${path}`, `close:${path}`]);
   });
 
   it('a gate that throws still releases the handle (finally), and the error propagates as before', async () => {
     const { anchor, ids } = seeded(1);
     const path = descriptorPathFor(ANCHOR, ids[0] ?? '');
-    const store = heldStore(anchor, () => Promise.reject(new Error('helper transport failed')));
+    const store = heldStore(anchor, only(path, () => Promise.reject(new Error('helper transport failed'))));
     await expect(discoverControlRuntime(ANCHOR, () => Promise.resolve('PRESENT'), store.deps)).rejects.toThrow(
       'helper transport failed',
     );
@@ -1848,16 +1888,22 @@ describe('D062 F2 stable object — the gate and the read share ONE held descrip
     const { anchor } = seeded(1);
     const store = heldStore(anchor, pass);
     let closed = 0;
+    const heldOpener = store.deps.openDescriptor;
     const result = await discoverControlRuntime(ANCHOR, () => Promise.resolve('PRESENT'), {
       ...store.deps,
-      openDescriptor: (): DescriptorHandle => ({
-        read: (): string => {
-          throw new Error('EIO');
-        },
-        close: (): void => {
-          closed += 1;
-        },
-      }),
+      openDescriptor: (path: string): DescriptorHandle => {
+        if (path === SECRET_PATH && heldOpener !== undefined) {
+          return heldOpener(path); // the secret itself is fine; only the candidate's read fails
+        }
+        return {
+          read: (): string => {
+            throw new Error('EIO');
+          },
+          close: (): void => {
+            closed += 1;
+          },
+        };
+      },
     });
     expect(result).toEqual({
       kind: 'UNAVAILABLE',
@@ -1921,11 +1967,12 @@ describe('D062 F2 stable object — the gate and the read share ONE held descrip
         return Promise.resolve({ ok: true });
       },
     });
-    // No real file exists at the fake path: the real opener throws, the candidate is unverified.
+    // No real file exists at the fake paths: the real opener throws ENOENT on the
+    // anchor secret first, so discovery fails closed before any candidate is held.
     expect(result).toEqual({
       kind: 'UNAVAILABLE',
-      reason: DISCOVERY_UNAVAILABLE.NO_VERIFIED_CANDIDATES,
-      counts: { candidates: 1, unverified: 1, malformed: 0, live: 0, dead: 0, unknown: 0 },
+      reason: DISCOVERY_UNAVAILABLE.ANCHOR_SECRET_ABSENT,
+      counts: { candidates: 1, unverified: 0, malformed: 0, live: 0, dead: 0, unknown: 0 },
     });
     expect(gateCalls).toBe(0);
   });
@@ -2018,5 +2065,261 @@ describe('D062 F2 stable object — the gate and the read share ONE held descrip
         }
       },
     );
+  });
+});
+
+describe('D062 trusted origin — a candidate is trusted only when bound to the reserved anchor secret', () => {
+  const present = (): Promise<'PRESENT'> => Promise.resolve('PRESENT');
+
+  it('secret body: fixed two-key form round-trips; anything else is null (fail closed)', () => {
+    const { secret, text } = createAnchorSecret();
+    expect(secret).toHaveLength(32);
+    expect(parseAnchorSecret(text)?.equals(secret)).toBe(true);
+    expect(parseAnchorSecret(serializeAnchorSecret(TEST_ANCHOR_SECRET))?.equals(TEST_ANCHOR_SECRET)).toBe(true);
+    expect(parseAnchorSecret('not json')).toBeNull();
+    expect(parseAnchorSecret('[]')).toBeNull();
+    expect(parseAnchorSecret(JSON.stringify({ version: 1 }))).toBeNull();
+    expect(parseAnchorSecret(JSON.stringify({ version: 2, anchorSecret: Buffer.alloc(32, 1).toString('base64url') }))).toBeNull();
+    expect(parseAnchorSecret(JSON.stringify({ version: 1, anchorSecret: Buffer.alloc(16, 1).toString('base64url') }))).toBeNull();
+    expect(parseAnchorSecret(JSON.stringify({ version: 1, anchorSecret: Buffer.alloc(32, 1).toString('base64url'), x: 1 }))).toBeNull();
+    // A descriptor is never a secret, and the secret is never a descriptor.
+    expect(parseAnchorSecret(serializeDescriptor(mintBound().descriptor))).toBeNull();
+    expect(parseDescriptor(text)).toBeNull();
+    expect(() => serializeAnchorSecret(Buffer.alloc(16))).toThrow(TypeError);
+  });
+
+  it('the reserved id is never minted, never parses as a runtime, and names exactly the secret path', () => {
+    expect(isRuntimeId(ANCHOR_SECRET_RUNTIME_ID)).toBe(true); // creator-acceptable shape
+    for (let index = 0; index < 64; index += 1) {
+      expect(createRuntimeDescriptor().runtimeId).not.toBe(ANCHOR_SECRET_RUNTIME_ID);
+    }
+    const claimed = serializeDescriptor({ version: 2, pipeName: pipeNameForRuntimeId(ANCHOR_SECRET_RUNTIME_ID), token: Buffer.alloc(32, 1).toString('base64url') });
+    expect(parseDescriptor(claimed)).toBeNull();
+    expect(anchorSecretPathFor(ANCHOR)).toBe(descriptorPathFor(ANCHOR, ANCHOR_SECRET_RUNTIME_ID));
+    expect(TEST_ANCHOR_SECRET_FILENAME).toBe(descriptorFilenameFor(ANCHOR_SECRET_RUNTIME_ID));
+  });
+
+  it('binding: proof = HMAC(secret, id ‖ token); bind is pure; verify is exact and rejects unbound / other-secret / tampered', () => {
+    const minted = createRuntimeDescriptor();
+    expect(minted.proof).toBeNull();
+    const bound = bindDescriptor(minted, TEST_ANCHOR_SECRET);
+    expect(minted.descriptor.proof).toBeUndefined(); // input untouched
+    expect(bound.proof.equals(descriptorProof(TEST_ANCHOR_SECRET, minted.runtimeId, minted.token))).toBe(true);
+    expect(bound.descriptor.proof).toBe(bound.proof.toString('base64url'));
+    expect(verifyDescriptorProof(TEST_ANCHOR_SECRET, bound)).toBe(true);
+    expect(verifyDescriptorProof(TEST_ANCHOR_SECRET, minted)).toBe(false); // unbound
+    expect(verifyDescriptorProof(Buffer.alloc(32, 9), bound)).toBe(false); // another anchor's secret
+    // Tampering with any bound field breaks the binding.
+    const reparsed = parseDescriptor(serializeDescriptor(bound.descriptor));
+    expect(reparsed).not.toBeNull();
+    expect(reparsed !== null && verifyDescriptorProof(TEST_ANCHOR_SECRET, reparsed)).toBe(true);
+    const otherToken = createRuntimeDescriptor();
+    expect(verifyDescriptorProof(TEST_ANCHOR_SECRET, { ...bound, token: otherToken.token })).toBe(false);
+    expect(verifyDescriptorProof(TEST_ANCHOR_SECRET, { ...bound, runtimeId: otherToken.runtimeId })).toBe(false);
+    expect(verifyDescriptorProof(TEST_ANCHOR_SECRET, { ...bound, proof: Buffer.alloc(32, 0) })).toBe(false);
+    expect(verifyDescriptorProof(TEST_ANCHOR_SECRET, { ...bound, proof: bound.proof.subarray(0, 31) })).toBe(false);
+    // Serialized: exactly four keys; a fifth or a malformed proof is malformed.
+    expect(Object.keys(JSON.parse(serializeDescriptor(bound.descriptor)) as object)).toEqual(['version', 'pipeName', 'token', 'proof']);
+    expect(parseDescriptor(JSON.stringify({ ...bound.descriptor, proof: 'nope' }))).toBeNull();
+    expect(parseDescriptor(JSON.stringify({ ...bound.descriptor, extra: 1 }))).toBeNull();
+  });
+
+  it('genuine bound descriptor, single live runtime → FOUND with its token (the secret is read through the gate first)', async () => {
+    const { anchor, ids } = seeded(1);
+    const log: string[] = [];
+    const deps: DescriptorFileDeps = {
+      ...anchor.deps,
+      verifyDescriptor: (path: string): Promise<DescriptorAclVerification> => {
+        log.push(path);
+        return Promise.resolve({ ok: true });
+      },
+    };
+    const result = await discoverControlRuntime(ANCHOR, present, deps);
+    expect(result.kind).toBe('FOUND');
+    if (result.kind === 'FOUND') {
+      expect(result.parsed.runtimeId).toBe(ids[0]);
+      expect(result.parsed.token.equals(parseDescriptor(anchor.get(ids[0] ?? ''))?.token ?? Buffer.alloc(0))).toBe(true);
+      expect(result.counts).toEqual({ candidates: 1, unverified: 0, malformed: 0, live: 1, dead: 0, unknown: 0 });
+    }
+    expect(log).toEqual([SECRET_PATH, descriptorPathFor(ANCHOR, ids[0] ?? '')]);
+  });
+
+  it('two valid bound live runtimes remain AMBIGUOUS', async () => {
+    const { anchor, ids } = seeded(2);
+    const result = await discoverControlRuntime(ANCHOR, present, anchor.deps);
+    expect(result.kind).toBe('AMBIGUOUS');
+    if (result.kind === 'AMBIGUOUS') {
+      expect([...result.live].sort()).toEqual([...ids].sort());
+    }
+  });
+
+  it('LEGACY: an unbound descriptor with a perfect current ACL and a PRESENT pipe is never trusted; its pipe is never probed', async () => {
+    const { anchor, ids, pipes } = seeded(1);
+    const legacy = createRuntimeDescriptor(); // three-key v2 file: exactly what pre-binding code wrote
+    anchor.set(legacy.runtimeId, serializeDescriptor(legacy.descriptor));
+    const probed: string[] = [];
+    const result = await discoverControlRuntime(
+      ANCHOR,
+      (pipePath: string) => {
+        probed.push(pipePath);
+        return Promise.resolve('PRESENT'); // the attacker serves the legacy pipe
+      },
+      anchor.deps, // the gate PASSES the legacy file: its repaired ACL is indistinguishable
+    );
+    // Alone with a genuine runtime: the genuine one is FOUND, the legacy one is malformed, not live.
+    expect(result.kind).toBe('FOUND');
+    if (result.kind === 'FOUND') {
+      expect(result.parsed.runtimeId).toBe(ids[0]);
+      expect(result.counts).toEqual({ candidates: 2, unverified: 0, malformed: 1, live: 1, dead: 0, unknown: 0 });
+    }
+    expect(probed).toEqual([pipes[0]]);
+    // Alone, with no genuine runtime: nothing is trusted, exit path is NO_LIVE_CANDIDATES.
+    anchor.remove(ids[0] ?? '');
+    const alone = await discoverControlRuntime(ANCHOR, present, anchor.deps);
+    expect(alone).toEqual({
+      kind: 'UNAVAILABLE',
+      reason: DISCOVERY_UNAVAILABLE.NO_LIVE_CANDIDATES,
+      counts: { candidates: 1, unverified: 0, malformed: 1, live: 0, dead: 0, unknown: 0 },
+    });
+  });
+
+  it('FORGED: a proof under another secret, a proof from another descriptor, or a rewritten token is malformed, never live', async () => {
+    const { anchor, ids } = seeded(1);
+    const forgedUnderOtherSecret = bindDescriptor(createRuntimeDescriptor(), Buffer.alloc(32, 0xee));
+    anchor.set(forgedUnderOtherSecret.runtimeId, serializeDescriptor(forgedUnderOtherSecret.descriptor));
+    const genuine = parseDescriptor(anchor.get(ids[0] ?? '') ?? '');
+    const transplanted = createRuntimeDescriptor();
+    anchor.set(
+      transplanted.runtimeId,
+      serializeDescriptor({ ...transplanted.descriptor, proof: genuine?.descriptor.proof ?? '' }),
+    );
+    const rewritten = { ...(genuine?.descriptor ?? transplanted.descriptor), token: createRuntimeDescriptor().descriptor.token };
+    anchor.set(ids[0] ?? '', serializeDescriptor(rewritten)); // genuine file, token swapped in place
+    const result = await discoverControlRuntime(ANCHOR, present, anchor.deps);
+    expect(result).toEqual({
+      kind: 'UNAVAILABLE',
+      reason: DISCOVERY_UNAVAILABLE.NO_LIVE_CANDIDATES,
+      counts: { candidates: 3, unverified: 0, malformed: 3, live: 0, dead: 0, unknown: 0 },
+    });
+  });
+
+  it('ABSENT secret: fail closed before any candidate is gated, read, or probed', async () => {
+    const anchor = memAnchor(ANCHOR, false);
+    const minted = mintBound();
+    anchor.set(minted.runtimeId, serializeDescriptor(minted.descriptor));
+    const gated: string[] = [];
+    let probes = 0;
+    const result = await discoverControlRuntime(
+      ANCHOR,
+      () => {
+        probes += 1;
+        return Promise.resolve('PRESENT');
+      },
+      {
+        ...anchor.deps,
+        verifyDescriptor: (path: string): Promise<DescriptorAclVerification> => {
+          gated.push(path);
+          return Promise.resolve({ ok: true });
+        },
+      },
+    );
+    expect(result).toEqual({
+      kind: 'UNAVAILABLE',
+      reason: DISCOVERY_UNAVAILABLE.ANCHOR_SECRET_ABSENT,
+      counts: { candidates: 1, unverified: 0, malformed: 0, live: 0, dead: 0, unknown: 0 },
+    });
+    // The in-memory store surfaces absence only at read, so the secret's own
+    // gate ran; the CANDIDATE was never gated, read, or probed.
+    expect(gated).toEqual([SECRET_PATH]);
+    expect(probes).toBe(0);
+    expect(anchor.removeCalls()).toBe(0);
+  });
+
+  it.each([
+    ['unverified (fails the descriptor gate)', (anchor: ReturnType<typeof memAnchor>): DescriptorFileDeps => ({
+      ...anchor.deps,
+      verifyDescriptor: (path: string): Promise<DescriptorAclVerification> =>
+        Promise.resolve(path === SECRET_PATH ? { ok: false, reason: CONTROL_ANCHOR_REJECTION.FOREIGN_PRINCIPAL } : { ok: true }),
+    })],
+    ['unholdable (EBUSY on open)', (anchor: ReturnType<typeof memAnchor>): DescriptorFileDeps => ({
+      ...anchor.deps,
+      openDescriptor: (path: string): DescriptorHandle => {
+        if (path === SECRET_PATH) {
+          throw Object.assign(new Error('EBUSY'), { code: 'EBUSY' });
+        }
+        return { read: (): string => anchor.deps.readFile?.(path) ?? '', close: (): void => {} };
+      },
+    })],
+    ['malformed body', (anchor: ReturnType<typeof memAnchor>): DescriptorFileDeps => {
+      anchor.setRaw(TEST_ANCHOR_SECRET_FILENAME, '{ nope');
+      return anchor.deps;
+    }],
+    ['a descriptor planted at the secret path', (anchor: ReturnType<typeof memAnchor>): DescriptorFileDeps => {
+      anchor.setRaw(TEST_ANCHOR_SECRET_FILENAME, serializeDescriptor(mintBound().descriptor));
+      return anchor.deps;
+    }],
+  ])('INVALID secret — %s: ANCHOR_SECRET_UNVERIFIED, no candidate gated, read, or probed', async (_label, mkDeps) => {
+    const { anchor, ids } = seeded(1);
+    const candidatePath = descriptorPathFor(ANCHOR, ids[0] ?? '');
+    const base = mkDeps(anchor);
+    const touched: string[] = [];
+    let probes = 0;
+    const result = await discoverControlRuntime(
+      ANCHOR,
+      () => {
+        probes += 1;
+        return Promise.resolve('PRESENT');
+      },
+      {
+        ...base,
+        readFile: (path: string): string => {
+          touched.push(path);
+          return base.readFile?.(path) ?? '';
+        },
+      },
+    );
+    expect(result).toEqual({
+      kind: 'UNAVAILABLE',
+      reason: DISCOVERY_UNAVAILABLE.ANCHOR_SECRET_UNVERIFIED,
+      counts: { candidates: 1, unverified: 0, malformed: 0, live: 0, dead: 0, unknown: 0 },
+    });
+    expect(touched).not.toContain(candidatePath);
+    expect(probes).toBe(0);
+    expect(anchor.removeCalls()).toBe(0);
+    expect(anchor.entries().has(TEST_ANCHOR_SECRET_FILENAME)).toBe(true); // never removed or replaced
+  });
+
+  it('the reserved secret file is never a candidate: excluded from enumeration, never probed, never swept', async () => {
+    const { anchor, ids } = seeded(2);
+    const enumeration = enumerateDescriptorCandidates(ANCHOR, anchor.deps);
+    expect(enumeration.ok && enumeration.candidates.map((c) => c.runtimeId)).toEqual([...ids].sort());
+    expect(enumeration.ok && enumeration.scanned).toBe(3); // two candidates + the secret entry
+    const probed: string[] = [];
+    const sweep = await sweepStaleDescriptors(
+      ANCHOR,
+      null,
+      (pipePath: string) => {
+        probed.push(pipePath);
+        return Promise.resolve('ABSENT');
+      },
+      anchor.deps,
+    );
+    expect([...sweep.removed].sort()).toEqual([...ids].sort());
+    expect(sweep.examined).toBe(2);
+    expect(probed).not.toContain(pipePathFromName(pipeNameForRuntimeId(ANCHOR_SECRET_RUNTIME_ID)));
+    expect(anchor.entries().has(TEST_ANCHOR_SECRET_FILENAME)).toBe(true);
+    // Even an all-ABSENT world with the secret alone leaves it untouched and discovery honest.
+    const alone = await discoverControlRuntime(ANCHOR, allAbsentProbe, anchor.deps);
+    expect(alone).toEqual({ kind: 'UNAVAILABLE', reason: DISCOVERY_UNAVAILABLE.NO_CANDIDATES, counts: { candidates: 0, unverified: 0, malformed: 0, live: 0, dead: 0, unknown: 0 } });
+    expect(anchor.entries().has(TEST_ANCHOR_SECRET_FILENAME)).toBe(true);
+  });
+
+  it('a legacy (unbound) stale descriptor is still swept when its pipe is ABSENT — cleanup is not narrowed', async () => {
+    const anchor = memAnchor(ANCHOR);
+    const legacy = createRuntimeDescriptor();
+    anchor.set(legacy.runtimeId, serializeDescriptor(legacy.descriptor));
+    const sweep = await sweepStaleDescriptors(ANCHOR, null, allAbsentProbe, anchor.deps);
+    expect(sweep.removed).toEqual([legacy.runtimeId]);
+    expect(sweep.malformed).toEqual([]);
   });
 });

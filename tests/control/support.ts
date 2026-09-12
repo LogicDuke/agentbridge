@@ -26,10 +26,14 @@ import {
 import { CONTROL_RESULT, type ControlResultStatus } from '../../src/control/control-command.js';
 import { runControlCli, type ControlCliOutcome } from '../../src/control/cli.js';
 import {
+  ANCHOR_SECRET_RUNTIME_ID,
   DESCRIPTOR_CREATION_REJECTION,
+  bindDescriptor,
+  createRuntimeDescriptor,
   descriptorFilenameFor,
   parseDescriptor,
   pipePathFromName,
+  serializeAnchorSecret,
   serializeDescriptor,
   type ControlAnchorVerification,
   type DescriptorAclVerification,
@@ -37,7 +41,6 @@ import {
   type DescriptorFileDeps,
   type ParsedDescriptor,
   type PipeProbe,
-  type RuntimeDescriptor,
 } from '../../src/control/control-store.js';
 import {
   startControlChannel,
@@ -56,6 +59,20 @@ export const BINDING: WorkflowBinding = {
 
 export const FAKE_ANCHOR = 'C:\\FakeAnchor';
 
+/**
+ * The fixed anchor secret every in-memory anchor is born with (see memAnchor),
+ * so bound descriptors minted by tests verify against any memAnchor. Real
+ * anchors mint a random one through the creator; only the in-memory fixture
+ * shares a constant.
+ */
+export const TEST_ANCHOR_SECRET: Buffer = Buffer.alloc(32, 0x5a);
+export const TEST_ANCHOR_SECRET_FILENAME = descriptorFilenameFor(ANCHOR_SECRET_RUNTIME_ID);
+
+/** Mint a descriptor already bound to {@link TEST_ANCHOR_SECRET}. */
+export function mintBound(): ParsedDescriptor {
+  return bindDescriptor(createRuntimeDescriptor(), TEST_ANCHOR_SECRET);
+}
+
 export function passingVerify(): Promise<ControlAnchorVerification> {
   return Promise.resolve({ ok: true, anchorPath: FAKE_ANCHOR });
 }
@@ -72,6 +89,8 @@ export function passingDescriptorVerify(): Promise<DescriptorAclVerification> {
  */
 export interface MemAnchor {
   readonly anchorPath: string;
+  /** The anchor secret this anchor was born with (TEST_ANCHOR_SECRET unless seeded without one). */
+  readonly secret: Buffer;
   readonly deps: DescriptorFileDeps;
   /** The CREATE_NEW creation seam: refuses an existing path (CREATOR_FAILED). */
   readonly create: DescriptorCreatorFn;
@@ -91,8 +110,21 @@ export interface MemAnchor {
   createCalls(): number;
 }
 
-export function memAnchor(anchorPath: string = FAKE_ANCHOR): MemAnchor {
+/** An in-memory `ENOENT`, shaped like the fs error (`code`) the real opener throws. */
+function enoent(): Error {
+  return Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+}
+
+/**
+ * @param withSecret Seed the reserved anchor secret file (TEST_ANCHOR_SECRET) —
+ * the state every provisioned anchor reaches after its first runtime start.
+ * `false` models an anchor no bound runtime has ever started in.
+ */
+export function memAnchor(anchorPath: string = FAKE_ANCHOR, withSecret = true): MemAnchor {
   const files = new Map<string, string>();
+  if (withSecret) {
+    files.set(TEST_ANCHOR_SECRET_FILENAME, serializeAnchorSecret(TEST_ANCHOR_SECRET));
+  }
   let removeCalls = 0;
   let createCalls = 0;
   const pathOf = (basename: string): string => join(anchorPath, basename);
@@ -106,17 +138,18 @@ export function memAnchor(anchorPath: string = FAKE_ANCHOR): MemAnchor {
   };
   return {
     anchorPath,
+    secret: TEST_ANCHOR_SECRET,
     deps: {
       listAnchor: (dir: string): readonly string[] => {
         if (dir !== anchorPath) {
-          throw new Error('ENOENT');
+          throw enoent();
         }
         return [...files.keys()];
       },
       readFile: (path: string): string => {
         const name = basenameOf(path);
         if (name === null) {
-          throw new Error('ENOENT');
+          throw enoent();
         }
         return files.get(name) ?? '';
       },
@@ -124,7 +157,7 @@ export function memAnchor(anchorPath: string = FAKE_ANCHOR): MemAnchor {
         removeCalls += 1;
         const name = basenameOf(path);
         if (name === null) {
-          throw new Error('ENOENT');
+          throw enoent();
         }
         files.delete(name);
       },
@@ -269,12 +302,18 @@ export function descriptorFacts(
 
 /** Produce a descriptor JSON with the same pipe name but a different token. */
 export function withTamperedToken(serialized: string): string {
-  const parsed = JSON.parse(serialized) as RuntimeDescriptor;
-  return serializeDescriptor({
-    version: 2,
-    pipeName: parsed.pipeName,
-    token: randomBytes(32).toString('base64url'),
-  });
+  const parsed = parseDescriptor(serialized);
+  if (parsed === null) {
+    throw new Error('withTamperedToken: input is not a descriptor');
+  }
+  const token = randomBytes(32);
+  // Correctly BOUND to the test anchor secret, so only the token is wrong: the
+  // rejection under test is the server's (HMAC), not discovery's binding check.
+  const tampered = bindDescriptor(
+    { descriptor: { version: 2, pipeName: parsed.descriptor.pipeName, token: token.toString('base64url') }, token, runtimeId: parsed.runtimeId, proof: null },
+    TEST_ANCHOR_SECRET,
+  );
+  return serializeDescriptor(tampered.descriptor);
 }
 
 export type RawOutcome =

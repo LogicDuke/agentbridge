@@ -27,21 +27,26 @@ import {
 } from '../../src/control/control-command.js';
 import { createControlDispatcher, type ControlDispatcher } from '../../src/control/control-dispatch.js';
 import {
+  ANCHOR_SECRET_RUNTIME_ID,
   CONTROL_ANCHOR_REJECTION,
   DESCRIPTOR_CREATION_REJECTION,
   MAX_ANCHOR_ENTRIES,
   MAX_DESCRIPTOR_CANDIDATES,
+  anchorSecretPathFor,
+  createAnchorSecret,
   createRuntimeDescriptor,
   defaultPipeProbe,
   descriptorFilenameFor,
   descriptorPathFor,
   discoverControlRuntime,
+  parseAnchorSecret,
   parseDescriptor,
   pipeNameForRuntimeId,
   pipePathFromName,
   runtimeIdFromDescriptorFilename,
   serializeDescriptor,
   verifyDescriptorAcl,
+  verifyDescriptorProof,
   type ControlAnchorVerification,
   type DescriptorAclVerification,
   type OwnerVerifierDeps,
@@ -53,10 +58,12 @@ import {
   startControlChannel,
   type ControlChannelHandle,
   type DescriptorCreatorFn,
+  type StartControlChannelDeps,
 } from '../../src/control/control-runtime.js';
 import {
   BINDING,
   FAKE_ANCHOR,
+  TEST_ANCHOR_SECRET_FILENAME,
   allAbsentProbe,
   closeServer,
   memAnchor,
@@ -89,8 +96,9 @@ const silent = (): void => {
 const realProbe = defaultPipeProbe(1500);
 
 /** Every identity-named file currently in the anchor. */
+/** Descriptor files in the anchor. The reserved anchor secret is a fixed fixture entry, not a descriptor. */
 function filesIn(anchor: MemAnchor): string[] {
-  return [...anchor.entries().keys()].sort();
+  return [...anchor.entries().keys()].filter((name) => name !== TEST_ANCHOR_SECRET_FILENAME).sort();
 }
 
 /**
@@ -1197,7 +1205,8 @@ describe('D062 lifecycle v2 — startup sweep of foreign descriptors', () => {
   it('FINDING 2 — exactly MAX_ANCHOR_ENTRIES entries leaves no entry slot: startup fails closed before listen/publish', async () => {
     const { orchestrator } = newOrchestrator();
     const anchor = memAnchor();
-    for (let index = 0; index < MAX_ANCHOR_ENTRIES; index += 1) {
+    // The anchor secret is one entry already; MAX-1 junk fills the anchor to exactly MAX.
+    for (let index = 0; index < MAX_ANCHOR_ENTRIES - 1; index += 1) {
       anchor.setRaw(`junk-${String(index)}.txt`, 'x');
     }
     let serverCreated = false;
@@ -1229,7 +1238,7 @@ describe('D062 lifecycle v2 — startup sweep of foreign descriptors', () => {
   it('FINDING 2 — MAX_ANCHOR_ENTRIES-1 entries leaves one entry slot: startup proceeds to exactly MAX and stays discoverable', async () => {
     const { orchestrator } = newOrchestrator();
     const anchor = memAnchor();
-    for (let index = 0; index < MAX_ANCHOR_ENTRIES - 1; index += 1) {
+    for (let index = 0; index < MAX_ANCHOR_ENTRIES - 2; index += 1) {
       anchor.setRaw(`junk-${String(index)}.txt`, 'x');
     }
     const handle = await startControlChannel({
@@ -1244,7 +1253,7 @@ describe('D062 lifecycle v2 — startup sweep of foreign descriptors', () => {
     expect(handle).not.toBeNull();
     if (handle !== null) {
       handles.push(handle);
-      expect(anchor.entries().size).toBe(MAX_ANCHOR_ENTRIES); // (MAX-1 junk) + own = MAX
+      expect(anchor.entries().size).toBe(MAX_ANCHOR_ENTRIES); // secret + (MAX-2 junk) + own = MAX
       await expectDiscoverableNotOverfull(anchor.deps, handle.runtimeId);
     }
   });
@@ -1252,10 +1261,10 @@ describe('D062 lifecycle v2 — startup sweep of foreign descriptors', () => {
   it('FINDING 2 — a removable ABSENT descriptor frees entry room: startup proceeds to exactly MAX and stays discoverable', async () => {
     const { orchestrator } = newOrchestrator();
     const anchor = memAnchor();
-    for (let index = 0; index < MAX_ANCHOR_ENTRIES - 1; index += 1) {
+    for (let index = 0; index < MAX_ANCHOR_ENTRIES - 2; index += 1) {
       anchor.setRaw(`junk-${String(index)}.txt`, 'x');
     }
-    const dead = foreignDescriptor(); // valid foreign descriptor; +1 → exactly MAX total
+    const dead = foreignDescriptor(); // valid foreign descriptor; secret + junk + dead = exactly MAX total
     anchor.set(dead.runtimeId, dead.text);
     const handle = await startControlChannel({
       orchestrator,
@@ -1270,7 +1279,7 @@ describe('D062 lifecycle v2 — startup sweep of foreign descriptors', () => {
     if (handle !== null) {
       handles.push(handle);
       expect(anchor.removeCalls()).toBe(1); // the ABSENT foreign descriptor was removed
-      expect(anchor.entries().size).toBe(MAX_ANCHOR_ENTRIES); // (MAX-1 junk) + own = MAX
+      expect(anchor.entries().size).toBe(MAX_ANCHOR_ENTRIES); // secret + (MAX-2 junk) + own = MAX
       await expectDiscoverableNotOverfull(anchor.deps, handle.runtimeId);
     }
   });
@@ -1445,5 +1454,203 @@ describe('D062 lifecycle v2 — negative controls against the reconstructed fixe
 
   it('NC-1. the legacy fixed name is not an identity-named candidate and can never be discovered or swept', () => {
     expect(runtimeIdFromDescriptorFilename('runtime-descriptor.json')).toBeNull();
+  });
+});
+
+/* ---- trusted origin: the reserved anchor secret's lifecycle at the runtime ---- */
+
+describe('D062 trusted origin — anchor secret lifecycle at runtime start', () => {
+  const secretPath = anchorSecretPathFor(FAKE_ANCHOR);
+
+  it('ABSENT secret: created exactly once through the creator seam, then this runtime is bound to it and discoverable', async () => {
+    const { orchestrator } = newOrchestrator();
+    const anchor = memAnchor(FAKE_ANCHOR, false); // no runtime has ever started here
+    expect(anchor.entries().has(TEST_ANCHOR_SECRET_FILENAME)).toBe(false);
+    const created: string[] = [];
+    const create: DescriptorCreatorFn = (dir, id, bytes) => {
+      created.push(id);
+      return anchor.create(dir, id, bytes);
+    };
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: passingDescriptorVerify,
+      descriptorDeps: anchor.deps,
+      createDescriptor: create,
+      probePipe: allAbsentProbe,
+      logger: silent,
+    });
+    expect(handle).not.toBeNull();
+    if (handle === null) {
+      return;
+    }
+    handles.push(handle);
+    // Secret first (reserved id), then the descriptor — both via the CREATE_NEW seam.
+    expect(created).toEqual([ANCHOR_SECRET_RUNTIME_ID, handle.runtimeId]);
+    const secret = parseAnchorSecret(anchor.entries().get(TEST_ANCHOR_SECRET_FILENAME) ?? '');
+    expect(secret).not.toBeNull();
+    const published = parseDescriptor(anchor.get(handle.runtimeId) ?? '');
+    expect(published).not.toBeNull();
+    expect(published !== null && secret !== null && verifyDescriptorProof(secret, published)).toBe(true);
+    const discovery = await discoverControlRuntime(FAKE_ANCHOR, realProbe, anchor.deps);
+    expect(discovery.kind).toBe('FOUND');
+    if (discovery.kind === 'FOUND') {
+      expect(discovery.parsed.runtimeId).toBe(handle.runtimeId);
+    }
+    // Close never touches the secret.
+    handles.splice(handles.indexOf(handle), 1);
+    await handle.close();
+    expect(anchor.entries().has(TEST_ANCHOR_SECRET_FILENAME)).toBe(true);
+    expect(filesIn(anchor)).toEqual([]);
+  });
+
+  it('ABSENT secret + CREATE_NEW collision (a peer created it first): the existing secret is re-read and used, never replaced', async () => {
+    const { orchestrator } = newOrchestrator();
+    const anchor = memAnchor(FAKE_ANCHOR, false);
+    const peerSecret = createAnchorSecret();
+    const create: DescriptorCreatorFn = (dir, id, bytes) => {
+      if (id === ANCHOR_SECRET_RUNTIME_ID) {
+        // The peer wins the race: the file appears, and OUR creation is refused.
+        anchor.setRaw(TEST_ANCHOR_SECRET_FILENAME, peerSecret.text);
+        return Promise.resolve({ ok: false, reason: DESCRIPTOR_CREATION_REJECTION.CREATOR_FAILED });
+      }
+      return anchor.create(dir, id, bytes);
+    };
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: passingDescriptorVerify,
+      descriptorDeps: anchor.deps,
+      createDescriptor: create,
+      probePipe: allAbsentProbe,
+      logger: silent,
+    });
+    expect(handle).not.toBeNull();
+    if (handle === null) {
+      return;
+    }
+    handles.push(handle);
+    expect(anchor.entries().get(TEST_ANCHOR_SECRET_FILENAME)).toBe(peerSecret.text); // the peer's, intact
+    const published = parseDescriptor(anchor.get(handle.runtimeId) ?? '');
+    expect(published !== null && verifyDescriptorProof(peerSecret.secret, published)).toBe(true);
+  });
+
+  it('ABSENT secret + creation that leaves nothing: disabled before listen, nothing published', async () => {
+    const { orchestrator } = newOrchestrator();
+    const anchor = memAnchor(FAKE_ANCHOR, false);
+    let serverCreated = false;
+    const createServer: typeof createControlChannelServer = ((options) => {
+      serverCreated = true;
+      return createControlChannelServer(options);
+    }) as typeof createControlChannelServer;
+    const logs: string[] = [];
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: passingDescriptorVerify,
+      descriptorDeps: anchor.deps,
+      createDescriptor: () => Promise.resolve({ ok: false, reason: DESCRIPTOR_CREATION_REJECTION.CREATOR_TIMEOUT }),
+      createServer,
+      probePipe: allAbsentProbe,
+      logger: (m) => logs.push(m),
+    });
+    expect(handle).toBeNull();
+    expect(serverCreated).toBe(false);
+    expect(anchor.entries().size).toBe(0);
+    expect(logs.some((m) => m.includes('anchor secret absent after creation'))).toBe(true);
+  });
+
+  it.each([
+    ['malformed body', (anchor: MemAnchor): Partial<StartControlChannelDeps> => {
+      anchor.setRaw(TEST_ANCHOR_SECRET_FILENAME, '{ nope');
+      return {};
+    }],
+    ['a descriptor planted at the secret path', (anchor: MemAnchor): Partial<StartControlChannelDeps> => {
+      anchor.setRaw(TEST_ANCHOR_SECRET_FILENAME, serializeDescriptor(createRuntimeDescriptor().descriptor));
+      return {};
+    }],
+    ['fails the descriptor gate', (anchor: MemAnchor): Partial<StartControlChannelDeps> => ({
+      descriptorDeps: {
+        ...anchor.deps,
+        verifyDescriptor: (path: string): Promise<DescriptorAclVerification> =>
+          Promise.resolve(path === secretPath ? { ok: false, reason: CONTROL_ANCHOR_REJECTION.DACL_UNPROTECTED } : { ok: true }),
+      },
+    })],
+  ])('EXISTING invalid secret — %s: disabled before sweep/listen, never created, replaced, or removed', async (_label, arrange) => {
+    const { orchestrator } = newOrchestrator();
+    const anchor = memAnchor();
+    const overrides = arrange(anchor);
+    const before = anchor.entries().get(TEST_ANCHOR_SECRET_FILENAME);
+    let serverCreated = false;
+    const createServer: typeof createControlChannelServer = ((options) => {
+      serverCreated = true;
+      return createControlChannelServer(options);
+    }) as typeof createControlChannelServer;
+    let probes = 0;
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: passingDescriptorVerify,
+      descriptorDeps: anchor.deps,
+      createDescriptor: anchor.create,
+      createServer,
+      probePipe: () => {
+        probes += 1;
+        return Promise.resolve('ABSENT');
+      },
+      logger: silent,
+      ...overrides,
+    });
+    expect(handle).toBeNull();
+    expect(serverCreated).toBe(false);
+    expect(probes).toBe(0); // fails before the sweep
+    expect(anchor.createCalls()).toBe(0);
+    expect(anchor.removeCalls()).toBe(0);
+    expect(anchor.entries().get(TEST_ANCHOR_SECRET_FILENAME)).toBe(before);
+  });
+
+  it('the runtime-level descriptor gate (with env) gates the secret when no descriptor-deps gate is injected', async () => {
+    const { orchestrator } = newOrchestrator();
+    const anchor = memAnchor();
+    const { verifyDescriptor: omitted, ...deps } = anchor.deps;
+    void omitted;
+    const seen: string[] = [];
+    const handle = await startControlChannel({
+      orchestrator,
+      verify: passingVerify,
+      verifyDescriptor: (path: string): Promise<DescriptorAclVerification> => {
+        seen.push(path);
+        return Promise.resolve({ ok: false, reason: CONTROL_ANCHOR_REJECTION.OWNER_MISMATCH });
+      },
+      descriptorDeps: deps,
+      createDescriptor: anchor.create,
+      probePipe: allAbsentProbe,
+      logger: silent,
+    });
+    expect(handle).toBeNull();
+    expect(seen).toEqual([secretPath]); // the secret was gated first and failed closed
+    expect(anchor.createCalls()).toBe(0);
+  });
+
+  it('MULTI-RUNTIME unchanged: two runtimes share one secret; both bound; AMBIGUOUS; one closes → the other FOUND', async () => {
+    const anchor = memAnchor();
+    const a = await startServer(newOrchestrator().orchestrator, anchor);
+    const b = await startServer(newOrchestrator().orchestrator, anchor);
+    handles.push(a, b);
+    expect(anchor.createCalls()).toBe(2); // two descriptors, no secret creation (it existed)
+    for (const handle of [a, b]) {
+      const parsed = parseDescriptor(anchor.get(handle.runtimeId) ?? '');
+      expect(parsed !== null && verifyDescriptorProof(anchor.secret, parsed)).toBe(true);
+    }
+    const both = await discoverControlRuntime(FAKE_ANCHOR, realProbe, anchor.deps);
+    expect(both.kind).toBe('AMBIGUOUS');
+    handles.splice(handles.indexOf(a), 1);
+    await a.close();
+    const one = await discoverControlRuntime(FAKE_ANCHOR, realProbe, anchor.deps);
+    expect(one.kind).toBe('FOUND');
+    if (one.kind === 'FOUND') {
+      expect(one.parsed.runtimeId).toBe(b.runtimeId);
+    }
+    expect(anchor.entries().has(TEST_ANCHOR_SECRET_FILENAME)).toBe(true);
   });
 });
