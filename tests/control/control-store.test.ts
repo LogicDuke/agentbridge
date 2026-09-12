@@ -1,5 +1,7 @@
+import { closeSync, mkdtempSync, openSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
-import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { basename, join } from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -13,6 +15,7 @@ import {
   createDescriptorFileNative,
   createRuntimeDescriptor,
   defaultCreatorRunner,
+  defaultOpenDescriptor,
   defaultPipeProbe,
   descriptorFilenameFor,
   descriptorPathFor,
@@ -45,6 +48,7 @@ import {
   type DescriptorAclVerification,
   type DescriptorCreatorDeps,
   type DescriptorFileDeps,
+  type DescriptorHandle,
   type LstatProbe,
   type OperatorIdentity,
   type OwnerVerifierDeps,
@@ -1668,5 +1672,351 @@ describe('D062 F2 — discovery security-verifies each candidate before its toke
     const result = await sweepStaleDescriptors(ANCHOR, null, allAbsentProbe, logged(anchor, gate, log));
     expect(log.some((entry) => entry.startsWith('verify:'))).toBe(false);
     expect([...result.removed].sort()).toEqual([...ids].sort());
+  });
+});
+
+describe('D062 F2 stable object — the gate and the read share ONE held descriptor handle', () => {
+  type Gate = (path: string) => Promise<DescriptorAclVerification>;
+  interface HeldStore {
+    readonly deps: DescriptorFileDeps;
+    readonly log: string[];
+    /** Overwrite a stored file "from outside" (the attacker's retained writer). */
+    overwrite(path: string, text: string): void;
+    openCount(path: string): number;
+    closeCount(path: string): number;
+  }
+
+  /**
+   * An opener that models exclusive holding faithfully: the handle's contents are
+   * fixed at open time (nothing can write to a held file), the store logs
+   * open/verify/read/close in order, and `busy` paths cannot be held (EBUSY).
+   */
+  function heldStore(anchor: ReturnType<typeof memAnchor>, gate: Gate, busy: readonly string[] = []): HeldStore {
+    const log: string[] = [];
+    const opens = new Map<string, number>();
+    const closes = new Map<string, number>();
+    const bump = (map: Map<string, number>, path: string): void => {
+      map.set(path, (map.get(path) ?? 0) + 1);
+    };
+    const { readFile: storeRead, ...rest } = anchor.deps;
+    const readNow = (path: string): string => storeRead?.(path) ?? '';
+    return {
+      log,
+      overwrite: (path: string, text: string): void => {
+        anchor.setRaw(basename(path), text);
+      },
+      openCount: (path: string): number => opens.get(path) ?? 0,
+      closeCount: (path: string): number => closes.get(path) ?? 0,
+      deps: {
+        ...rest,
+        // No readFile: discovery MUST go through the opener; the sweep still may not.
+        openDescriptor: (path: string): DescriptorHandle => {
+          if (busy.includes(path)) {
+            const error = new Error('EBUSY: resource busy or locked') as NodeJS.ErrnoException;
+            error.code = 'EBUSY';
+            throw error;
+          }
+          bump(opens, path);
+          log.push(`open:${path}`);
+          const held = readNow(path); // the bytes of the object being held
+          return {
+            read: (): string => {
+              log.push(`read:${path}`);
+              return held;
+            },
+            close: (): void => {
+              bump(closes, path);
+              log.push(`close:${path}`);
+            },
+          };
+        },
+        verifyDescriptor: (path: string): Promise<DescriptorAclVerification> => {
+          log.push(`verify:${path}`);
+          return gate(path);
+        },
+      },
+    };
+  }
+
+  const pass: Gate = () => Promise.resolve({ ok: true });
+
+  it('holds the candidate across the gate: open → verify → read → close, exactly once, then probe', async () => {
+    const { anchor, ids, pipes } = seeded(1);
+    const path = descriptorPathFor(ANCHOR, ids[0] ?? '');
+    const store = heldStore(anchor, pass);
+    const result = await discoverControlRuntime(
+      ANCHOR,
+      (pipePath: string) => {
+        store.log.push(`probe:${pipePath}`);
+        return Promise.resolve('PRESENT');
+      },
+      store.deps,
+    );
+    expect(result.kind).toBe('FOUND');
+    expect(store.log).toEqual([`open:${path}`, `verify:${path}`, `read:${path}`, `close:${path}`, `probe:${pipes[0] ?? ''}`]);
+    expect(store.openCount(path)).toBe(1);
+    expect(store.closeCount(path)).toBe(1);
+  });
+
+  it('the token used is the held object\'s, not a later pathname lookup: an overwrite after the ACL check is never trusted', async () => {
+    const { anchor, ids } = seeded(1);
+    const path = descriptorPathFor(ANCHOR, ids[0] ?? '');
+    const genuine = parseDescriptor(anchor.get(ids[0] ?? ''));
+    const forged = createRuntimeDescriptor();
+    // A forged descriptor under the SAME runtime id / pipe name but a different token.
+    const forgedText = serializeDescriptor({ ...forged.descriptor, pipeName: genuine?.descriptor.pipeName ?? '' });
+    let store: HeldStore | null = null;
+    const gate: Gate = () => {
+      // The attacker "passes" the check, then rewrites the pathname's contents.
+      store?.overwrite(path, forgedText);
+      return Promise.resolve({ ok: true });
+    };
+    store = heldStore(anchor, gate);
+    const result = await discoverControlRuntime(ANCHOR, () => Promise.resolve('PRESENT'), store.deps);
+    expect(result.kind).toBe('FOUND');
+    if (result.kind === 'FOUND') {
+      expect(result.parsed.token.equals(genuine?.token ?? Buffer.alloc(0))).toBe(true);
+      expect(result.parsed.token.equals(parseDescriptor(forgedText)?.token ?? Buffer.alloc(0))).toBe(false);
+    }
+    // And the pathname really does hold the forged bytes now — only the held object was trusted.
+    expect(anchor.get(ids[0] ?? '')).toBe(forgedText);
+  });
+
+  it('the pre-repair verify-then-reopen sequence is gone: after a passing gate the read comes from the held handle, never readFile', async () => {
+    const { anchor, ids } = seeded(1);
+    const path = descriptorPathFor(ANCHOR, ids[0] ?? '');
+    const store = heldStore(anchor, pass);
+    let pathReads = 0;
+    const result = await discoverControlRuntime(ANCHOR, () => Promise.resolve('PRESENT'), {
+      ...store.deps,
+      readFile: (): string => {
+        pathReads += 1;
+        throw new Error('a fresh pathname read must never happen after the gate');
+      },
+    });
+    expect(result.kind).toBe('FOUND');
+    expect(pathReads).toBe(0);
+    expect(store.log).toEqual([`open:${path}`, `verify:${path}`, `read:${path}`, `close:${path}`]);
+  });
+
+  it('a candidate that cannot be held (EBUSY) is unverified: no gate, no read, no probe, NO_VERIFIED_CANDIDATES', async () => {
+    const { anchor, ids } = seeded(1);
+    const path = descriptorPathFor(ANCHOR, ids[0] ?? '');
+    const store = heldStore(anchor, pass, [path]);
+    let probes = 0;
+    const result = await discoverControlRuntime(
+      ANCHOR,
+      () => {
+        probes += 1;
+        return Promise.resolve('PRESENT');
+      },
+      store.deps,
+    );
+    expect(result).toEqual({
+      kind: 'UNAVAILABLE',
+      reason: DISCOVERY_UNAVAILABLE.NO_VERIFIED_CANDIDATES,
+      counts: { candidates: 1, unverified: 1, malformed: 0, live: 0, dead: 0, unknown: 0 },
+    });
+    expect(store.log).toEqual([]);
+    expect(probes).toBe(0);
+    expect(anchor.removeCalls()).toBe(0);
+  });
+
+  it('a failed gate closes the held handle without reading it: the token is never taken from an unverified object', async () => {
+    const { anchor, ids } = seeded(1);
+    const path = descriptorPathFor(ANCHOR, ids[0] ?? '');
+    const store = heldStore(anchor, () => Promise.resolve({ ok: false, reason: CONTROL_ANCHOR_REJECTION.OWNER_MISMATCH }));
+    const result = await discoverControlRuntime(ANCHOR, () => Promise.resolve('PRESENT'), store.deps);
+    expect(result.kind).toBe('UNAVAILABLE');
+    if (result.kind === 'UNAVAILABLE') {
+      expect(result.reason).toBe(DISCOVERY_UNAVAILABLE.NO_VERIFIED_CANDIDATES);
+    }
+    expect(store.log).toEqual([`open:${path}`, `verify:${path}`, `close:${path}`]);
+  });
+
+  it('a gate that throws still releases the handle (finally), and the error propagates as before', async () => {
+    const { anchor, ids } = seeded(1);
+    const path = descriptorPathFor(ANCHOR, ids[0] ?? '');
+    const store = heldStore(anchor, () => Promise.reject(new Error('helper transport failed')));
+    await expect(discoverControlRuntime(ANCHOR, () => Promise.resolve('PRESENT'), store.deps)).rejects.toThrow(
+      'helper transport failed',
+    );
+    expect(store.closeCount(path)).toBe(1);
+  });
+
+  it('a held read that fails is malformed (never a live runtime), and the handle is released', async () => {
+    const { anchor } = seeded(1);
+    const store = heldStore(anchor, pass);
+    let closed = 0;
+    const result = await discoverControlRuntime(ANCHOR, () => Promise.resolve('PRESENT'), {
+      ...store.deps,
+      openDescriptor: (): DescriptorHandle => ({
+        read: (): string => {
+          throw new Error('EIO');
+        },
+        close: (): void => {
+          closed += 1;
+        },
+      }),
+    });
+    expect(result).toEqual({
+      kind: 'UNAVAILABLE',
+      reason: DISCOVERY_UNAVAILABLE.NO_LIVE_CANDIDATES,
+      counts: { candidates: 1, unverified: 0, malformed: 1, live: 0, dead: 0, unknown: 0 },
+    });
+    expect(closed).toBe(1);
+  });
+
+  it('held contents whose runtime id disagrees with the filename are still malformed (validity rule unchanged)', async () => {
+    const { anchor, ids } = seeded(2);
+    const [first, second] = ids;
+    // Put the second runtime\'s (valid) text under the first runtime\'s filename.
+    anchor.set(first ?? '', anchor.get(second ?? '') ?? '');
+    anchor.remove(second ?? '');
+    const store = heldStore(anchor, pass);
+    const result = await discoverControlRuntime(ANCHOR, () => Promise.resolve('PRESENT'), store.deps);
+    expect(result.kind).toBe('UNAVAILABLE');
+    if (result.kind === 'UNAVAILABLE') {
+      expect(result.counts).toEqual({ candidates: 1, unverified: 0, malformed: 1, live: 0, dead: 0, unknown: 0 });
+    }
+  });
+
+  it('two held, verified, live candidates remain AMBIGUOUS; each opened and closed exactly once', async () => {
+    const { anchor, ids } = seeded(2);
+    const store = heldStore(anchor, pass);
+    const result = await discoverControlRuntime(ANCHOR, () => Promise.resolve('PRESENT'), store.deps);
+    expect(result.kind).toBe('AMBIGUOUS');
+    if (result.kind === 'AMBIGUOUS') {
+      expect([...result.live].sort()).toEqual([...ids].sort());
+    }
+    for (const id of ids) {
+      const path = descriptorPathFor(ANCHOR, id);
+      expect(store.openCount(path)).toBe(1);
+      expect(store.closeCount(path)).toBe(1);
+    }
+  });
+
+  it('a busy candidate beside a held live one: the live one is FOUND, the busy one counted unverified', async () => {
+    const { anchor, ids } = seeded(2);
+    const [busy, good] = ids;
+    const store = heldStore(anchor, pass, [descriptorPathFor(ANCHOR, busy ?? '')]);
+    const result = await discoverControlRuntime(ANCHOR, () => Promise.resolve('PRESENT'), store.deps);
+    expect(result.kind).toBe('FOUND');
+    if (result.kind === 'FOUND') {
+      expect(result.parsed.runtimeId).toBe(good);
+      expect(result.counts).toEqual({ candidates: 2, unverified: 1, malformed: 0, live: 1, dead: 0, unknown: 0 });
+    }
+  });
+
+  it('the opener cannot be bypassed by omission: no opener and no readFile ⇒ the real exclusive opener, and a passing gate is never even consulted for an unholdable path', async () => {
+    const { anchor } = seeded(1);
+    const { readFile: omittedRead, verifyDescriptor: omittedGate, ...rest } = anchor.deps;
+    void omittedRead;
+    void omittedGate;
+    let gateCalls = 0;
+    const result = await discoverControlRuntime(ANCHOR, () => Promise.resolve('PRESENT'), {
+      ...rest,
+      verifyDescriptor: (): Promise<DescriptorAclVerification> => {
+        gateCalls += 1;
+        return Promise.resolve({ ok: true });
+      },
+    });
+    // No real file exists at the fake path: the real opener throws, the candidate is unverified.
+    expect(result).toEqual({
+      kind: 'UNAVAILABLE',
+      reason: DISCOVERY_UNAVAILABLE.NO_VERIFIED_CANDIDATES,
+      counts: { candidates: 1, unverified: 1, malformed: 0, live: 0, dead: 0, unknown: 0 },
+    });
+    expect(gateCalls).toBe(0);
+  });
+
+  it('stale sweep semantics unchanged: the sweep never opens through the opener and still removes only ABSENT files', async () => {
+    const { anchor, ids } = seeded(2);
+    let opens = 0;
+    const result = await sweepStaleDescriptors(ANCHOR, null, allAbsentProbe, {
+      ...anchor.deps,
+      openDescriptor: (): DescriptorHandle => {
+        opens += 1;
+        throw new Error('the sweep must not use the discovery opener');
+      },
+    });
+    expect(opens).toBe(0);
+    expect([...result.removed].sort()).toEqual([...ids].sort());
+  });
+
+  describe('defaultOpenDescriptor — the real handle', () => {
+    let dir: string | null = null;
+    afterEach(() => {
+      if (dir !== null) {
+        rmSync(dir, { recursive: true, force: true });
+        dir = null;
+      }
+    });
+    const file = (text: string): string => {
+      dir = mkdtempSync(join(tmpdir(), 'ab-held-'));
+      const path = join(dir, 'runtime-descriptor-00000000000000000000000000000001.json');
+      writeFileSync(path, text);
+      return path;
+    };
+
+    it('reads the held file\'s bounded contents and throws ENOENT for an absent path (never a silent empty read)', () => {
+      const path = file('{"held":true}');
+      const handle = defaultOpenDescriptor(path);
+      try {
+        expect(handle.read()).toBe('{"held":true}');
+      } finally {
+        handle.close();
+      }
+      expect(() => defaultOpenDescriptor(join(dir ?? '', 'missing.json'))).toThrow(/ENOENT/);
+    });
+
+    it('is bounded like the plain reader: at most MAX_DESCRIPTOR_BYTES + 1 bytes are ever read', () => {
+      const path = file('x'.repeat(MAX_DESCRIPTOR_BYTES + 100));
+      const handle = defaultOpenDescriptor(path);
+      try {
+        expect(handle.read().length).toBe(MAX_DESCRIPTOR_BYTES + 1);
+      } finally {
+        handle.close();
+      }
+    });
+
+    it.skipIf(process.platform !== 'win32')(
+      'win32: a retained writer handle makes the open fail (EBUSY) — the legacy-ACL overwrite race cannot start',
+      () => {
+        const path = file('{"v":1}');
+        const writer = openSync(path, 'r+');
+        try {
+          expect(() => defaultOpenDescriptor(path)).toThrow(/EBUSY/);
+        } finally {
+          closeSync(writer);
+        }
+        // Released ⇒ holdable again.
+        defaultOpenDescriptor(path).close();
+      },
+    );
+
+    it.skipIf(process.platform !== 'win32')(
+      'win32: while held, no one can open the file for write or read, or unlink it; its bytes are fixed until close',
+      () => {
+        const path = file('{"v":1}');
+        const handle = defaultOpenDescriptor(path);
+        try {
+          expect(() => openSync(path, 'r+')).toThrow(/EBUSY/);
+          expect(() => openSync(path, 'r')).toThrow(/EBUSY/);
+          expect(() => { unlinkSync(path); }).toThrow(/EBUSY/);
+          expect(() => { writeFileSync(path, '{"v":2}'); }).toThrow(/EBUSY/);
+          expect(handle.read()).toBe('{"v":1}');
+        } finally {
+          handle.close();
+        }
+        writeFileSync(path, '{"v":2}');
+        const again = defaultOpenDescriptor(path);
+        try {
+          expect(again.read()).toBe('{"v":2}');
+        } finally {
+          again.close();
+        }
+      },
+    );
   });
 });

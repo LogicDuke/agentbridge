@@ -94,7 +94,16 @@
 
 import { execFile } from 'node:child_process';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import { closeSync, lstatSync, openSync, opendirSync, readFileSync, readSync, unlinkSync } from 'node:fs';
+import {
+  closeSync,
+  constants as fsConstants,
+  lstatSync,
+  openSync,
+  opendirSync,
+  readFileSync,
+  readSync,
+  unlinkSync,
+} from 'node:fs';
 import net from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -1095,6 +1104,25 @@ export interface DescriptorFileDeps {
    * that injects nothing gets the fail-closed gate, never a bypass.
    */
   readonly verifyDescriptor?: (descriptorPath: string) => Promise<DescriptorAclVerification>;
+  /**
+   * Open one exact discovered candidate as a held {@link DescriptorHandle} that
+   * {@link discoverControlRuntime} keeps open ACROSS the security gate and the
+   * content read, so both refer to one file object. Throws when the candidate
+   * cannot be held. Omitted ⇒ the real exclusive-share opener
+   * ({@link defaultOpenDescriptor}); an injected `readFile` without an opener is
+   * honored as a plain (non-exclusive) store for in-memory tests.
+   */
+  readonly openDescriptor?: (descriptorPath: string) => DescriptorHandle;
+}
+
+/**
+ * One held descriptor file object: `read` returns its bounded contents from the
+ * held handle (never a fresh pathname lookup); `close` releases it. Every
+ * successful open is closed by the discoverer in `finally`.
+ */
+export interface DescriptorHandle {
+  readonly read: () => string;
+  readonly close: () => void;
 }
 
 /**
@@ -1123,12 +1151,56 @@ function* defaultListAnchor(anchorPath: string): IterableIterator<string> {
 function defaultReadFile(path: string): string {
   const fd = openSync(path, 'r');
   try {
-    const buffer = Buffer.alloc(MAX_DESCRIPTOR_BYTES + 1);
-    const bytesRead = readSync(fd, buffer, 0, buffer.length, 0);
-    return buffer.subarray(0, bytesRead).toString('utf8');
+    return readBoundedDescriptor(fd);
   } finally {
     closeSync(fd);
   }
+}
+function readBoundedDescriptor(fd: number): string {
+  const buffer = Buffer.alloc(MAX_DESCRIPTOR_BYTES + 1);
+  const bytesRead = readSync(fd, buffer, 0, buffer.length, 0);
+  return buffer.subarray(0, bytesRead).toString('utf8');
+}
+
+/**
+ * libuv's `UV_FS_O_EXLOCK` open flag. On win32 libuv implements it as
+ * `CreateFileW(..., dwShareMode = 0)`: the open FAILS (EBUSY) while any other
+ * handle with data access is open on the file, and while it is held no one can
+ * open the file for read, write, or delete — so the pathname stays bound to this
+ * one file object and its bytes cannot change until the handle closes. Node does
+ * not export the constant on win32, so the libuv value is spelled here; it is 0
+ * elsewhere because the descriptor security model (owner + DACL) is Windows-only.
+ */
+const EXCLUSIVE_OPEN_FLAG = process.platform === 'win32' ? 0x10000000 : 0;
+
+/**
+ * The production descriptor opener: hold the exact file exclusively (see
+ * {@link EXCLUSIVE_OPEN_FLAG}) for the whole verify-then-read window. A retained
+ * writer handle — the legacy-ACL attack: keep a writable handle, present the
+ * expected ACL for the check, then overwrite before the read — makes this open
+ * fail instead, and a writer arriving after it is refused by the kernel. Throws
+ * (EBUSY/ENOENT/...) when the file cannot be held; never falls back to a shared
+ * open.
+ */
+export function defaultOpenDescriptor(path: string): DescriptorHandle {
+  const fd = openSync(path, fsConstants.O_RDONLY | EXCLUSIVE_OPEN_FLAG);
+  return {
+    read: (): string => readBoundedDescriptor(fd),
+    close: (): void => {
+      closeSync(fd);
+    },
+  };
+}
+function resolveDescriptorOpener(deps: DescriptorFileDeps): (path: string) => DescriptorHandle {
+  if (deps.openDescriptor !== undefined) {
+    return deps.openDescriptor;
+  }
+  const readFile = deps.readFile;
+  if (readFile !== undefined) {
+    // An injected in-memory store has no OS handle to hold; read through it.
+    return (path: string): DescriptorHandle => ({ read: (): string => readFile(path), close: (): void => {} });
+  }
+  return defaultOpenDescriptor;
 }
 function defaultRemoveFile(path: string): void {
   unlinkSync(path);
@@ -1260,8 +1332,16 @@ export function enumerateDescriptorCandidates(
 export function readDescriptorCandidate(
   candidate: DescriptorCandidate,
   deps: DescriptorFileDeps = {},
-): { readonly kind: 'valid'; readonly parsed: ParsedDescriptor } | { readonly kind: 'malformed' } {
-  const parsed = readDescriptorFile(candidate.path, deps);
+): CandidateRead {
+  return validateCandidate(candidate, readDescriptorFile(candidate.path, deps));
+}
+
+export type CandidateRead =
+  | { readonly kind: 'valid'; readonly parsed: ParsedDescriptor }
+  | { readonly kind: 'malformed' };
+
+/** The validity rule of {@link readDescriptorCandidate}, applied to an already-parsed read. */
+function validateCandidate(candidate: DescriptorCandidate, parsed: ParsedDescriptor | null): CandidateRead {
   if (parsed === null || parsed.runtimeId !== candidate.runtimeId) {
     return { kind: 'malformed' };
   }
@@ -1492,11 +1572,15 @@ export type DiscoveryOutcome =
 
 /**
  * Discover the one live control runtime. Enumerates the bounded candidate set
- * and, for each candidate IN THIS ORDER: (1) runs the descriptor security gate
- * on the exact candidate path — a candidate that fails it is `unverified`: its
- * contents are never read, so its token is never held, and its pipe is never
- * probed; (2) parses it deterministically (malformed files are ignored, never a
- * blocker); (3) probes its pipe. Then it decides:
+ * and, for each candidate IN THIS ORDER: (1) opens the exact candidate path as a
+ * held exclusive handle — one that cannot be held is `unverified`; (2) runs the
+ * descriptor security gate on that path WHILE the handle is held, so the gate
+ * and the read below see one and the same file object with no writer able to
+ * exist in between — a candidate that fails it is `unverified`: its contents
+ * are never read, so its token is never held, and its pipe is never probed;
+ * (3) reads the contents through the held handle (never a second pathname
+ * lookup) and parses them deterministically (malformed files are ignored, never
+ * a blocker); (4) releases the handle and probes the pipe. Then it decides:
  *
  * - exactly one PRESENT candidate ⇒ `FOUND` (the caller then runs the mutual-HMAC
  *   handshake with that candidate's token — the protocol's only message is the
@@ -1521,6 +1605,7 @@ export async function discoverControlRuntime(
 ): Promise<DiscoveryOutcome> {
   const verifyDescriptor =
     deps.verifyDescriptor ?? ((path: string): Promise<DescriptorAclVerification> => verifyDescriptorAcl(path));
+  const openDescriptor = resolveDescriptorOpener(deps);
   const enumeration = enumerateDescriptorCandidates(anchorPath, deps);
   const zero: DiscoveryCounts = { candidates: 0, unverified: 0, malformed: 0, live: 0, dead: 0, unknown: 0 };
   if (!enumeration.ok) {
@@ -1548,14 +1633,11 @@ export async function discoverControlRuntime(
   let unknown = 0;
   const live: { readonly runtimeId: string; readonly parsed: ParsedDescriptor }[] = [];
   for (const candidate of enumeration.candidates) {
-    // Security gate FIRST, on the exact path enumerated: no read, no token, no
-    // probe for a candidate that is not currently verified.
-    const verdict = await verifyDescriptor(candidate.path);
-    if (!verdict.ok) {
+    const read = await gateAndReadHeld(candidate, openDescriptor, verifyDescriptor);
+    if (read.kind === 'unverified') {
       unverified += 1;
       continue;
     }
-    const read = readDescriptorCandidate(candidate, deps);
     if (read.kind === 'malformed') {
       malformed += 1;
       continue;
@@ -1597,6 +1679,41 @@ export async function discoverControlRuntime(
     return { kind: 'UNAVAILABLE', reason, counts };
   }
   return { kind: 'AMBIGUOUS', live: live.map((entry) => entry.runtimeId), counts };
+}
+
+/**
+ * The stable-object step of discovery: hold the candidate, gate it, read it
+ * through the SAME held handle, release it. The handle spans the gate, so the
+ * contents returned are those of the very file object whose security was
+ * verified — never a later pathname lookup, and never a token from a file that
+ * failed the gate or could not be held.
+ */
+async function gateAndReadHeld(
+  candidate: DescriptorCandidate,
+  openDescriptor: (path: string) => DescriptorHandle,
+  verifyDescriptor: (path: string) => Promise<DescriptorAclVerification>,
+): Promise<CandidateRead | { readonly kind: 'unverified' }> {
+  let handle: DescriptorHandle;
+  try {
+    handle = openDescriptor(candidate.path);
+  } catch {
+    return { kind: 'unverified' };
+  }
+  try {
+    const verdict = await verifyDescriptor(candidate.path);
+    if (!verdict.ok) {
+      return { kind: 'unverified' };
+    }
+    let text: string;
+    try {
+      text = handle.read();
+    } catch {
+      return { kind: 'malformed' };
+    }
+    return validateCandidate(candidate, parseDescriptor(text));
+  } finally {
+    handle.close();
+  }
 }
 
 /* ------------------------------------------------------------------ *
