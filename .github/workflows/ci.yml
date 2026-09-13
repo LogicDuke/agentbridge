@@ -29,3 +29,33 @@ jobs:
 
       - name: Verify
         run: npm run verify
+
+  # Decision 062 Amendment A (PR #84 F1): a bounded Windows lane that builds the
+  # source-in-repo owner-SID helper with the GitHub-hosted MSVC/SDK toolchain and
+  # runs the Windows-specific control tests (the win32-gated integration exercises
+  # the real compiled binary). The Linux verify job above remains authoritative.
+  windows-owner-helper:
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Clean install
+        run: npm ci
+
+      - name: Build runtime (tsc)
+        run: npm run build
+
+      - name: Build owner helper (MSVC + Windows SDK)
+        run: npm run helper:build
+
+      - name: Windows control + owner-helper tests
+        run: npx vitest run tests/control
