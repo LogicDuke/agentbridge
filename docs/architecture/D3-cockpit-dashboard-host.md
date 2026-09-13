@@ -140,7 +140,7 @@ channel is wanted.
 The control channel has **two** distinct prerequisites, in this order:
 
     externally provisioned hardened control anchor   (external prerequisite)
-      -> npm run control:provision                    (two native artifact/provenance pairs)
+      -> npm run control:provision                    (three native artifact/provenance pairs)
       -> npm run cockpit:live                          (one-shot control-startup attempt)
       -> npm run control
 
@@ -172,9 +172,9 @@ Details, so the table is read exactly as the code behaves. SYSTEM is
 *permitted*, not *required*, on the anchor: an operator-only DACL that meets
 every other requirement is accepted. The allow/deny type and the access mask are
 carried in the snapshot but do **not** gate authorization — a DENY operator ACE
-still counts as the operator being present — because token possession (mutual
-HMAC) remains the actual authenticator; this policy governs anchor trust, not
-per-call permission. No file-inheritance (`OBJECT_INHERIT_ACE`) requirement is
+still counts as the operator being present — because token possession (the
+token-keyed client MAC) remains the authorizer for the command direction; this
+policy governs anchor trust, not per-call permission. No file-inheritance (`OBJECT_INHERIT_ACE`) requirement is
 placed on the anchor's ACEs: nothing relies on a descriptor inheriting the
 anchor's entries, because every descriptor is created with its own explicit
 protected DACL (below).
@@ -190,9 +190,11 @@ operator/deployment responsibility, outside the scope of these npm scripts.
 **2. `control:provision` provisions only the native artifacts.**
 `control:provision` runs the existing validated gate
 (`node tools/control-owner/ensure-helper.mjs`) and nothing else: it provisions
-the two build-provenanced native artifacts — the read-only owner/DACL snapshot
-helper (`agentbridge-win-owner.exe`) and the create-only descriptor creator
-(`agentbridge-win-descriptor-create.exe`) — each with its own generated
+the three build-provenanced native artifacts — the read-only owner/DACL snapshot
+helper (`agentbridge-win-owner.exe`), the create-only descriptor creator
+(`agentbridge-win-descriptor-create.exe`), and the read-only live pipe-server
+identity relayer (`agentbridge-win-pipe-attest.exe`, whose generated provenance
+module is `pipe-attestor-provenance.js`) — each with its own generated
 provenance module. It does **not** create, harden, or verify the control anchor.
 
 The gate accepts an artifact pair only when the on-disk provenance is the exact
@@ -225,7 +227,7 @@ launching or serving (`CONTROL_PROVISION_FAILURE ⇏ COCKPIT_FAILURE`,
 `cockpit:live`, and control is started from the Cockpit's `listening` event with
 every failure contained.
 
-### Descriptor lifecycle v2 (identity-named, listen-before-publish)
+### Descriptor lifecycle v4 (identity-named, listen-before-publish)
 
 There is **no shared fixed descriptor pathname**. Each runtime mints a 128-bit
 random runtime id — the hex suffix of its unpredictable pipe name
@@ -236,7 +238,12 @@ random runtime id — the hex suffix of its unpredictable pipe name
 The id is whitelisted character-by-character everywhere it enters a filename (the
 runtime, the CLI, and the native creator), so no caller-controlled path,
 separator, or traversal can reach the filesystem. The descriptor holds only
-`{ version: 2, pipeName, token }` — no PID.
+`{ version: 4, pipeName, token }` — no PID, and **never** a `verifyKey`. A
+descriptor is a rendezvous hint, not a credential for the server direction: a
+file is copyable, so a key read from disk could only ever prove that those bytes
+existed somewhere, never that the process now serving the pipe holds the
+matching private half. A descriptor carrying a `verifyKey` is therefore rejected
+outright as a surplus key, never quietly ignored or partially trusted.
 
 Startup order, structurally: verify the anchor → sweep foreign descriptors whose
 pipe the kernel reports absent → mint the identity → **listen** on the pipe (the
@@ -260,10 +267,45 @@ failure; it never overwrites or rotates another runtime's file.
 Discovery (`npm run control`) enumerates a bounded set of identity-named
 candidates, parses each safely (a file whose name and contents disagree is
 malformed and ignored, never deleted), probes each valid candidate's pipe, and
-proceeds only with **exactly one** live candidate — the mutual-HMAC handshake is
-then attempted against that runtime alone, because the protocol's only message is
-the authoritative command. Zero live candidates is unavailable; two or more is
-ambiguous and fails closed. The CLI never deletes.
+proceeds only with **exactly one** live candidate. Zero live candidates is
+unavailable; two or more is ambiguous and fails closed. The CLI never deletes.
+
+### Live pipe attestation, then the two-primitive handshake (DDR-D062-B)
+
+The one live candidate is **attested before any command is sent**. The third
+native artifact (`agentbridge-win-pipe-attest.exe`) connects to that pipe
+`GENERIC_READ`-only — it can never write a byte to it — asks the **kernel** which
+process serves it, **pins that process against PID reuse** by its exact creation
+FILETIME (re-proved after the token query and again after the read), reads the
+pinned process's **TokenUser SID**, and relays exactly one **bounded server
+hello** read from the SAME pipe handle. It makes no policy decision; every
+failure is a nonzero exit with no stdout.
+
+The CLI holds the policy, and both of these must hold:
+
+- the attested **server SID must equal the operator SID** the anchor gate already
+  resolved (`SERVER_SID_MISMATCH` otherwise);
+- the command session's own hello must announce the **very same `verifyKey`** the
+  attestation relayed.
+
+The two directions are then authenticated by **different** primitives, because
+they answer different questions:
+
+- **client → server (the command)** — a **token-keyed HMAC** over a length-framed
+  transcript binding runtime id, pipe name, attested `verifyKey`, both nonces and
+  the exact command bytes. Token possession still means only "could read the
+  descriptor inside the hardened anchor".
+- **server → client (the result)** — an **Ed25519** signature under the ephemeral
+  key whose public half attestation produced, over that transcript plus the exact
+  result bytes. The private half exists only in the live runtime's process memory
+  and is never serialized, so a squatter holding a byte-perfect descriptor copy
+  can neither pass attestation nor sign. There is deliberately **no** server-side
+  HMAC path to fall back to.
+
+Any attestation failure, a `SERVER_SID_MISMATCH`, malformed evidence, a session
+hello whose key differs from the attested one, or a failed signature check
+**fails closed before the command is sent**: the session is abandoned, never
+downgraded.
 
 ## Tests
 
