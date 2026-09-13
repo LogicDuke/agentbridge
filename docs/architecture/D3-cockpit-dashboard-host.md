@@ -302,10 +302,23 @@ they answer different questions:
   can neither pass attestation nor sign. There is deliberately **no** server-side
   HMAC path to fall back to.
 
-Any attestation failure, a `SERVER_SID_MISMATCH`, malformed evidence, a session
-hello whose key differs from the attested one, or a failed signature check
-**fails closed before the command is sent**: the session is abandoned, never
-downgraded.
+Failures fall into two classes, and the difference is operationally
+load-bearing — it decides whether an operator may assume nothing happened:
+
+- **Before the command is sent** — an attestation failure, a
+  `SERVER_SID_MISMATCH`, malformed attestation evidence, or a session hello whose
+  key differs from the attested one. The session is abandoned before any request
+  reaches the runtime, so no mutation can have occurred.
+- **After the command is dispatched** — a result that is lost, malformed, or
+  unparseable, or an Ed25519 signature that does not verify. The runtime signs
+  only after `dispatch` has returned, so a result that never arrives or never
+  verifies says nothing about whether the gate was opened: `OPEN_HUMAN_GATE` may
+  already have been applied. The CLI fails authentication and **never** reports
+  `APPLIED` — an unverified result is not evidence of anything, but it is equally
+  not evidence that the command did not take effect. Re-running is the correct
+  recovery, and is safe because the command is idempotent (Decision 062 §15).
+
+Neither class is ever downgraded to a weaker check.
 
 ## Tests
 
