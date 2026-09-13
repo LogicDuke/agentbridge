@@ -15,9 +15,12 @@
  *      a rotating 256-bit token, and an EPHEMERAL Ed25519 keypair whose private
  *      half never leaves process memory and whose public half is announced in
  *      every hello but is NEVER written to the descriptor (DDR-D062-B);
- *   4. listen on the identity-named pipe — the kernel-owned exclusivity/liveness
- *      claim; a same-name collision or any listen error fails **closed** and
- *      nothing has been published;
+ *   4. listen on the identity-named pipe through the build-provenanced
+ *      in-process accept provider (DDR-D062-C: every instance carries an
+ *      explicit operator-only security descriptor) — the kernel-owned
+ *      exclusivity/liveness claim; a same-name collision, an unverified or
+ *      unloadable provider, or any listen error fails **closed** and nothing
+ *      has been published;
  *   5. only after the pipe is live, publish `runtime-descriptor-<id>.json`
  *      through the build-provenanced create-only native creator (CREATE_NEW,
  *      exact operator owner, protected operator+SYSTEM DACL, bytes on stdin);
@@ -36,12 +39,11 @@
  */
 
 import { timingSafeEqual } from 'node:crypto';
-import type net from 'node:net';
 
 import type { AutoflowOrchestrator } from '../autoflow/orchestrator.js';
 import { generateRuntimeKeyPair, type ChannelIdentity } from './control-auth.js';
 import { CONTROL_RESULT, type ControlCommand, type ControlResultStatus } from './control-command.js';
-import { createControlChannelServer } from './control-channel.js';
+import { createControlChannelServer, type ControlChannelServer } from './control-channel.js';
 import { createControlDispatcher, type ControlDispatcher } from './control-dispatch.js';
 import {
   DESCRIPTOR_CREATION_REJECTION,
@@ -102,7 +104,7 @@ export interface StartControlChannelDeps {
 }
 
 /** Close a server, resolving once it has stopped (never rejecting). */
-function closeServer(server: net.Server): Promise<void> {
+function closeServer(server: ControlChannelServer): Promise<void> {
   return new Promise<void>((resolvePromise) => {
     server.close(() => {
       resolvePromise();
@@ -111,7 +113,7 @@ function closeServer(server: net.Server): Promise<void> {
 }
 
 /** Listen once; resolve on success, reject on the first listen error. */
-function listen(server: net.Server, pipePath: string): Promise<void> {
+function listen(server: ControlChannelServer, pipePath: string): Promise<void> {
   return new Promise<void>((resolvePromise, rejectPromise) => {
     const onError = (error: unknown): void => {
       rejectPromise(error instanceof Error ? error : new Error('listen failed'));
@@ -235,8 +237,11 @@ export async function startControlChannel(
   );
   try {
     await listen(server, pipePath);
-  } catch {
-    log('AgentBridge control channel: disabled (pipe unavailable).');
+  } catch (error: unknown) {
+    // The reason is a fixed diagnostic (a missing/unverified accept provider, a
+    // name collision, a Win32 code) — never a secret.
+    const reason = error instanceof Error ? error.message : 'listen failed';
+    log(`AgentBridge control channel: disabled (pipe unavailable: ${reason}).`);
     return null;
   }
 

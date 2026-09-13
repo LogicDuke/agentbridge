@@ -60,6 +60,7 @@ import {
   allAbsentProbe,
   closeServer,
   memAnchor,
+  netControlServer,
   newOrchestrator,
   passingDescriptorVerify,
   passingVerify,
@@ -172,7 +173,7 @@ describe('D062 lifecycle v2 — startup ordering (listen before publish)', () =>
     };
     let listening = false;
     const createServer: typeof createControlChannelServer = (options) => {
-      const server = createControlChannelServer(options);
+      const server = netControlServer(options);
       server.once('listening', () => {
         listening = true;
       });
@@ -231,7 +232,7 @@ describe('D062 lifecycle v2 — startup ordering (listen before publish)', () =>
     // Wrap createServer so we can learn the pipe path at listen time and squat it.
     let squatted: net.Server | null = null;
     const createServer: typeof createControlChannelServer = (options) => {
-      const server = createControlChannelServer(options);
+      const server = netControlServer(options);
       const originalListen = server.listen.bind(server);
       // Squat the same path synchronously before the real listen proceeds.
       (server as { listen: unknown }).listen = ((path: string, cb?: () => void): net.Server => {
@@ -302,6 +303,7 @@ describe('D062 lifecycle v2 — startup ordering (listen before publish)', () =>
       },
       descriptorDeps: anchor.deps,
       createDescriptor: anchor.create,
+      createServer: netControlServer,
       logger: silent,
     });
     expect(handle).not.toBeNull();
@@ -396,6 +398,7 @@ describe('D062 lifecycle v2 — descriptor verification fails closed (real evalu
       verifyDescriptor: gate,
       descriptorDeps: anchor.deps,
       createDescriptor: anchor.create,
+      createServer: netControlServer,
       probePipe: realProbe,
       logger: silent,
     });
@@ -485,10 +488,16 @@ describe('D062 lifecycle v2 — descriptor verification fails closed (real evalu
         verifyDescriptor: passingDescriptorVerify,
         descriptorDeps: anchor.deps,
         createDescriptor: create,
+        createServer: netControlServer,
         probePipe: realProbe,
         logger: silent,
       });
       expect(handle, label).toBeNull();
+      // Non-vacuity: the read-back gate is what rejected — listen and publication
+      // BOTH succeeded (peer's create + ours = 2), then exactly our own file was
+      // removed. A vacuous failure before listen would show 1 create, 0 removals.
+      expect(anchor.createCalls(), label).toBe(2);
+      expect(anchor.removeCalls(), label).toBe(1);
       expect(filesIn(anchor), label).toEqual([descriptorFilenameFor(peer.runtimeId)]);
     }
   });
@@ -516,7 +525,7 @@ describe('D062 lifecycle v2 — dispatcher is inert until armed (control readine
   function capturingServer(sink: { dispatcher: ControlDispatcher | null }): typeof createControlChannelServer {
     return ((options) => {
       sink.dispatcher = options.dispatcher;
-      return createControlChannelServer(options);
+      return netControlServer(options);
     }) as typeof createControlChannelServer;
   }
 
@@ -664,10 +673,14 @@ describe('D062 lifecycle v2 — creation failures after listen', () => {
         ownPipe = pipePathFromName(pipeNameForRuntimeId(id));
         return Promise.resolve({ ok: false, reason });
       },
+      createServer: netControlServer,
       probePipe: realProbe,
       logger: silent,
     });
     expect(handle).toBeNull();
+    // Non-vacuity: the creator was actually reached (it recorded our pipe path),
+    // so listen had already succeeded and THIS rejection is what failed startup.
+    expect(ownPipe).not.toBe('');
     // Nothing was created by us, so nothing is removed — the peer is untouched.
     expect(anchor.removeCalls()).toBe(0);
     expect(filesIn(anchor)).toEqual([descriptorFilenameFor(peer.runtimeId)]);
@@ -684,7 +697,7 @@ describe('D062 lifecycle v2 — creation failures after listen', () => {
     const createServer: typeof createControlChannelServer = ((options) => {
       serverCreated = true;
       sink.dispatcher = options.dispatcher;
-      return createControlChannelServer(options);
+      return netControlServer(options);
     }) as typeof createControlChannelServer;
     const create: DescriptorCreatorFn = (_dir, id, bytes) => {
       ownId = id;
@@ -725,6 +738,7 @@ describe('D062 lifecycle v2 — creation failures after listen', () => {
       verifyDescriptor: passingDescriptorVerify,
       descriptorDeps: anchor.deps,
       createDescriptor: create,
+      createServer: netControlServer,
       probePipe: realProbe,
       logger: silent,
     });
@@ -750,6 +764,7 @@ describe('D062 lifecycle v2 — creation failures after listen', () => {
       verifyDescriptor: passingDescriptorVerify,
       descriptorDeps: anchor.deps,
       createDescriptor: create,
+      createServer: netControlServer,
       probePipe: realProbe,
       logger: silent,
     });
@@ -761,15 +776,23 @@ describe('D062 lifecycle v2 — creation failures after listen', () => {
   it('a creator that throws is contained; the channel disables, nothing propagates', async () => {
     const { orchestrator } = newOrchestrator();
     const anchor = memAnchor();
+    let throwingCreatorCalls = 0;
     const handle = await startControlChannel({
       orchestrator,
       verify: passingVerify,
       verifyDescriptor: passingDescriptorVerify,
       descriptorDeps: anchor.deps,
-      createDescriptor: () => Promise.reject(new Error('boom')),
+      createDescriptor: () => {
+        throwingCreatorCalls += 1;
+        return Promise.reject(new Error('boom'));
+      },
+      createServer: netControlServer,
       logger: silent,
     });
     expect(handle).toBeNull();
+    // Non-vacuity: the throwing creator really ran, so containment of ITS rejection
+    // is what produced the null handle — not an earlier listen failure.
+    expect(throwingCreatorCalls).toBe(1);
     expect(filesIn(anchor)).toEqual([]);
   });
 
@@ -786,6 +809,7 @@ describe('D062 lifecycle v2 — creation failures after listen', () => {
         calls.push({ dir, id, bytes });
         return anchor.create(dir, id, bytes);
       },
+      createServer: netControlServer,
       logger: silent,
     });
     expect(handle).not.toBeNull();
@@ -851,6 +875,7 @@ describe('D062 lifecycle v2 — cleanup removes only the runtime\'s own identity
         ownId = id;
         return anchor.create(dir, id, bytes);
       },
+      createServer: netControlServer,
       probePipe: realProbe,
       logger: silent,
     });
@@ -952,7 +977,7 @@ describe('D062 lifecycle v2 — startup sweep of foreign descriptors', () => {
     let created = 0;
     const createServer: typeof createControlChannelServer = ((options) => {
       serverCreated = true;
-      return createControlChannelServer(options);
+      return netControlServer(options);
     }) as typeof createControlChannelServer;
     const create: DescriptorCreatorFn = async (dir, id, bytes) => {
       created += 1;
@@ -994,7 +1019,7 @@ describe('D062 lifecycle v2 — startup sweep of foreign descriptors', () => {
     let created = 0;
     const createServer: typeof createControlChannelServer = ((options) => {
       serverCreated = true;
-      return createControlChannelServer(options);
+      return netControlServer(options);
     }) as typeof createControlChannelServer;
     const create: DescriptorCreatorFn = async (dir, id, bytes) => {
       created += 1;
@@ -1026,6 +1051,7 @@ describe('D062 lifecycle v2 — startup sweep of foreign descriptors', () => {
       verifyDescriptor: passingDescriptorVerify,
       descriptorDeps: anchor.deps,
       createDescriptor: anchor.create,
+      createServer: netControlServer,
       probePipe: allAbsentProbe,
       logger: silent,
     });
@@ -1047,6 +1073,7 @@ describe('D062 lifecycle v2 — startup sweep of foreign descriptors', () => {
       verifyDescriptor: passingDescriptorVerify,
       descriptorDeps: anchor.deps,
       createDescriptor: anchor.create,
+      createServer: netControlServer,
       probePipe: allAbsentProbe, // the seeded foreign file's pipe is ABSENT
       logger: silent,
     });
@@ -1078,7 +1105,7 @@ describe('D062 lifecycle v2 — startup sweep of foreign descriptors', () => {
     let created = 0;
     const createServer: typeof createControlChannelServer = ((options) => {
       serverCreated = true;
-      return createControlChannelServer(options);
+      return netControlServer(options);
     }) as typeof createControlChannelServer;
     const create: DescriptorCreatorFn = async (dir, id, bytes) => {
       created += 1;
@@ -1111,6 +1138,7 @@ describe('D062 lifecycle v2 — startup sweep of foreign descriptors', () => {
       verifyDescriptor: passingDescriptorVerify,
       descriptorDeps: anchor.deps,
       createDescriptor: anchor.create,
+      createServer: netControlServer,
       probePipe: () => Promise.resolve('UNKNOWN'),
       logger: silent,
     });
@@ -1133,6 +1161,7 @@ describe('D062 lifecycle v2 — startup sweep of foreign descriptors', () => {
       verifyDescriptor: passingDescriptorVerify,
       descriptorDeps: anchor.deps,
       createDescriptor: anchor.create,
+      createServer: netControlServer,
       probePipe: (path) => Promise.resolve(path === deadPipe ? 'ABSENT' : 'UNKNOWN'),
       logger: silent,
     });
@@ -1158,7 +1187,7 @@ describe('D062 lifecycle v2 — startup sweep of foreign descriptors', () => {
     let created = 0;
     const createServer: typeof createControlChannelServer = ((options) => {
       serverCreated = true;
-      return createControlChannelServer(options);
+      return netControlServer(options);
     }) as typeof createControlChannelServer;
     const create: DescriptorCreatorFn = async (dir, id, bytes) => {
       created += 1;
@@ -1201,7 +1230,7 @@ describe('D062 lifecycle v2 — startup sweep of foreign descriptors', () => {
     let created = 0;
     const createServer: typeof createControlChannelServer = ((options) => {
       serverCreated = true;
-      return createControlChannelServer(options);
+      return netControlServer(options);
     }) as typeof createControlChannelServer;
     const create: DescriptorCreatorFn = async (dir, id, bytes) => {
       created += 1;
@@ -1235,6 +1264,7 @@ describe('D062 lifecycle v2 — startup sweep of foreign descriptors', () => {
       verifyDescriptor: passingDescriptorVerify,
       descriptorDeps: anchor.deps,
       createDescriptor: anchor.create,
+      createServer: netControlServer,
       probePipe: allAbsentProbe,
       logger: silent,
     });
@@ -1260,6 +1290,7 @@ describe('D062 lifecycle v2 — startup sweep of foreign descriptors', () => {
       verifyDescriptor: passingDescriptorVerify,
       descriptorDeps: anchor.deps,
       createDescriptor: anchor.create,
+      createServer: netControlServer,
       probePipe: (path) => Promise.resolve(path === dead.pipePath ? 'ABSENT' : 'ABSENT'),
       logger: silent,
     });
@@ -1285,6 +1316,7 @@ describe('D062 lifecycle v2 — startup sweep of foreign descriptors', () => {
       verifyDescriptor: passingDescriptorVerify,
       descriptorDeps: deps,
       createDescriptor: anchor.create,
+      createServer: netControlServer,
       probePipe: allAbsentProbe,
       logger: (message): void => {
         logs.push(message);

@@ -22,12 +22,15 @@ import {
 import {
   buildHelloBody,
   buildResultBody,
+  createServeContext,
   frameMessage,
   LENGTH_PREFIX_BYTES,
   MAX_BODY_BYTES,
   parseClientRequest,
   parseHelloBody,
   parseResultBody,
+  serveConnection,
+  type CreateControlChannelServerOptions,
 } from '../../src/control/control-channel.js';
 import { CONTROL_RESULT, type ControlResultStatus } from '../../src/control/control-command.js';
 import { runControlCli, type AttestFn, type ControlCliOutcome } from '../../src/control/cli.js';
@@ -300,6 +303,21 @@ export interface StartServerOptions {
  * the anchor's CREATE_NEW seam; the pipe probe is the REAL one unless injected,
  * so liveness reflects the real kernel pipe namespace.
  */
+/**
+ * TEST TRANSPORT ONLY: the exact production connection service
+ * (`serveConnection` over `createServeContext`) on a plain `net.createServer`
+ * listener, so the protocol/lifecycle tests run cross-platform (a unix socket on
+ * POSIX, a default-descriptor pipe on Windows) without the built explicit-DACL
+ * accept provider. Production never uses this: `createControlChannelServer` is
+ * the in-process provider with no fallback (pinned in pipe-acceptor.test.ts).
+ */
+export function netControlServer(options: CreateControlChannelServerOptions): net.Server {
+  const ctx = createServeContext(options);
+  return net.createServer((socket: net.Socket) => {
+    serveConnection(socket, ctx);
+  });
+}
+
 export async function startServer(
   orchestrator: AutoflowOrchestrator,
   anchor: MemAnchor,
@@ -311,6 +329,7 @@ export async function startServer(
     verifyDescriptor: passingDescriptorVerify,
     descriptorDeps: anchor.deps,
     createDescriptor: anchor.create,
+    createServer: netControlServer,
     logger: (): void => {
       /* silent */
     },

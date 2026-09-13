@@ -11,12 +11,14 @@
  * stays up and read-only.
  *
  * The explicit control launch must not silently omit the mandatory native artifacts
- * and their generated provenance. There are THREE, each with its own provenance and
+ * and their generated provenance. There are FOUR, each with its own provenance and
  * its own runtime hash gate:
  *
  *   agentbridge-win-owner.exe             READ-ONLY   owner/DACL snapshot probe
  *   agentbridge-win-descriptor-create.exe CREATE-ONLY identity-named descriptor creator
  *   agentbridge-win-pipe-attest.exe       READ-ONLY   live pipe-server identity relayer
+ *   agentbridge-win-pipe-accept.node      IN-PROCESS  explicit-DACL pipe accept provider
+ *                                                     (DDR-D062-C; a Node-API addon, not a process)
  *
  * Without a VALID pair the corresponding runtime gate fails closed
  * (HELPER_PROVENANCE_MISSING / HELPER_MISSING / HELPER_HASH_MISMATCH, and the
@@ -60,12 +62,15 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
+  ACCEPTOR_PROVENANCE_BASENAME,
   ATTESTOR_PROVENANCE_BASENAME,
   CREATOR_PROVENANCE_BASENAME,
   DESCRIPTOR_CREATOR_BASENAME,
   OWNER_HELPER_BASENAME,
+  PIPE_ACCEPTOR_BASENAME,
   PIPE_ATTESTOR_BASENAME,
   PROVENANCE_BASENAME,
+  validateAcceptorPair,
   validateAttestorPair,
   validateCreatorPair,
   validateHelperPair,
@@ -101,6 +106,12 @@ const ARTIFACTS = [
     exePath: join(outDir, PIPE_ATTESTOR_BASENAME),
     provenancePath: join(outDir, ATTESTOR_PROVENANCE_BASENAME),
     validate: validateAttestorPair,
+  },
+  {
+    label: 'pipe acceptor',
+    exePath: join(outDir, PIPE_ACCEPTOR_BASENAME),
+    provenancePath: join(outDir, ACCEPTOR_PROVENANCE_BASENAME),
+    validate: validateAcceptorPair,
   },
 ];
 

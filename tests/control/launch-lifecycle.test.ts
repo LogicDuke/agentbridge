@@ -78,15 +78,20 @@ import {
   descriptorCreatorSourceId,
   ownerHelperSourceId,
   pipeAttestorSourceId,
+  pipeAcceptorSourceId,
   sourceIdFor,
   validateAttestorPair,
+  validateAcceptorPair,
   encodeAttestorProvenance,
+  encodeAcceptorProvenance,
+  ACCEPTOR_PROVENANCE_BASENAME,
   ATTESTOR_PROVENANCE_BASENAME,
   CREATOR_PROVENANCE_BASENAME,
   DESCRIPTOR_CREATOR_BASENAME,
   DESCRIPTOR_CREATOR_SOURCE_PATH,
   OWNER_HELPER_BASENAME,
   OWNER_HELPER_SOURCE_PATH,
+  PIPE_ACCEPTOR_BASENAME,
   PIPE_ATTESTOR_BASENAME,
 } from '../../tools/control-owner/helper-pair.mjs';
 import {
@@ -132,6 +137,7 @@ const realCreatorProv = join(repoRoot, 'dist', 'control', 'native', CREATOR_PROV
 const OWNER_SOURCE_ID = ownerHelperSourceId() ?? '';
 const CREATOR_SOURCE_ID = descriptorCreatorSourceId() ?? '';
 const ATTESTOR_SOURCE_ID = pipeAttestorSourceId() ?? '';
+const ACCEPTOR_SOURCE_ID = pipeAcceptorSourceId() ?? '';
 /** Every published native artifact basename (binaries + provenance modules). */
 const ALL_NATIVE_BASENAMES = [
   OWNER_HELPER_BASENAME,
@@ -140,6 +146,8 @@ const ALL_NATIVE_BASENAMES = [
   CREATOR_PROVENANCE_BASENAME,
   PIPE_ATTESTOR_BASENAME,
   ATTESTOR_PROVENANCE_BASENAME,
+  PIPE_ACCEPTOR_BASENAME,
+  ACCEPTOR_PROVENANCE_BASENAME,
 ];
 
 const pkg = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')) as {
@@ -158,6 +166,9 @@ function creatorCanonicalFor(bytes: Buffer): string {
 }
 function attestorCanonicalFor(bytes: Buffer): string {
   return encodeAttestorProvenance(sha256Hex(bytes), ATTESTOR_SOURCE_ID);
+}
+function acceptorCanonicalFor(bytes: Buffer): string {
+  return encodeAcceptorProvenance(sha256Hex(bytes), ACCEPTOR_SOURCE_ID);
 }
 
 interface Pair {
@@ -745,10 +756,21 @@ function isolatedGateTree(withSource: boolean): {
       'agentbridge-win-owner.c',
       'agentbridge-win-descriptor-create.c',
       'agentbridge-win-pipe-attest.c',
+      'agentbridge-win-pipe-accept.c',
     );
   }
   for (const f of files) {
     cpSync(join(repoRoot, 'tools', 'control-owner', f), join(toolDir, f));
+  }
+  // The in-process acceptor's ONLY build dependency: the exact-pinned, build-only
+  // node-api-headers package (include/ + the official def/node_api.def). The
+  // builder resolves it repo-relative, so the isolated tree carries its own copy.
+  if (withSource) {
+    cpSync(
+      join(repoRoot, 'node_modules', 'node-api-headers'),
+      join(root, 'node_modules', 'node-api-headers'),
+      { recursive: true },
+    );
   }
   return {
     root,
@@ -779,7 +801,7 @@ const vswherePath = vswherePathFor(process.env['ProgramFiles(x86)'] ?? 'C:\\Prog
 const TEST_BUILD_ELIGIBLE = isBuildEligible();
 
 describe.skipIf(!TEST_BUILD_ELIGIBLE)('D062 explicit provisioning — MSVC available + helper missing', () => {
-  it('the gate compiles ALL THREE artifacts and publishes three canonical, source-bound pairs (exit 0)', () => {
+  it('the gate compiles ALL FOUR artifacts and publishes four canonical, source-bound pairs (exit 0)', () => {
     const t = isolatedGateTree(true);
     try {
       const run = spawnSync(process.execPath, [t.gateScript], { encoding: 'utf8' });
@@ -790,6 +812,8 @@ describe.skipIf(!TEST_BUILD_ELIGIBLE)('D062 explicit provisioning — MSVC avail
       const creatorProv = join(t.nativeDir, CREATOR_PROVENANCE_BASENAME);
       const attestor = join(t.nativeDir, PIPE_ATTESTOR_BASENAME);
       const attestorProv = join(t.nativeDir, ATTESTOR_PROVENANCE_BASENAME);
+      const acceptor = join(t.nativeDir, PIPE_ACCEPTOR_BASENAME);
+      const acceptorProv = join(t.nativeDir, ACCEPTOR_PROVENANCE_BASENAME);
       expect(readdirSync(t.nativeDir).sort()).toEqual([...ALL_NATIVE_BASENAMES].sort());
       // The copied tree's sources are byte-identical to the repo's, so the copied
       // validators (which hash their own module-relative sources) accept exactly
@@ -797,12 +821,18 @@ describe.skipIf(!TEST_BUILD_ELIGIBLE)('D062 explicit provisioning — MSVC avail
       expect(readFileSync(prov, 'utf8')).toBe(canonicalFor(readFileSync(exe)));
       expect(readFileSync(creatorProv, 'utf8')).toBe(creatorCanonicalFor(readFileSync(creator)));
       expect(readFileSync(attestorProv, 'utf8')).toBe(attestorCanonicalFor(readFileSync(attestor)));
+      expect(readFileSync(acceptorProv, 'utf8')).toBe(acceptorCanonicalFor(readFileSync(acceptor)));
       expect(validateHelperPair({ exePath: exe, provenancePath: prov })).toEqual({ valid: true, reason: 'valid' });
       expect(validateCreatorPair({ exePath: creator, provenancePath: creatorProv })).toEqual({ valid: true, reason: 'valid' });
       expect(validateAttestorPair({ exePath: attestor, provenancePath: attestorProv })).toEqual({ valid: true, reason: 'valid' });
+      expect(validateAcceptorPair({ exePath: acceptor, provenancePath: acceptorProv })).toEqual({ valid: true, reason: 'valid' });
       // Each artifact's provenance names ONLY its own binary: no cross-wiring.
       expect(validateAttestorPair({ exePath: exe, provenancePath: attestorProv }).valid).toBe(false);
       expect(validateHelperPair({ exePath: attestor, provenancePath: prov }).valid).toBe(false);
+      expect(validateAcceptorPair({ exePath: attestor, provenancePath: acceptorProv }).valid).toBe(false);
+      expect(validateAttestorPair({ exePath: acceptor, provenancePath: attestorProv }).valid).toBe(false);
+      // The addon is a DLL image (MZ), published under the `.node` name, never an .exe.
+      expect(readFileSync(acceptor).subarray(0, 2).toString('latin1')).toBe('MZ');
     } finally {
       rmSync(t.root, { recursive: true, force: true });
     }
@@ -1023,6 +1053,8 @@ function withToolchain(spec: ToolchainSpec, fn: (ctx: ToolchainCtx) => void): vo
       const msvcRoot = join(vsRoot, 'VC', 'Tools', 'MSVC', TOOLSET);
       mkdirSync(join(msvcRoot, 'bin', 'Hostx64', 'x64'), { recursive: true });
       writeFileSync(join(msvcRoot, 'bin', 'Hostx64', 'x64', 'cl.exe'), '');
+      // lib.exe (the Node import-library generator) is a builder prerequisite too.
+      writeFileSync(join(msvcRoot, 'bin', 'Hostx64', 'x64', 'lib.exe'), '');
       mkdirSync(join(msvcRoot, 'include'), { recursive: true });
       mkdirSync(join(msvcRoot, 'lib', 'x64'), { recursive: true });
     }
@@ -1682,13 +1714,16 @@ describe.skipIf(!TEST_BUILD_ELIGIBLE)('D062 concurrent rebuild — isolated real
       const creatorProv = join(t.nativeDir, CREATOR_PROVENANCE_BASENAME);
       const attestor = join(t.nativeDir, PIPE_ATTESTOR_BASENAME);
       const attestorProv = join(t.nativeDir, ATTESTOR_PROVENANCE_BASENAME);
+      const acceptor = join(t.nativeDir, PIPE_ACCEPTOR_BASENAME);
+      const acceptorProv = join(t.nativeDir, ACCEPTOR_PROVENANCE_BASENAME);
       // Every final pair canonical and source-bound.
       expect(readFileSync(prov, 'utf8')).toBe(canonicalFor(readFileSync(exe)));
       expect(readFileSync(creatorProv, 'utf8')).toBe(creatorCanonicalFor(readFileSync(creator)));
       expect(readFileSync(attestorProv, 'utf8')).toBe(attestorCanonicalFor(readFileSync(attestor)));
+      expect(readFileSync(acceptorProv, 'utf8')).toBe(acceptorCanonicalFor(readFileSync(acceptor)));
       // No shared object directory and no private workspace leaked into native/.
       expect(existsSync(join(t.nativeDir, 'obj'))).toBe(false);
-      // Every entry under native/ is one of the four authoritative artifacts.
+      // Every entry under native/ is one of the eight authoritative files (four pairs).
       // (A leaked .build-* dir would violate isolation cleanup.)
       const names = readdirSync(t.nativeDir);
       expect(names.sort()).toEqual([...ALL_NATIVE_BASENAMES].sort());

@@ -2046,3 +2046,152 @@ export async function createDescriptorFileNative(
   }
   return { ok: true };
 }
+
+/* ------------------------------------------------------------------ *
+ * In-process explicit-DACL pipe accept provider (DDR-D062-C)
+ * ------------------------------------------------------------------ *
+ *
+ * D062 Revision 2 — CONTROL TRANSPORT ACCESS BOUNDARY. Node's own named-pipe
+ * server leaves every pipe instance with the kernel DEFAULT security
+ * descriptor, which admits broad local principals. The FOURTH build-provenanced
+ * native artifact is not a process: it is a Node-API addon loaded INTO the
+ * runtime process, so Node remains the pipe SERVER PROCESS (the attestor still
+ * observes the runtime's own PID and TokenUser SID). It creates every server
+ * instance with an explicit descriptor — owner = the runtime's exact TokenUser
+ * SID, a PRESENT + PROTECTED DACL with exactly one ALLOW ACE for that same SID
+ * granting exactly FILE_GENERIC_READ | FILE_GENERIC_WRITE | SYNCHRONIZE
+ * (0x12019F) — accepts connections asynchronously, and hands each connected
+ * handle to JavaScript as a libuv file descriptor. It parses no protocol byte,
+ * performs no cryptography, dispatches nothing, and never touches a file.
+ *
+ * Trust: identical to the executables. The addon is resolved module-relative
+ * from its OWN generated provenance module and SHA-256-verified against the
+ * exact bytes on disk BEFORE it is loaded; any absence, mismatch, load failure,
+ * or unexpected export shape fails closed, which disables the CONTROL CHANNEL
+ * ONLY (the read-only Cockpit is unaffected). There is deliberately NO fallback
+ * to the default-descriptor pipe server for control authority.
+ *
+ * Residual (documented, same class as the executables): the bytes are hashed
+ * by path and then loaded by path, so a sub-millisecond check-to-load window
+ * exists. It is no wider than the trust already placed in the runtime's own
+ * compiled JavaScript under dist/, which is loaded in-process without any hash.
+ */
+
+/** Why the pipe acceptor could not be used. Every value is fail-closed. */
+export const PIPE_ACCEPTOR_REJECTION = Object.freeze({
+  ACCEPTOR_PROVENANCE_MISSING: 'ACCEPTOR_PROVENANCE_MISSING',
+  ACCEPTOR_MISSING: 'ACCEPTOR_MISSING',
+  ACCEPTOR_HASH_MISMATCH: 'ACCEPTOR_HASH_MISMATCH',
+  /** The verified addon could not be loaded into this process. */
+  ACCEPTOR_LOAD_FAILED: 'ACCEPTOR_LOAD_FAILED',
+  /** The loaded module does not expose exactly the expected accept-provider surface. */
+  ACCEPTOR_SHAPE_INVALID: 'ACCEPTOR_SHAPE_INVALID',
+} as const);
+
+export type PipeAcceptorRejection =
+  (typeof PIPE_ACCEPTOR_REJECTION)[keyof typeof PIPE_ACCEPTOR_REJECTION];
+
+/**
+ * One completed accept: `(null, fd)` with a libuv file descriptor JavaScript now
+ * owns (adopt it with `new net.Socket({ fd })`), or `(reason, -1)` after the
+ * failed instance was already closed natively.
+ */
+export type NativeAcceptCallback = (error: string | null, fd: number) => void;
+
+/** A live native listener: one pending instance at a time, JavaScript-paced. */
+export interface NativePipeServer {
+  /** Create + arm the next server instance (no-op while one is already pending). Throws on failure. */
+  accept(): void;
+  /** Stop accepting and release every native resource; handed-out sockets are unaffected. */
+  close(): void;
+}
+
+/** The complete surface the verified addon exposes. */
+export interface PipeAcceptorAddon {
+  /**
+   * Hold `pipePath` (the FIRST instance claims the name; a collision throws) and
+   * arm the first accept. Every instance is created with the explicit descriptor.
+   */
+  createServer(pipePath: string, onAccept: NativeAcceptCallback): NativePipeServer;
+}
+
+/** Injection seams for the acceptor gate; production defaults use the real build output. */
+export interface PipeAcceptorDeps {
+  readonly loadProvenance?: () => Promise<OwnerHelperProvenance | null>;
+  readonly resolveAcceptorPath?: (filename: string) => string;
+  readonly readAcceptorBytes?: (acceptorPath: string) => Buffer | null;
+  readonly hashBytes?: (bytes: Buffer) => string;
+  /** Load the verified addon into this process; production is `process.dlopen`. */
+  readonly loadAddon?: (acceptorPath: string) => unknown;
+}
+
+export type PipeAcceptorLoad =
+  | { readonly ok: true; readonly addon: PipeAcceptorAddon }
+  | { readonly ok: false; readonly reason: PipeAcceptorRejection };
+
+/** The pipe acceptor's generated provenance module (its own trust root). */
+function defaultLoadAcceptorProvenance(): Promise<OwnerHelperProvenance | null> {
+  return loadProvenanceModule('pipe-acceptor-provenance.js', 'PIPE_ACCEPTOR_PROVENANCE');
+}
+
+/** Load a Node-API addon by absolute path into this process (no PATH, no search). */
+function defaultLoadAddon(acceptorPath: string): unknown {
+  const holder: { exports: unknown } = { exports: {} };
+  process.dlopen(holder, acceptorPath);
+  return holder.exports;
+}
+
+/** Exactly the expected export surface: an object whose `createServer` is a function. */
+function isPipeAcceptorAddon(value: unknown): value is PipeAcceptorAddon {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof (value as { createServer?: unknown }).createServer === 'function'
+  );
+}
+
+/**
+ * Resolve, hash-verify, and load the in-process pipe accept provider. The bytes
+ * are compared against generated provenance BEFORE `loadAddon` runs, so an
+ * absent, substituted, or torn addon is never loaded. Fail-closed on every fault.
+ */
+export async function loadPipeAcceptor(deps: PipeAcceptorDeps = {}): Promise<PipeAcceptorLoad> {
+  const provenance = await (deps.loadProvenance ?? defaultLoadAcceptorProvenance)();
+  if (
+    provenance === null ||
+    !HELPER_SHA256_PATTERN.test(provenance.sha256) ||
+    !HELPER_FILENAME_PATTERN.test(provenance.filename)
+  ) {
+    return { ok: false, reason: PIPE_ACCEPTOR_REJECTION.ACCEPTOR_PROVENANCE_MISSING };
+  }
+
+  const acceptorPath = (deps.resolveAcceptorPath ?? defaultResolveNativePath)(provenance.filename);
+  const bytes = (deps.readAcceptorBytes ?? defaultReadNativeBytes)(acceptorPath);
+  if (bytes === null) {
+    return { ok: false, reason: PIPE_ACCEPTOR_REJECTION.ACCEPTOR_MISSING };
+  }
+  const actualHash = (deps.hashBytes ?? sha256Hex)(bytes);
+  if (!digestsEqual(actualHash, provenance.sha256)) {
+    return { ok: false, reason: PIPE_ACCEPTOR_REJECTION.ACCEPTOR_HASH_MISMATCH };
+  }
+
+  let loaded: unknown;
+  try {
+    loaded = (deps.loadAddon ?? defaultLoadAddon)(acceptorPath);
+  } catch {
+    return { ok: false, reason: PIPE_ACCEPTOR_REJECTION.ACCEPTOR_LOAD_FAILED };
+  }
+  if (!isPipeAcceptorAddon(loaded)) {
+    return { ok: false, reason: PIPE_ACCEPTOR_REJECTION.ACCEPTOR_SHAPE_INVALID };
+  }
+  // Project onto exactly the expected surface; nothing else the module exports
+  // is ever reachable from the runtime.
+  const addon = loaded;
+  return {
+    ok: true,
+    addon: {
+      createServer: (pipePath: string, onAccept: NativeAcceptCallback): NativePipeServer =>
+        addon.createServer(pipePath, onAccept),
+    },
+  };
+}

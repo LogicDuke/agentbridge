@@ -37,6 +37,7 @@ import {
   closeServer,
   descriptorFacts,
   memAnchor,
+  netControlServer,
   newOrchestrator,
   passingVerify,
   startRogueServer,
@@ -334,6 +335,7 @@ describe('D062 control channel — the write path is inert during the verificati
       verifyDescriptor,
       descriptorDeps: anchor.deps,
       createDescriptor: anchor.create,
+      createServer: netControlServer,
       logger: (): void => {
         /* silent */
       },

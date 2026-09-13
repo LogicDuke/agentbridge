@@ -39,14 +39,19 @@
  * holding nothing but a copied descriptor cannot answer a client even after the
  * genuine runtime has exited and its pipe name has been freed.
  *
- * ## Limitations preserved (§11)
+ * ## Transport access boundary (DDR-D062-C, Revision 2)
  *
- * The pipe name is unpredictable per process but **not secret**. This layer does
- * not inspect or assert the pipe's security descriptor, does not claim to prove
- * remote-pipe rejection or other-user rejection, and does not rely on
- * `FILE_FLAG_FIRST_PIPE_INSTANCE`. A same-name collision fails closed at listen
- * time (the caller surfaces the listen error). Command authorization rests on
- * token possession, never on pipe-ACL assumptions.
+ * The pipe name is unpredictable per process but **not secret**. The server
+ * instances are created by the build-provenanced in-process accept provider
+ * (see {@link loadPipeAcceptor}) with an EXPLICIT security descriptor — owner =
+ * the runtime's exact TokenUser SID, a PRESENT + PROTECTED DACL with exactly one
+ * ALLOW ACE for that same SID (0x12019F) — so no other local principal can open
+ * the pipe at all. Node remains the server process; the addon never sees a
+ * protocol byte. A same-name collision fails closed at listen time (the first
+ * instance claims the name exclusively), and a missing, substituted, or
+ * unloadable provider disables the control channel with NO fallback to a
+ * default-descriptor pipe. Command authorization still rests on token
+ * possession and live attestation, never on the pipe ACL alone.
  *
  * ## Reentrancy (§15)
  *
@@ -56,8 +61,10 @@
  * `REENTRANCY_GUARD_NOT_REQUIRED_NOW` holds and no queue/replay is introduced.
  */
 
-import net from 'node:net';
 import { randomBytes, type KeyObject } from 'node:crypto';
+import { EventEmitter } from 'node:events';
+import { closeSync } from 'node:fs';
+import net from 'node:net';
 
 import {
   computeClientMac,
@@ -77,6 +84,7 @@ import {
   type ControlResultStatus,
 } from './control-command.js';
 import type { ControlDispatcher } from './control-dispatch.js';
+import { loadPipeAcceptor, type NativePipeServer, type PipeAcceptorLoad } from './control-store.js';
 
 /** Wire constants. */
 export const LENGTH_PREFIX_BYTES = 4;
@@ -425,7 +433,7 @@ export function serveConnection(socket: ControlSocket, ctx: ServeConnectionConte
 }
 
 /* ------------------------------------------------------------------ *
- * Named-pipe server
+ * Named-pipe server (explicit-DACL in-process accept provider)
  * ------------------------------------------------------------------ */
 
 export interface CreateControlChannelServerOptions {
@@ -435,13 +443,13 @@ export interface CreateControlChannelServerOptions {
   readonly dispatcher: ControlDispatcher;
   readonly nonceGen?: () => Buffer;
   readonly timeoutMs?: number;
+  /** Injection seam (tests): the verified accept-provider loader. Production is the real one. */
+  readonly loadAcceptor?: () => Promise<PipeAcceptorLoad>;
 }
 
-/** Create the (not-yet-listening) named-pipe server. */
-export function createControlChannelServer(
-  options: CreateControlChannelServerOptions,
-): net.Server {
-  const ctx: ServeConnectionContext = {
+/** Build the per-connection service context from the server options. */
+export function createServeContext(options: CreateControlChannelServerOptions): ServeConnectionContext {
+  return {
     identity: options.identity,
     token: options.token,
     privateKey: options.privateKey,
@@ -449,7 +457,164 @@ export function createControlChannelServer(
     nonceGen: options.nonceGen ?? ((): Buffer => randomBytesFn(NONCE_BYTES)),
     timeoutMs: options.timeoutMs ?? DEFAULT_CONNECTION_TIMEOUT_MS,
   };
-  return net.createServer((socket: net.Socket) => {
-    serveConnection(socket, ctx);
-  });
+}
+
+/**
+ * The listener surface the runtime composes: exactly what it uses of a
+ * `net.Server` (listen, close, and `error` events), so a test transport built on
+ * `net.createServer` satisfies it structurally while production uses the
+ * explicit-DACL provider below.
+ */
+export interface ControlChannelServer {
+  listen(pipePath: string, onListening?: () => void): this;
+  close(onClosed?: () => void): this;
+  on(event: 'error', listener: (error: Error) => void): this;
+  once(event: 'error', listener: (error: Error) => void): this;
+  removeListener(event: 'error', listener: (error: Error) => void): this;
+}
+
+/** Delay before re-arming accept after a failed accept, so a fault cannot spin. */
+const REARM_DELAY_MS = 1000;
+
+/**
+ * The production control-pipe server. `listen()` hash-verifies and loads the
+ * in-process accept provider, which holds the pipe name with the explicit
+ * operator-only descriptor; every accepted HANDLE arrives as a libuv fd that is
+ * adopted here as an ordinary `net.Socket` and served by {@link serveConnection}
+ * — JavaScript owns the protocol end to end. A provider that is missing,
+ * substituted, or unloadable surfaces as a listen `error` (the runtime then
+ * disables the control channel); there is no fallback transport.
+ */
+class NativeControlPipeServer extends EventEmitter implements ControlChannelServer {
+  readonly #ctx: ServeConnectionContext;
+  readonly #load: () => Promise<PipeAcceptorLoad>;
+  #native: NativePipeServer | null = null;
+  readonly #sockets = new Set<net.Socket>();
+  #closed = false;
+  #onClosed: (() => void) | null = null;
+
+  constructor(ctx: ServeConnectionContext, load: () => Promise<PipeAcceptorLoad>) {
+    super();
+    this.#ctx = ctx;
+    this.#load = load;
+  }
+
+  listen(pipePath: string, onListening?: () => void): this {
+    void this.#start(pipePath, onListening);
+    return this;
+  }
+
+  close(onClosed?: () => void): this {
+    this.#closed = true;
+    const native = this.#native;
+    this.#native = null;
+    if (native !== null) {
+      try {
+        native.close();
+      } catch {
+        // Already closed natively; nothing further to release.
+      }
+    }
+    const done = onClosed ?? ((): void => undefined);
+    if (this.#sockets.size === 0) {
+      queueMicrotask(done);
+    } else {
+      this.#onClosed = done;
+    }
+    return this;
+  }
+
+  async #start(pipePath: string, onListening?: () => void): Promise<void> {
+    const load = await this.#load();
+    if (!load.ok) {
+      this.emit('error', new Error(`pipe acceptor unavailable (${load.reason})`));
+      return;
+    }
+    if (this.#closed) {
+      return;
+    }
+    let native: NativePipeServer;
+    try {
+      native = load.addon.createServer(pipePath, (error: string | null, fd: number): void => {
+        this.#onAccept(error, fd);
+      });
+    } catch (error: unknown) {
+      this.emit('error', error instanceof Error ? error : new Error('pipe listen failed'));
+      return;
+    }
+    this.#native = native;
+    onListening?.();
+  }
+
+  #onAccept(error: string | null, fd: number): void {
+    if (error !== null) {
+      this.emit('error', new Error(`pipe accept failed (${error})`));
+      this.#rearmLater();
+      return;
+    }
+    let socket: net.Socket;
+    try {
+      // Adopt the connected handle: from here it is an ordinary libuv stream.
+      socket = new net.Socket({ fd, readable: true, writable: true });
+    } catch (error: unknown) {
+      try {
+        closeSync(fd);
+      } catch {
+        // Best effort: the fd could not be adopted or closed; nothing else owns it.
+      }
+      this.emit('error', error instanceof Error ? error : new Error('pipe socket adoption failed'));
+      this.#rearmLater();
+      return;
+    }
+    if (this.#native === null) {
+      // Closed between the native completion and this call: never serve.
+      socket.destroy();
+      return;
+    }
+    // Re-arm BEFORE serving so the next client finds an instance waiting.
+    this.#rearm();
+    this.#sockets.add(socket);
+    socket.on('close', () => {
+      this.#sockets.delete(socket);
+      if (this.#sockets.size === 0 && this.#onClosed !== null) {
+        const done = this.#onClosed;
+        this.#onClosed = null;
+        done();
+      }
+    });
+    serveConnection(socket, this.#ctx);
+  }
+
+  #rearm(): void {
+    if (this.#native === null) {
+      return;
+    }
+    try {
+      this.#native.accept();
+    } catch (error: unknown) {
+      this.emit('error', error instanceof Error ? error : new Error('pipe accept re-arm failed'));
+      this.#rearmLater();
+    }
+  }
+
+  #rearmLater(): void {
+    const timer = setTimeout(() => {
+      this.#rearm();
+    }, REARM_DELAY_MS);
+    timer.unref();
+  }
+}
+
+/**
+ * Create the (not-yet-listening) control-pipe server. Production: the
+ * explicit-DACL in-process accept provider, verified against its generated
+ * provenance at `listen()` time. Never a default-descriptor `net.createServer`.
+ */
+export function createControlChannelServer(
+  options: CreateControlChannelServerOptions,
+): ControlChannelServer {
+  return new NativeControlPipeServer(
+    createServeContext(options),
+    options.loadAcceptor ?? ((): Promise<PipeAcceptorLoad> => loadPipeAcceptor()),
+  );
 }
