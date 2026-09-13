@@ -25,18 +25,24 @@ import { fileURLToPath } from 'node:url';
 import {
   DESCRIPTOR_CREATOR_SOURCE_BASENAME,
   OWNER_HELPER_SOURCE_BASENAME,
+  PIPE_ATTESTOR_SOURCE_BASENAME,
+  encodeAttestorProvenance,
   encodeCreatorProvenance,
   encodeProvenance,
 } from './provenance-format.mjs';
 
 // Re-export the canonical producers so tests import everything from one module.
 export {
+  ATTESTOR_PROVENANCE_BASENAME,
   CREATOR_PROVENANCE_BASENAME,
   DESCRIPTOR_CREATOR_BASENAME,
   DESCRIPTOR_CREATOR_SOURCE_BASENAME,
   OWNER_HELPER_BASENAME,
   OWNER_HELPER_SOURCE_BASENAME,
+  PIPE_ATTESTOR_BASENAME,
+  PIPE_ATTESTOR_SOURCE_BASENAME,
   PROVENANCE_BASENAME,
+  encodeAttestorProvenance,
   encodeCreatorProvenance,
   encodeProvenance,
 } from './provenance-format.mjs';
@@ -48,6 +54,7 @@ const here = dirname(fileURLToPath(import.meta.url));
  *  SAME file. This is the one artifact->source mapping. */
 export const OWNER_HELPER_SOURCE_PATH = join(here, OWNER_HELPER_SOURCE_BASENAME);
 export const DESCRIPTOR_CREATOR_SOURCE_PATH = join(here, DESCRIPTOR_CREATOR_SOURCE_BASENAME);
+export const PIPE_ATTESTOR_SOURCE_PATH = join(here, PIPE_ATTESTOR_SOURCE_BASENAME);
 
 /**
  * The canonical build-source identity: the SHA-256 (lowercase hex) of the exact
@@ -73,6 +80,11 @@ export function ownerHelperSourceId() {
 /** The current descriptor-creator build-source identity, or `null` if unreadable. */
 export function descriptorCreatorSourceId() {
   return sourceIdFor(DESCRIPTOR_CREATOR_SOURCE_PATH);
+}
+
+/** The current pipe-attestor build-source identity, or `null` if unreadable. */
+export function pipeAttestorSourceId() {
+  return sourceIdFor(PIPE_ATTESTOR_SOURCE_PATH);
 }
 
 /**
@@ -150,5 +162,18 @@ export function validateCreatorPair({ exePath, provenancePath }) {
     provenancePath,
     encode: encodeCreatorProvenance,
     sourceId: descriptorCreatorSourceId(),
+  });
+}
+
+/**
+ * The same decision for the PIPE ATTESTOR (DDR-D062-B), against its OWN encoder and
+ * its OWN reviewed source.
+ */
+export function validateAttestorPair({ exePath, provenancePath }) {
+  return validateArtifactPair({
+    exePath,
+    provenancePath,
+    encode: encodeAttestorProvenance,
+    sourceId: pipeAttestorSourceId(),
   });
 }

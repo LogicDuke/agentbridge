@@ -12,7 +12,9 @@
  *   2. sweep foreign descriptors whose pipe the kernel reports ABSENT (best
  *      effort; nothing PRESENT/UNKNOWN/malformed is ever removed);
  *   3. mint this runtime's identity: a 128-bit random runtime id, its pipe name,
- *      and a rotating 256-bit token;
+ *      a rotating 256-bit token, and an EPHEMERAL Ed25519 keypair whose private
+ *      half never leaves process memory and whose public half is announced in
+ *      every hello but is NEVER written to the descriptor (DDR-D062-B);
  *   4. listen on the identity-named pipe — the kernel-owned exclusivity/liveness
  *      claim; a same-name collision or any listen error fails **closed** and
  *      nothing has been published;
@@ -28,13 +30,16 @@
  * no lease, and no polling. A failure at any step disables the control channel
  * and returns `null`; it never throws into the Cockpit path and never converts
  * the Cockpit into a writer. The token is never logged, never put in an
- * environment variable, argv, or an error message.
+ * environment variable, argv, or an error message. The signing key is stronger
+ * still: it is never serialized at all, so nothing on disk — however faithfully
+ * copied — can answer a client in this runtime's name.
  */
 
 import { timingSafeEqual } from 'node:crypto';
 import type net from 'node:net';
 
 import type { AutoflowOrchestrator } from '../autoflow/orchestrator.js';
+import { generateRuntimeKeyPair, type ChannelIdentity } from './control-auth.js';
 import { CONTROL_RESULT, type ControlCommand, type ControlResultStatus } from './control-command.js';
 import { createControlChannelServer } from './control-channel.js';
 import { createControlDispatcher, type ControlDispatcher } from './control-dispatch.js';
@@ -189,11 +194,19 @@ export async function startControlChannel(
     );
   }
 
-  // 3. Mint this runtime's identity.
+  // 3. Mint this runtime's identity. The keypair is ephemeral and per-start: the
+  //    private half is never serialized, logged, or passed to a subprocess, and
+  //    the public half is announced on the wire only — never in the descriptor.
   const minted = createRuntimeDescriptor();
+  const keyPair = generateRuntimeKeyPair();
   const { runtimeId } = minted;
   const pipePath = pipePathFromName(minted.descriptor.pipeName);
   const descriptorPath = descriptorPathFor(anchorPath, runtimeId);
+  const identity: ChannelIdentity = {
+    runtimeId,
+    pipeName: minted.descriptor.pipeName,
+    verifyKey: keyPair.verifyKey,
+  };
 
   // 4. Kernel-owned exclusivity/liveness: listen BEFORE anything is published.
   //    The server is armed with an INERT gate dispatcher, never the real one:
@@ -209,10 +222,16 @@ export async function startControlChannel(
       return live === null ? CONTROL_RESULT.UNAVAILABLE : live.dispatch(command);
     },
   });
+  const serverOptions = {
+    identity,
+    token: minted.token,
+    privateKey: keyPair.privateKey,
+    dispatcher: gate,
+  };
   const server = createServer(
     deps.timeoutMs === undefined
-      ? { token: minted.token, dispatcher: gate }
-      : { token: minted.token, dispatcher: gate, timeoutMs: deps.timeoutMs },
+      ? serverOptions
+      : { ...serverOptions, timeoutMs: deps.timeoutMs },
   );
   try {
     await listen(server, pipePath);

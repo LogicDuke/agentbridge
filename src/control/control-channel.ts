@@ -14,16 +14,30 @@
  * into a **fresh** trusted {@link ControlCommand}; the caller's object never
  * reaches the dispatch layer.
  *
- * ## Handshake (§12)
+ * ## Handshake (§12, DDR-D062-B)
  *
- *   S→C  hello   { v, nonceS }
- *   C→S  request { v, nonceC, command, mac }   mac = HMAC(token, T("C", nonceS, nonceC, command))
- *   S→C  result  { v, result, mac }            mac = HMAC(token, T("S", nonceS, nonceC, command, result))
+ *   S->C  hello   { v, nonceS, verifyKey }
+ *   C->S  request { v, nonceC, command, mac }
+ *           mac = HMAC(token, T("C", runtimeId, pipeName, verifyKey, nonceS, nonceC, command))
+ *   S->C  result  { v, result, sig }
+ *           sig = Ed25519(sk, T("S", runtimeId, pipeName, verifyKey, nonceS, nonceC, command, result))
  *
  * The server verifies `macC` with a constant-time compare **before** any
- * dispatch. The MAC binds the **exact command bytes received**, not a
+ * dispatch. Both transcripts bind the **exact command bytes received**, not a
  * re-serialized JSON, so tampering with the command after signing fails
- * authentication rather than slipping through.
+ * authentication rather than slipping through; the result signature additionally
+ * binds the exact result bytes, so a signature is never a reusable coupon for an
+ * arbitrary outcome.
+ *
+ * The hello announces this runtime's raw Ed25519 `verifyKey`. That announcement
+ * carries no authority by itself — anyone can announce a key. It becomes
+ * trustworthy only when the native pipe attestor relays it out of a hello read
+ * from a pipe whose SERVER PROCESS it proved belongs to the trusted operator
+ * SID; the CLI then requires the command session's hello to announce the very
+ * same key bytes. The result is signed with the runtime's EPHEMERAL private key,
+ * which exists only in this process's memory and is never serialized, so a party
+ * holding nothing but a copied descriptor cannot answer a client even after the
+ * genuine runtime has exited and its pipe name has been freed.
  *
  * ## Limitations preserved (§11)
  *
@@ -31,8 +45,8 @@
  * not inspect or assert the pipe's security descriptor, does not claim to prove
  * remote-pipe rejection or other-user rejection, and does not rely on
  * `FILE_FLAG_FIRST_PIPE_INSTANCE`. A same-name collision fails closed at listen
- * time (the caller surfaces the listen error). Authorization rests on token
- * possession, never on pipe-ACL assumptions.
+ * time (the caller surfaces the listen error). Command authorization rests on
+ * token possession, never on pipe-ACL assumptions.
  *
  * ## Reentrancy (§15)
  *
@@ -43,14 +57,17 @@
  */
 
 import net from 'node:net';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, type KeyObject } from 'node:crypto';
 
 import {
   computeClientMac,
-  computeServerMac,
   macEqual,
+  signServerResult,
   MAC_BYTES,
   NONCE_BYTES,
+  SIG_BYTES,
+  VERIFY_KEY_BYTES,
+  type ChannelIdentity,
 } from './control-auth.js';
 import { decodeBase64UrlExact, encodeBase64Url } from './control-codec.js';
 import {
@@ -65,7 +82,7 @@ import type { ControlDispatcher } from './control-dispatch.js';
 export const LENGTH_PREFIX_BYTES = 4;
 export const MAX_BODY_BYTES = 4096;
 export const MAX_FRAME_BYTES = LENGTH_PREFIX_BYTES + MAX_BODY_BYTES;
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 export const DEFAULT_CONNECTION_TIMEOUT_MS = 5000;
 
 const randomBytesFn = randomBytes;
@@ -134,10 +151,14 @@ export function frameMessage(body: Buffer): Buffer {
  * Message bodies (pure)
  * ------------------------------------------------------------------ */
 
-/** Build the server hello body `{ v, nonceS }`. */
-export function buildHelloBody(nonceS: Buffer): Buffer {
+/** Build the server hello body `{ v, nonceS, verifyKey }`. */
+export function buildHelloBody(nonceS: Buffer, verifyKey: Buffer): Buffer {
   return Buffer.from(
-    JSON.stringify({ v: PROTOCOL_VERSION, nonceS: encodeBase64Url(nonceS) }),
+    JSON.stringify({
+      v: PROTOCOL_VERSION,
+      nonceS: encodeBase64Url(nonceS),
+      verifyKey: encodeBase64Url(verifyKey),
+    }),
     'utf8',
   );
 }
@@ -155,38 +176,58 @@ export function buildRequestBody(nonceC: Buffer, command: string, mac: Buffer): 
   );
 }
 
-/** Build the server result body `{ v, result, mac }`. */
-export function buildResultBody(status: ControlResultStatus, macS: Buffer): Buffer {
+/** Build the server result body `{ v, result, sig }`. */
+export function buildResultBody(status: ControlResultStatus, sigS: Buffer): Buffer {
   return Buffer.from(
-    JSON.stringify({ v: PROTOCOL_VERSION, result: status, mac: encodeBase64Url(macS) }),
+    JSON.stringify({ v: PROTOCOL_VERSION, result: status, sig: encodeBase64Url(sigS) }),
     'utf8',
   );
 }
 
-/** Parse the server hello `{ v, nonceS }` and return the raw nonce, or `null`. */
-export function parseHelloBody(body: Buffer): Buffer | null {
-  const record = decodeJsonObject(body, ['v', 'nonceS']);
+/** The announced-but-not-yet-trusted contents of a server hello. */
+export interface ParsedHello {
+  readonly nonceS: Buffer;
+  /** Raw 32-byte Ed25519 public key as ANNOUNCED. Trust comes from attestation. */
+  readonly verifyKey: Buffer;
+}
+
+/**
+ * Parse the server hello `{ v, nonceS, verifyKey }`, or `null`. Exact-key and
+ * exact-width: a v1 hello (no `verifyKey`) fails the key check here, so there is
+ * deliberately no downgrade branch to a keyless handshake.
+ */
+export function parseHelloBody(body: Buffer): ParsedHello | null {
+  const record = decodeJsonObject(body, ['v', 'nonceS', 'verifyKey']);
   if (record === null || record['v'] !== PROTOCOL_VERSION) {
     return null;
   }
-  return decodeBase64UrlExact(record['nonceS'], NONCE_BYTES);
+  const nonceS = decodeBase64UrlExact(record['nonceS'], NONCE_BYTES);
+  const verifyKey = decodeBase64UrlExact(record['verifyKey'], VERIFY_KEY_BYTES);
+  if (nonceS === null || verifyKey === null) {
+    return null;
+  }
+  return { nonceS, verifyKey };
 }
 
-/** Parse the server result `{ v, result, mac }`, or `null`. */
+/**
+ * Parse the server result `{ v, result, sig }`, or `null`. A protocol-version-1
+ * body carries `mac`, not `sig`, so it fails the exact-key check here: there is
+ * deliberately no downgrade branch to token-authenticated results.
+ */
 export function parseResultBody(body: Buffer): {
   readonly result: string;
-  readonly mac: Buffer;
+  readonly sig: Buffer;
 } | null {
-  const record = decodeJsonObject(body, ['v', 'result', 'mac']);
+  const record = decodeJsonObject(body, ['v', 'result', 'sig']);
   if (record === null || record['v'] !== PROTOCOL_VERSION) {
     return null;
   }
   const result = record['result'];
-  const mac = decodeBase64UrlExact(record['mac'], MAC_BYTES);
-  if (typeof result !== 'string' || mac === null) {
+  const sig = decodeBase64UrlExact(record['sig'], SIG_BYTES);
+  if (typeof result !== 'string' || sig === null) {
     return null;
   }
-  return { result, mac };
+  return { result, sig };
 }
 
 /* ------------------------------------------------------------------ *
@@ -279,7 +320,12 @@ export interface ControlSocket {
 }
 
 export interface ServeConnectionContext {
+  /** Bound into both transcripts so a signature cannot be relayed as another runtime's. */
+  readonly identity: ChannelIdentity;
+  /** Client-to-server command authorization only. */
   readonly token: Buffer;
+  /** Ephemeral Ed25519 signing key; process memory only, never serialized. */
+  readonly privateKey: KeyObject;
   readonly dispatcher: ControlDispatcher;
   readonly nonceGen: () => Buffer;
   readonly timeoutMs: number;
@@ -315,9 +361,16 @@ export function serveConnection(socket: ControlSocket, ctx: ServeConnectionConte
 
   const respond = (status: ControlResultStatus, nonceC: Buffer, commandBytes: Buffer): void => {
     const resultBytes = Buffer.from(status, 'utf8');
-    const macS = computeServerMac(ctx.token, nonceS, nonceC, commandBytes, resultBytes);
+    const sigS = signServerResult(
+      ctx.privateKey,
+      ctx.identity,
+      nonceS,
+      nonceC,
+      commandBytes,
+      resultBytes,
+    );
     try {
-      socket.end(frameMessage(buildResultBody(status, macS)));
+      socket.end(frameMessage(buildResultBody(status, sigS)));
     } catch {
       // Peer vanished after we dispatched; the result is lost but any state
       // change already stands. Retrying OPEN_HUMAN_GATE is safe (§15).
@@ -346,7 +399,13 @@ export function serveConnection(socket: ControlSocket, ctx: ServeConnectionConte
       return;
     }
 
-    const expectedMac = computeClientMac(ctx.token, nonceS, parsed.nonceC, parsed.commandBytes);
+    const expectedMac = computeClientMac(
+      ctx.token,
+      ctx.identity,
+      nonceS,
+      parsed.nonceC,
+      parsed.commandBytes,
+    );
     if (!macEqual(expectedMac, parsed.mac)) {
       respond(CONTROL_RESULT.AUTH_FAILED, parsed.nonceC, parsed.commandBytes);
       return;
@@ -362,7 +421,7 @@ export function serveConnection(socket: ControlSocket, ctx: ServeConnectionConte
     respond(status, parsed.nonceC, parsed.commandBytes);
   });
 
-  socket.write(frameMessage(buildHelloBody(nonceS)));
+  socket.write(frameMessage(buildHelloBody(nonceS, ctx.identity.verifyKey)));
 }
 
 /* ------------------------------------------------------------------ *
@@ -370,7 +429,9 @@ export function serveConnection(socket: ControlSocket, ctx: ServeConnectionConte
  * ------------------------------------------------------------------ */
 
 export interface CreateControlChannelServerOptions {
+  readonly identity: ChannelIdentity;
   readonly token: Buffer;
+  readonly privateKey: KeyObject;
   readonly dispatcher: ControlDispatcher;
   readonly nonceGen?: () => Buffer;
   readonly timeoutMs?: number;
@@ -381,7 +442,9 @@ export function createControlChannelServer(
   options: CreateControlChannelServerOptions,
 ): net.Server {
   const ctx: ServeConnectionContext = {
+    identity: options.identity,
     token: options.token,
+    privateKey: options.privateKey,
     dispatcher: options.dispatcher,
     nonceGen: options.nonceGen ?? ((): Buffer => randomBytesFn(NONCE_BYTES)),
     timeoutMs: options.timeoutMs ?? DEFAULT_CONNECTION_TIMEOUT_MS,

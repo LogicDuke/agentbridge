@@ -2,7 +2,12 @@ import { randomBytes } from 'node:crypto';
 
 import { describe, expect, it } from 'vitest';
 
-import { NONCE_BYTES, MAC_BYTES } from '../../src/control/control-auth.js';
+import {
+  NONCE_BYTES,
+  MAC_BYTES,
+  SIG_BYTES,
+  VERIFY_KEY_BYTES,
+} from '../../src/control/control-auth.js';
 import { encodeBase64Url } from '../../src/control/control-codec.js';
 import {
   buildHelloBody,
@@ -186,17 +191,51 @@ describe('D062 client-request parser — hostile input, fail closed', () => {
 });
 
 describe('D062 wire bodies round-trip', () => {
-  it('hello body round-trips a nonce', () => {
+  it('hello body round-trips a nonce and the announced verify key', () => {
     const nonceS = randomBytes(NONCE_BYTES);
-    const parsed = parseHelloBody(buildHelloBody(nonceS));
-    expect(parsed?.equals(nonceS)).toBe(true);
+    const verifyKey = randomBytes(VERIFY_KEY_BYTES);
+    const parsed = parseHelloBody(buildHelloBody(nonceS, verifyKey));
+    expect(parsed?.nonceS.equals(nonceS)).toBe(true);
+    expect(parsed?.verifyKey.equals(verifyKey)).toBe(true);
   });
 
-  it('result body round-trips status + mac', () => {
-    const mac = randomBytes(MAC_BYTES);
-    const parsed = parseResultBody(buildResultBody(CONTROL_RESULT.APPLIED, mac));
+  it('a hello without a verifyKey is rejected — there is no keyless downgrade', () => {
+    const body = Buffer.from(
+      JSON.stringify({ v: 2, nonceS: randomBytes(NONCE_BYTES).toString('base64url') }),
+      'utf8',
+    );
+    expect(parseHelloBody(body)).toBeNull();
+  });
+
+  it('a hello with a wrong-width verifyKey is rejected', () => {
+    const body = Buffer.from(
+      JSON.stringify({
+        v: 2,
+        nonceS: randomBytes(NONCE_BYTES).toString('base64url'),
+        verifyKey: randomBytes(VERIFY_KEY_BYTES - 1).toString('base64url'),
+      }),
+      'utf8',
+    );
+    expect(parseHelloBody(body)).toBeNull();
+  });
+
+  it('result body round-trips status + signature', () => {
+    const sig = randomBytes(SIG_BYTES);
+    const parsed = parseResultBody(buildResultBody(CONTROL_RESULT.APPLIED, sig));
     expect(parsed?.result).toBe('APPLIED');
-    expect(parsed?.mac.equals(mac)).toBe(true);
+    expect(parsed?.sig.equals(sig)).toBe(true);
+  });
+
+  it('a v1 result body (mac, not sig) is rejected — no downgrade to token-MAC results', () => {
+    const body = Buffer.from(
+      JSON.stringify({
+        v: 2,
+        result: 'APPLIED',
+        mac: randomBytes(MAC_BYTES).toString('base64url'),
+      }),
+      'utf8',
+    );
+    expect(parseResultBody(body)).toBeNull();
   });
 
   it('a built request body parses back', () => {

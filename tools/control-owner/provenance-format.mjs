@@ -10,10 +10,11 @@
  * on-disk provenance bytes equal that encoding for the artifact's own binary hash
  * and the CURRENT reviewed source. No second template, no parser.
  *
- * TWO native artifacts exist, with SEPARATE identities and SEPARATE provenance:
+ * THREE native artifacts exist, with SEPARATE identities and SEPARATE provenance:
  *
  *   agentbridge-win-owner.exe             READ-ONLY   -> OWNER_HELPER_PROVENANCE
  *   agentbridge-win-descriptor-create.exe CREATE-ONLY -> DESCRIPTOR_CREATOR_PROVENANCE
+ *   agentbridge-win-pipe-attest.exe       READ-ONLY   -> PIPE_ATTESTOR_PROVENANCE
  *
  * Each generated module exports a DISTINCT binding name and names a DISTINCT
  * filename, so a swapped or cross-wired provenance module can never satisfy the
@@ -58,6 +59,15 @@ export const DESCRIPTOR_CREATOR_SOURCE_BASENAME = 'agentbridge-win-descriptor-cr
 
 /** The generated creator provenance module's basename under dist/control/native/. */
 export const CREATOR_PROVENANCE_BASENAME = 'descriptor-creator-provenance.js';
+
+/** The live pipe-server identity relayer's filename (DDR-D062-B). */
+export const PIPE_ATTESTOR_BASENAME = 'agentbridge-win-pipe-attest.exe';
+
+/** The pipe attestor's reviewed C source basename (this directory). */
+export const PIPE_ATTESTOR_SOURCE_BASENAME = 'agentbridge-win-pipe-attest.c';
+
+/** The generated attestor provenance module's basename under dist/control/native/. */
+export const ATTESTOR_PROVENANCE_BASENAME = 'pipe-attestor-provenance.js';
 
 /** The canonical (runtime-consumed) SHA-256 digest shape: lowercase 64-hex. */
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
@@ -131,6 +141,25 @@ export function encodeCreatorProvenance(sha256Hex, sourceId) {
     'DESCRIPTOR_CREATOR_PROVENANCE',
     DESCRIPTOR_CREATOR_BASENAME,
     'the descriptor creator',
+    sha256Hex,
+    sourceId,
+  );
+}
+
+/**
+ * Encode the canonical provenance ES-module text for the READ-ONLY live pipe-server
+ * identity relayer: again a separate binding name, a separate filename, and its own
+ * reviewed-source digest, so no artifact's trust root can satisfy another's.
+ *
+ * @param {string} sha256Hex
+ * @param {string} sourceId
+ * @returns {string}
+ */
+export function encodeAttestorProvenance(sha256Hex, sourceId) {
+  return encodeModule(
+    'PIPE_ATTESTOR_PROVENANCE',
+    PIPE_ATTESTOR_BASENAME,
+    'the pipe attestor',
     sha256Hex,
     sourceId,
   );

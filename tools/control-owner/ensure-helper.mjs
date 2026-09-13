@@ -11,11 +11,12 @@
  * stays up and read-only.
  *
  * The explicit control launch must not silently omit the mandatory native artifacts
- * and their generated provenance. There are TWO, each with its own provenance and
+ * and their generated provenance. There are THREE, each with its own provenance and
  * its own runtime hash gate:
  *
  *   agentbridge-win-owner.exe             READ-ONLY   owner/DACL snapshot probe
  *   agentbridge-win-descriptor-create.exe CREATE-ONLY identity-named descriptor creator
+ *   agentbridge-win-pipe-attest.exe       READ-ONLY   live pipe-server identity relayer
  *
  * Without a VALID pair the corresponding runtime gate fails closed
  * (HELPER_PROVENANCE_MISSING / HELPER_MISSING / HELPER_HASH_MISMATCH, and the
@@ -59,10 +60,13 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
+  ATTESTOR_PROVENANCE_BASENAME,
   CREATOR_PROVENANCE_BASENAME,
   DESCRIPTOR_CREATOR_BASENAME,
   OWNER_HELPER_BASENAME,
+  PIPE_ATTESTOR_BASENAME,
   PROVENANCE_BASENAME,
+  validateAttestorPair,
   validateCreatorPair,
   validateHelperPair,
 } from './helper-pair.mjs';
@@ -91,6 +95,12 @@ const ARTIFACTS = [
     exePath: join(outDir, DESCRIPTOR_CREATOR_BASENAME),
     provenancePath: join(outDir, CREATOR_PROVENANCE_BASENAME),
     validate: validateCreatorPair,
+  },
+  {
+    label: 'pipe attestor',
+    exePath: join(outDir, PIPE_ATTESTOR_BASENAME),
+    provenancePath: join(outDir, ATTESTOR_PROVENANCE_BASENAME),
+    validate: validateAttestorPair,
   },
 ];
 

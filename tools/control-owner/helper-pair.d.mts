@@ -82,3 +82,31 @@ export declare function encodeProvenance(sha256Hex: string, sourceId: string): s
  * name. Pure; throws a TypeError on a malformed digest.
  */
 export declare function encodeCreatorProvenance(sha256Hex: string, sourceId: string): string;
+
+/**
+ * The same decision for the PIPE ATTESTOR (DDR-D062-B), against its OWN canonical
+ * encoder and its OWN reviewed source. A cross-wired provenance module is never valid.
+ */
+export declare function validateAttestorPair(input: HelperPairInput): HelperPairValidity;
+
+/** The pipe attestor's reviewed C source basename (re-exported). */
+export declare const PIPE_ATTESTOR_SOURCE_BASENAME: string;
+
+/** Absolute path to the reviewed pipe-attestor C source (module-relative). */
+export declare const PIPE_ATTESTOR_SOURCE_PATH: string;
+
+/** The current pipe-attestor build-source identity, or `null` if unreadable. */
+export declare function pipeAttestorSourceId(): string | null;
+
+/** The pipe attestor's filename (re-exported from provenance-format.mjs). */
+export declare const PIPE_ATTESTOR_BASENAME: string;
+
+/** The generated attestor provenance module's basename (re-exported). */
+export declare const ATTESTOR_PROVENANCE_BASENAME: string;
+
+/**
+ * The canonical pipe-attestor provenance encoder (re-exported): attestor SHA-256 +
+ * its reviewed-source SHA-256 -> exact provenance module text with its own binding
+ * name. Pure; throws a TypeError on a malformed digest.
+ */
+export declare function encodeAttestorProvenance(sha256Hex: string, sourceId: string): string;

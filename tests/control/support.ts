@@ -13,30 +13,40 @@ import { join } from 'node:path';
 import { AutoflowOrchestrator } from '../../src/autoflow/orchestrator.js';
 import { AutoflowRuntime } from '../../src/autoflow/runtime.js';
 import type { WorkflowBinding } from '../../src/domain/index.js';
-import { NONCE_BYTES, computeServerMac } from '../../src/control/control-auth.js';
+import {
+  NONCE_BYTES,
+  generateRuntimeKeyPair,
+  signServerResult,
+  type ChannelIdentity,
+} from '../../src/control/control-auth.js';
 import {
   buildHelloBody,
   buildResultBody,
   frameMessage,
+  LENGTH_PREFIX_BYTES,
   MAX_BODY_BYTES,
   parseClientRequest,
   parseHelloBody,
   parseResultBody,
 } from '../../src/control/control-channel.js';
 import { CONTROL_RESULT, type ControlResultStatus } from '../../src/control/control-command.js';
-import { runControlCli, type ControlCliOutcome } from '../../src/control/cli.js';
+import { runControlCli, type AttestFn, type ControlCliOutcome } from '../../src/control/cli.js';
 import {
   DESCRIPTOR_CREATION_REJECTION,
+  attestPipeServer,
   descriptorFilenameFor,
   parseDescriptor,
   pipePathFromName,
+  runtimeIdFromPipeName,
   serializeDescriptor,
   type ControlAnchorVerification,
   type DescriptorAclVerification,
   type DescriptorCreation,
   type DescriptorFileDeps,
   type ParsedDescriptor,
+  type PipeAttestation,
   type PipeProbe,
+  type ProcessResult,
   type RuntimeDescriptor,
 } from '../../src/control/control-store.js';
 import {
@@ -56,8 +66,17 @@ export const BINDING: WorkflowBinding = {
 
 export const FAKE_ANCHOR = 'C:\\FakeAnchor';
 
+/** The trusted operator SID the injected anchor gate reports. */
+export const FAKE_OPERATOR_SID = 'S-1-5-21-1111111111-2222222222-3333333333-1001';
+/** A DIFFERENT principal's SID — the "another account on this machine" case. */
+export const FOREIGN_OPERATOR_SID = 'S-1-5-21-1111111111-2222222222-3333333333-1002';
+
 export function passingVerify(): Promise<ControlAnchorVerification> {
-  return Promise.resolve({ ok: true, anchorPath: FAKE_ANCHOR });
+  return Promise.resolve({
+    ok: true,
+    anchorPath: FAKE_ANCHOR,
+    operatorSid: FAKE_OPERATOR_SID,
+  });
 }
 
 export function passingDescriptorVerify(): Promise<DescriptorAclVerification> {
@@ -158,6 +177,100 @@ export function memAnchor(anchorPath: string = FAKE_ANCHOR): MemAnchor {
   };
 }
 
+/* ------------------------------------------------------------------ *
+ * Pipe attestation doubles
+ * ------------------------------------------------------------------ */
+
+/** Build the exact AGENTBRIDGE-ATTEST-V1 bytes the native attestor emits. */
+export function attestEvidenceText(serverSid: string, helloBody: Buffer): string {
+  return `AGENTBRIDGE-ATTEST-V1\nSERVERSID ${serverSid}\nHELLO ${helloBody.toString('hex')}\n`;
+}
+
+/**
+ * Read exactly one bounded frame body from a live pipe, the way the native
+ * attestor does: connect, read the length prefix and that many bytes, write
+ * nothing, close. Resolves `null` on any error, timeout, or framing violation.
+ */
+export function readOneFrameBody(pipePath: string, timeoutMs = 2000): Promise<Buffer | null> {
+  return new Promise<Buffer | null>((resolvePromise) => {
+    const socket = net.connect(pipePath);
+    let carry: Buffer = Buffer.alloc(0);
+    const state = { done: false };
+    const finish = (value: Buffer | null): void => {
+      if (state.done) {
+        return;
+      }
+      state.done = true;
+      socket.destroy();
+      resolvePromise(value);
+    };
+    socket.setTimeout(timeoutMs);
+    socket.on('timeout', () => {
+      finish(null);
+    });
+    socket.on('error', () => {
+      finish(null);
+    });
+    socket.on('close', () => {
+      finish(null);
+    });
+    socket.on('data', (chunk: Buffer) => {
+      carry = Buffer.concat([carry, chunk]);
+      if (carry.length < LENGTH_PREFIX_BYTES) {
+        return;
+      }
+      const length = carry.readUInt32BE(0);
+      if (length === 0 || length > MAX_BODY_BYTES) {
+        finish(null);
+        return;
+      }
+      if (carry.length < LENGTH_PREFIX_BYTES + length) {
+        return;
+      }
+      finish(Buffer.from(carry.subarray(LENGTH_PREFIX_BYTES, LENGTH_PREFIX_BYTES + length)));
+    });
+  });
+}
+
+export interface AttestDoubleOptions {
+  /** The SID the simulated native artifact reports for the serving process. */
+  readonly serverSid?: string;
+  /** Rewrite the evidence text (malformed/truncated/extra-line adversarial cases). */
+  readonly mangle?: (evidence: string, helloBody: Buffer) => string;
+  /** Force the simulated artifact to exit nonzero. */
+  readonly fail?: boolean;
+}
+
+/**
+ * An attestor double that keeps EVERY production decision real: the hello is
+ * read off the genuine live pipe, the evidence text is the exact native grammar,
+ * and it is handed to the REAL {@link attestPipeServer}, so the real parser, the
+ * real SID comparison, and the real fail-closed reasons all run. Only the native
+ * subprocess itself is simulated — in-process tests cannot serve a pipe from a
+ * second account, so the reported SID is injectable.
+ */
+export function attestDouble(options: AttestDoubleOptions = {}): AttestFn {
+  return async (pipePath: string, operatorSid: string): Promise<PipeAttestation> => {
+    const helloBody = await readOneFrameBody(pipePath);
+    const runProcess = (): Promise<ProcessResult> => {
+      if (options.fail === true || helloBody === null) {
+        return Promise.resolve({ ok: false });
+      }
+      const evidence = attestEvidenceText(options.serverSid ?? FAKE_OPERATOR_SID, helloBody);
+      return Promise.resolve({
+        ok: true,
+        stdout: options.mangle === undefined ? evidence : options.mangle(evidence, helloBody),
+      });
+    };
+    return attestPipeServer(pipePath, operatorSid, runProcess, {
+      loadProvenance: () => Promise.resolve({ filename: 'x.exe', sha256: 'a'.repeat(64) }),
+      readAttestorBytes: (): Buffer => Buffer.from('native'),
+      hashBytes: (): string => 'a'.repeat(64),
+      resolveAttestorPath: (filename: string): string => filename,
+    });
+  };
+}
+
 /** A pipe probe answering from a fixed table (pipe path -> liveness); default UNKNOWN. */
 export function tableProbe(
   table: Readonly<Record<string, 'ABSENT' | 'PRESENT' | 'UNKNOWN'>>,
@@ -221,6 +334,8 @@ export interface CallCliOptions {
   readonly descriptorDeps?: DescriptorFileDeps;
   readonly probePipe?: PipeProbe;
   readonly timeoutMs?: number;
+  /** Defaults to a genuine-operator attestation of the real live pipe. */
+  readonly attest?: AttestFn;
 }
 
 /** Drive the official CLI against the in-memory anchor (real pipe transport, real probe). */
@@ -229,6 +344,7 @@ export async function callCli(anchor: MemAnchor, options: CallCliOptions = {}): 
   const err: string[] = [];
   const outcome = await runControlCli({
     verify: passingVerify,
+    attest: options.attest ?? attestDouble(),
     descriptorDeps: options.descriptorDeps ?? anchor.deps,
     out: (message: string): void => {
       out.push(message);
@@ -255,6 +371,17 @@ export function descriptorOf(anchor: MemAnchor, handle: ControlChannelHandle): P
   return parsed;
 }
 
+/**
+ * The channel identity a raw client must bind: the handle's runtime id and pipe
+ * name plus the key the server ANNOUNCED in this connection's hello. A genuine
+ * CLI would use the ATTESTED key here; a raw adversarial client reads it off the
+ * wire, which is exactly the weaker position the attestation gate exists to
+ * close.
+ */
+export function identityOf(handle: ControlChannelHandle, verifyKey: Buffer): ChannelIdentity {
+  return { runtimeId: handle.runtimeId, pipeName: handle.pipeName, verifyKey };
+}
+
 /** The token + pipe path for a handle's descriptor. */
 export function descriptorFacts(
   anchor: MemAnchor,
@@ -268,7 +395,7 @@ export function descriptorFacts(
 export function withTamperedToken(serialized: string): string {
   const parsed = JSON.parse(serialized) as RuntimeDescriptor;
   return serializeDescriptor({
-    version: 2,
+    version: 4,
     pipeName: parsed.pipeName,
     token: randomBytes(32).toString('base64url'),
   });
@@ -279,8 +406,8 @@ export type RawOutcome =
   | { readonly kind: 'closed' };
 
 export interface RawClientOptions {
-  /** Given the server nonce, return the frame to send, or `null` to just wait. */
-  onHello: (nonceS: Buffer) => Buffer | null;
+  /** Given the server nonce and announced key, return the frame to send, or `null` to wait. */
+  onHello: (nonceS: Buffer, verifyKey: Buffer) => Buffer | null;
   readonly waitMs?: number;
 }
 
@@ -336,13 +463,13 @@ export function rawClient(pipePath: string, options: RawClientOptions): Promise<
         const body = carry.subarray(4, total);
         carry = carry.subarray(total);
         if (phase === 'hello') {
-          const nonceS = parseHelloBody(body);
-          if (nonceS === null) {
+          const hello = parseHelloBody(body);
+          if (hello === null) {
             finish({ kind: 'closed' });
             return;
           }
           phase = 'result';
-          const toSend = options.onHello(nonceS);
+          const toSend = options.onHello(hello.nonceS, hello.verifyKey);
           if (toSend === null) {
             // Hold the connection open (e.g., to trigger a server timeout).
             holdTimer = setTimeout(() => {
@@ -365,11 +492,33 @@ export function rawClient(pipePath: string, options: RawClientOptions): Promise<
   });
 }
 
-/** A rogue server that completes the handshake but signs macS with a wrong token. */
+export interface RogueServerOptions {
+  readonly status?: ControlResultStatus;
+  /**
+   * The key the rogue ANNOUNCES in its hello. Defaults to its own freshly minted
+   * key. Set it to a genuine runtime's key to model an attacker who echoes a
+   * public key it observed but does not hold the private half of.
+   */
+  readonly announceKey?: Buffer;
+}
+
+/**
+ * A rogue server that speaks the whole protocol but holds its OWN ephemeral
+ * keypair, so it cannot produce a signature under a genuine runtime's key.
+ */
 export function startRogueServer(
   pipePath: string,
-  status: ControlResultStatus = CONTROL_RESULT.APPLIED,
+  options: RogueServerOptions = {},
 ): Promise<net.Server> {
+  const status = options.status ?? CONTROL_RESULT.APPLIED;
+  const rogueKeys = generateRuntimeKeyPair();
+  const announceKey = options.announceKey ?? rogueKeys.verifyKey;
+  const runtimeId = runtimeIdFromPipeName(pipePath.replace('\\\\.\\pipe\\', '')) ?? 'f'.repeat(32);
+  const identity: ChannelIdentity = {
+    runtimeId,
+    pipeName: `agentbridge-control-${runtimeId}`,
+    verifyKey: announceKey,
+  };
   const server = net.createServer((socket: net.Socket) => {
     const nonceS = randomBytes(NONCE_BYTES);
     let carry: Buffer = Buffer.alloc(0);
@@ -391,12 +540,18 @@ export function startRogueServer(
         socket.destroy();
         return;
       }
-      const wrongToken = randomBytes(32);
       const resultBytes = Buffer.from(status, 'utf8');
-      const macS = computeServerMac(wrongToken, nonceS, parsed.nonceC, parsed.commandBytes, resultBytes);
-      socket.end(frameMessage(buildResultBody(status, macS)));
+      const sigS = signServerResult(
+        rogueKeys.privateKey,
+        identity,
+        nonceS,
+        parsed.nonceC,
+        parsed.commandBytes,
+        resultBytes,
+      );
+      socket.end(frameMessage(buildResultBody(status, sigS)));
     });
-    socket.write(frameMessage(buildHelloBody(nonceS)));
+    socket.write(frameMessage(buildHelloBody(nonceS, announceKey)));
   });
   return new Promise<net.Server>((resolvePromise, rejectPromise) => {
     server.once('error', rejectPromise);
