@@ -625,6 +625,26 @@ async function loadDistAcceptorProvenance(): Promise<OwnerHelperProvenance | nul
   return typeof filename === 'string' && typeof sha256 === 'string' ? { filename, sha256 } : null;
 }
 
+/**
+ * SDDL renders a security descriptor for DISPLAY: Windows is free to abbreviate
+ * a well-known SID to an alias (`O:LAD:P(A;;0x12019f;;;LA)`). Alias text is
+ * therefore never an identity here — every principal compared below is a
+ * canonical numeric SID read back off a .NET `SecurityIdentifier`.
+ */
+function isCanonicalSid(value: string): boolean {
+  return /^S-1-\d+(?:-\d+)+$/i.test(value);
+}
+
+describe('DDR-D062-C — SDDL alias text is never trusted as a principal identity', () => {
+  it('only canonical numeric SIDs are accepted; every SDDL alias is rejected', () => {
+    for (const alias of ['LA', 'BA', 'SY', 'WD', 'AU', 'BU', 'AN', 'IU', 'O:LAD:P(A;;0x12019f;;;LA)', '']) {
+      expect(isCanonicalSid(alias)).toBe(false);
+    }
+    expect(isCanonicalSid('S-1-5-21-1111111111-2222222222-3333333333-500')).toBe(true);
+    expect(isCanonicalSid('S-1-5-18')).toBe(true);
+  });
+});
+
 describe.skipIf(!liveReady)('DDR-D062-C LIVE — sacrificial pipe: kernel security descriptor, server PID, same-SID round trip', () => {
   const opened: NativePipeServer[] = [];
   const sockets: net.Socket[] = [];
@@ -711,9 +731,13 @@ describe.skipIf(!liveReady)('DDR-D062-C LIVE — sacrificial pipe: kernel securi
     expect(ace === undefined ? 0 : ace.mask & (0x40000 | 0x80000 | 0x10000)).toBe(0);
   }, 20000);
 
-  it('GetNamedPipeServerProcessId reports THIS Node process, and .NET reads the same protected one-ACE SDDL', async () => {
+  it('GetNamedPipeServerProcessId reports THIS Node process, and .NET reads the same protected one-ACE descriptor', async () => {
     const { pipePath } = await sacrificialServer();
     const name = pipePath.slice('\\\\.\\pipe\\'.length);
+    // The probe is a CHILD of this Node process, so its TokenUser SID is this
+    // process's TokenUser SID. Every identity it reports is read off a .NET
+    // SecurityIdentifier and emitted as a canonical numeric SID; the SDDL
+    // display form is carried alongside as diagnostics only.
     const script = [
       "$ErrorActionPreference = 'Stop'",
       'Add-Type -Namespace AB -Name P -MemberDefinition \'[DllImport("kernel32.dll", SetLastError=true)] public static extern bool GetNamedPipeServerProcessId(IntPtr h, out uint pid);\'',
@@ -721,8 +745,14 @@ describe.skipIf(!liveReady)('DDR-D062-C LIVE — sacrificial pipe: kernel securi
       '$c.Connect(5000)',
       '[uint32]$serverPid = 0',
       '[void][AB.P]::GetNamedPipeServerProcessId($c.SafePipeHandle.DangerousGetHandle(), [ref]$serverPid)',
-      "$sddl = $c.GetAccessControl().GetSecurityDescriptorSddlForm('Owner,Access')",
-      'Write-Output "$serverPid $sddl"',
+      '$sidType = [System.Security.Principal.SecurityIdentifier]',
+      '$sd = $c.GetAccessControl()',
+      'Write-Output "PID|$serverPid"',
+      'Write-Output ("TOKENUSER|" + [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value)',
+      'Write-Output ("OWNER|" + $sd.GetOwner($sidType).Value)',
+      'Write-Output ("PROTECTED|" + $sd.AreAccessRulesProtected)',
+      'Write-Output ("SDDL|" + $sd.GetSecurityDescriptorSddlForm(\'Owner,Access\'))',
+      '$sd.GetAccessRules($true, $true, $sidType) | ForEach-Object { Write-Output ("ACE|" + $_.AccessControlType + "|" + $_.IdentityReference.Value + "|" + [int]$_.PipeAccessRights + "|" + [int]$_.InheritanceFlags + "|" + [int]$_.PropagationFlags) }',
       '$c.Dispose()',
     ].join('\n');
     const powershell = join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
@@ -732,19 +762,47 @@ describe.skipIf(!liveReady)('DDR-D062-C LIVE — sacrificial pipe: kernel securi
       { encoding: 'utf8', timeout: 15000, windowsHide: true },
     );
     expect(result.status, result.stderr).toBe(0);
-    const line = result.stdout.trim().split(/\r?\n/).pop() ?? '';
-    const match = /^(\d+) (O:(S-1-5-[\d-]+)D:P\(A;;([^;]+);;;([^)]+)\))$/.exec(line);
-    expect(match, line).not.toBeNull();
-    if (match === null) {
-      return;
+    const lines = result.stdout
+      .split(/\r?\n/)
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0);
+    const diag = lines.join(' / ');
+    const field = (key: string): string | null => {
+      const hit = lines.find((entry) => entry.startsWith(`${key}|`));
+      return hit === undefined ? null : hit.slice(key.length + 1);
+    };
+    const aces = lines.filter((entry) => entry.startsWith('ACE|')).map((entry) => entry.split('|'));
+
+    // IDENTITY AUTHORITY: the running process's own TokenUser SID, canonical.
+    const tokenUser = field('TOKENUSER');
+    expect(tokenUser, diag).not.toBeNull();
+    expect(isCanonicalSid(tokenUser ?? ''), diag).toBe(true);
+
+    expect(Number(field('PID')), diag).toBe(process.pid); // Node is the server process
+    expect(field('OWNER'), diag).toBe(tokenUser); // owner IS that exact runtime SID
+    expect(field('PROTECTED'), diag).toBe('True'); // DACL PRESENT + PROTECTED
+    expect(aces, diag).toHaveLength(1); // exactly ONE ACE
+    const [, aceType, aceSid, aceMask, aceInherit, acePropagate] = aces[0] ?? [];
+    expect(aceType, diag).toBe('Allow');
+    expect(isCanonicalSid(aceSid ?? ''), diag).toBe(true); // an alias string can never satisfy this
+    expect(aceSid, diag).toBe(tokenUser); // the sole ACE names that exact runtime SID
+    expect(aceSid, diag).toBe(field('OWNER')); // owner and ACE are the same identity
+    expect(Number(aceMask), diag).toBe(0x12019f); // exact mask, pinned
+    expect(Number(aceMask) & (0x40000 | 0x80000 | 0x10000), diag).toBe(0); // no WRITE_DAC/WRITE_OWNER/DELETE
+    expect(`${aceInherit ?? ''}/${acePropagate ?? ''}`, diag).toBe('0/0');
+    for (const forbidden of ['S-1-1-0', 'S-1-5-7', 'S-1-5-11', 'S-1-5-18', 'S-1-5-32-544', 'S-1-5-32-545']) {
+      expect(
+        aces.some((entry) => (entry[2] ?? '').toUpperCase() === forbidden),
+        diag,
+      ).toBe(false);
     }
-    const [, pid, , ownerSid, mask, aceSid] = match;
-    expect(Number(pid)).toBe(process.pid); // Node is the server process
-    expect(aceSid).toBe(ownerSid); // the one ACE names the owner
-    expect(['FRFW', 'FWFR', '0x12019f'].includes((mask ?? '').toLowerCase() === '0x12019f' ? '0x12019f' : mask ?? '')).toBe(true);
-    // Exactly one ACE and a protected DACL (D:P), nothing else in the SD.
-    expect((line.match(/\(A;/g) ?? []).length).toBe(1);
-    expect(line).not.toMatch(/\(D;|;;;(WD|AN|BU|AU|BA|SY)\)/);
+    // Supplemental diagnostics only — NEVER the source of identity: whatever
+    // representation Windows chose, the SD still shows one ALLOW ACE under a
+    // protected DACL and no DENY ACE.
+    const sddl = field('SDDL') ?? '';
+    expect((sddl.match(/\(A;/g) ?? []).length, diag).toBe(1);
+    expect(sddl, diag).toMatch(/D:P/);
+    expect(sddl, diag).not.toMatch(/\(D;/);
   }, 30000);
 
   it('an ordinary same-SID client connects and round-trips bytes through the adopted net.Socket; the name is held exclusively', async () => {
