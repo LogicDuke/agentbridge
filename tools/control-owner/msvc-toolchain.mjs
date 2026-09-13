@@ -131,6 +131,13 @@ export function resolveBuildToolchain(options = {}) {
   if (!existsSync(cl)) {
     return { ok: false, reason: 'cl-missing', cl };
   }
+  // lib.exe generates the local Node import library (from the official Node-API
+  // .def material) the in-process pipe acceptor links against; it ships in the
+  // same host bin directory as cl.exe and is a builder prerequisite like it.
+  const lib = join(hostBin, 'lib.exe');
+  if (!existsSync(lib)) {
+    return { ok: false, reason: 'lib-missing', lib };
+  }
 
   // 3. Windows SDK roots, the selected version, and EVERY include/lib dir the
   //    compile consumes for THAT version (ucrt/um/shared includes; ucrt/um x64 libs).
@@ -167,6 +174,7 @@ export function resolveBuildToolchain(options = {}) {
       msvcRoot,
       hostBin,
       cl,
+      lib,
       sdkRoot,
       sdkIncludeRoot,
       sdkLibRoot,
@@ -216,6 +224,55 @@ export function compileEnvFor(plan, env = process.env) {
  */
 export function compileArgsFor({ source, exe, objDir }) {
   return [...CL_COMPILE_FLAGS, source, `/Fe:${exe}`, `/Fo:${objDir}\\`, '/link', ...CL_LINK_FLAGS];
+}
+
+/* ---- In-process Node-API addon shape (DDR-D062-C pipe acceptor) ------------- */
+
+/**
+ * The exact extra cl.exe compile flags for the in-process addon: the SAME shared
+ * compile flags as the executables plus `/LD` (build a DLL; the default static
+ * CRT, so the addon needs no redistributable). The Node-API version floor is
+ * fixed in the reviewed source itself, not here.
+ */
+export const CL_ADDON_COMPILE_FLAGS = Object.freeze(['/LD']);
+
+/**
+ * The exact linker flags for the addon after `/link`: reproducible, a DLL, the
+ * Windows security/import libraries it uses, and the locally generated Node
+ * import library (appended by `compileAddonArgsFor`). No node-gyp, no
+ * binding.gyp, no cmake-js, no node-addon-api.
+ */
+export const CL_ADDON_LINK_FLAGS = Object.freeze(['/Brepro', '/DLL', 'advapi32.lib']);
+
+/**
+ * The ONE compile+link argv shape for the addon: shared flags, `/LD`, the Node-API
+ * include directory (the exact-pinned node-api-headers package), the source,
+ * private /Fe (the `.node` output) and /Fo (object dir), then `/link` + the addon
+ * link flags + the generated Node import library. Pure.
+ */
+export function compileAddonArgsFor({ source, out, objDir, includeDir, importLib }) {
+  return [
+    ...CL_COMPILE_FLAGS,
+    ...CL_ADDON_COMPILE_FLAGS,
+    `/I${includeDir}`,
+    source,
+    `/Fe:${out}`,
+    `/Fo:${objDir}\\`,
+    '/link',
+    ...CL_ADDON_LINK_FLAGS,
+    importLib,
+  ];
+}
+
+/** The exact lib.exe flags that turn the official Node-API .def into an x64 import library. */
+export const LIB_IMPORT_FLAGS = Object.freeze(['/nologo', '/MACHINE:X64']);
+
+/**
+ * The ONE lib.exe argv shape: generate the Node import library locally from the
+ * official `node_api.def` (`NAME NODE.EXE`) shipped by node-api-headers. Pure.
+ */
+export function importLibArgsFor({ def, out }) {
+  return [...LIB_IMPORT_FLAGS, `/DEF:${def}`, `/OUT:${out}`];
 }
 
 /**

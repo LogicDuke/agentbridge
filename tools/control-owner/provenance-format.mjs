@@ -69,6 +69,19 @@ export const PIPE_ATTESTOR_SOURCE_BASENAME = 'agentbridge-win-pipe-attest.c';
 /** The generated attestor provenance module's basename under dist/control/native/. */
 export const ATTESTOR_PROVENANCE_BASENAME = 'pipe-attestor-provenance.js';
 
+/**
+ * The in-process explicit-DACL pipe accept provider (DDR-D062-C). NOT an
+ * executable: a Node-API addon loaded into the runtime process, so the named-pipe
+ * server instances it creates are served by the Node runtime itself.
+ */
+export const PIPE_ACCEPTOR_BASENAME = 'agentbridge-win-pipe-accept.node';
+
+/** The pipe acceptor's reviewed C source basename (this directory). */
+export const PIPE_ACCEPTOR_SOURCE_BASENAME = 'agentbridge-win-pipe-accept.c';
+
+/** The generated acceptor provenance module's basename under dist/control/native/. */
+export const ACCEPTOR_PROVENANCE_BASENAME = 'pipe-acceptor-provenance.js';
+
 /** The canonical (runtime-consumed) SHA-256 digest shape: lowercase 64-hex. */
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 
@@ -160,6 +173,25 @@ export function encodeAttestorProvenance(sha256Hex, sourceId) {
     'PIPE_ATTESTOR_PROVENANCE',
     PIPE_ATTESTOR_BASENAME,
     'the pipe attestor',
+    sha256Hex,
+    sourceId,
+  );
+}
+
+/**
+ * Encode the canonical provenance ES-module text for the IN-PROCESS pipe accept
+ * provider (DDR-D062-C): its own binding name, its own filename (a `.node` addon,
+ * never an executable), and its own reviewed-source digest.
+ *
+ * @param {string} sha256Hex
+ * @param {string} sourceId
+ * @returns {string}
+ */
+export function encodeAcceptorProvenance(sha256Hex, sourceId) {
+  return encodeModule(
+    'PIPE_ACCEPTOR_PROVENANCE',
+    PIPE_ACCEPTOR_BASENAME,
+    'the pipe acceptor',
     sha256Hex,
     sourceId,
   );

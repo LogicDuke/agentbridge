@@ -43,6 +43,10 @@ const exePath = join(nativeDir, 'agentbridge-win-owner.exe');
 const provPath = join(nativeDir, 'owner-helper-provenance.js');
 const creatorPath = join(nativeDir, 'agentbridge-win-descriptor-create.exe');
 const creatorProvPath = join(nativeDir, 'descriptor-creator-provenance.js');
+// DDR-D062-C: the built runtime listens ONLY through the in-process explicit-DACL
+// accept provider, so this real-Windows integration also needs its built pair.
+const acceptorPath = join(nativeDir, 'agentbridge-win-pipe-accept.node');
+const acceptorProvPath = join(nativeDir, 'pipe-acceptor-provenance.js');
 
 const ready =
   process.platform === 'win32' &&
@@ -52,7 +56,9 @@ const ready =
   existsSync(exePath) &&
   existsSync(provPath) &&
   existsSync(creatorPath) &&
-  existsSync(creatorProvPath);
+  existsSync(creatorProvPath) &&
+  existsSync(acceptorPath) &&
+  existsSync(acceptorProvPath);
 
 type StoreModule = typeof import('../../src/control/control-store.js');
 type RuntimeModule = typeof import('../../src/control/control-runtime.js');

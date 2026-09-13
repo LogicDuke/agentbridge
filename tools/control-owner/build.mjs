@@ -15,10 +15,10 @@
  * the gate and is rebuilt. The source identity function is the ONE shared with the
  * gate (helper-pair.mjs), so producer and acceptor cannot drift.
  *
- * THREE artifacts are built, with SEPARATE identities and SEPARATE provenance modules.
- * Neither can stand in for the other: each generated module exports its own binding
+ * FOUR artifacts are built, with SEPARATE identities and SEPARATE provenance modules.
+ * None can stand in for another: each generated module exports its own binding
  * name, and each runtime consumer hashes its own binary against its own provenance
- * before executing it.
+ * before executing or loading it.
  *
  *   agentbridge-win-owner.c             -> agentbridge-win-owner.exe
  *                                          owner-helper-provenance.js
@@ -29,6 +29,18 @@
  *   agentbridge-win-pipe-attest.c       -> agentbridge-win-pipe-attest.exe
  *                                          pipe-attestor-provenance.js
  *                                          (READ-ONLY live pipe-server identity relayer)
+ *   agentbridge-win-pipe-accept.c       -> agentbridge-win-pipe-accept.node
+ *                                          pipe-acceptor-provenance.js
+ *                                          (IN-PROCESS explicit-DACL pipe accept provider,
+ *                                          DDR-D062-C — a Node-API addon, not a process)
+ *
+ * The addon follows the ratified D062 Revision-2 native build policy: the ONLY
+ * build dependency is the exact-pinned node-api-headers package (its `include/`
+ * for the Node-API declarations and its official `def/node_api.def` from which
+ * the Node import library is generated LOCALLY by the same MSVC toolchain's
+ * lib.exe, inside the private workspace); no node-gyp, no binding.gyp, no
+ * cmake-js, no node-addon-api, no prebuilt binary from anywhere. The Node-API
+ * version floor (10) is fixed in the reviewed C source.
  *
  * Every artifact is compiled inside the SAME private, per-invocation workspace but in
  * its OWN object directory and to its OWN private executable path, so no mutable
@@ -55,12 +67,15 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
+  ACCEPTOR_PROVENANCE_BASENAME,
   ATTESTOR_PROVENANCE_BASENAME,
   CREATOR_PROVENANCE_BASENAME,
   DESCRIPTOR_CREATOR_BASENAME,
   OWNER_HELPER_BASENAME,
+  PIPE_ACCEPTOR_BASENAME,
   PIPE_ATTESTOR_BASENAME,
   PROVENANCE_BASENAME,
+  encodeAcceptorProvenance,
   encodeAttestorProvenance,
   encodeCreatorProvenance,
   encodeProvenance,
@@ -70,16 +85,35 @@ import {
 import {
   DESCRIPTOR_CREATOR_SOURCE_PATH,
   OWNER_HELPER_SOURCE_PATH,
+  PIPE_ACCEPTOR_SOURCE_PATH,
   PIPE_ATTESTOR_SOURCE_PATH,
   sourceIdFor,
 } from './helper-pair.mjs';
-import { compileArgsFor, compileEnvFor, resolveBuildToolchain } from './msvc-toolchain.mjs';
+import {
+  compileAddonArgsFor,
+  compileArgsFor,
+  compileEnvFor,
+  importLibArgsFor,
+  resolveBuildToolchain,
+} from './msvc-toolchain.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(here, '..', '..');
 
 /** Deterministic module-relative runtime output: dist/control/native/. */
 const outDir = join(repoRoot, 'dist', 'control', 'native');
+
+/**
+ * The ratified D062 Revision-2 addon build input: the exact-pinned, build-only
+ * node-api-headers package. Its version is asserted here as well as in
+ * package.json, so a header-version change cannot reach the reviewed build
+ * without being re-adjudicated in this file (provenance regeneration, CI
+ * validation, and Commander review are required by policy).
+ */
+const NODE_API_HEADERS_VERSION = '1.9.0';
+const nodeApiHeadersDir = join(repoRoot, 'node_modules', 'node-api-headers');
+const nodeApiIncludeDir = join(nodeApiHeadersDir, 'include');
+const nodeApiDef = join(nodeApiHeadersDir, 'def', 'node_api.def');
 
 /**
  * The complete set of native artifacts this build publishes. Each entry is fully
@@ -112,6 +146,16 @@ const ARTIFACTS = [
     provenanceBasename: ATTESTOR_PROVENANCE_BASENAME,
     encode: encodeAttestorProvenance,
   },
+  {
+    key: 'acceptor',
+    label: 'pipe acceptor',
+    source: PIPE_ACCEPTOR_SOURCE_PATH,
+    basename: PIPE_ACCEPTOR_BASENAME,
+    provenanceBasename: ACCEPTOR_PROVENANCE_BASENAME,
+    encode: encodeAcceptorProvenance,
+    /** A Node-API addon (DLL), not a console executable: a different compile shape. */
+    addon: true,
+  },
 ];
 
 function fail(message) {
@@ -130,6 +174,8 @@ function toolchainRejectionMessage(resolution) {
       return `MSVC toolset version file missing: ${resolution.toolsetFile}`;
     case 'cl-missing':
       return `cl.exe not found: ${resolution.cl}`;
+    case 'lib-missing':
+      return `lib.exe not found: ${resolution.lib}`;
     case 'sdk-roots-missing':
       return `Windows SDK not found under ${resolution.sdkRoot}`;
     case 'sdk-version-missing':
@@ -155,7 +201,7 @@ const resolved = resolveBuildToolchain();
 if (!resolved.ok) {
   fail(toolchainRejectionMessage(resolved));
 }
-const { cl, toolset, sdkVersion } = resolved.plan;
+const { cl, lib, toolset, sdkVersion } = resolved.plan;
 
 process.stderr.write(
   `owner-helper build: MSVC ${toolset}, Windows SDK ${sdkVersion}\n` +
@@ -197,6 +243,54 @@ function failClean(message) {
 // builder and the test gate cannot drift in env, include/lib paths, or flags.
 const clEnv = compileEnvFor(resolved.plan);
 
+/* ---- Node import library for the in-process addon (generated locally) ------ */
+
+/** The private-workspace Node import library, generated once per invocation. */
+let nodeImportLib = null;
+
+/**
+ * Generate `node.lib` INSIDE this invocation's private workspace from the official
+ * `node_api.def` shipped by the exact-pinned node-api-headers package, using the
+ * same resolved MSVC toolchain's lib.exe (absolute path, explicit argv, shell:false).
+ * It is never published: only the `.node` addon and its provenance are. The
+ * installed header package must be exactly the ratified version.
+ */
+function ensureNodeImportLib() {
+  if (nodeImportLib !== null) {
+    return nodeImportLib;
+  }
+  let installedVersion = null;
+  try {
+    installedVersion = JSON.parse(readFileSync(join(nodeApiHeadersDir, 'package.json'), 'utf8')).version;
+  } catch {
+    installedVersion = null;
+  }
+  if (installedVersion !== NODE_API_HEADERS_VERSION) {
+    failClean(
+      `node-api-headers@${NODE_API_HEADERS_VERSION} is required for the pipe acceptor ` +
+        `(installed: ${installedVersion ?? 'none'}); run npm ci.`,
+    );
+  }
+  if (!existsSync(nodeApiDef) || !existsSync(join(nodeApiIncludeDir, 'node_api.h'))) {
+    failClean('node-api-headers is incomplete (node_api.def / node_api.h missing).');
+  }
+  const out = join(workspace, 'node.lib');
+  try {
+    execFileSync(lib, importLibArgsFor({ def: nodeApiDef, out }), {
+      cwd: workspace,
+      env: clEnv,
+      stdio: ['ignore', 'inherit', 'inherit'],
+    });
+  } catch {
+    failClean('lib.exe failed to generate the Node import library from node_api.def.');
+  }
+  if (!existsSync(out)) {
+    failClean('lib.exe reported success but the Node import library is missing.');
+  }
+  nodeImportLib = out;
+  return out;
+}
+
 /** SHA-256 (lowercase hex) of a file, or null if it cannot be read. */
 function sha256File(path) {
   try {
@@ -227,7 +321,18 @@ function buildArtifact(artifact) {
   const publishedProvenance = join(outDir, artifact.provenanceBasename);
   mkdirSync(workObjDir, { recursive: true });
 
-  const clArgs = compileArgsFor({ source: srcC, exe: workExe, objDir: workObjDir });
+  // The addon shares every compile flag with the executables and differs only in
+  // its DLL shape, the Node-API include directory, and the locally generated Node
+  // import library it links against.
+  const clArgs = artifact.addon
+    ? compileAddonArgsFor({
+        source: srcC,
+        out: workExe,
+        objDir: workObjDir,
+        includeDir: nodeApiIncludeDir,
+        importLib: ensureNodeImportLib(),
+      })
+    : compileArgsFor({ source: srcC, exe: workExe, objDir: workObjDir });
   try {
     execFileSync(cl, clArgs, {
       cwd: workObjDir,

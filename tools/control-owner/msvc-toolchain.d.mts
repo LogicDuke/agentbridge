@@ -30,6 +30,7 @@ export interface BuildPlan {
   readonly msvcRoot: string;
   readonly hostBin: string;
   readonly cl: string;
+  readonly lib: string;
   readonly sdkRoot: string;
   readonly sdkIncludeRoot: string;
   readonly sdkLibRoot: string;
@@ -47,6 +48,7 @@ export type BuildToolchainResolution =
       readonly vswhere?: string;
       readonly toolsetFile?: string;
       readonly cl?: string;
+      readonly lib?: string;
       readonly sdkRoot?: string;
     };
 
@@ -81,6 +83,28 @@ export interface CompileTargets {
   readonly objDir: string;
 }
 export declare function compileArgsFor(targets: CompileTargets): string[];
+
+/** The extra compile flags and the `/link` flags for the in-process Node-API addon. */
+export declare const CL_ADDON_COMPILE_FLAGS: readonly string[];
+export declare const CL_ADDON_LINK_FLAGS: readonly string[];
+
+/** The one addon compile+link argv shape (shared flags, /LD, /I, source, /Fe, /Fo, /link, import lib). */
+export interface AddonCompileTargets {
+  readonly source: string;
+  readonly out: string;
+  readonly objDir: string;
+  readonly includeDir: string;
+  readonly importLib: string;
+}
+export declare function compileAddonArgsFor(targets: AddonCompileTargets): string[];
+
+/** The lib.exe flags and argv shape that generate the Node import library from the official .def. */
+export declare const LIB_IMPORT_FLAGS: readonly string[];
+export interface ImportLibTargets {
+  readonly def: string;
+  readonly out: string;
+}
+export declare function importLibArgsFor(targets: ImportLibTargets): string[];
 
 /** Direct cl.exe runner (absolute path, explicit argv, shell:false); throws on failure. */
 export type CompilerRunner = (

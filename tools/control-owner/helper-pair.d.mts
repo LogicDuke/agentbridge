@@ -110,3 +110,31 @@ export declare const ATTESTOR_PROVENANCE_BASENAME: string;
  * name. Pure; throws a TypeError on a malformed digest.
  */
 export declare function encodeAttestorProvenance(sha256Hex: string, sourceId: string): string;
+
+/**
+ * The same decision for the IN-PROCESS PIPE ACCEPTOR (DDR-D062-C), against its OWN
+ * canonical encoder and its OWN reviewed source. `exePath` names the `.node` addon.
+ */
+export declare function validateAcceptorPair(input: HelperPairInput): HelperPairValidity;
+
+/** The pipe acceptor's reviewed C source basename (re-exported). */
+export declare const PIPE_ACCEPTOR_SOURCE_BASENAME: string;
+
+/** Absolute path to the reviewed pipe-acceptor C source (module-relative). */
+export declare const PIPE_ACCEPTOR_SOURCE_PATH: string;
+
+/** The current pipe-acceptor build-source identity, or `null` if unreadable. */
+export declare function pipeAcceptorSourceId(): string | null;
+
+/** The pipe acceptor addon's filename (re-exported from provenance-format.mjs). */
+export declare const PIPE_ACCEPTOR_BASENAME: string;
+
+/** The generated acceptor provenance module's basename (re-exported). */
+export declare const ACCEPTOR_PROVENANCE_BASENAME: string;
+
+/**
+ * The canonical pipe-acceptor provenance encoder (re-exported): addon SHA-256 +
+ * its reviewed-source SHA-256 -> exact provenance module text with its own binding
+ * name. Pure; throws a TypeError on a malformed digest.
+ */
+export declare function encodeAcceptorProvenance(sha256Hex: string, sourceId: string): string;

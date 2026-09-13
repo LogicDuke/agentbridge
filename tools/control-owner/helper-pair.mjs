@@ -25,7 +25,9 @@ import { fileURLToPath } from 'node:url';
 import {
   DESCRIPTOR_CREATOR_SOURCE_BASENAME,
   OWNER_HELPER_SOURCE_BASENAME,
+  PIPE_ACCEPTOR_SOURCE_BASENAME,
   PIPE_ATTESTOR_SOURCE_BASENAME,
+  encodeAcceptorProvenance,
   encodeAttestorProvenance,
   encodeCreatorProvenance,
   encodeProvenance,
@@ -33,15 +35,19 @@ import {
 
 // Re-export the canonical producers so tests import everything from one module.
 export {
+  ACCEPTOR_PROVENANCE_BASENAME,
   ATTESTOR_PROVENANCE_BASENAME,
   CREATOR_PROVENANCE_BASENAME,
   DESCRIPTOR_CREATOR_BASENAME,
   DESCRIPTOR_CREATOR_SOURCE_BASENAME,
   OWNER_HELPER_BASENAME,
   OWNER_HELPER_SOURCE_BASENAME,
+  PIPE_ACCEPTOR_BASENAME,
+  PIPE_ACCEPTOR_SOURCE_BASENAME,
   PIPE_ATTESTOR_BASENAME,
   PIPE_ATTESTOR_SOURCE_BASENAME,
   PROVENANCE_BASENAME,
+  encodeAcceptorProvenance,
   encodeAttestorProvenance,
   encodeCreatorProvenance,
   encodeProvenance,
@@ -55,6 +61,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 export const OWNER_HELPER_SOURCE_PATH = join(here, OWNER_HELPER_SOURCE_BASENAME);
 export const DESCRIPTOR_CREATOR_SOURCE_PATH = join(here, DESCRIPTOR_CREATOR_SOURCE_BASENAME);
 export const PIPE_ATTESTOR_SOURCE_PATH = join(here, PIPE_ATTESTOR_SOURCE_BASENAME);
+export const PIPE_ACCEPTOR_SOURCE_PATH = join(here, PIPE_ACCEPTOR_SOURCE_BASENAME);
 
 /**
  * The canonical build-source identity: the SHA-256 (lowercase hex) of the exact
@@ -85,6 +92,11 @@ export function descriptorCreatorSourceId() {
 /** The current pipe-attestor build-source identity, or `null` if unreadable. */
 export function pipeAttestorSourceId() {
   return sourceIdFor(PIPE_ATTESTOR_SOURCE_PATH);
+}
+
+/** The current pipe-acceptor build-source identity, or `null` if unreadable. */
+export function pipeAcceptorSourceId() {
+  return sourceIdFor(PIPE_ACCEPTOR_SOURCE_PATH);
 }
 
 /**
@@ -175,5 +187,18 @@ export function validateAttestorPair({ exePath, provenancePath }) {
     provenancePath,
     encode: encodeAttestorProvenance,
     sourceId: pipeAttestorSourceId(),
+  });
+}
+
+/**
+ * The same decision for the IN-PROCESS PIPE ACCEPTOR (DDR-D062-C), against its
+ * OWN encoder and its OWN reviewed source. `exePath` names the `.node` addon.
+ */
+export function validateAcceptorPair({ exePath, provenancePath }) {
+  return validateArtifactPair({
+    exePath,
+    provenancePath,
+    encode: encodeAcceptorProvenance,
+    sourceId: pipeAcceptorSourceId(),
   });
 }
