@@ -272,17 +272,71 @@ void objectFreeze(InternalPromise);
  * fault in the intrinsic's own species prologue costs nothing here.
  */
 function internalStep<T>(
-  step: (settle: (value: T) => void, fail: (reason: unknown) => void) => Promise<void>,
+  step: (settle: (value: T) => void, fail: (reason: unknown) => void) => void,
 ): Promise<T> {
   return new InternalPromise<T>((resolve, reject) => {
-    const running = step(resolve, reject);
     try {
-      void reflectApply(promiseThen, running, [undefined, reject]);
-    } catch {
-      // See the doc comment: the step has already reported through `resolve`
-      // or `reject`, so nothing is waiting on this attachment.
+      step(resolve, reject);
+    } catch (error) {
+      // A step reports through the capability it is handed, so reaching here is
+      // a step that threw before it could. The reason is still owed to the
+      // caller, and this is the only place left to hand it over.
+      reject(error);
     }
   });
+}
+
+/**
+ * Register a continuation on a promise this module owns, without awaiting it.
+ *
+ * `await` is the one operation this module cannot use on its own promises. It
+ * resolves the awaited value through `PromiseResolve`, which reads
+ * `constructor` off it to decide whether the internal fast path applies — and
+ * that read is a property lookup on an object an ordinary `async_hooks` `init`
+ * hook has already seen. The hook receives each promise inside the allocation
+ * that produced it, while it is still extensible, and may both *reparent* it to
+ * the ordinary `Promise.prototype` and seal it there. Neither of this module's
+ * two answers to that lookup survives the pair: the own property cannot be
+ * defined on a sealed target, and the prototype that would have answered it is
+ * no longer on the instance's chain. The lookup then reaches a mutated
+ * `Promise.prototype.constructor`, the value is assimilated as a plain thenable
+ * through a mutated `then`, and a `then` that installs no continuation leaves
+ * the `await` suspended for good — including the ordinary timeout settlement
+ * and the mandatory hardening rejection, neither of which has any deadline left
+ * to rescue it.
+ *
+ * `Promise.prototype.then` applied through {@link reflectApply} reads none of
+ * that. It is the intrinsic captured at module load, invoked on the promise
+ * directly, and it works from the promise's own internal state: no `constructor`
+ * lookup, no `then` lookup, and nothing that a prototype change or a seal can
+ * reach. The same idiom the taskkill reaper already relies on, applied to every
+ * internal continuation rather than to one.
+ *
+ * `onFault` receives a fault from the intrinsic's own prologue as well as a
+ * rejection, because a caller that cannot register a continuation is in exactly
+ * the position a rejection describes: it will never be told, and the obligation
+ * to settle is the one thing that may not be dropped.
+ *
+ * **It does not catch throws from `onValue`.** A continuation runs from a
+ * promise job, outside every `try` that lexically encloses the call, so a fault
+ * raised there reaches no `catch` at all: it becomes an unhandled rejection on
+ * a promise nothing observes, and whatever the continuation was going to settle
+ * stays pending for good. Every continuation that reads the child handle —
+ * `hasEnded`, `pid`, `stdout`, `stderr`, or anything reached through
+ * {@link waitForExit} — therefore carries its own guard and routes the fault to
+ * the capability it was given. The guarded steps in the termination strategies
+ * and in the exchange lifecycle exist for exactly that reason.
+ */
+function whenSettled<T>(
+  promise: Promise<T>,
+  onValue: (value: T) => void,
+  onFault: (reason: unknown) => void,
+): void {
+  try {
+    void reflectApply(promiseThen, promise, [onValue, onFault]);
+  } catch (error) {
+    onFault(error);
+  }
 }
 
 /**
@@ -620,14 +674,29 @@ function clearEventsKeepingAbsorber(child: ChildProcess): void {
   });
 }
 
-/** Kill and reap a helper whose post-spawn dispatch hardening failed. */
-async function reapUnprotectedHelper(child: ChildProcess): Promise<void> {
+/**
+ * Kill and reap a helper whose post-spawn dispatch hardening failed.
+ *
+ * Reports through `done` rather than through a promise the caller would have to
+ * await: the wait itself is registered with {@link whenSettled}, and `done` runs
+ * on both of its outcomes. The steps after the wait operate on a handle already
+ * observed to be hostile and can throw, which must not stop `done` from being
+ * called — the caller's own settlement depends on it.
+ */
+function reapUnprotectedHelper(child: ChildProcess, done: () => void): void {
+  const finish = (): void => {
+    try {
+      removeAllEvents(child);
+      // Clearing the listeners also cleared the absorber, and this helper's own
+      // spawn failure may still be queued, so cover the handle again.
+      rearmSpawnFailureAbsorber(child);
+    } catch {
+      // Best effort on a hostile handle; the reap is over either way.
+    }
+    done();
+  };
   killDirectChild(child);
-  await waitForExit(child, TASKKILL_TIMEOUT_MS);
-  removeAllEvents(child);
-  // Clearing the listeners also cleared the absorber, and this helper's own
-  // spawn failure may still be queued, so cover the handle again.
-  rearmSpawnFailureAbsorber(child);
+  whenSettled(waitForExit(child, TASKKILL_TIMEOUT_MS), finish, finish);
 }
 
 /**
@@ -710,16 +779,10 @@ function runTaskkill(
       // fault there still degrades to the same honest "not issued" answer the
       // continuations give rather than rejecting a promise the callers of this
       // helper treat as total.
-      const reaped = reapUnprotectedHelper(killer);
       try {
-        void reflectApply(promiseThen, reaped, [
-          () => {
-            resolve(false);
-          },
-          () => {
-            resolve(false);
-          },
-        ]);
+        reapUnprotectedHelper(killer, () => {
+          resolve(false);
+        });
       } catch {
         resolve(false);
       }
@@ -775,47 +838,32 @@ function terminatePosix(
   pid: number,
   graceMs: number,
 ): Promise<TerminationScope> {
-  return internalStep<TerminationScope>(async (settle, fail) => {
+  return internalStep<TerminationScope>((settle, fail) => {
+    const scopeFor = (groupReached: boolean): TerminationScope =>
+      groupReached
+        ? TERMINATION_SCOPE.PROCESS_GROUP_REQUESTED
+        : TERMINATION_SCOPE.DIRECT_CHILD_ONLY;
+
     try {
       if (hasEnded(child)) {
         settle(TERMINATION_SCOPE.DIRECT_CHILD_ONLY);
         return;
       }
 
-      let groupReached = signalProcessGroup(pid, 'SIGTERM');
+      const groupReached = signalProcessGroup(pid, 'SIGTERM');
       if (!groupReached) {
         killDirectChild(child, 'SIGTERM');
       }
-      if (await waitForExit(child, graceMs)) {
-        settle(
-          groupReached
-            ? TERMINATION_SCOPE.PROCESS_GROUP_REQUESTED
-            : TERMINATION_SCOPE.DIRECT_CHILD_ONLY,
-        );
-        return;
-      }
-
-      // The grace timer and child exit can become ready in the same event-loop
-      // turn. Once the child is observed ended, its numeric process-group ID may
-      // be reused, so it must not receive the escalation signal.
-      if (hasEnded(child)) {
-        settle(
-          groupReached
-            ? TERMINATION_SCOPE.PROCESS_GROUP_REQUESTED
-            : TERMINATION_SCOPE.DIRECT_CHILD_ONLY,
-        );
-        return;
-      }
-
-      if (!signalProcessGroup(pid, 'SIGKILL')) {
-        killDirectChild(child, 'SIGKILL');
-        groupReached = false;
-      }
-      await waitForExit(child, graceMs);
-      settle(
-        groupReached
-          ? TERMINATION_SCOPE.PROCESS_GROUP_REQUESTED
-          : TERMINATION_SCOPE.DIRECT_CHILD_ONLY,
+      whenSettled(
+        waitForExit(child, graceMs),
+        (ended: boolean) => {
+          if (ended) {
+            settle(scopeFor(groupReached));
+            return;
+          }
+          escalate(groupReached);
+        },
+        fail,
       );
     } catch (error) {
       // Every observation above reads the handle, and a hostile accessor can
@@ -823,6 +871,36 @@ function terminatePosix(
       // the same rejection the `async` form produced, reported through the
       // capability instead of through a promise nothing here may await.
       fail(error);
+    }
+
+    // The escalation half, entered only when the grace window expired with the
+    // child still running. Its own guard, because every observation it makes
+    // reads the handle and a hostile accessor can fault on any of them.
+    function escalate(groupReached: boolean): void {
+      try {
+        // The grace timer and child exit can become ready in the same event-loop
+        // turn. Once the child is observed ended, its numeric process-group ID
+        // may be reused, so it must not receive the escalation signal.
+        if (hasEnded(child)) {
+          settle(scopeFor(groupReached));
+          return;
+        }
+
+        let reached = groupReached;
+        if (!signalProcessGroup(pid, 'SIGKILL')) {
+          killDirectChild(child, 'SIGKILL');
+          reached = false;
+        }
+        whenSettled(
+          waitForExit(child, graceMs),
+          () => {
+            settle(scopeFor(reached));
+          },
+          fail,
+        );
+      } catch (error) {
+        fail(error);
+      }
     }
   });
 }
@@ -840,7 +918,45 @@ function terminateWindows(
   pid: number,
   graceMs: number,
 ): Promise<TerminationScope> {
-  return internalStep<TerminationScope>(async (settle, fail) => {
+  return internalStep<TerminationScope>((settle, fail) => {
+    // The degraded ending, shared by both paths that could not reach the tree:
+    // signal the direct child, wait out the grace window, and claim nothing
+    // beyond it. Its own guard, for the same reason the POSIX strategy needs
+    // one — every step here reads the handle.
+    const killDirectAndSettle = (): void => {
+      try {
+        killDirectChild(child);
+        whenSettled(
+          waitForExit(child, graceMs),
+          () => {
+            settle(TERMINATION_SCOPE.DIRECT_CHILD_ONLY);
+          },
+          fail,
+        );
+      } catch (error) {
+        fail(error);
+      }
+    };
+
+    // The tree-requested ending, entered once `taskkill` reported conclusively.
+    // Its own guard, for the same reason the degraded ending needs one:
+    // {@link waitForExit} observes the handle before it waits, this runs from a
+    // continuation the function-wide `try` below does not cover, and a fault
+    // that escapes a continuation reaches no `catch` at all.
+    const awaitTreeExit = (): void => {
+      try {
+        whenSettled(
+          waitForExit(child, graceMs),
+          () => {
+            settle(TERMINATION_SCOPE.PROCESS_TREE_REQUESTED);
+          },
+          fail,
+        );
+      } catch (error) {
+        fail(error);
+      }
+    };
+
     try {
       // Once the leader has ended, its numeric PID may identify an unrelated
       // process. Safety outranks reaching descendants that outlived the leader.
@@ -851,22 +967,21 @@ function terminateWindows(
 
       const taskkill = resolveTaskkill();
       if (taskkill === null) {
-        killDirectChild(child);
-        await waitForExit(child, graceMs);
-        settle(TERMINATION_SCOPE.DIRECT_CHILD_ONLY);
+        killDirectAndSettle();
         return;
       }
 
-      const issued = await runTaskkill(taskkill, pid);
-      if (!issued) {
-        killDirectChild(child);
-        await waitForExit(child, graceMs);
-        settle(TERMINATION_SCOPE.DIRECT_CHILD_ONLY);
-        return;
-      }
-
-      await waitForExit(child, graceMs);
-      settle(TERMINATION_SCOPE.PROCESS_TREE_REQUESTED);
+      whenSettled(
+        runTaskkill(taskkill, pid),
+        (issued: boolean) => {
+          if (!issued) {
+            killDirectAndSettle();
+            return;
+          }
+          awaitTreeExit();
+        },
+        fail,
+      );
     } catch (error) {
       // Same contract as the POSIX strategy: the handle reads above can fault,
       // and the reason reaches the caller unchanged.
@@ -917,7 +1032,7 @@ function terminate(
   platform: TransportPlatform,
   graceMs: number,
 ): Promise<TerminationScope> {
-  return internalStep<TerminationScope>(async (settle, fail) => {
+  return internalStep<TerminationScope>((settle, fail) => {
     try {
       const pid = child.pid;
       if (pid === undefined) {
@@ -926,12 +1041,13 @@ function terminate(
         settle(TERMINATION_SCOPE.DIRECT_CHILD_ONLY);
         return;
       }
-      const scope = await protectPromiseResolution(
+      whenSettled(
         platform === 'posix'
           ? terminatePosix(child, pid, graceMs)
           : terminateWindows(child, pid, graceMs),
+        settle,
+        fail,
       );
-      settle(scope);
     } catch (error) {
       fail(error);
     }
@@ -955,14 +1071,25 @@ function terminate(
  * before it can signal, a single non-ignorable direct-child signal follows, and
  * no process group, tree, or descendant is claimed on that path.
  */
-async function releaseUnprotectedChild(
+function releaseUnprotectedChild(
   child: ChildProcess,
   platform: TransportPlatform,
   graceMs: number,
-): Promise<void> {
-  try {
-    await protectPromiseResolution(terminate(child, platform, graceMs));
-  } catch {
+  done: () => void,
+): void {
+  // The cleanup half, reached on both outcomes of the bounded attempt.
+  const cleanUp = (): void => {
+    attemptCleanup(() => {
+      destroyReadable(child.stdout);
+    });
+    attemptCleanup(() => {
+      destroyReadable(child.stderr);
+    });
+    clearEventsKeepingAbsorber(child);
+    done();
+  };
+
+  const onAttemptFailed = (): void => {
     // A bounded termination attempt that fails is still only an attempt. The
     // exchange's obligation is to settle, not to prove the child is gone.
     //
@@ -991,15 +1118,17 @@ async function releaseUnprotectedChild(
     // unconditionally, so this is the same operation the default already was.
     // It is still only the direct child — `SIGKILL` is delivered to one
     // process, is not inherited by descendants, and claims nothing about them.
-    killDirectChild(child, 'SIGKILL');
+    attemptCleanup(() => {
+      killDirectChild(child, 'SIGKILL');
+    });
+    cleanUp();
+  };
+
+  try {
+    whenSettled(terminate(child, platform, graceMs), cleanUp, onAttemptFailed);
+  } catch {
+    onAttemptFailed();
   }
-  attemptCleanup(() => {
-    destroyReadable(child.stdout);
-  });
-  attemptCleanup(() => {
-    destroyReadable(child.stderr);
-  });
-  clearEventsKeepingAbsorber(child);
 }
 
 /**
@@ -1179,34 +1308,22 @@ export function invokeAgentProcess(
       // reached on every route through it. Nothing above decides anything this
       // call depends on — it is ordered second only to keep hostile accessors
       // away from the caught value, not because it is contingent on the result.
-      const release = releaseUnprotectedChild(child, platform, invocation.graceMs);
-      // `releaseUnprotectedChild` runs every step and never rejects, and the
-      // rejection is scheduled on *both* settlement paths of the chain anyway,
-      // so neither a termination failure nor a cleanup step that throws on a
-      // poisoned `stdout`/`stderr` value can leave this exchange pending or
-      // leave an internal rejection unhandled. The mandatory hardening failure
-      // stays the externally visible reason on every one of those paths.
+      // `releaseUnprotectedChild` runs every step, never rejects, and reports
+      // through the callback it is handed, so neither a termination failure nor
+      // a cleanup step that throws on a poisoned `stdout`/`stderr` value can
+      // leave this exchange pending. The mandatory hardening failure stays the
+      // externally visible reason on every one of those paths.
       //
-      // Scheduled through the captured {@link promiseThen} rather than through
-      // `release.then`. The value that faulted hardening has already run its
-      // own code by this point, and the cheapest thing that code can do is
-      // replace the scheduler this path is about to reach — a lookup here would
-      // find the replacement. One that installs nothing leaves this exchange
-      // pending with no deadline yet armed to end it; one that throws escapes
-      // this executor and hands the caller the hostile value in place of the
-      // mandatory failure. The `catch` closes the same gap for the intrinsic's
-      // own prologue, which reads the promise's `constructor` before it
-      // registers anything: the release is already running and never rejects,
-      // so settling from here loses nothing but the wait.
+      // The release registers its own continuations through the captured
+      // intrinsic rather than through an `await`. The value that faulted
+      // hardening has already run its own code by this point, and the cheapest
+      // thing that code can do is replace the scheduler this path is about to
+      // reach. The `catch` covers a release that throws before it can report:
+      // the rejection is still owed, and this is the last place to deliver it.
       try {
-        void reflectApply(promiseThen, release, [
-          () => {
-            reject(hardeningFailure);
-          },
-          () => {
-            reject(hardeningFailure);
-          },
-        ]);
+        releaseUnprotectedChild(child, platform, invocation.graceMs, () => {
+          reject(hardeningFailure);
+        });
       } catch {
         reject(hardeningFailure);
       }
@@ -1238,7 +1355,7 @@ export function invokeAgentProcess(
 
     const dispatchAbort = (): void => {
       if (claim(TRANSPORT_OUTCOME.CANCELLED)) {
-        void runTermination();
+        runTermination();
       }
     };
 
@@ -1346,33 +1463,92 @@ export function invokeAgentProcess(
      * resolved. Once settled there is also nothing left to wait for, so this
      * lifecycle simply stops.
      */
-    async function runTermination(): Promise<void> {
+    function runTermination(): void {
       if (terminating) {
         return;
       }
       terminating = true;
-      terminationScope = await protectPromiseResolution(
+
+      /**
+       * The close wait and the settlement, once termination has reported.
+       *
+       * Guarded as a whole. Every observation left in this lifecycle reads the
+       * handle — `hasEnded`, and the two pipe releases — and each of them runs
+       * from a continuation no enclosing `try` covers. A fault that escaped one
+       * would leave this exchange pending with its deadline already spent,
+       * which is the failure this repair exists to remove. Settlement is the
+       * one obligation that is absolute, so every route through here reaches
+       * {@link settle}.
+       */
+      const finishTermination = (): void => {
+        try {
+          if (settled) {
+            return;
+          }
+
+          if (closed) {
+            settle();
+            return;
+          }
+
+          if (!hasEnded(child)) {
+            terminationScope = TERMINATION_SCOPE.ESCALATION_FAILED;
+          }
+          whenSettled(
+            awaitClose(invocation.graceMs),
+            (closeObserved: boolean) => {
+              try {
+                if (!closeObserved) {
+                  // A detached descendant can retain the inherited pipe handles
+                  // after the direct child ends. Release this process's local
+                  // ends before the forced settlement so the caller is not kept
+                  // alive by leaked wraps.
+                  destroyReadable(child.stdout);
+                  destroyReadable(child.stderr);
+                }
+              } catch {
+                // Releasing a local pipe end is best effort on a handle that
+                // can fault; the settlement below is not contingent on it.
+              }
+              settle();
+            },
+            () => {
+              // The close wait could not report. Nothing further is observable
+              // and the exchange is still owed its settlement.
+              settle();
+            },
+          );
+        } catch {
+          // A handle read faulted after termination had already reported.
+          settle();
+        }
+      };
+
+      /**
+       * A platform strategy that faulted before it could report.
+       *
+       * The `async` form left this exchange pending on a rejection nothing was
+       * waiting for. The fault is reported the way an incomplete termination
+       * already is — as {@link TERMINATION_SCOPE.ESCALATION_FAILED} — and the
+       * same lifecycle continues. Nothing stronger is claimed: a strategy that
+       * faulted proved nothing about the child, which is exactly what that
+       * scope says.
+       */
+      const onTerminationFault = (): void => {
+        terminationScope = TERMINATION_SCOPE.ESCALATION_FAILED;
+        finishTermination();
+      };
+
+      const afterTermination = (scope: TerminationScope): void => {
+        terminationScope = scope;
+        finishTermination();
+      };
+
+      whenSettled(
         terminate(child, platform, invocation.graceMs),
+        afterTermination,
+        onTerminationFault,
       );
-
-      if (settled) {
-        return;
-      }
-
-      if (!closed) {
-        if (!hasEnded(child)) {
-          terminationScope = TERMINATION_SCOPE.ESCALATION_FAILED;
-        }
-        const closeObserved = await awaitClose(invocation.graceMs);
-        if (!closeObserved) {
-          // A detached descendant can retain the inherited pipe handles after
-          // the direct child ends. Release this process's local ends before the
-          // forced settlement so the caller is not kept alive by leaked wraps.
-          destroyReadable(child.stdout);
-          destroyReadable(child.stderr);
-        }
-      }
-      settle();
     }
 
     const onStdout = (chunk: unknown): void => {
@@ -1380,7 +1556,7 @@ export function invokeAgentProcess(
         return;
       }
       if (pushChunk(stdoutSink, chunk) && claim(TRANSPORT_OUTCOME.OUTPUT_LIMIT_EXCEEDED)) {
-        void runTermination();
+        runTermination();
       }
     };
 
@@ -1389,7 +1565,7 @@ export function invokeAgentProcess(
         return;
       }
       if (pushChunk(stderrSink, chunk) && claim(TRANSPORT_OUTCOME.OUTPUT_LIMIT_EXCEEDED)) {
-        void runTermination();
+        runTermination();
       }
     };
 
@@ -1461,7 +1637,7 @@ export function invokeAgentProcess(
 
     deadline = scheduleTimeout(() => {
       if (claim(TRANSPORT_OUTCOME.TIMED_OUT)) {
-        void runTermination();
+        runTermination();
       }
     }, invocation.timeoutMs);
   });

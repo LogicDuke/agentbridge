@@ -240,20 +240,37 @@ describe('termination vocabulary claims no more than the OS provides', () => {
     const start = IMPLEMENTATION_SOURCE.indexOf('function terminatePosix');
     const end = IMPLEMENTATION_SOURCE.indexOf('function terminateWindows');
     const implementation = IMPLEMENTATION_SOURCE.slice(start, end);
-    const firstGuard = implementation.indexOf('if (hasEnded(child))');
-    const termSignal = implementation.indexOf("signalProcessGroup(pid, 'SIGTERM')");
-    const graceWait = implementation.indexOf('if (await waitForExit(child, graceMs))');
-    const secondGuard = implementation.indexOf('if (hasEnded(child))', firstGuard + 1);
-    const killSignal = implementation.indexOf("signalProcessGroup(pid, 'SIGKILL')");
 
-    expect(firstGuard).toBeGreaterThanOrEqual(0);
+    // The strategy is written as two regions rather than as one straight-line
+    // `async` body: the escalation half is a named step the graceful half hands
+    // control to once the grace window has expired. The regions still appear in
+    // execution order, and each one is checked on its own, which is the claim
+    // that actually matters — neither signal is reachable without a fresh
+    // `hasEnded` observation ahead of it in the same region.
+    const escalation = implementation.indexOf('function escalate(');
+    expect(escalation).toBeGreaterThanOrEqual(0);
+    const gracefulRegion = implementation.slice(0, escalation);
+    const escalateRegion = implementation.slice(escalation);
+
+    // The graceful half: observe, then request the group with SIGTERM, then
+    // wait out the bounded grace window.
+    const gracefulGuard = gracefulRegion.indexOf('if (hasEnded(child))');
+    const termSignal = gracefulRegion.indexOf("signalProcessGroup(pid, 'SIGTERM')");
+    const graceWait = gracefulRegion.indexOf('waitForExit(child, graceMs)');
+    // The escalation half: observe again — the grace timer and the child's exit
+    // can become ready in the same turn, and a reused process-group ID must not
+    // receive SIGKILL — then escalate.
+    const escalationGuard = escalateRegion.indexOf('if (hasEnded(child))');
+    const killSignal = escalateRegion.indexOf("signalProcessGroup(pid, 'SIGKILL')");
+
+    expect(gracefulGuard).toBeGreaterThanOrEqual(0);
     expect(termSignal).toBeGreaterThanOrEqual(0);
     expect(graceWait).toBeGreaterThanOrEqual(0);
-    expect(secondGuard).toBeGreaterThanOrEqual(0);
+    expect(escalationGuard).toBeGreaterThanOrEqual(0);
     expect(killSignal).toBeGreaterThanOrEqual(0);
-    expect(firstGuard).toBeLessThan(termSignal);
-    expect(secondGuard).toBeGreaterThan(graceWait);
-    expect(secondGuard).toBeLessThan(killSignal);
+    expect(gracefulGuard).toBeLessThan(termSignal);
+    expect(termSignal).toBeLessThan(graceWait);
+    expect(escalationGuard).toBeLessThan(killSignal);
   });
 
   it('invalidates a Windows PID before resolving or spawning taskkill', () => {
@@ -269,6 +286,59 @@ describe('termination vocabulary claims no more than the OS provides', () => {
     expect(signal).toBeGreaterThanOrEqual(0);
     expect(guard).toBeLessThan(resolve);
     expect(guard).toBeLessThan(signal);
+  });
+
+  /**
+   * Every continuation that observes the handle carries its own guard.
+   *
+   * A continuation runs from a promise job, outside every `try` that lexically
+   * encloses the call that registered it, so a fault raised inside one reaches
+   * no `catch`: it becomes an unhandled rejection on a promise nothing observes
+   * and whatever it was going to settle stays pending. `waitForExit` reads
+   * `exitCode` and `signalCode` before it waits, so reaching it from a bare
+   * continuation is exactly that hazard.
+   *
+   * Asserted on the source text rather than by execution, deliberately. The
+   * runtime case needs Windows, a real `taskkill` that reports conclusively,
+   * and an accessor that faults on a *later* read than the one the strategy
+   * opens with — a read count that spans two handles and a real helper
+   * process. The property this protects is a property of the code as written,
+   * which is what this file already asserts for "no shell on any path" and
+   * "this layer performs no policy".
+   */
+  it('reaches every handle-observing wait through a guarded step', () => {
+    const start = IMPLEMENTATION_SOURCE.indexOf('function terminateWindows');
+    const end = IMPLEMENTATION_SOURCE.indexOf('/** Dispatch termination', start);
+    const implementation = IMPLEMENTATION_SOURCE.slice(start, end);
+
+    // Both endings are named steps, and each opens by entering its own `try`.
+    for (const step of ['killDirectAndSettle', 'awaitTreeExit']) {
+      const declaration = implementation.indexOf(`const ${step} = (): void => {`);
+      expect(declaration).toBeGreaterThanOrEqual(0);
+      const body = implementation.slice(declaration);
+      const opensGuard = body.indexOf('try {');
+      const observes = body.indexOf('waitForExit(child, graceMs)');
+      const routesFault = body.indexOf('fail(error);');
+      expect(opensGuard).toBeGreaterThanOrEqual(0);
+      expect(observes).toBeGreaterThanOrEqual(0);
+      expect(routesFault).toBeGreaterThanOrEqual(0);
+      // The guard is entered before anything reads the handle, and the fault it
+      // catches is handed to the capability rather than escaping.
+      expect(opensGuard).toBeLessThan(observes);
+      expect(observes).toBeLessThan(routesFault);
+    }
+
+    // The continuation `runTaskkill` reports into delegates to the guarded step
+    // instead of observing the handle itself. Inlining the wait there is the
+    // regression this asserts against.
+    const reported = implementation.indexOf('runTaskkill(taskkill, pid),');
+    expect(reported).toBeGreaterThanOrEqual(0);
+    const continuation = implementation.slice(
+      reported,
+      implementation.indexOf('} catch (error) {', reported),
+    );
+    expect(continuation).toContain('awaitTreeExit();');
+    expect(continuation).not.toContain('waitForExit(child, graceMs)');
   });
 });
 
