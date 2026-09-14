@@ -306,6 +306,43 @@ describe('termination vocabulary claims no more than the OS provides', () => {
    * which is what this file already asserts for "no shell on any path" and
    * "this layer performs no policy".
    */
+  /**
+   * A continuation that was never registered is not an operation that failed.
+   *
+   * The captured `Promise.prototype.then` runs `SpeciesConstructor` before it
+   * registers anything: it reads `constructor` off the promise and `@@species`
+   * off whatever that yields. On a reparented, sealed instance both reads reach
+   * attacker-controlled objects, so the intrinsic can throw with no continuation
+   * installed and nothing that will ever report. Handing that to the same
+   * callback a rejection uses would let a bounded termination be abandoned
+   * mid-flight — the escalation never sent, the retained pipes never released —
+   * while the exchange settles as though termination had reported.
+   *
+   * So the helper answers with a boolean and every call site branches on it.
+   * Asserted on the source text because it is a property of the code as
+   * written: one bare call is the whole defect.
+   */
+  it('handles continuation registration failure at every call site', () => {
+    const declaration = IMPLEMENTATION_SOURCE.indexOf('function whenSettled<T>(');
+    expect(declaration).toBeGreaterThanOrEqual(0);
+    const signature = IMPLEMENTATION_SOURCE.slice(declaration, declaration + 240);
+    expect(signature).toContain('): boolean {');
+
+    // Everything after the helper's own body is call sites.
+    const body = IMPLEMENTATION_SOURCE.slice(
+      IMPLEMENTATION_SOURCE.indexOf('\n}', declaration),
+    );
+    // Matched on the negation alone, not on an enclosing `if (`: the formatter
+    // wraps the longer call sites across lines, and an assertion that depended
+    // on where the line breaks fall would fail on a reformat rather than on a
+    // defect.
+    const calls = body.split('whenSettled(').length - 1;
+    const branched = body.split('!whenSettled(').length - 1;
+
+    expect(calls).toBeGreaterThanOrEqual(10);
+    expect(branched).toBe(calls);
+  });
+
   it('reaches every handle-observing wait through a guarded step', () => {
     const start = IMPLEMENTATION_SOURCE.indexOf('function terminateWindows');
     const end = IMPLEMENTATION_SOURCE.indexOf('/** Dispatch termination', start);
