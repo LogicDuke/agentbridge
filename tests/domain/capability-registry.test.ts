@@ -1184,7 +1184,7 @@ describe('structural prohibitions', () => {
       /\bcrypto\b/,
       /process\.env/,
       /globalThis/,
-      /\blet\s+\w+\s*=.*\n/y,
+      /^(?:export\s+)?(?:let|var)\s/m,
     ]) {
       expect(MODULE_SOURCE).not.toMatch(forbidden);
     }
