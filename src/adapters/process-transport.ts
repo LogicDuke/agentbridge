@@ -696,7 +696,23 @@ function reapUnprotectedHelper(child: ChildProcess, done: () => void): void {
     done();
   };
   killDirectChild(child);
-  whenSettled(waitForExit(child, TASKKILL_TIMEOUT_MS), finish, finish);
+  // Constructed before the continuation is registered, and guarded separately.
+  // {@link waitForExit} observes `exitCode` and `signalCode` before it has a
+  // promise to hand back, so a hostile accessor faults here — before
+  // {@link whenSettled} runs and therefore before `finish` is attached to
+  // anything. Ending through the same `finish` keeps the reap total: the
+  // listeners are cleared, the absorber is rearmed, and `done` is called
+  // exactly once. Guarding only the construction is deliberate — a `catch`
+  // around the whole registration would also catch a throw from `finish`
+  // itself and call it a second time.
+  let wait: Promise<boolean>;
+  try {
+    wait = waitForExit(child, TASKKILL_TIMEOUT_MS);
+  } catch {
+    finish();
+    return;
+  }
+  whenSettled(wait, finish, finish);
 }
 
 /**
