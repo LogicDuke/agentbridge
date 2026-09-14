@@ -70,7 +70,27 @@ const objectFreeze = Object.freeze;
 const objectDefineProperty = Object.defineProperty;
 const objectSetPrototypeOf = Object.setPrototypeOf;
 const arrayIsArray = Array.isArray;
+const numberIsInteger = Number.isInteger;
 const stringOf = String;
+
+/**
+ * Classify an untrusted value as an array, or report that classifying threw.
+ *
+ * `Array.isArray` is not total: on a revoked Proxy the engine throws before any
+ * trap is consulted. Capturing the intrinsic does not help, because the throw
+ * is in the operation and not in the lookup. A thrown classification is not an
+ * answer, so it is reported as one — `null` — and each call site maps it to the
+ * refusal it already returns for a value of the wrong shape. Nothing here
+ * decides anything: a value that cannot be classified is never treated as one
+ * that was.
+ */
+function isArraySafe(value: unknown): boolean | null {
+  try {
+    return arrayIsArray(value);
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Append by defining an own element, bypassing inherited index setters.
@@ -309,7 +329,7 @@ function readApprovalState(value: unknown): CapabilityApprovalState | null {
  */
 function readLength(list: object): number | null {
   const raw = readOwnProperty(list, 'length');
-  if (typeof raw !== 'number' || !Number.isInteger(raw) || raw < 0) {
+  if (typeof raw !== 'number' || !numberIsInteger(raw) || raw < 0) {
     return null;
   }
   return raw;
@@ -324,7 +344,7 @@ function readLength(list: object): number | null {
  * smaller one — so none of the three can be satisfied at another's expense.
  */
 function readApprovedPurposes(value: unknown): readonly InvocationPurpose[] | null {
-  if (!arrayIsArray(value)) {
+  if (isArraySafe(value) !== true || typeof value !== 'object' || value === null) {
     return null;
   }
   const list: object = value;
@@ -356,7 +376,7 @@ function readApprovedPurposes(value: unknown): readonly InvocationPurpose[] | nu
  * read therefore cannot have one value validated and a different one matched.
  */
 function readEntry(value: unknown): EntrySnapshot | null {
-  if (typeof value !== 'object' || value === null || arrayIsArray(value)) {
+  if (typeof value !== 'object' || value === null || isArraySafe(value) !== false) {
     return null;
   }
   const providerId = readExactIdentifier(readOwnProperty(value, 'providerId'));
@@ -447,7 +467,7 @@ export function evaluateCapabilityEligibility(
   query: CapabilityQuery,
 ): CapabilityEligibility {
   const registry: unknown = registryVersion;
-  if (typeof registry !== 'object' || registry === null || arrayIsArray(registry)) {
+  if (typeof registry !== 'object' || registry === null || isArraySafe(registry) !== false) {
     return unreadable();
   }
 
@@ -457,7 +477,7 @@ export function evaluateCapabilityEligibility(
   }
 
   const rawEntries = readOwnProperty(registry, 'entries');
-  if (!arrayIsArray(rawEntries)) {
+  if (isArraySafe(rawEntries) !== true || typeof rawEntries !== 'object' || rawEntries === null) {
     return unreadable();
   }
   const entries: object = rawEntries;
@@ -492,7 +512,7 @@ export function evaluateCapabilityEligibility(
   let providerId: string | null = null;
   let agentId: string | null = null;
   let purpose: InvocationPurpose | null = null;
-  if (typeof request === 'object' && request !== null && !arrayIsArray(request)) {
+  if (typeof request === 'object' && request !== null && isArraySafe(request) === false) {
     providerId = readExactIdentifier(readOwnProperty(request, 'providerId'));
     agentId = readExactIdentifier(readOwnProperty(request, 'agentId'));
     const rawPurpose = readOwnProperty(request, 'purpose');

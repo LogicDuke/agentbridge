@@ -86,6 +86,59 @@ function hostileProxy(target: object): object {
   });
 }
 
+/**
+ * A Proxy that has already been revoked.
+ *
+ * Distinct from {@link hostileProxy}: a revoked Proxy does not run traps that
+ * throw, it makes the *engine* throw before any trap is consulted, and
+ * `Array.isArray` is one of the operations that throws.
+ */
+function revokedProxy(target: object): object {
+  const { proxy, revoke } = Proxy.revocable(target, {});
+  revoke();
+  return proxy;
+}
+
+/**
+ * An array Proxy that reports a non-integer `length`.
+ *
+ * The only lever that forces `readLength` to consult `Number.isInteger` and
+ * refuse on its answer, so a test can tell a captured intrinsic from a live
+ * one. `length` is writable on an array, so the trap breaks no Proxy invariant.
+ */
+function fractionalLengthArray(members: readonly unknown[]): object {
+  const inner = [...members];
+  return new Proxy(inner, {
+    get(target, key): unknown {
+      return key === 'length' ? 1.5 : Reflect.get(target, key);
+    },
+  });
+}
+
+/** Run `body`, restoring `Number.isInteger` however it exits. */
+function restoringIsInteger<T>(body: () => T): T {
+  const real = Number.isInteger;
+  try {
+    return body();
+  } finally {
+    Number.isInteger = real;
+  }
+}
+
+/** A getter that poisons `Number.isInteger` mid-evaluation, then answers. */
+function poisoningGetter(value: unknown): PropertyDescriptor {
+  return {
+    get(): unknown {
+      Number.isInteger = (): never => {
+        throw new Error('poisoned Number.isInteger');
+      };
+      return value;
+    },
+    enumerable: true,
+    configurable: true,
+  };
+}
+
 describe('happy path', () => {
   it('admits an exact pair whose approved purpose set contains the purpose', () => {
     const result = evaluate(baselineRegistry(), queryOf(PROVIDER, AGENT, 'review'));
@@ -558,6 +611,119 @@ describe('totality against hostile input', () => {
     const trappedQuery = hostileProxy({});
     expect(() => evaluate(baselineRegistry(), trappedQuery)).not.toThrow();
     expect(evaluate(baselineRegistry(), trappedQuery).reason).toBe(REASON.QUERY_INVALID);
+  });
+
+  it('fails closed when the registry argument is a revoked Proxy', () => {
+    const registry = revokedProxy({});
+
+    expect(() => evaluate(registry, queryOf(PROVIDER, AGENT))).not.toThrow();
+    expect(evaluate(registry, queryOf(PROVIDER, AGENT))).toStrictEqual({
+      eligible: false,
+      reason: REASON.REGISTRY_UNREADABLE,
+      registryVersion: null,
+      providerId: null,
+      agentId: null,
+      purpose: null,
+    });
+  });
+
+  it('fails closed when the entry list is a revoked Proxy', () => {
+    const registry = { registryVersion: VERSION, entries: revokedProxy([]) };
+
+    expect(() => evaluate(registry, queryOf(PROVIDER, AGENT))).not.toThrow();
+    expect(evaluate(registry, queryOf(PROVIDER, AGENT))).toStrictEqual({
+      eligible: false,
+      reason: REASON.REGISTRY_UNREADABLE,
+      registryVersion: null,
+      providerId: null,
+      agentId: null,
+      purpose: null,
+    });
+  });
+
+  it('fails closed when one entry is a revoked Proxy', () => {
+    const registry = versionOf([revokedProxy({})]);
+
+    expect(() => evaluate(registry, queryOf(PROVIDER, AGENT))).not.toThrow();
+    // Identity and the entry list both read cleanly, so this is malformed
+    // content rather than an unreadable registry, and the version is echoed.
+    expect(evaluate(registry, queryOf(PROVIDER, AGENT))).toStrictEqual({
+      eligible: false,
+      reason: REASON.REGISTRY_INVALID,
+      registryVersion: VERSION,
+      providerId: null,
+      agentId: null,
+      purpose: null,
+    });
+  });
+
+  it('fails closed when an entry purpose set is a revoked Proxy', () => {
+    const registry = versionOf([
+      {
+        providerId: PROVIDER,
+        agentId: AGENT,
+        approvedPurposes: revokedProxy([]),
+        approvalState: STATE.APPROVED,
+      },
+    ]);
+
+    expect(() => evaluate(registry, queryOf(PROVIDER, AGENT))).not.toThrow();
+    expect(evaluate(registry, queryOf(PROVIDER, AGENT))).toStrictEqual({
+      eligible: false,
+      reason: REASON.REGISTRY_INVALID,
+      registryVersion: VERSION,
+      providerId: null,
+      agentId: null,
+      purpose: null,
+    });
+  });
+
+  it('fails closed when the query argument is a revoked Proxy', () => {
+    const query = revokedProxy({});
+
+    expect(() => evaluate(baselineRegistry(), query)).not.toThrow();
+    expect(evaluate(baselineRegistry(), query)).toStrictEqual({
+      eligible: false,
+      reason: REASON.QUERY_INVALID,
+      registryVersion: VERSION,
+      providerId: null,
+      agentId: null,
+      purpose: null,
+    });
+  });
+
+  it('refuses on a poisoned Number.isInteger planted before the entry-count read', () => {
+    restoringIsInteger(() => {
+      const registry: Record<string, unknown> = { entries: fractionalLengthArray([]) };
+      // Runs before the entry list is measured, which is the whole window a
+      // live `Number.isInteger` would be resolved in.
+      Object.defineProperty(registry, 'registryVersion', poisoningGetter(VERSION));
+
+      expect(() => evaluate(registry, queryOf(PROVIDER, AGENT))).not.toThrow();
+      const result = evaluate(registry, queryOf(PROVIDER, AGENT));
+      expect(result.eligible).toBe(false);
+      // A fractional length is refused on the captured intrinsic's answer, so
+      // the verdict proves the capture is both used and still functional.
+      expect(result.reason).toBe(REASON.REGISTRY_UNREADABLE);
+    });
+  });
+
+  it('refuses on a poisoned Number.isInteger planted before the purpose-set read', () => {
+    restoringIsInteger(() => {
+      const entry: Record<string, unknown> = {
+        providerId: PROVIDER,
+        approvedPurposes: fractionalLengthArray(['review']),
+        approvalState: STATE.APPROVED,
+      };
+      Object.defineProperty(entry, 'agentId', poisoningGetter(AGENT));
+      const registry = versionOf([entry]);
+
+      expect(() => evaluate(registry, queryOf(PROVIDER, AGENT))).not.toThrow();
+      const result = evaluate(registry, queryOf(PROVIDER, AGENT));
+      expect(result.eligible).toBe(false);
+      expect(result.reason).toBe(REASON.REGISTRY_INVALID);
+      expect(result.registryVersion).toBe(VERSION);
+    });
   });
 
   it('ignores prototype-planted fields on registries, entries, and queries', () => {
