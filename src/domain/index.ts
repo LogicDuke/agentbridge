@@ -254,3 +254,18 @@ export {
 } from './workflow.js';
 
 export { applyWorkflowEvent, openWorkflow, readWorkflowState } from './workflow-transitions.js';
+
+export {
+  CAPABILITY_APPROVAL_STATE,
+  CAPABILITY_APPROVAL_STATES,
+  CAPABILITY_ELIGIBILITY_REASON,
+  CAPABILITY_ELIGIBILITY_REASONS,
+  CAPABILITY_REGISTRY_BOUNDS,
+  evaluateCapabilityEligibility,
+  type CapabilityApprovalState,
+  type CapabilityEligibility,
+  type CapabilityEligibilityReason,
+  type CapabilityQuery,
+  type CapabilityRegistryEntry,
+  type CapabilityRegistryVersion,
+} from './capability-registry.js';

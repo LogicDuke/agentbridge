@@ -14,7 +14,7 @@ import {
   type CapabilityEligibility,
   type CapabilityQuery,
   type CapabilityRegistryVersion,
-} from '../../src/domain/capability-registry.js';
+} from '../../src/domain/index.js';
 
 /**
  * Pure capability-registry evaluator.
