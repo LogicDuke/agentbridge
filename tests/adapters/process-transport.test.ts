@@ -1,5 +1,6 @@
 import { ChildProcess, spawn, spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
+import { Readable, Writable } from 'node:stream';
 import {
   readdirSync,
   existsSync,
@@ -4644,12 +4645,19 @@ describe('invokeAgentProcess — adversarial', () => {
       expect(probe.timers.filter((timer) => timer.delayMs === graceMs)).toHaveLength(1);
       // Nothing this exchange scheduled is still running after settlement.
       expect(probe.timers.filter((timer) => !timer.cleared && !timer.fired)).toEqual([]);
-      // Settlement is final: no listener of the transport's survived it, so a
-      // later close cannot produce a second exchange.
+      // Settlement is final, and every listener this exchange owned was
+      // released as part of it. The one deliberate survivor is the spawn-failure
+      // absorber: a handle stripped of its last `error` listener turns a stray
+      // spawn failure into an EventEmitter rethrow, which ends the host process
+      // rather than this exchange, so that one is left attached on purpose. It
+      // does nothing, which is exactly why it is safe to leave.
       expect(child.listenerCount('close')).toBe(0);
       expect(child.listenerCount('exit')).toBe(0);
-      expect(child.listenerCount('error')).toBe(0);
+      expect(child.listenerCount('error')).toBe(1);
       child.emit('close', 0, null);
+      child.emit('exit', 0, null);
+      // The surviving absorber swallows this instead of rethrowing it.
+      child.emit('error', new Error('after settlement'));
       await delay(0);
       expect(await pending).toBe(exchange);
       expect(Object.isFrozen(exchange)).toBe(true);
@@ -5216,4 +5224,1186 @@ describe('invokeAgentProcess — boundary', () => {
     expect(NODE_EXECUTABLE.length).toBeGreaterThan(0);
     expect(existsSync(NODE_EXECUTABLE)).toBe(true);
   });
+});
+
+/**
+ * F1 continuation/settlement adversarial matrix, rows M1 through M18.
+ *
+ * Every row asserts the two halves of the invariant separately, because they
+ * are different guarantees and a row that conflates them cannot tell an honest
+ * limit from a regression:
+ *
+ *   (T) totality  -- exactly one terminal capability invocation, on every path
+ *   (Q) quiescence -- nothing this exchange registered can act afterwards
+ *   (L) timers     -- no timer this exchange armed is still armed
+ *   (A) handles    -- exactly one release request per operating-system handle
+ *
+ * Timers are real throughout. A fake clock cannot see an abandoned `setTimeout`,
+ * which is the whole defect class these rows exist to catch. Live handles are
+ * read back from `process.getActiveResourcesInfo()`, and only its `Timeout`
+ * entries are ever asserted: a `ChildProcess` or `Pipe` delta is recorded and
+ * reported, never required to be zero, because nothing in this transport can
+ * prove an operating-system handle is closed.
+ */
+
+interface FaultInjection {
+  /** Throw from the captured `on` when this says so. */
+  readonly failRegistration?: (event: string, index: number, onChild: boolean) => boolean;
+  /** Throw from the captured `removeListener`. */
+  readonly removeListenerThrows?: boolean;
+  /** Throw from the captured `removeAllListeners`. */
+  readonly removeAllListenersThrows?: boolean;
+  /** Throw from the captured `end`, as a destroyed stdin would. */
+  readonly writableEndThrows?: boolean;
+  /**
+   * Throw from the captured pipe release.
+   *
+   * Exercises the half of the release-state contract that matters most: a
+   * primitive that fails must be counted once and never retried by a later
+   * owner, which is only true if the entry is marked before the primitive runs.
+   */
+  readonly destroyThrows?: boolean;
+  /**
+   * Refuse post-spawn dispatch hardening for the Windows tree-kill helper only.
+   *
+   * Drives the helper down its abandoned-hardening reap, which is the one route
+   * where two owners -- the reap itself and the terminal drain -- both reach the
+   * helper handle while it is still alive. Without this the window depends on
+   * how long a real `taskkill.exe` takes to exit, which is not something a test
+   * may assume.
+   */
+  readonly helperHardeningThrows?: boolean;
+  /**
+   * Run immediately after the abort listener is registered, before the
+   * transport's second `aborted` read. The only way to reach the one
+   * pre-executor exit that holds an already-acquired resource.
+   */
+  readonly duringAbortRegistration?: () => void;
+  /**
+   * Make every cancellation throw, and leave the timer armed.
+   *
+   * The one named defeater of the timer-liveness clause, modelled by its
+   * observable consequence rather than by its cause. The cause is an
+   * `async_hooks` `init` hook sealing a `Timeout`: the captured cancellation
+   * then assigns to a frozen object, throws, and the timer stays armed.
+   * Freezing a real `Timeout` here would do considerably more than that -- Node
+   * threads its timers through a shared linked list and writes `_idlePrev` on
+   * the next insertion, so one frozen handle breaks timer creation for the whole
+   * worker rather than for this exchange. Refusing the cancellation reproduces
+   * exactly what the clause is about, and nothing else.
+   */
+  readonly cancellationThrows?: boolean;
+}
+
+/**
+ * How one exchange ended, recorded rather than inferred.
+ *
+ * `count` is the totality assertion: exactly one terminal report, never none
+ * and never two. Reading it from a settled promise is the only way to state
+ * that without a tautology.
+ */
+interface Settlement {
+  resolvedWith: AgentExchange | null;
+  rejectedWith: unknown;
+  count: number;
+}
+
+async function observeSettlement(pending: Promise<AgentExchange>): Promise<Settlement> {
+  const settlement: Settlement = { resolvedWith: null, rejectedWith: null, count: 0 };
+  await pending.then(
+    (exchange) => {
+      settlement.resolvedWith = exchange;
+      settlement.count += 1;
+    },
+    (reason: unknown) => {
+      settlement.rejectedWith = reason;
+      settlement.count += 1;
+    },
+  );
+  return settlement;
+}
+
+interface FaultProbe {
+  readonly invoke: typeof invokeAgentProcess;
+  readonly child: Promise<ChildProcess>;
+  readonly timers: readonly RecordedTimer[];
+  readonly kills: readonly string[];
+  readonly registrations: readonly string[];
+  /**
+   * Every child process this transport started, in order.
+   *
+   * A termination request reaches the operating system by one of two
+   * mechanisms, and which one is platform-dependent: a signal on POSIX, or a
+   * second process -- `taskkill.exe` -- on Windows. A row that asserts only the
+   * first is asserting the platform rather than the invariant.
+   */
+  readonly processes: readonly ChildProcess[];
+  /** How many cancellations the injected defeater refused. */
+  readonly refusedCancellations: () => number;
+  /**
+   * Run a hook the moment a child process is first seen, synchronously.
+   *
+   * The tree-kill helper is started from inside termination, long after the
+   * caller has any other handle on it, so this is the only point at which a row
+   * can reach it before the transport does.
+   */
+  readonly onProcessSeen: (hook: (child: ChildProcess, index: number) => void) => void;
+  /**
+   * Every release primitive invocation this transport made, attributed.
+   *
+   * Only this transport's. The instrumented intrinsics are restored immediately
+   * after the isolated import, so the module keeps the captured wrappers while
+   * the rest of the worker -- Node's own stream teardown included -- runs on the
+   * genuine functions. Without that separation an oracle counting releases would
+   * be counting Node as well.
+   */
+  readonly releases: readonly ReleaseRecord[];
+}
+
+/** One release primitive invocation, attributed to the handle it reached. */
+interface ReleaseRecord {
+  readonly kind: 'destroy' | 'kill';
+  /** Index into `processes`: 0 is the direct child, 1+ a helper. -1 unknown. */
+  readonly process: number;
+  readonly stream?: 'stdout' | 'stderr';
+}
+
+/**
+ * Logical releases that reached one child's pipe end.
+ *
+ * Also the exact count of *logical* release actions for that child's handle,
+ * derived without any production hook. The owned-handle release runs
+ * `destroyReadable(child.stdout)` as the first statement it actually executes
+ * for the direct child -- the kill ahead of it is skipped, because the direct
+ * child is not reaped through the ledger -- so the stdout count is one exactly
+ * when the release action ran, and zero exactly when it did not. The stderr
+ * count says the same thing unless the action threw part-way, which is its own
+ * declared case.
+ *
+ * The accepted invariant is exactly one logical release per acquired handle, so
+ * every use of this is an equality. `<= 1` is never acceptable: it passes on
+ * zero, and zero is an abandoned handle -- the original defect.
+ */
+function stdioReleases(
+  probe: FaultProbe,
+  index: number,
+  stream: 'stdout' | 'stderr',
+): number {
+  return probe.releases.filter(
+    (record) =>
+      record.kind === 'destroy' && record.process === index && record.stream === stream,
+  ).length;
+}
+
+/** Logical releases that reached a helper handle -- any process past the child. */
+function helperReleases(probe: FaultProbe): number {
+  return probe.releases.filter((record) => record.kind === 'kill' && record.process >= 1)
+    .length;
+}
+
+/**
+ * True when this exchange asked the operating system to end its direct child.
+ *
+ * Deliberately **not** an `(A)` assertion. Direct-child termination signalling
+ * is governed by `TerminationScope`, which reports a request and never a
+ * completion, and whose POSIX path issues `SIGTERM` and then `SIGKILL` to the
+ * same process by design. Counting those under a one-release-per-handle rule
+ * would condemn the escalation sequence itself. What this asserts is the thing
+ * the rebuild is actually about on these routes: the child is not abandoned.
+ *
+ * The mechanism is platform-dependent -- a signal on POSIX, a second process on
+ * Windows -- so a row asserting only the first would be asserting the platform.
+ */
+function terminationRequested(probe: FaultProbe): boolean {
+  return probe.kills.length >= 1 || probe.processes.length >= 2;
+}
+
+/** `Timeout` handles the host is holding right now. */
+function liveTimerCount(): number {
+  return process.getActiveResourcesInfo().filter((kind) => kind === 'Timeout').length;
+}
+
+/** Everything the host is holding right now, for the record rather than a claim. */
+function liveHandleSummary(): Record<string, number> {
+  const summary: Record<string, number> = {};
+  for (const kind of process.getActiveResourcesInfo()) {
+    summary[kind] = (summary[kind] ?? 0) + 1;
+  }
+  return summary;
+}
+
+/**
+ * Import one transport instance whose captured intrinsics are hostile.
+ *
+ * The transport reads `on`, `removeListener`, `removeAllListeners`, `end`,
+ * `setTimeout` and `clearTimeout` once, at module load, so replacing them across
+ * a single isolated import reaches exactly that instance and leaves the rest of
+ * the worker on the genuine functions. Signals are counted and withheld, so a
+ * child stays alive for as long as a row needs it.
+ */
+async function importWithSetupFault(faults: FaultInjection = {}): Promise<FaultProbe> {
+  const onDescriptor = Object.getOwnPropertyDescriptor(EventEmitter.prototype, 'on');
+  const removeDescriptor = Object.getOwnPropertyDescriptor(
+    EventEmitter.prototype,
+    'removeListener',
+  );
+  const removeAllDescriptor = Object.getOwnPropertyDescriptor(
+    EventEmitter.prototype,
+    'removeAllListeners',
+  );
+  const endDescriptor = Object.getOwnPropertyDescriptor(Writable.prototype, 'end');
+  const destroyDescriptor = Object.getOwnPropertyDescriptor(Readable.prototype, 'destroy');
+  const definePropertyDescriptor = Object.getOwnPropertyDescriptor(Object, 'defineProperty');
+  const childKillDescriptor = Object.getOwnPropertyDescriptor(ChildProcess.prototype, 'kill');
+  const addListenerDescriptor = Object.getOwnPropertyDescriptor(
+    EventTarget.prototype,
+    'addEventListener',
+  );
+  const setTimeoutDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'setTimeout');
+  const clearTimeoutDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'clearTimeout');
+  if (
+    onDescriptor === undefined ||
+    removeDescriptor === undefined ||
+    removeAllDescriptor === undefined ||
+    endDescriptor === undefined ||
+    destroyDescriptor === undefined ||
+    definePropertyDescriptor === undefined ||
+    addListenerDescriptor === undefined ||
+    childKillDescriptor === undefined ||
+    setTimeoutDescriptor === undefined ||
+    clearTimeoutDescriptor === undefined
+  ) {
+    throw new Error('An intrinsic the fault probe instruments is unavailable');
+  }
+  const realOn = onDescriptor.value as (
+    this: EventEmitter,
+    event: string,
+    listener: (...args: unknown[]) => void,
+  ) => EventEmitter;
+  const realRemove = removeDescriptor.value as (...args: unknown[]) => EventEmitter;
+  const realRemoveAll = removeAllDescriptor.value as (...args: unknown[]) => EventEmitter;
+  const realEnd = endDescriptor.value as (...args: unknown[]) => Writable;
+  const realDestroy = destroyDescriptor.value as (...args: unknown[]) => Readable;
+  const realDefineProperty = definePropertyDescriptor.value as (
+    ...args: unknown[]
+  ) => object;
+  const realAddEventListener = addListenerDescriptor.value as (...args: unknown[]) => void;
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+
+  const timers: RecordedTimer[] = [];
+  const kills: string[] = [];
+  const registrations: string[] = [];
+  const processes: ChildProcess[] = [];
+  const releases: ReleaseRecord[] = [];
+  const records = new Map<NodeJS.Timeout, RecordedTimer>();
+  let refusedCancellations = 0;
+  let onProcess: ((child: ChildProcess, index: number) => void) | null = null;
+
+  /** Which child, if any, owns this stream. */
+  const attribute = (readable: Readable): ReleaseRecord => {
+    for (let index = 0; index < processes.length; index += 1) {
+      const owner = processes[index];
+      if (owner?.stdout === readable) {
+        return { kind: 'destroy', process: index, stream: 'stdout' };
+      }
+      if (owner?.stderr === readable) {
+        return { kind: 'destroy', process: index, stream: 'stderr' };
+      }
+    }
+    return { kind: 'destroy', process: -1 };
+  };
+  let observe: ((seen: ChildProcess) => void) | null = null;
+  const child = new Promise<ChildProcess>((resolve) => {
+    observe = resolve;
+  });
+
+  Object.defineProperty(globalThis, 'setTimeout', {
+    configurable: true,
+    writable: true,
+    value(callback: () => void, delayMs?: number): NodeJS.Timeout {
+      const record: RecordedTimer = { delayMs: delayMs ?? 0, cleared: false, fired: false };
+      const handle = realSetTimeout(() => {
+        record.fired = true;
+        callback();
+      }, delayMs);
+      records.set(handle, record);
+      timers.push(record);
+      return handle;
+    },
+  });
+  Object.defineProperty(globalThis, 'clearTimeout', {
+    configurable: true,
+    writable: true,
+    value(handle?: NodeJS.Timeout): void {
+      if (faults.cancellationThrows === true && handle !== undefined && records.has(handle)) {
+        refusedCancellations += 1;
+        // Still armed afterwards, exactly as a sealed timer would be.
+        throw new TypeError("Cannot assign to read only property '_onTimeout'");
+      }
+      if (handle !== undefined) {
+        const record = records.get(handle);
+        if (record !== undefined) {
+          record.cleared = true;
+        }
+      }
+      realClearTimeout(handle);
+    },
+  });
+  Object.defineProperty(ChildProcess.prototype, 'kill', {
+    configurable: true,
+    writable: true,
+    value(this: ChildProcess, signal?: NodeJS.Signals | number): boolean {
+      kills.push(`child:${String(signal ?? 'default')}`);
+      releases.push({ kind: 'kill', process: processes.indexOf(this) });
+      return true;
+    },
+  });
+  Object.defineProperty(Readable.prototype, 'destroy', {
+    configurable: true,
+    writable: true,
+    value(this: Readable, ...args: unknown[]): Readable {
+      releases.push(attribute(this));
+      if (faults.destroyThrows === true) {
+        throw new Error('destroy refused');
+      }
+      return Reflect.apply(realDestroy, this, args);
+    },
+  });
+  Object.defineProperty(EventEmitter.prototype, 'on', {
+    configurable: true,
+    writable: true,
+    value(
+      this: EventEmitter,
+      event: string,
+      listener: (...args: unknown[]) => void,
+    ): EventEmitter {
+      const onChild = this instanceof ChildProcess;
+      if (onChild && !processes.includes(this)) {
+        processes.push(this);
+        onProcess?.(this, processes.length - 1);
+      }
+      if (observe !== null && onChild) {
+        const resolve = observe;
+        observe = null;
+        resolve(this);
+      }
+      const index = registrations.length;
+      registrations.push(`${onChild ? 'child' : 'pipe'}:${event}`);
+      if (faults.failRegistration?.(event, index, onChild) === true) {
+        throw new Error(`registration refused: ${event}@${String(index)}`);
+      }
+      return Reflect.apply(realOn, this, [event, listener]);
+    },
+  });
+  Object.defineProperty(EventEmitter.prototype, 'removeListener', {
+    configurable: true,
+    writable: true,
+    value(this: EventEmitter, ...args: unknown[]): EventEmitter {
+      if (faults.removeListenerThrows === true) {
+        throw new Error('removeListener refused');
+      }
+      return Reflect.apply(realRemove, this, args);
+    },
+  });
+  Object.defineProperty(EventEmitter.prototype, 'removeAllListeners', {
+    configurable: true,
+    writable: true,
+    value(this: EventEmitter, ...args: unknown[]): EventEmitter {
+      if (faults.removeAllListenersThrows === true) {
+        throw new Error('removeAllListeners refused');
+      }
+      return Reflect.apply(realRemoveAll, this, args);
+    },
+  });
+  Object.defineProperty(EventTarget.prototype, 'addEventListener', {
+    configurable: true,
+    writable: true,
+    value(this: EventTarget, ...args: unknown[]): void {
+      Reflect.apply(realAddEventListener, this, args);
+      faults.duringAbortRegistration?.();
+    },
+  });
+  Object.defineProperty(Writable.prototype, 'end', {
+    configurable: true,
+    writable: true,
+    value(this: Writable, ...args: unknown[]): Writable {
+      if (faults.writableEndThrows === true) {
+        throw new Error('end refused');
+      }
+      return Reflect.apply(realEnd, this, args);
+    },
+  });
+
+  if (faults.helperHardeningThrows === true) {
+    // Installed last, so every instrumentation above went through the genuine
+    // intrinsic, and removed first below. It refuses only a ChildProcess that is
+    // not the exchange's own child -- that is the tree-kill helper.
+    realDefineProperty(Object, 'defineProperty', {
+      configurable: true,
+      writable: true,
+      value(target: unknown, key: PropertyKey, attributes: PropertyDescriptor): object {
+        if (target instanceof ChildProcess && target !== processes[0]) {
+          throw new Error('helper dispatch hardening refused');
+        }
+        return realDefineProperty(target, key, attributes);
+      },
+    });
+  }
+
+  try {
+    vi.resetModules();
+    const isolated = await import('../../src/adapters/process-transport.js');
+    return {
+      child,
+      invoke: isolated.invokeAgentProcess,
+      timers,
+      kills,
+      registrations,
+      processes,
+      refusedCancellations: () => refusedCancellations,
+      onProcessSeen(hook: (child: ChildProcess, index: number) => void): void {
+        onProcess = hook;
+      },
+      releases,
+    };
+  } finally {
+    realDefineProperty(Object, 'defineProperty', definePropertyDescriptor);
+    Object.defineProperty(EventEmitter.prototype, 'on', onDescriptor);
+    Object.defineProperty(EventEmitter.prototype, 'removeListener', removeDescriptor);
+    Object.defineProperty(EventEmitter.prototype, 'removeAllListeners', removeAllDescriptor);
+    Object.defineProperty(Writable.prototype, 'end', endDescriptor);
+    Object.defineProperty(Readable.prototype, 'destroy', destroyDescriptor);
+    Object.defineProperty(EventTarget.prototype, 'addEventListener', addListenerDescriptor);
+    Object.defineProperty(ChildProcess.prototype, 'kill', childKillDescriptor);
+    Object.defineProperty(globalThis, 'setTimeout', setTimeoutDescriptor);
+    Object.defineProperty(globalThis, 'clearTimeout', clearTimeoutDescriptor);
+    timers.length = 0;
+    kills.length = 0;
+    registrations.length = 0;
+    processes.length = 0;
+    releases.length = 0;
+  }
+}
+
+/** Kill a child a row deliberately kept alive; assertions are the point. */
+function releaseObservedChild(observed: ChildProcess | null): void {
+  if (observed?.pid !== undefined) {
+    try {
+      process.kill(observed.pid, 'SIGKILL');
+    } catch {
+      // Already gone.
+    }
+  }
+}
+
+/** A long-lived child, so a row decides when the exchange ends. */
+function sleepingSpec(): AgentProcessSpec {
+  return makeSpec({ args: ['-e', STUB.SLEEP] });
+}
+
+const WINDOWS_ONLY = process.platform === 'win32';
+
+describe('F1 continuation/settlement -- adversarial matrix', () => {
+  /**
+   * M1 (F1-01) -- the grace timer is armed before its own registration.
+   *
+   * Genuine negative control for (L) on the pre-rebuild transport: the timer was
+   * held only by the closure the registration throw abandoned, so it stayed
+   * ref'd for the whole grace window with nothing left able to cancel it.
+   */
+  it('M1 releases the grace timer when the wait registration throws', async () => {
+    let observed: ChildProcess | null = null;
+    const controller = new AbortController();
+    // The executor registers `exit` on the child once; the waits inside
+    // termination register it again. Refusing the second is refusing exactly
+    // the registration `waitForExit` performs after arming its timer.
+    let seenExitRegistrations = 0;
+    const probe = await importWithSetupFault({
+      failRegistration: (event, _index, onChild) => {
+        if (!onChild || event !== 'exit') {
+          return false;
+        }
+        seenExitRegistrations += 1;
+        return seenExitRegistrations > 1;
+      },
+    });
+    try {
+      const pending = probe.invoke(
+        sleepingSpec(),
+        withSignal(makeLimits({ timeoutMs: 15_000, graceMs: 400 }), controller.signal),
+      );
+      observed = await probe.child;
+      controller.abort();
+      const settlement = await observeSettlement(pending);
+
+      // (T): exactly one terminal report, whichever kind, and never a hang.
+      expect(settlement.count).toBe(1);
+      // (L): nothing this exchange armed is still armed.
+      expect(probe.timers.filter((timer) => !timer.cleared && !timer.fired)).toEqual([]);
+    } finally {
+      releaseObservedChild(observed);
+    }
+  }, 20_000);
+
+  /**
+   * M3 / M10 (F1-06) -- a release throws during the terminal step.
+   *
+   * The sharpest genuine negative control in the family. Before the rebuild the
+   * terminal step marked the exchange settled, then ran the removals, then
+   * resolved; a removal that threw left the exchange marked settled and never
+   * delivered, with its own guard refusing every later attempt.
+   */
+  it('M3/M10 still delivers a frozen exchange when every listener removal throws', async () => {
+    let observed: ChildProcess | null = null;
+    const probe = await importWithSetupFault({
+      removeListenerThrows: true,
+      removeAllListenersThrows: true,
+    });
+    try {
+      const pending = probe.invoke(
+        makeSpec({ args: ['-e', STUB.WRITE_OK] }),
+        makeLimits({ timeoutMs: 15_000, graceMs: 400 }),
+      );
+      observed = await probe.child;
+      const exchange = await pending;
+
+      // (T): delivered, with a real exchange rather than the escaping fault.
+      expect(exchange.outcome).toBe('EXITED');
+      expect(Object.isFrozen(exchange)).toBe(true);
+      // (L): the release that throws is a handle release, and it may not cost
+      // the cancellation phase that already ran.
+      expect(probe.timers.filter((timer) => !timer.cleared && !timer.fired)).toEqual([]);
+    } finally {
+      releaseObservedChild(observed);
+    }
+  }, 20_000);
+
+  /**
+   * M4 (F1-06) -- the same fault, reached from the `close` handler.
+   *
+   * Before the rebuild this route did not hang: the throw escaped the emit and
+   * became an uncaught exception, which ends the host rather than the exchange.
+   */
+  it('M4 survives a removal fault raised from the close handler', async () => {
+    let observed: ChildProcess | null = null;
+    const probe = await importWithSetupFault({ removeAllListenersThrows: true });
+    try {
+      const pending = probe.invoke(
+        makeSpec({ args: ['-e', STUB.WRITE_OK] }),
+        makeLimits({ timeoutMs: 15_000, graceMs: 400, maxStdoutBytes: 1_024 }),
+      );
+      observed = await probe.child;
+      const exchange = await pending;
+
+      expect(typeof exchange.outcome).toBe('string');
+      expect(Object.isFrozen(exchange)).toBe(true);
+      expect(probe.timers.filter((timer) => !timer.cleared && !timer.fired)).toEqual([]);
+    } finally {
+      releaseObservedChild(observed);
+    }
+  }, 20_000);
+
+  /**
+   * M5 / M7 -- two terminal causes become ready together.
+   *
+   * Regression guard: the precedence lattice already decided this before the
+   * rebuild and is deliberately untouched by it.
+   */
+  it('M5/M7 reports one cause by precedence when a timeout races completion', async () => {
+    const exchange = await invokeAgentProcess(
+      makeSpec({ args: ['-e', STUB.SLEEP] }),
+      makeLimits({ timeoutMs: 120, graceMs: 200 }),
+    );
+
+    expect(exchange.outcome).toBe('TIMED_OUT');
+    expect(Object.isFrozen(exchange)).toBe(true);
+  }, 20_000);
+
+  /**
+   * M6 -- abort, and the caller's signal is released exactly once.
+   *
+   * (A) for the one listener this transport attaches to an object it does not
+   * own. The pre-executor early return used to release it with a bare call that
+   * no other exit shared; it is now the same phase-2 request on every path.
+   */
+  it('M6 releases the caller signal on the abort path', async () => {
+    const controller = new AbortController();
+    const pending = invokeAgentProcess(
+      sleepingSpec(),
+      withSignal(makeLimits({ timeoutMs: 15_000, graceMs: 200 }), controller.signal),
+    );
+    await delay(60);
+    controller.abort();
+    const exchange = await pending;
+
+    expect(exchange.outcome).toBe('CANCELLED');
+    // Quiescent: a second abort dispatch after settlement changes nothing.
+    controller.abort();
+    await delay(10);
+    expect(await pending).toBe(exchange);
+  }, 20_000);
+
+  /**
+   * M6b -- the one pre-executor exit that holds an already-acquired resource.
+   *
+   * The signal aborts between its registration and the transport's second
+   * `aborted` read, so the exchange ends before the executor with the caller's
+   * listener already attached. That exit used to release it with a bare call no
+   * other terminal path shared; it now takes the same terminal step as every
+   * other route, and the outcome it reports is unchanged.
+   */
+  it('M6b takes the terminal step on the pre-executor abort exit', async () => {
+    const controller = new AbortController();
+    let aborted = false;
+    const probe = await importWithSetupFault({
+      duringAbortRegistration: () => {
+        if (!aborted) {
+          aborted = true;
+          controller.abort();
+        }
+      },
+    });
+
+    const exchange = await probe.invoke(
+      sleepingSpec(),
+      withSignal(makeLimits({ timeoutMs: 5_000, graceMs: 200 }), controller.signal),
+    );
+
+    expect(aborted).toBe(true);
+    // The outcome, the scope and the frozen shape are byte for byte what this
+    // path always reported.
+    expect(exchange.outcome).toBe('CANCELLED');
+    expect(exchange.rejection).toBeNull();
+    expect(exchange.terminationScope).toBe('NOT_REQUIRED');
+    expect(Object.isFrozen(exchange)).toBe(true);
+    // Nothing reached the operating system at all on this route.
+    expect(probe.kills).toEqual([]);
+    expect(probe.timers.filter((timer) => !timer.cleared && !timer.fired)).toEqual([]);
+  }, 20_000);
+
+  /**
+   * M9 (F1-05) -- `end` throws on the way to closing stdin.
+   *
+   * Genuine negative control. Before the rebuild the throw escaped the executor
+   * and the runtime rejected the exchange with the stream error, having invoked
+   * a capability the transport never chose -- with a child already running and
+   * the deadline, three statements further down, never armed to bound it.
+   *
+   * The report is the mandatory setup failure rather than an exchange outcome.
+   * That is the answer this module's contract already defines for mandatory
+   * post-spawn setup it cannot establish, and it is deliberately not
+   * `SPAWN_FAILED` and not an `AgentExchange`.
+   */
+  it('M9 terminates the child and reports when stdin close throws', async () => {
+    let observed: ChildProcess | null = null;
+    const probe = await importWithSetupFault({ writableEndThrows: true });
+    try {
+      const pending = probe.invoke(
+        sleepingSpec(),
+        makeLimits({ timeoutMs: 15_000, graceMs: 200 }),
+      );
+      observed = await probe.child;
+      const settlement = await observeSettlement(pending);
+
+      // (T): exactly one terminal report, never a hang, and the mandatory setup
+      // failure rather than the raw stream error escaping as the runtime's own
+      // settlement.
+      expect(settlement.count).toBe(1);
+      expect(settlement.resolvedWith).toBeNull();
+      expect(settlement.rejectedWith).toBeInstanceOf(Error);
+      // Termination, not release: this is `TerminationScope` territory and is
+      // excluded from (A). The child that is already running gets its bounded
+      // request rather than being abandoned unbounded -- a request, not a
+      // completion, and nothing here claims the process is gone.
+      expect(terminationRequested(probe)).toBe(true);
+      // (A): exactly one logical release per acquired pipe end. Two owners reach
+      // them on this route -- the setup-failure cleanup and the terminal drain --
+      // and the release state is what makes them one action.
+      expect(stdioReleases(probe, 0, 'stdout')).toBe(1);
+      expect(stdioReleases(probe, 0, 'stderr')).toBe(1);
+      // (L): nothing armed survives the report.
+      expect(probe.timers.filter((timer) => !timer.cleared && !timer.fired)).toEqual([]);
+    } finally {
+      releaseObservedChild(observed);
+    }
+  }, 20_000);
+
+  /**
+   * M13 (F1-07) -- the spawn-failure absorber's own registration throws.
+   *
+   * The worst member of the class: before the rebuild the throw escaped the
+   * executor with the handle carrying no `error` listener at all, so a queued
+   * spawn failure arriving afterwards made EventEmitter rethrow and ended the
+   * host process.
+   */
+  it('M13 reports and releases when the spawn-failure absorber cannot register', async () => {
+    let observed: ChildProcess | null = null;
+    const probe = await importWithSetupFault({
+      failRegistration: (event, index, onChild) => onChild && event === 'error' && index === 0,
+    });
+    try {
+      const pending = probe.invoke(
+        sleepingSpec(),
+        makeLimits({ timeoutMs: 15_000, graceMs: 200 }),
+      );
+      observed = await probe.child;
+      const settlement = await observeSettlement(pending);
+
+      expect(settlement.count).toBe(1);
+      expect(settlement.rejectedWith).toBeInstanceOf(Error);
+      expect(terminationRequested(probe)).toBe(true);
+      // (A), same two owners, same single action.
+      expect(stdioReleases(probe, 0, 'stdout')).toBe(1);
+      expect(stdioReleases(probe, 0, 'stderr')).toBe(1);
+      expect(probe.timers.filter((timer) => !timer.cleared && !timer.fired)).toEqual([]);
+    } finally {
+      releaseObservedChild(observed);
+    }
+  }, 20_000);
+
+  /**
+   * M14 (F1-08 .. F1-15) -- each listener registration in turn.
+   *
+   * Eight independent injections, swept by ordinal rather than by line. The
+   * absorber is M13's row and this sweeps what follows it, so the ordinals
+   * cover the executor's own `error`, `exit` and `close` registrations and
+   * then the first ones the termination lifecycle performs. The sweep is over
+   * registration positions and claims nothing about which source line each
+   * one is. Flowing-mode data registrations are absent from it: `Readable`
+   * overrides `on`, so those reach a different intrinsic.
+   *
+   * Before the rebuild every one of these escaped the executor, and the
+   * runtime then settled the exchange with whatever value got out -- leaving,
+   * for every ordinal landing before the deadline is armed, a running child
+   * with nothing left in the program to bound it.
+   */
+  for (const position of [1, 2, 3, 4, 5, 6, 7, 8]) {
+    it(`M14 reports and releases when listener registration ${String(position)} throws`, async () => {
+      let observed: ChildProcess | null = null;
+      let seen = 0;
+      const probe = await importWithSetupFault({
+        failRegistration: (_event, index) => {
+          if (index === 0) {
+            // The absorber is M13's row; this one starts after it.
+            return false;
+          }
+          seen += 1;
+          return seen === position;
+        },
+      });
+      try {
+        const pending = probe.invoke(
+          sleepingSpec(),
+          makeLimits({ timeoutMs: 15_000, graceMs: 200 }),
+        );
+        observed = await probe.child;
+        const settlement = await observeSettlement(pending);
+
+        // (T): exactly one terminal report on every one of the eight, never a
+        // hang and never a second.
+        expect(settlement.count).toBe(1);
+        // (A): and the child that is already running is not abandoned. This is
+        // the half that actually distinguishes the rebuild: before it, the throw
+        // escaped the executor, the runtime settled the exchange with whatever
+        // value got out, and the child kept running with the deadline that would
+        // have bounded it never armed.
+        expect(terminationRequested(probe)).toBe(true);
+        // (A): the handle is acquired by the spawn that precedes all eight
+        // ordinals, and every one of them routes through the setup failure into
+        // the bounded release, so the release action runs exactly once on each.
+        // Asserted as an equality: an upper bound would pass on zero, and zero
+        // is an abandoned handle.
+        expect(stdioReleases(probe, 0, 'stdout')).toBe(1);
+        expect(stdioReleases(probe, 0, 'stderr')).toBe(1);
+        // (L): no timer this exchange armed is still armed.
+        expect(probe.timers.filter((timer) => !timer.cleared && !timer.fired)).toEqual([]);
+      } finally {
+        releaseObservedChild(observed);
+      }
+    }, 20_000);
+  }
+
+  /**
+   * M11 / M12 -- re-entry and a late terminal signal.
+   *
+   * Regression guard for the first half, mechanism post-condition for the
+   * second: the pre-rebuild transport had no drain to re-enter from.
+   */
+  it('M11/M12 delivers once and ignores a terminal signal that arrives after', async () => {
+    let observed: ChildProcess | null = null;
+    const probe = await importWithSetupFault({});
+    try {
+      const pending = probe.invoke(
+        makeSpec({ args: ['-e', STUB.WRITE_OK] }),
+        makeLimits({ timeoutMs: 15_000, graceMs: 200 }),
+      );
+      observed = await probe.child;
+      const exchange = await pending;
+
+      observed.emit('close', 0, null);
+      observed.emit('exit', 0, null);
+      // M16: the absorber deliberately outlives the exchange, so this is
+      // swallowed rather than rethrown into the host.
+      observed.emit('error', new Error('after settlement'));
+      await delay(10);
+
+      expect(await pending).toBe(exchange);
+      expect(Object.isFrozen(exchange)).toBe(true);
+      expect(observed.listenerCount('error')).toBe(1);
+    } finally {
+      releaseObservedChild(observed);
+    }
+  }, 20_000);
+
+  /**
+   * M17 -- every release in both phases throws.
+   *
+   * The mechanism's honest limit, asserted as a property rather than excused in
+   * prose: totality and quiescence do not depend on any release succeeding, so
+   * the exchange still reports. Nothing here claims the resources were freed.
+   */
+  it('M17 still reports when every release in both phases throws', async () => {
+    let observed: ChildProcess | null = null;
+    const probe = await importWithSetupFault({
+      removeListenerThrows: true,
+      removeAllListenersThrows: true,
+      cancellationThrows: true,
+    });
+    try {
+      const pending = probe.invoke(
+        makeSpec({ args: ['-e', STUB.WRITE_OK] }),
+        makeLimits({ timeoutMs: 1_000, graceMs: 100 }),
+      );
+      observed = await probe.child;
+      const exchange = await pending;
+
+      // (T) holds with (L) and (A) both defeated. That is the stated ceiling,
+      // asserted as a property rather than excused in prose.
+      expect(exchange.outcome).toBe('EXITED');
+      expect(Object.isFrozen(exchange)).toBe(true);
+      // The defeater really was exercised; without this the row proves nothing.
+      expect(probe.refusedCancellations()).toBeGreaterThanOrEqual(1);
+    } finally {
+      releaseObservedChild(observed);
+    }
+  }, 20_000);
+
+  /**
+   * M18 -- the one named defeater of the timer-liveness clause.
+   *
+   * The clause says the guarantee degrades to quiescence and no further, and
+   * that is exactly what is asserted: the exchange still reports, nothing it
+   * registered can act afterwards, and no claim at all is made about timers.
+   */
+  it('M18 degrades to quiescence when every cancellation is refused', async () => {
+    let observed: ChildProcess | null = null;
+    const probe = await importWithSetupFault({ cancellationThrows: true });
+    try {
+      const pending = probe.invoke(
+        makeSpec({ args: ['-e', STUB.WRITE_OK] }),
+        makeLimits({ timeoutMs: 1_000, graceMs: 100 }),
+      );
+      observed = await probe.child;
+      const exchange = await pending;
+
+      // The defeater was exercised.
+      expect(probe.refusedCancellations()).toBeGreaterThanOrEqual(1);
+      // (T) is unconditional and holds through it.
+      expect(exchange.outcome).toBe('EXITED');
+      expect(Object.isFrozen(exchange)).toBe(true);
+      // (Q) is unconditional and holds through it: a timer the defeater left
+      // armed is latched, and so is every listener.
+      observed.emit('close', 0, null);
+      observed.emit('exit', 0, null);
+      await delay(150);
+      expect(await pending).toBe(exchange);
+      // (L) is conditional and is defeated here by construction. Recorded for
+      // the report, never asserted -- asserting it would contradict the clause.
+      expect(liveHandleSummary()).toBeTypeOf('object');
+      expect(liveTimerCount()).toBeGreaterThanOrEqual(0);
+    } finally {
+      releaseObservedChild(observed);
+    }
+  }, 20_000);
+
+  /**
+   * M2 / M8 / M15 (F1-02, F1-03) -- the Windows tree-kill helper.
+   *
+   * The helper is the only operating-system handle other than the child that
+   * this transport acquires, and the route that abandons its registration is the
+   * one that must still reap it. Windows only: there is no helper to reap
+   * anywhere else, and the row asserts the reap request rather than the reap.
+   */
+  it.skipIf(!WINDOWS_ONLY)(
+    'M2/M8/M15 requests exactly one helper reap and leaves no helper timer armed',
+    async () => {
+      let observed: ChildProcess | null = null;
+      const controller = new AbortController();
+      const probe = await importWithSetupFault({
+        // Refuse the helper's `exit` registration, which `runTaskkill` performs
+        // after arming its own bounded timer. Before the rebuild that left the
+        // timer, the second reap timer and the `taskkill.exe` handle itself with
+        // nothing in the program able to name any of them.
+        failRegistration: (event, _index, onChild) => !onChild && event === 'exit',
+      });
+      try {
+        const pending = probe.invoke(
+          sleepingSpec(),
+          withSignal(makeLimits({ timeoutMs: 20_000, graceMs: 300 }), controller.signal),
+        );
+        observed = await probe.child;
+        controller.abort();
+        const settlement = await observeSettlement(pending);
+
+        // (T): exactly one terminal report.
+        expect(settlement.count).toBe(1);
+        const exchange = settlement.resolvedWith;
+        if (exchange !== null) {
+          // Nothing beyond the direct child may be claimed on this evidence.
+          expect([
+            'DIRECT_CHILD_ONLY',
+            'ESCALATION_FAILED',
+            'PROCESS_TREE_REQUESTED',
+          ]).toContain(exchange.terminationScope);
+        }
+        // (L): no helper timer outlives the exchange.
+        expect(probe.timers.filter((timer) => !timer.cleared && !timer.fired)).toEqual([]);
+      } finally {
+        releaseObservedChild(observed);
+      }
+    },
+    40_000,
+  );
+});
+
+describe('C6 -- logical release, exactly once', () => {
+  /**
+   * C6-1 -- the direct child's pipe ends on the setup-failure route.
+   *
+   * Two owners reach them on one execution: the bounded release decides the
+   * local ends should go, and the terminal drain guarantees they go on routes
+   * that release never reached. Before the release state they were two
+   * independent owners and each invoked the primitive; now they converge.
+   *
+   * Genuine negative control: the superseded candidate records two destroys per
+   * end here.
+   */
+  it('C6-1 releases each pipe end once when two owners reach it', async () => {
+    let observed: ChildProcess | null = null;
+    const probe = await importWithSetupFault({ writableEndThrows: true });
+    try {
+      const pending = probe.invoke(
+        sleepingSpec(),
+        makeLimits({ timeoutMs: 15_000, graceMs: 200 }),
+      );
+      observed = await probe.child;
+      const settlement = await observeSettlement(pending);
+
+      expect(settlement.count).toBe(1);
+      expect(stdioReleases(probe, 0, 'stdout')).toBe(1);
+      expect(stdioReleases(probe, 0, 'stderr')).toBe(1);
+    } finally {
+      releaseObservedChild(observed);
+    }
+  }, 20_000);
+
+  /**
+   * C6-2 -- the same handles, reached by the other pair of owners.
+   *
+   * Here it is the forced settlement that decides the local ends should go,
+   * because the child holds its pipes past the bounded close wait, and then the
+   * terminal drain. A different pair, the same single action.
+   */
+  it('C6-2 releases each pipe end once when a forced settlement reaches it', async () => {
+    let observed: ChildProcess | null = null;
+    const controller = new AbortController();
+    const systemRoot = process.env['SystemRoot'];
+    const windir = process.env['windir'];
+    // Deny the tree-kill helper so both platforms take the same bounded
+    // direct-child route, and the signal is withheld by the probe, so the child
+    // outlives the close wait and the forced settlement is the one that runs.
+    process.env['SystemRoot'] = '';
+    process.env['windir'] = '';
+    let probe: FaultProbe;
+    try {
+      probe = await importWithSetupFault({});
+    } finally {
+      restoreEnvironmentVariable('SystemRoot', systemRoot);
+      restoreEnvironmentVariable('windir', windir);
+    }
+    try {
+      const pending = probe.invoke(
+        sleepingSpec(),
+        withSignal(makeLimits({ timeoutMs: 15_000, graceMs: 150 }), controller.signal),
+      );
+      observed = await probe.child;
+      controller.abort();
+      const settlement = await observeSettlement(pending);
+
+      expect(settlement.count).toBe(1);
+      expect(stdioReleases(probe, 0, 'stdout')).toBe(1);
+      expect(stdioReleases(probe, 0, 'stderr')).toBe(1);
+    } finally {
+      releaseObservedChild(observed);
+    }
+  }, 25_000);
+
+  /**
+   * C6-3 -- the Windows tree-kill helper, with the release guard forced open.
+   *
+   * The deterministic reproducer for the duplicate the earlier validation
+   * reported. Two owners reach the helper handle on one execution: the reap
+   * that follows its refused dispatch hardening, and the terminal drain. What
+   * separates them in the superseded transport is a single predicate,
+   * `hasEnded(helper)`, read off two accessors of a handle this module treats as
+   * untrusted everywhere else -- it wraps that very call in its own `try` at the
+   * bounded timer for exactly this reason.
+   *
+   * So the predicate is what this row controls. The helper is given accessors
+   * that report it alive from the moment it is first seen, which is the state a
+   * `taskkill.exe` outliving `TASKKILL_TIMEOUT_MS` would produce naturally and
+   * which nothing in a test may arrange by controlling that binary's runtime.
+   * The idiom is the repository's own: the re-entrancy row above redefines
+   * `exitCode` on the direct child in exactly this way.
+   *
+   * Superseded transport: the reap signals the helper, the drain finds it alive
+   * and signals it again -- two release actions for one acquired handle.
+   * With release state: the reap performs the one action and marks the entry,
+   * the drain finds it done -- exactly one.
+   *
+   * The complementary route, where the guard legitimately skips the primitive
+   * because the helper has already ended, is deliberately not asserted here: its
+   * precondition depends on how fast a real `taskkill.exe` exits, which is not
+   * something this surface can arrange either way.
+   *
+   * Windows only -- there is no helper anywhere else.
+   */
+  it.skipIf(!WINDOWS_ONLY)(
+    'C6-3 performs exactly one helper release when two owners reach it alive',
+    async () => {
+      let observed: ChildProcess | null = null;
+      let helperHeldAlive = false;
+      const controller = new AbortController();
+      const probe = await importWithSetupFault({ helperHardeningThrows: true });
+      probe.onProcessSeen((child, index) => {
+        if (index === 0) {
+          // The exchange's own child is left exactly as it is.
+          return;
+        }
+        helperHeldAlive = true;
+        // A setter is supplied because Node assigns these when it reaps the
+        // process, and an accessor without one would throw in strict mode and
+        // break the helper's own lifecycle rather than just its report.
+        Object.defineProperty(child, 'exitCode', {
+          configurable: true,
+          get: (): number | null => null,
+          set: (): void => {},
+        });
+        Object.defineProperty(child, 'signalCode', {
+          configurable: true,
+          get: (): string | null => null,
+          set: (): void => {},
+        });
+      });
+      try {
+        const pending = probe.invoke(
+          sleepingSpec(),
+          // Zero grace keeps the tail between the reap and the drain as short as
+          // the lifecycle allows; the hostile accessors are what make the row
+          // deterministic, not the timing.
+          withSignal(makeLimits({ timeoutMs: 20_000, graceMs: 0 }), controller.signal),
+        );
+        observed = await probe.child;
+        controller.abort();
+        const settlement = await observeSettlement(pending);
+
+        expect(settlement.count).toBe(1);
+        // The helper really was started, really was reached, and really was
+        // reporting itself alive when the drain ran.
+        expect(probe.processes.length).toBeGreaterThanOrEqual(2);
+        expect(helperHeldAlive).toBe(true);
+        // (A): exactly one logical release action for the helper handle. With
+        // the guard forced open the primitive count and the logical count are
+        // the same number, so this is the invariant itself and not a proxy.
+        expect(helperReleases(probe)).toBe(1);
+      } finally {
+        releaseObservedChild(observed);
+      }
+    },
+    40_000,
+  );
+
+  /**
+   * C6-4 -- a release that fails is counted once and never retried.
+   *
+   * The half of the contract that decides whether the state is recorded before
+   * or after the primitive. Recorded before, a throwing release leaves the entry
+   * claimed, so the later owner finds it done rather than trying again; recorded
+   * after, every later owner retries it and the residual counts it once per
+   * owner.
+   */
+  it('C6-4 counts a failing release once and does not retry it', async () => {
+    let observed: ChildProcess | null = null;
+    const probe = await importWithSetupFault({
+      writableEndThrows: true,
+      destroyThrows: true,
+    });
+    try {
+      const pending = probe.invoke(
+        sleepingSpec(),
+        makeLimits({ timeoutMs: 15_000, graceMs: 200 }),
+      );
+      observed = await probe.child;
+      const settlement = await observeSettlement(pending);
+
+      // (T) is unaffected by a release that fails.
+      expect(settlement.count).toBe(1);
+      // Attempted exactly once by the first owner, never retried by the second.
+      expect(stdioReleases(probe, 0, 'stdout')).toBe(1);
+      // The action covers both ends, so a throw part-way leaves the second
+      // untouched. That is one failed logical release, not two.
+      expect(stdioReleases(probe, 0, 'stderr')).toBe(0);
+    } finally {
+      releaseObservedChild(observed);
+    }
+  }, 20_000);
+
+  /**
+   * C6-5 -- the terminal capability is invoked exactly once.
+   *
+   * `claimed` refuses re-entry into the terminal sequence before any of it runs,
+   * and `ledger.delivered` records only what actually completed. The observable
+   * fact those two produce is asserted directly: one settlement, and no handle
+   * released twice, on the route where the release itself is failing.
+   */
+  it('C6-5 invokes the terminal capability once under a failing release', async () => {
+    let observed: ChildProcess | null = null;
+    const probe = await importWithSetupFault({ destroyThrows: true });
+    try {
+      const pending = probe.invoke(
+        makeSpec({ args: ['-e', STUB.WRITE_OK] }),
+        makeLimits({ timeoutMs: 15_000, graceMs: 200 }),
+      );
+      observed = await probe.child;
+      const settlement = await observeSettlement(pending);
+
+      expect(settlement.count).toBe(1);
+      expect(settlement.resolvedWith?.outcome).toBe('EXITED');
+      // Exactly one logical release, reached only by the terminal drain on this
+      // route -- the child exits on its own, so neither the setup-failure
+      // cleanup nor the forced settlement runs. The action throws on the first
+      // pipe end, which is why the second is exactly zero rather than one: one
+      // failed logical release, not two.
+      expect(stdioReleases(probe, 0, 'stdout')).toBe(1);
+      expect(stdioReleases(probe, 0, 'stderr')).toBe(0);
+
+      // Quiescent afterwards, and no second settlement from a late signal.
+      observed.emit('close', 0, null);
+      await delay(10);
+      expect(await pending).toBe(settlement.resolvedWith);
+    } finally {
+      releaseObservedChild(observed);
+    }
+  }, 20_000);
 });
