@@ -123,11 +123,18 @@ describe('no shell on any path', () => {
 
   it('passes shell: false at every spawn site', () => {
     const executable = code(IMPLEMENTATION_SOURCE);
+    // Lower-case `spawn(` matches the primitive itself and not `ownSpawn(`,
+    // which is the one place the transport is now allowed to call it.
     const spawnCalls = executable.match(/spawn\(/g) ?? [];
+    const ownedSpawns = executable.match(/ownSpawn\(/g) ?? [];
     const shellFalse = executable.match(/shell: false/g) ?? [];
 
-    expect(spawnCalls.length).toBe(2);
-    expect(shellFalse.length).toBe(spawnCalls.length);
+    // One primitive call site, inside the single owning helper, reached from
+    // exactly the two spawns this transport performs: the child, and the
+    // Windows tree-kill helper.
+    expect(spawnCalls.length).toBe(1);
+    expect(ownedSpawns.length).toBe(3);
+    expect(shellFalse.length).toBe(2);
   });
 
   it('imports only child_process from Node, and no filesystem or network API', () => {
@@ -256,7 +263,7 @@ describe('termination vocabulary claims no more than the OS provides', () => {
     // wait out the bounded grace window.
     const gracefulGuard = gracefulRegion.indexOf('if (hasEnded(child))');
     const termSignal = gracefulRegion.indexOf("signalProcessGroup(pid, 'SIGTERM')");
-    const graceWait = gracefulRegion.indexOf('waitForExit(child, graceMs)');
+    const graceWait = gracefulRegion.indexOf('waitForExit(ledger, child, graceMs)');
     // The escalation half: observe again — the grace timer and the child's exit
     // can become ready in the same turn, and a reused process-group ID must not
     // receive SIGKILL — then escalate.
@@ -279,7 +286,7 @@ describe('termination vocabulary claims no more than the OS provides', () => {
     const implementation = IMPLEMENTATION_SOURCE.slice(start, end);
     const guard = implementation.indexOf('if (hasEnded(child))');
     const resolve = implementation.indexOf('resolveTaskkill()');
-    const signal = implementation.indexOf('runTaskkill(taskkill, pid)');
+    const signal = implementation.indexOf('runTaskkill(ledger, taskkill, pid)');
 
     expect(guard).toBeGreaterThanOrEqual(0);
     expect(resolve).toBeGreaterThanOrEqual(0);
@@ -342,20 +349,27 @@ describe('termination vocabulary claims no more than the OS provides', () => {
     expect(start).toBeGreaterThanOrEqual(0);
     const executor = IMPLEMENTATION_SOURCE.slice(start);
 
-    const deadlineArmed = executor.indexOf('deadline = scheduleTimeout(');
+    // The deadline is armed through the exchange ledger, so its cancellation is
+    // recorded at the moment it is created rather than left to whichever
+    // closure happened to still be running.
+    const deadlineArmed = executor.indexOf('TRANSPORT_OUTCOME.TIMED_OUT');
     const dispatch = executor.indexOf('dispatchAbort();');
     expect(deadlineArmed).toBeGreaterThanOrEqual(0);
     expect(dispatch).toBeGreaterThanOrEqual(0);
+    expect(executor).toContain('invocation.timeoutMs,');
 
     // The only statement that can settle synchronously runs after every
     // resource this exchange owns already exists.
     expect(deadlineArmed).toBeLessThan(dispatch);
 
-    // And nothing follows it. The executor's own closing braces are all that
-    // may appear after the dispatch, so there is no statement left that could
-    // assume the exchange is still pending.
+    // And nothing of substance follows it. What may appear after the dispatch
+    // is the executor-wide guard that routes a setup fault to the terminal
+    // step, and nothing else: no statement is left that could assume the
+    // exchange is still pending.
     const afterDispatch = executor.slice(dispatch + 'dispatchAbort();'.length);
-    expect(afterDispatch.replace(/[\s});]/g, '')).toBe('');
+    expect(afterDispatch.replace(/\s+/g, ' ').trim()).toBe(
+      '} } catch (error: unknown) { failSetup(error); } }); }',
+    );
   });
 
   it('handles continuation registration failure at every call site', () => {
@@ -390,7 +404,7 @@ describe('termination vocabulary claims no more than the OS provides', () => {
       expect(declaration).toBeGreaterThanOrEqual(0);
       const body = implementation.slice(declaration);
       const opensGuard = body.indexOf('try {');
-      const observes = body.indexOf('waitForExit(child, graceMs)');
+      const observes = body.indexOf('waitForExit(ledger, child, graceMs)');
       const routesFault = body.indexOf('fail(error);');
       expect(opensGuard).toBeGreaterThanOrEqual(0);
       expect(observes).toBeGreaterThanOrEqual(0);
@@ -404,14 +418,14 @@ describe('termination vocabulary claims no more than the OS provides', () => {
     // The continuation `runTaskkill` reports into delegates to the guarded step
     // instead of observing the handle itself. Inlining the wait there is the
     // regression this asserts against.
-    const reported = implementation.indexOf('runTaskkill(taskkill, pid),');
+    const reported = implementation.indexOf('runTaskkill(ledger, taskkill, pid),');
     expect(reported).toBeGreaterThanOrEqual(0);
     const continuation = implementation.slice(
       reported,
       implementation.indexOf('} catch (error) {', reported),
     );
     expect(continuation).toContain('awaitTreeExit();');
-    expect(continuation).not.toContain('waitForExit(child, graceMs)');
+    expect(continuation).not.toContain('waitForExit(ledger, child, graceMs)');
   });
 });
 
@@ -1758,5 +1772,147 @@ describe('the transport is dormant', () => {
       }
     }
     expect(callers).toEqual([]);
+  });
+});
+
+/**
+ * Every acquisition primitive the F1 invariant quantifies over, and the only
+ * declarations allowed to reach one.
+ *
+ * Latching a listener and cancelling a timer establish quiescence and timer
+ * liveness *by construction*, which holds only for as long as no acquisition
+ * site bypasses the exchange ledger. Without this assertion the invariant is
+ * established by audit instead, and the claim to close the family rather than
+ * the sixteen sites in it does not survive the next edit that adds a
+ * seventeenth.
+ *
+ * Each primitive is here for one of four reasons, and nothing is here for
+ * completeness. Release primitives are deliberately absent: removal is an
+ * optimisation over the latch, not a correctness requirement, so an unowned
+ * removal is not a defect.
+ */
+const GUARDED_ACQUISITIONS: readonly {
+  readonly token: string;
+  readonly because: string;
+  readonly allowed: readonly string[];
+}[] = Object.freeze([
+  Object.freeze({
+    token: 'scheduleTimeout(',
+    because: 'timer acquisition',
+    allowed: Object.freeze(['ownTimer']),
+  }),
+  Object.freeze({
+    token: 'onEvent(',
+    because: 'event-listener registration',
+    // `onEvent` itself is its own declaration; the absorber is the one listener
+    // that must outlive the terminal step and so is owned by nothing.
+    allowed: Object.freeze(['onEvent', 'ownListener', 'rearmSpawnFailureAbsorber']),
+  }),
+  Object.freeze({
+    token: 'onReadableData(',
+    because: 'event-listener registration',
+    allowed: Object.freeze(['onReadableData', 'ownReadableData']),
+  }),
+  Object.freeze({
+    token: 'eventEmitterOn',
+    because: 'event-listener registration, one layer below its wrapper',
+    allowed: Object.freeze(['', 'onEvent']),
+  }),
+  Object.freeze({
+    token: 'readableOn',
+    because: 'event-listener registration, one layer below its wrapper',
+    allowed: Object.freeze(['', 'onReadableData']),
+  }),
+  Object.freeze({
+    token: 'addAbortListener(',
+    because: 'abort-listener registration',
+    allowed: Object.freeze(['addAbortListener', 'ownAbortListener']),
+  }),
+  Object.freeze({
+    token: 'eventTargetAddEventListener',
+    because: 'abort-listener registration, one layer below its wrapper',
+    allowed: Object.freeze(['', 'addAbortListener']),
+  }),
+  Object.freeze({
+    token: 'spawn(',
+    because: 'process acquisition',
+    allowed: Object.freeze(['ownSpawn']),
+  }),
+]);
+
+/**
+ * Name the top-level declaration an offset falls inside.
+ *
+ * The empty string is module scope, which is where the intrinsic captures live.
+ */
+function enclosingDeclaration(source: string, offset: number): string {
+  let name = '';
+  const declarations = /^(?:export )?function ([A-Za-z0-9_]+)/gm;
+  let match = declarations.exec(source);
+  while (match !== null) {
+    if (match.index > offset) {
+      return name;
+    }
+    name = match[1] ?? '';
+    match = declarations.exec(source);
+  }
+  return name;
+}
+
+describe('every owned acquisition goes through the exchange ledger', () => {
+  const executable = code(IMPLEMENTATION_SOURCE);
+
+  for (const { token, because, allowed } of GUARDED_ACQUISITIONS) {
+    it(`reaches ${token} only from an owning helper (${because})`, () => {
+      const reached = new Set<string>();
+      let at = executable.indexOf(token);
+      expect(at).toBeGreaterThanOrEqual(0);
+      while (at >= 0) {
+        reached.add(enclosingDeclaration(executable, at));
+        at = executable.indexOf(token, at + token.length);
+      }
+
+      const strays = [...reached].filter((where) => !allowed.includes(where));
+      expect(strays).toEqual([]);
+    });
+  }
+
+  it('guards exactly the eight primitives the invariant quantifies over', () => {
+    expect(GUARDED_ACQUISITIONS.map(({ token }) => token)).toEqual([
+      'scheduleTimeout(',
+      'onEvent(',
+      'onReadableData(',
+      'eventEmitterOn',
+      'readableOn',
+      'addAbortListener(',
+      'eventTargetAddEventListener',
+      'spawn(',
+    ]);
+  });
+
+  it('routes every acquisition through a ledger the exchange allocates first', () => {
+    // The ledger exists before the first acquisition, and the first acquisition
+    // is the caller's abort listener. Both halves are asserted, because either
+    // one alone permits the ordering this repair exists to remove.
+    const entry = executable.indexOf('export function invokeAgentProcess');
+    expect(entry).toBeGreaterThanOrEqual(0);
+    const body = executable.slice(entry);
+    const allocated = body.indexOf('createLedger()');
+    const acquired = body.indexOf('ownAbortListener(ledger,');
+    expect(allocated).toBeGreaterThanOrEqual(0);
+    expect(acquired).toBeGreaterThanOrEqual(0);
+    expect(allocated).toBeLessThan(acquired);
+
+    // And the terminal step runs its phases in the order that makes the strong
+    // clauses independent of the weak ones.
+    const finalize = executable.indexOf('const finalize =');
+    expect(finalize).toBeGreaterThanOrEqual(0);
+    const phases = executable.slice(finalize, finalize + 400);
+    const latch = phases.indexOf('latchLedger(ledger)');
+    const drain = phases.indexOf('drainLedger(ledger)');
+    const deliver = phases.indexOf('deliver()');
+    expect(latch).toBeGreaterThanOrEqual(0);
+    expect(latch).toBeLessThan(drain);
+    expect(drain).toBeLessThan(deliver);
   });
 });
