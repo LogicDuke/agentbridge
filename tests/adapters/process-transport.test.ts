@@ -1150,6 +1150,8 @@ const MODES = [
   'timeout-persistent-ctor-then',
   'hardening-persistent-sealed-ctor-then',
   'timeout-persistent-sealed-ctor-then',
+  'hardening-persistent-reparented-ctor-then',
+  'timeout-persistent-reparented-ctor-then',
 ];
 if (!MODES.includes(mode)) {
   console.log('MODE_INVALID=' + String(mode));
@@ -1158,12 +1160,15 @@ if (!MODES.includes(mode)) {
 const HARDENING =
   mode === 'hardening-persistent-then' ||
   mode === 'hardening-persistent-ctor-then' ||
-  mode === 'hardening-persistent-sealed-ctor-then';
+  mode === 'hardening-persistent-sealed-ctor-then' ||
+  mode === 'hardening-persistent-reparented-ctor-then';
 const MUTATE_CTOR =
   mode === 'hardening-persistent-ctor-then' ||
   mode === 'timeout-persistent-ctor-then' ||
   mode === 'hardening-persistent-sealed-ctor-then' ||
-  mode === 'timeout-persistent-sealed-ctor-then';
+  mode === 'timeout-persistent-sealed-ctor-then' ||
+  mode === 'hardening-persistent-reparented-ctor-then' ||
+  mode === 'timeout-persistent-reparented-ctor-then';
 // The third axis. A promise is not private between the allocation that makes it
 // and the next statement of the code that asked for one: an ordinary
 // 'async_hooks' init hook receives each newly allocated promise as its own
@@ -1171,7 +1176,20 @@ const MUTATE_CTOR =
 // would install on a promise it just created then throws instead of landing.
 const SEAL =
   mode === 'hardening-persistent-sealed-ctor-then' ||
-  mode === 'timeout-persistent-sealed-ctor-then';
+  mode === 'timeout-persistent-sealed-ctor-then' ||
+  mode === 'hardening-persistent-reparented-ctor-then' ||
+  mode === 'timeout-persistent-reparented-ctor-then';
+// The fourth axis, and the one no prototype this module owns can answer.
+// Sealing alone leaves the instance's prototype chain intact, so a promise
+// allocated from a class whose own prototype carries the recognition answer
+// still resolves it without needing an own property. An init hook receives
+// each promise while it is still extensible, though, and may *reparent* it
+// before sealing it: one 'setPrototypeOf' to the ordinary 'Promise.prototype'
+// removes the owned link, and the seal that follows makes the own-property
+// fallback impossible. Both mechanisms are then gone at once.
+const REPARENT =
+  mode === 'hardening-persistent-reparented-ctor-then' ||
+  mode === 'timeout-persistent-reparented-ctor-then';
 
 // Intrinsics captured before anything is installed over them. This probe has to
 // keep observing, timing, and cleaning up while its own substitution is in
@@ -1183,6 +1201,8 @@ const REAL_PROMISE = Promise;
 const REAL_CTOR_DESCRIPTOR = Object.getOwnPropertyDescriptor(Promise.prototype, 'constructor');
 const REAL_IS_EXTENSIBLE = Object.isExtensible;
 const REAL_PREVENT_EXTENSIONS = Object.preventExtensions;
+const REAL_SET_PROTOTYPE_OF = Object.setPrototypeOf;
+const REAL_GET_PROTOTYPE_OF = Object.getPrototypeOf;
 const realSetTimeout = setTimeout;
 const realClearTimeout = clearTimeout;
 
@@ -1316,9 +1336,25 @@ REAL_DEFINE(Object, 'defineProperty', {
 // enabled for the whole exchange.
 // ---------------------------------------------------------------------------
 let sealedPromises = 0;
+let reparentedPromises = 0;
 const sealHook = createHook({
   init(id, type, triggerId, resource) {
     if (type !== 'PROMISE') return;
+    // Reparenting first, while the resource is still extensible: the seal that
+    // follows would otherwise refuse the prototype change. Every promise is
+    // pointed at the ordinary 'Promise.prototype', which is a no-op for one
+    // that already has it and the whole attack for one allocated from a class
+    // whose own prototype answered the recognition test.
+    if (REPARENT) {
+      try {
+        if (REAL_GET_PROTOTYPE_OF(resource) !== REAL_PROMISE.prototype) {
+          REAL_SET_PROTOTYPE_OF(resource, REAL_PROMISE.prototype);
+          reparentedPromises += 1;
+        }
+      } catch {
+        // A resource this facility cannot reparent is not part of the staging.
+      }
+    }
     try {
       REAL_PREVENT_EXTENSIONS(resource);
       sealedPromises += 1;
@@ -1536,6 +1572,14 @@ const hookCallsAfterCall = hookCalls;
 
 let armedAtSettlement = false;
 let hookCallsAtSettlement = -1;
+// Counted at settlement, before any counterfactual runs. The controls below
+// include one — protectLikeRepair — that performs the same own-property
+// definition the transport does, against the same armed seal hook, and would
+// otherwise be indistinguishable from the transport's own failed protection in
+// the final totals. Reading the counters here attributes them to the exchange
+// alone, which is what makes the failure evidence and not a coincidence.
+let protectionAttemptsAtSettlement = -1;
+let protectionFailuresAtSettlement = -1;
 let settlement = null;
 const controls = {};
 
@@ -1544,6 +1588,8 @@ observe(exchange, 12000, (result) => {
   settlement = result;
   armedAtSettlement = armed();
   hookCallsAtSettlement = hookCalls;
+  protectionAttemptsAtSettlement = protectionAttempts;
+  protectionFailuresAtSettlement = protectionFailures;
   // Still armed, and now asked directly. Each control reproduces one shape of
   // the dispatcher against the runtime the transport just survived.
   observe(controlThenableReturn(), 400, (a) => {
@@ -1575,9 +1621,12 @@ function report(stillArmedAtEnd) {
   } catch { restored = false; }
   console.log('SEALED_BEFORE_CALL=' + sealedBeforeCall);
   console.log('SEALED_PROMISES=' + sealedPromises);
+  console.log('REPARENTED_PROMISES=' + reparentedPromises);
   console.log('PROTECTION_ATTEMPTS=' + protectionAttempts);
+  console.log('PROTECTION_ATTEMPTS_AT_SETTLEMENT=' + protectionAttemptsAtSettlement);
   console.log('PROTECTION_FAILURES_BEFORE_CALL=' + protectionFailuresBeforeCall);
   console.log('PROTECTION_FAILURES=' + protectionFailures);
+  console.log('PROTECTION_FAILURES_AT_SETTLEMENT=' + protectionFailuresAtSettlement);
   console.log('HOOK_INSTALLED=' + hookInstalled);
   console.log('HOOK_CALLS_AFTER_CALL=' + hookCallsAfterCall);
   console.log('HOOK_CALLS_AT_SETTLEMENT=' + hookCallsAtSettlement);
@@ -3257,9 +3306,17 @@ describe('invokeAgentProcess — adversarial', () => {
     // The protection was attempted under the seal and could not land. Before
     // the exchange began nothing had failed yet, so every counted failure is
     // one this exchange actually reached.
+    //
+    // Asserted on the counts taken *at settlement*, not on the final totals.
+    // One of the counterfactuals run afterwards — `protectLikeRepair` — makes
+    // the same own-property definition against the same armed seal hook, so it
+    // increments the same counters. A final total of one failure is therefore
+    // satisfiable by the probe's own control alone, and would report a pass for
+    // a transport that never reached the branch under audit. The settlement-time
+    // reading is attributable to the exchange and to nothing else.
     expect(probe.stdout).toMatch(/^PROTECTION_FAILURES_BEFORE_CALL=0$/m);
-    expect(probe.stdout).toMatch(/^PROTECTION_FAILURES=[1-9][0-9]*$/m);
-    expect(probe.stdout).toMatch(/^PROTECTION_ATTEMPTS=[1-9][0-9]*$/m);
+    expect(probe.stdout).toMatch(/^PROTECTION_FAILURES_AT_SETTLEMENT=[1-9][0-9]*$/m);
+    expect(probe.stdout).toMatch(/^PROTECTION_ATTEMPTS_AT_SETTLEMENT=[1-9][0-9]*$/m);
   }
 
   it('settles a hardening failure when the protective constructor cannot be installed', async () => {
@@ -3313,6 +3370,75 @@ describe('invokeAgentProcess — adversarial', () => {
     expect(probe.stdout).toMatch(/^HARDENING_POISONED=0$/m);
     // The intended outcome, with the termination it initiated actually
     // reported rather than left at NOT_REQUIRED, and no scope invented for it.
+    expect(probe.stdout).toContain('SETTLEMENT=resolved');
+    expect(probe.stdout).toContain('DETAIL=TIMED_OUT');
+    expect(probe.stdout).not.toMatch(/^SCOPE=NOT_REQUIRED$/m);
+    expect(probe.stdout).not.toMatch(/^SCOPE=undefined$/m);
+    expect(probe.stdout).not.toContain('SETTLEMENT=rejected');
+  }, 60_000);
+
+  /**
+   * The evidence a reparenting mode owes on top of the sealing one.
+   *
+   * Sealing and reparenting are separate mechanisms and this mode stages both,
+   * so both are asserted. Without the reparent count a mode whose
+   * `setPrototypeOf` silently stopped landing would still satisfy every sealed
+   * assertion and report a pass for the case it no longer ran.
+   */
+  function expectReparentedProtectionDefeated(probe: ProbeResult): void {
+    expectSealedProtectionFailed(probe);
+    expect(probe.stdout).toMatch(/^REPARENTED_PROMISES=[1-9][0-9]*$/m);
+  }
+
+  it('settles a hardening failure when the owned prototype is reparented away', async () => {
+    const probe = await runPersistentPromiseProbe('hardening-persistent-reparented-ctor-then');
+
+    // The fourth mechanism. An `async_hooks` init hook receives each promise
+    // while it is still extensible, so it can point the instance back at the
+    // ordinary `Promise.prototype` *before* sealing it. The owned prototype is
+    // then no longer on the instance's chain and the own-property fallback can
+    // no longer be installed, so both of the transport's answers to the
+    // recognition test are gone at once and the awaited promise is assimilated
+    // through the mutated `then`.
+    //
+    // The counterfactual list is the statement of that: with this runtime
+    // staged, `AWAIT_OWNED` — the shape every internal await relies on — hangs
+    // alongside the three the sealing mode already defeats. Nothing that
+    // depends on the awaited object answering a `constructor` lookup survives
+    // here, so the transport may not depend on one.
+    expectPersistentMutationSurvived(probe, [
+      'THENABLE_RETURN',
+      'AWAIT_UNPROTECTED',
+      'AWAIT_PROTECTED',
+      'AWAIT_OWNED',
+    ]);
+    expectReparentedProtectionDefeated(probe);
+    // The staged failure was genuinely reached and genuinely mandatory.
+    expect(probe.stdout).toMatch(/^HARDENING_POISONED=[1-9][0-9]*$/m);
+    // The exact hardening failure, by identity, not by message.
+    expect(probe.stdout).toContain('SETTLEMENT=rejected');
+    expect(probe.stdout).toContain('DETAIL=forced post-spawn hardening failure');
+    expect(probe.stdout).toMatch(/^ERROR_IDENTITY=true$/m);
+    expect(probe.stdout).not.toContain('SPAWN_FAILED');
+    expect(probe.stdout).not.toContain('SETTLEMENT=resolved');
+  }, 60_000);
+
+  it('settles an ordinary timeout when the owned prototype is reparented away', async () => {
+    const probe = await runPersistentPromiseProbe('timeout-persistent-reparented-ctor-then');
+
+    // The same fourth mechanism on the path with nothing left to rescue it.
+    // The exchange deadline has already fired, so the termination it started is
+    // the last thing that could end the wait; an internal await that never
+    // resumes leaves the exchange pending with no deadline remaining.
+    expectPersistentMutationSurvived(probe, [
+      'THENABLE_RETURN',
+      'AWAIT_UNPROTECTED',
+      'AWAIT_PROTECTED',
+      'AWAIT_OWNED',
+    ]);
+    expectReparentedProtectionDefeated(probe);
+    // Nothing forced a failure here; this is the ordinary path.
+    expect(probe.stdout).toMatch(/^HARDENING_POISONED=0$/m);
     expect(probe.stdout).toContain('SETTLEMENT=resolved');
     expect(probe.stdout).toContain('DETAIL=TIMED_OUT');
     expect(probe.stdout).not.toMatch(/^SCOPE=NOT_REQUIRED$/m);
