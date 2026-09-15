@@ -322,6 +322,42 @@ describe('termination vocabulary claims no more than the OS provides', () => {
    * Asserted on the source text because it is a property of the code as
    * written: one bare call is the whole defect.
    */
+  /**
+   * Nothing the exchange owns is created after it can already have settled.
+   *
+   * Registering a continuation is synchronous, and so is the fallback when
+   * registration fails, so the pending-abort dispatch can run an entire
+   * termination lifecycle — including `cleanup()` — before it returns. Any
+   * statement after it would then create a resource `cleanup()` has already
+   * been past: a ref'd timer nothing cancels, holding the host for as long as
+   * the exchange was allowed to run.
+   *
+   * The ordering is therefore load-bearing rather than incidental. Asserted as
+   * source text, and asserted in both directions: the deadline is armed first,
+   * and the dispatch is the last statement of the executor, so a statement
+   * appended after it fails here rather than in a review.
+   */
+  it('creates every owned resource before settlement is reachable', () => {
+    const start = IMPLEMENTATION_SOURCE.indexOf('export function invokeAgentProcess');
+    expect(start).toBeGreaterThanOrEqual(0);
+    const executor = IMPLEMENTATION_SOURCE.slice(start);
+
+    const deadlineArmed = executor.indexOf('deadline = scheduleTimeout(');
+    const dispatch = executor.indexOf('dispatchAbort();');
+    expect(deadlineArmed).toBeGreaterThanOrEqual(0);
+    expect(dispatch).toBeGreaterThanOrEqual(0);
+
+    // The only statement that can settle synchronously runs after every
+    // resource this exchange owns already exists.
+    expect(deadlineArmed).toBeLessThan(dispatch);
+
+    // And nothing follows it. The executor's own closing braces are all that
+    // may appear after the dispatch, so there is no statement left that could
+    // assume the exchange is still pending.
+    const afterDispatch = executor.slice(dispatch + 'dispatchAbort();'.length);
+    expect(afterDispatch.replace(/[\s});]/g, '')).toBe('');
+  });
+
   it('handles continuation registration failure at every call site', () => {
     const declaration = IMPLEMENTATION_SOURCE.indexOf('function whenSettled<T>(');
     expect(declaration).toBeGreaterThanOrEqual(0);

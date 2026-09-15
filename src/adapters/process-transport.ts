@@ -1740,15 +1740,28 @@ export function invokeAgentProcess(
       reflectApply(writableEnd, stdin, [invocation.stdin, 'utf8']);
     }
 
-    abortDispatch = dispatchAbort;
-    if (abortPending || (invocation.signal !== null && readAbortState(invocation.signal))) {
-      dispatchAbort();
-    }
-
+    // Armed before the dispatch below, and that order is load-bearing.
+    //
+    // Registering a continuation is synchronous, and so is the fallback when
+    // registration fails, so an already-aborted signal can run an entire
+    // termination lifecycle — settlement and {@link cleanup} included — before
+    // the dispatch returns. A deadline armed after that would be a ref'd timer
+    // created past the cleanup that was supposed to release it, and nothing
+    // left would cancel it: a completed exchange holding the host for as long
+    // as it was allowed to run. Arming it first leaves {@link cleanup}
+    // authoritative over every resource this exchange owns, whenever it runs.
     deadline = scheduleTimeout(() => {
       if (claim(TRANSPORT_OUTCOME.TIMED_OUT)) {
         runTermination();
       }
     }, invocation.timeoutMs);
+
+    // The last statement of this executor, and the only one that can settle
+    // synchronously. Nothing may follow it: everything after this point would
+    // be running against an exchange that may already be over.
+    abortDispatch = dispatchAbort;
+    if (abortPending || (invocation.signal !== null && readAbortState(invocation.signal))) {
+      dispatchAbort();
+    }
   });
 }
