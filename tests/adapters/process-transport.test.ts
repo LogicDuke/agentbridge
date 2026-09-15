@@ -5341,6 +5341,12 @@ interface FaultProbe {
   /** How many cancellations the injected defeater refused. */
   readonly refusedCancellations: () => number;
   /**
+   * Every `process.kill` this transport issued, with its exact target and
+   * signal, so a row can identify *which* request it is looking at rather than
+   * counting an undifferentiated tally.
+   */
+  readonly signals: readonly SignalRecord[];
+  /**
    * Run a hook the moment a child process is first seen, synchronously.
    *
    * The tree-kill helper is started from inside termination, long after the
@@ -5358,6 +5364,22 @@ interface FaultProbe {
    * be counting Node as well.
    */
   readonly releases: readonly ReleaseRecord[];
+}
+
+/**
+ * One signal this transport sent through `process.kill`.
+ *
+ * The POSIX termination request does not go through `ChildProcess.prototype
+ * .kill` at all. The child is spawned `detached`, so it leads its own process
+ * group, `signalProcessGroup` reaches that group through `process.kill(-pid,
+ * signal)`, and the direct-child call is then never made. A probe that watches
+ * only the child handle's own `kill` is therefore blind to the entire POSIX
+ * mechanism -- which is exactly what it was, and why an Ubuntu run saw a valid
+ * group termination and reported no termination at all.
+ */
+interface SignalRecord {
+  readonly pid: number;
+  readonly signal: string;
 }
 
 /** One release primitive invocation, attributed to the handle it reached. */
@@ -5402,7 +5424,7 @@ function helperReleases(probe: FaultProbe): number {
 }
 
 /**
- * True when this exchange asked the operating system to end its direct child.
+ * True when this exchange asked the operating system to end *this* direct child.
  *
  * Deliberately **not** an `(A)` assertion. Direct-child termination signalling
  * is governed by `TerminationScope`, which reports a request and never a
@@ -5411,11 +5433,37 @@ function helperReleases(probe: FaultProbe): number {
  * would condemn the escalation sequence itself. What this asserts is the thing
  * the rebuild is actually about on these routes: the child is not abandoned.
  *
- * The mechanism is platform-dependent -- a signal on POSIX, a second process on
- * Windows -- so a row asserting only the first would be asserting the platform.
+ * The mechanism really is platform-dependent, and the previous version of this
+ * function said so in prose while testing only one of the two. Both of its
+ * disjuncts -- a `ChildProcess.prototype.kill`, or a second process -- are
+ * Windows shapes. On POSIX the child is spawned `detached` and leads its own
+ * group, `signalProcessGroup` reaches it through `process.kill(-pid, …)`, the
+ * direct-child call is consequently never made, and no helper process exists.
+ * So on Linux the old predicate was false by construction whatever production
+ * did, which is precisely what an Ubuntu run reported.
+ *
+ * Each platform now has to exhibit its own named request, identified rather
+ * than counted: the POSIX arm pins the target to this exchange's own child and
+ * the signal to the graceful `SIGTERM` that opens the sequence, so neither "a
+ * signal happened" nor "a negative pid appeared" satisfies it.
+ *
+ * It remains evidence that termination was **requested**. It claims nothing
+ * about the process exiting, the group ending, descendants, escalation, or
+ * success -- all of which stay with `TerminationScope`.
  */
-function terminationRequested(probe: FaultProbe): boolean {
-  return probe.kills.length >= 1 || probe.processes.length >= 2;
+function terminationRequested(probe: FaultProbe, child: ChildProcess | null): boolean {
+  if (process.platform === 'win32') {
+    // Unchanged: the tree-kill helper is a second process, and a denied helper
+    // degrades to a direct-child signal on the handle itself.
+    return probe.kills.length >= 1 || probe.processes.length >= 2;
+  }
+  const pid = child?.pid;
+  if (pid === undefined) {
+    return false;
+  }
+  return probe.signals.some(
+    (record) => record.pid === -pid && record.signal === 'SIGTERM',
+  );
 }
 
 /** `Timeout` handles the host is holding right now. */
@@ -5455,6 +5503,7 @@ async function importWithSetupFault(faults: FaultInjection = {}): Promise<FaultP
   const destroyDescriptor = Object.getOwnPropertyDescriptor(Readable.prototype, 'destroy');
   const definePropertyDescriptor = Object.getOwnPropertyDescriptor(Object, 'defineProperty');
   const childKillDescriptor = Object.getOwnPropertyDescriptor(ChildProcess.prototype, 'kill');
+  const processKillDescriptor = Object.getOwnPropertyDescriptor(process, 'kill');
   const addListenerDescriptor = Object.getOwnPropertyDescriptor(
     EventTarget.prototype,
     'addEventListener',
@@ -5470,6 +5519,7 @@ async function importWithSetupFault(faults: FaultInjection = {}): Promise<FaultP
     definePropertyDescriptor === undefined ||
     addListenerDescriptor === undefined ||
     childKillDescriptor === undefined ||
+    processKillDescriptor === undefined ||
     setTimeoutDescriptor === undefined ||
     clearTimeoutDescriptor === undefined
   ) {
@@ -5487,6 +5537,9 @@ async function importWithSetupFault(faults: FaultInjection = {}): Promise<FaultP
   const realDefineProperty = definePropertyDescriptor.value as (
     ...args: unknown[]
   ) => object;
+  const realProcessKill = processKillDescriptor.value as (
+    ...args: unknown[]
+  ) => boolean;
   const realAddEventListener = addListenerDescriptor.value as (...args: unknown[]) => void;
   const realSetTimeout = globalThis.setTimeout;
   const realClearTimeout = globalThis.clearTimeout;
@@ -5496,6 +5549,7 @@ async function importWithSetupFault(faults: FaultInjection = {}): Promise<FaultP
   const registrations: string[] = [];
   const processes: ChildProcess[] = [];
   const releases: ReleaseRecord[] = [];
+  const signals: SignalRecord[] = [];
   const records = new Map<NodeJS.Timeout, RecordedTimer>();
   let refusedCancellations = 0;
   let onProcess: ((child: ChildProcess, index: number) => void) | null = null;
@@ -5557,6 +5611,17 @@ async function importWithSetupFault(faults: FaultInjection = {}): Promise<FaultP
       kills.push(`child:${String(signal ?? 'default')}`);
       releases.push({ kind: 'kill', process: processes.indexOf(this) });
       return true;
+    },
+  });
+  Object.defineProperty(process, 'kill', {
+    configurable: true,
+    writable: true,
+    value(this: unknown, pid: number, signal?: string | number): boolean {
+      // Recorded, then delegated. The signal is really delivered, so production
+      // behaviour is exactly what it would be without the probe; this watches
+      // the request, it does not stand in for it.
+      signals.push({ pid, signal: String(signal ?? 'default') });
+      return Reflect.apply(realProcessKill, process, [pid, signal]);
     },
   });
   Object.defineProperty(Readable.prototype, 'destroy', {
@@ -5666,6 +5731,7 @@ async function importWithSetupFault(faults: FaultInjection = {}): Promise<FaultP
         onProcess = hook;
       },
       releases,
+      signals,
     };
   } finally {
     realDefineProperty(Object, 'defineProperty', definePropertyDescriptor);
@@ -5676,6 +5742,7 @@ async function importWithSetupFault(faults: FaultInjection = {}): Promise<FaultP
     Object.defineProperty(Readable.prototype, 'destroy', destroyDescriptor);
     Object.defineProperty(EventTarget.prototype, 'addEventListener', addListenerDescriptor);
     Object.defineProperty(ChildProcess.prototype, 'kill', childKillDescriptor);
+    Object.defineProperty(process, 'kill', processKillDescriptor);
     Object.defineProperty(globalThis, 'setTimeout', setTimeoutDescriptor);
     Object.defineProperty(globalThis, 'clearTimeout', clearTimeoutDescriptor);
     timers.length = 0;
@@ -5683,6 +5750,7 @@ async function importWithSetupFault(faults: FaultInjection = {}): Promise<FaultP
     registrations.length = 0;
     processes.length = 0;
     releases.length = 0;
+    signals.length = 0;
   }
 }
 
@@ -5916,7 +5984,7 @@ describe('F1 continuation/settlement -- adversarial matrix', () => {
       // excluded from (A). The child that is already running gets its bounded
       // request rather than being abandoned unbounded -- a request, not a
       // completion, and nothing here claims the process is gone.
-      expect(terminationRequested(probe)).toBe(true);
+      expect(terminationRequested(probe, observed)).toBe(true);
       // (A): exactly one logical release per acquired pipe end. Two owners reach
       // them on this route -- the setup-failure cleanup and the terminal drain --
       // and the release state is what makes them one action.
@@ -5952,7 +6020,7 @@ describe('F1 continuation/settlement -- adversarial matrix', () => {
 
       expect(settlement.count).toBe(1);
       expect(settlement.rejectedWith).toBeInstanceOf(Error);
-      expect(terminationRequested(probe)).toBe(true);
+      expect(terminationRequested(probe, observed)).toBe(true);
       // (A), same two owners, same single action.
       expect(stdioReleases(probe, 0, 'stdout')).toBe(1);
       expect(stdioReleases(probe, 0, 'stderr')).toBe(1);
@@ -6008,7 +6076,7 @@ describe('F1 continuation/settlement -- adversarial matrix', () => {
         // escaped the executor, the runtime settled the exchange with whatever
         // value got out, and the child kept running with the deadline that would
         // have bounded it never armed.
-        expect(terminationRequested(probe)).toBe(true);
+        expect(terminationRequested(probe, observed)).toBe(true);
         // (A): the handle is acquired by the spawn that precedes all eight
         // ordinals, and every one of them routes through the setup failure into
         // the bounded release, so the release action runs exactly once on each.
