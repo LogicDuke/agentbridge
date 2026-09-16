@@ -461,9 +461,41 @@ function absorbSpawnFailure(): void {
   // Intentionally empty; see the doc comment.
 }
 
-/** Keep a spawned process covered after its listeners have been cleared. */
+/**
+ * Keep a spawned process covered, including after its exchange is over.
+ *
+ * Deliberately not an owned listener: nothing records a removal for it, so the
+ * terminal step leaves it exactly where it is. The transport used to clear the
+ * child's listeners wholesale at settlement without restoring this one, and a
+ * spawn failure arriving on the uncovered handle afterwards makes EventEmitter
+ * rethrow -- which ends the host process rather than this exchange. It needs no
+ * latch either: it does nothing, so there is nothing for a latch to stop.
+ */
 function rearmSpawnFailureAbsorber(child: ChildProcess): void {
   onEvent(child, 'error', absorbSpawnFailure);
+}
+
+/**
+ * Cancel a timer from outside the terminal step's isolated drain.
+ *
+ * Every one of these is an optimisation over a cancellation the ledger already
+ * holds: it exists so a wait that ends early does not leave its bound running
+ * while the exchange is still going. What makes the guard mandatory is where
+ * they run from -- an `exit` dispatch, a `close` dispatch, a timer callback --
+ * none of which any `catch` in this file encloses. Cancelling is ordinarily
+ * total, but an `async_hooks` `init` hook receives each `Timeout` as its own
+ * resource and may seal it, and the cancellation assigns to it; an escape from
+ * one of these sites would then end the host process rather than the exchange.
+ * The ledger still holds the same cancellation, and the latch still makes the
+ * timer inert either way.
+ */
+function releaseTimer(timer: NodeJS.Timeout): void {
+  try {
+    cancelTimeout(timer);
+  } catch {
+    // See the doc comment: the ledger holds the same cancellation, and a sealed
+    // timer is latched inert regardless.
+  }
 }
 
 /** Release a child output pipe through the intrinsic captured at module load. */
@@ -491,6 +523,254 @@ function append<T>(list: T[], value: T): void {
     enumerable: true,
     configurable: true,
   });
+}
+
+/**
+ * Everything one exchange owns, recorded at the moment it is acquired.
+ *
+ * The transport used to hold each timer, listener and child handle in the one
+ * closure that created it, which made a resource reachable only through the
+ * code path that was still running. A path that threw part-way through its own
+ * construction therefore abandoned what it had already acquired -- not by
+ * oversight but by construction, because nothing else could name it. This
+ * structure is the name: every acquisition records its own release before the
+ * acquiring statement returns, so the terminal step can release what a failed
+ * construction left behind.
+ *
+ * Three fields, three different guarantees, kept apart deliberately.
+ *
+ * `latched` is the only one with no failure mode at all. Setting it is an
+ * assignment to a closure variable, and every listener and timer callback this
+ * module installs tests it first, so once it is set nothing this exchange
+ * registered can run exchange-affecting code again. That is the quiescence
+ * guarantee, and it is unconditional precisely because the assignment cannot
+ * fail.
+ *
+ * `timers` holds cancellations. A `Timeout` this module allocated never leaves
+ * it, so cancelling one is ordinarily total -- but ES modules are strict and
+ * the cancellation assigns to the timer, and an `async_hooks` `init` hook
+ * receives each `Timeout` as its own resource and may seal it first. So the
+ * cancellation is isolated like any other release, and a sealed timer degrades
+ * to the latch: still armed, still unable to affect anything.
+ *
+ * `handles` holds release *requests* for operating-system objects. A
+ * non-throwing `kill` means a signal was sent, not that a process is gone, and
+ * a non-throwing `destroy` means teardown was scheduled. Nothing in this file
+ * can prove an operating-system handle is closed, so this field promises
+ * exactly one request per handle and counts the ones that did not return
+ * normally. It is deliberately the same register {@link TerminationScope}
+ * already speaks in.
+ */
+/**
+ * One acquired resource, and whether its release has already happened.
+ *
+ * Release state is what makes "exactly one" true rather than merely intended.
+ * An acquired handle is reachable from more than one control path by design --
+ * the lifecycle that decides a pipe should go, and the terminal drain that
+ * guarantees it goes even on a route that lifecycle never reached -- and
+ * without shared state each of those paths is an independent owner that invokes
+ * the primitive on its own account. The flag makes them converge: the first
+ * path performs the action, every later one is a no-op, and the count of
+ * failures is taken once rather than once per owner.
+ */
+interface OwnedHandle {
+  released: boolean;
+  readonly release: () => void;
+}
+
+interface ExchangeLedger {
+  latched: boolean;
+  readonly timers: (() => void)[];
+  readonly handles: OwnedHandle[];
+  residual: number;
+  /**
+   * Whether the terminal capability invocation completed.
+   *
+   * A record, not a guard -- re-entry is refused by `claimed` in the terminal
+   * step, and nothing in this module consults this. It is kept for the same
+   * reason `residual` is: both are facts the mechanism establishes and does not
+   * itself consume, and a state model that cannot say whether the caller was
+   * actually answered is not a state model.
+   */
+  delivered: boolean;
+}
+
+function createLedger(): ExchangeLedger {
+  return {
+    latched: false,
+    timers: [],
+    handles: [],
+    residual: 0,
+    delivered: false,
+  };
+}
+
+/**
+ * Perform one acquired handle's release, at most once, whoever asks.
+ *
+ * The only route to a release primitive for a handle this exchange owns. The
+ * flag is set **before** the primitive runs, which is what makes the operation
+ * total under two conditions that both actually occur: a primitive that throws
+ * is counted once and never retried by a later owner, and a path re-entered
+ * from inside the release itself finds the entry already claimed.
+ *
+ * Termination signalling is deliberately not routed through here. The POSIX
+ * group and escalation signals, the Windows `taskkill` sequence and the
+ * direct-child fallback are requests governed by {@link TerminationScope},
+ * which reports a request and never a completion, and which describes an
+ * escalating sequence of more than one signal on purpose.
+ */
+function releaseOwned(ledger: ExchangeLedger, entry: OwnedHandle): void {
+  if (entry.released) {
+    return;
+  }
+  entry.released = true;
+  try {
+    entry.release();
+  } catch {
+    ledger.residual += 1;
+  }
+}
+
+/** Record one acquired handle and hand back the entry that owns its release. */
+function ownHandle(ledger: ExchangeLedger, release: () => void): OwnedHandle {
+  const entry: OwnedHandle = { released: false, release };
+  append(ledger.handles, entry);
+  return entry;
+}
+
+/**
+ * Phase 0 of the terminal step.
+ *
+ * The one release primitive in this module with no failure mode, which is why
+ * the unconditional half of the invariant rests on it alone, and why it runs
+ * before any work that can fail.
+ */
+function latchLedger(ledger: ExchangeLedger): void {
+  ledger.latched = true;
+}
+
+/** Wrap an event listener so it cannot act after phase 0. */
+function latchedEvent(
+  ledger: ExchangeLedger,
+  handler: (...args: never[]) => void,
+): (...args: never[]) => void {
+  return (...args: never[]): void => {
+    if (ledger.latched) {
+      return;
+    }
+    // Applied through the captured intrinsic rather than spread, which would
+    // read `@@iterator` off an ordinary array prototype on every dispatch.
+    reflectApply(handler, undefined, args);
+  };
+}
+
+/** Wrap a stream data listener so it cannot act after phase 0. */
+function latchedData(
+  ledger: ExchangeLedger,
+  handler: (chunk: unknown) => void,
+): (chunk: unknown) => void {
+  return (chunk: unknown): void => {
+    if (ledger.latched) {
+      return;
+    }
+    handler(chunk);
+  };
+}
+
+/**
+ * Arm a timer this exchange owns.
+ *
+ * The cancellation is recorded before this returns, so a caller that throws
+ * between arming the timer and registering whatever was supposed to release it
+ * no longer strands it. The callback is latched as well, because a cancellation
+ * that was defeated must still not be able to reach an exchange that is over.
+ */
+function ownTimer(
+  ledger: ExchangeLedger,
+  handler: () => void,
+  ms: number,
+): NodeJS.Timeout {
+  const timer = scheduleTimeout(() => {
+    if (ledger.latched) {
+      return;
+    }
+    handler();
+  }, ms);
+  append(ledger.timers, () => {
+    cancelTimeout(timer);
+  });
+  return timer;
+}
+
+/**
+ * Register an event listener this exchange owns, handing back what was actually
+ * registered so a caller that removes it early removes the same function.
+ *
+ * Two mechanisms, and only one of them is load-bearing. The latch is what makes
+ * the listener inert, and it cannot fail. The removal recorded here is a
+ * phase-2 request like any other: isolated, counted, and free to fail without
+ * costing the exchange its report. The transport used to do the removals inline
+ * in a cleanup that ran between the flag marking the exchange finished and the
+ * call that finished it, where one throwing removal abandoned every removal
+ * behind it and the delivery as well.
+ *
+ * What is deliberately *not* registered this way is the spawn-failure absorber:
+ * see {@link rearmSpawnFailureAbsorber}.
+ */
+function ownListener(
+  ledger: ExchangeLedger,
+  emitter: EventEmitter,
+  event: string,
+  listener: (...args: never[]) => void,
+): (...args: never[]) => void {
+  const registered = latchedEvent(ledger, listener);
+  onEvent(emitter, event, registered);
+  ownHandle(ledger, () => {
+    removeEventListener(emitter, event, registered);
+  });
+  return registered;
+}
+
+/** Register a flowing-mode data listener this exchange owns. */
+function ownReadableData(
+  ledger: ExchangeLedger,
+  readable: Readable,
+  listener: (chunk: unknown) => void,
+): void {
+  const registered = latchedData(ledger, listener);
+  onReadableData(readable, registered);
+  ownHandle(ledger, () => {
+    removeEventListener(readable, 'data', registered as (...args: never[]) => void);
+  });
+}
+
+/**
+ * Run the release phases and count what did not report.
+ *
+ * Phase 1 is cancellations, phase 2 is operating-system release requests, and
+ * the order is load-bearing: the phases are ordered by decreasing strength of
+ * what they establish, so a phase-2 failure can never retract what phase 1
+ * already did. Every entry is isolated, because the whole point is that the
+ * terminal report does not depend on any of them succeeding.
+ *
+ * Index loops rather than `for...of`: iterating would read `@@iterator` off an
+ * ordinary array prototype, on the one code path that may not fail.
+ */
+function drainLedger(ledger: ExchangeLedger): void {
+  for (let index = 0; index < ledger.timers.length; index += 1) {
+    try {
+      ledger.timers[index]?.();
+    } catch {
+      ledger.residual += 1;
+    }
+  }
+  for (let index = 0; index < ledger.handles.length; index += 1) {
+    const entry = ledger.handles[index];
+    if (entry !== undefined) {
+      releaseOwned(ledger, entry);
+    }
+  }
 }
 
 /** A bounded byte accumulator for one stream. */
@@ -571,6 +851,40 @@ function removeAbortListener(signal: AbortSignal, listener: EventListener): void
   }
 }
 
+
+/**
+ * Register the caller's abort listener as a resource this exchange owns.
+ *
+ * The signal belongs to the caller and may outlive the exchange by a long way,
+ * so this is the one listener whose removal is a real obligation rather than an
+ * optimisation: left attached, it retains a caller-owned object indefinitely.
+ * The removal is therefore recorded as a phase-2 request -- made exactly once,
+ * isolated like every other, and made on every terminal path, including the
+ * pre-executor one that used to remove the listener with a bare call no other
+ * exit shared.
+ *
+ * Registration failure records nothing, because nothing was acquired.
+ */
+function ownAbortListener(
+  ledger: ExchangeLedger,
+  signal: AbortSignal,
+  listener: EventListener,
+): boolean {
+  const registered: EventListener = (event: Event): void => {
+    if (ledger.latched) {
+      return;
+    }
+    listener(event);
+  };
+  if (!addAbortListener(signal, registered)) {
+    return false;
+  }
+  ownHandle(ledger, () => {
+    removeAbortListener(signal, registered);
+  });
+  return true;
+}
+
 /** An exchange that never reached the operating system. */
 function unspawnedExchange(
   outcome: TransportOutcome,
@@ -625,29 +939,110 @@ function hasEnded(child: ChildProcess): boolean {
   return child.exitCode !== null || child.signalCode !== null;
 }
 
+
+/**
+ * Start a process this exchange owns.
+ *
+ * The release request is recorded before this returns, which is the whole
+ * difference: a caller that threw between the spawn and whatever it meant to
+ * register next used to leave a live process with nothing left in the program
+ * able to name it. What is recorded is a *request*, never a completion -- this
+ * claims nothing about descendants and nothing about whether anything actually
+ * went away.
+ *
+ * `reap` is what separates the two processes this module starts, and they are
+ * genuinely different. The direct child's termination is a precedence-bearing
+ * operation that reports a {@link TerminationScope}, and every route that
+ * settles it has either run that lifecycle or observed the child end, so adding
+ * a second unreported signal here would invent an externally visible one and
+ * corrupt the scope it belongs to. The Windows tree-kill helper has no scope to
+ * report and its kill is a pure reap, so the one route that abandons its
+ * registration is exactly the route that must still reap it: without this, a
+ * `taskkill.exe` outlives the exchange that started it.
+ *
+ * The entry comes back with the child so that the lifecycle sites which decide
+ * *when* a release should happen can perform it through {@link releaseOwned}
+ * rather than on their own account. Their timing is unchanged; what changes is
+ * that they and the terminal drain are no longer two independent owners of the
+ * same handle.
+ */
+function ownSpawn(
+  ledger: ExchangeLedger,
+  executable: string,
+  args: readonly string[],
+  options: Parameters<typeof spawn>[2],
+  reap: boolean,
+): OwnedProcess {
+  const child = spawn(executable, args as string[], options);
+  const handle = ownHandle(ledger, () => {
+    if (reap && !hasEnded(child)) {
+      killDirectChild(child);
+    }
+    destroyReadable(child.stdout);
+    destroyReadable(child.stderr);
+  });
+  return { child, handle };
+}
+
+/** A started process and the ledger entry that owns its release. */
+interface OwnedProcess {
+  readonly child: ChildProcess;
+  readonly handle: OwnedHandle;
+}
+
 /** Resolve true when the child ends within `ms`, false when it outlives it. */
-function waitForExit(child: ChildProcess, ms: number): Promise<boolean> {
+function waitForExit(
+  ledger: ExchangeLedger,
+  child: ChildProcess,
+  ms: number,
+): Promise<boolean> {
   if (hasEnded(child)) {
     return internallyResolved(true);
   }
   const exited = new InternalPromise<boolean>((resolve) => {
     let done = false;
+    let registered: ((...args: never[]) => void) | null = null;
     const finish = (value: boolean): void => {
       if (done) {
         return;
       }
       done = true;
-      cancelTimeout(timer);
-      removeEventListener(child, 'exit', onExit);
+      // Reported before anything that can fail. The old order committed `done`,
+      // then cleared the listener, then resolved -- and the clearing reads a
+      // handle whose accessors can throw, which left the wait permanently
+      // pending with its own guard blocking every retry. Resolving first costs
+      // nothing: a promise capability handed a primitive schedules a job and
+      // reads nothing at all.
       resolve(value);
+      releaseTimer(timer);
+      if (registered !== null) {
+        try {
+          removeEventListener(child, 'exit', registered);
+        } catch {
+          // Latched either way, and the ledger still holds the same removal as
+          // a phase-2 request. This one exists only so repeated waits on one
+          // handle do not accumulate while the exchange is still running.
+        }
+      }
     };
     const onExit = (): void => {
       finish(true);
     };
-    const timer = scheduleTimeout(() => {
-      finish(false);
-    }, ms);
-    onEvent(child, 'exit', onExit);
+    // Armed through the ledger before the registration below, which is the
+    // ordering this repair exists for. The registration can throw, and when it
+    // does this executor is abandoned with the timer already running; recording
+    // the cancellation at the moment of arming is what lets the terminal step
+    // reach it through the exchange rather than only through `finish`. The
+    // listener is left attached and latched rather than removed -- see
+    // {@link ownListener}.
+    const timer = ownTimer(
+      ledger,
+      () => {
+        finish(false);
+      },
+      ms,
+    );
+    registered = ownListener(ledger, child, 'exit', onExit);
   });
   return protectPromiseResolution(exited);
 }
@@ -704,7 +1099,12 @@ function clearEventsKeepingAbsorber(child: ChildProcess): void {
  * observed to be hostile and can throw, which must not stop `done` from being
  * called — the caller's own settlement depends on it.
  */
-function reapUnprotectedHelper(child: ChildProcess, done: () => void): void {
+function reapUnprotectedHelper(
+  ledger: ExchangeLedger,
+  handle: OwnedHandle,
+  child: ChildProcess,
+  done: () => void,
+): void {
   const finish = (): void => {
     try {
       removeAllEvents(child);
@@ -716,7 +1116,10 @@ function reapUnprotectedHelper(child: ChildProcess, done: () => void): void {
     }
     done();
   };
-  killDirectChild(child);
+  // The reap is this handle's release, performed through the entry that owns
+  // it rather than on this function's own account: the terminal drain reaches
+  // the same entry, and without the shared state the two would each signal.
+  releaseOwned(ledger, handle);
   // Constructed before the continuation is registered, and guarded separately.
   // {@link waitForExit} observes `exitCode` and `signalCode` before it has a
   // promise to hand back, so a hostile accessor faults here — before
@@ -728,7 +1131,7 @@ function reapUnprotectedHelper(child: ChildProcess, done: () => void): void {
   // itself and call it a second time.
   let wait: Promise<boolean>;
   try {
-    wait = waitForExit(child, TASKKILL_TIMEOUT_MS);
+    wait = waitForExit(ledger, child, TASKKILL_TIMEOUT_MS);
   } catch {
     finish();
     return;
@@ -780,24 +1183,33 @@ function resolveTaskkill(): { readonly executable: string; readonly systemRoot: 
  * exit; exit code 128 counts, because it means the target was already gone.
  */
 function runTaskkill(
+  ledger: ExchangeLedger,
   taskkill: { readonly executable: string; readonly systemRoot: string },
   pid: number,
 ): Promise<boolean> {
   const issued = new InternalPromise<boolean>((resolve) => {
-    let killer: ChildProcess;
+    let spawnedKiller: OwnedProcess;
     try {
       const decimalPid = reflectApply(numberToString, pid, []);
-      killer = spawn(taskkill.executable, ['/PID', decimalPid, '/T', '/F'], {
-        stdio: 'ignore',
-        shell: false,
-        windowsHide: true,
-        windowsVerbatimArguments: false,
-        env: { SystemRoot: taskkill.systemRoot },
-      });
+      spawnedKiller = ownSpawn(
+        ledger,
+        taskkill.executable,
+        ['/PID', decimalPid, '/T', '/F'],
+        {
+          stdio: 'ignore',
+          shell: false,
+          windowsHide: true,
+          windowsVerbatimArguments: false,
+          env: { SystemRoot: taskkill.systemRoot },
+        },
+        true,
+      );
     } catch {
       resolve(false);
       return;
     }
+    const killer = spawnedKiller.child;
+    const killerHandle = spawnedKiller.handle;
     // Before anything else can throw: taskkill's own failure to start arrives
     // asynchronously, and hardening runs before this helper's error handler.
     rearmSpawnFailureAbsorber(killer);
@@ -821,7 +1233,7 @@ function runTaskkill(
       // continuations give rather than rejecting a promise the callers of this
       // helper treat as total.
       try {
-        reapUnprotectedHelper(killer, () => {
+        reapUnprotectedHelper(ledger, killerHandle, killer, () => {
           resolve(false);
         });
       } catch {
@@ -837,29 +1249,61 @@ function runTaskkill(
         return;
       }
       done = true;
-      cancelTimeout(timer);
-      if (reapTimer !== null) {
-        cancelTimeout(reapTimer);
-      }
-      removeAllEvents(killer);
+      // Reported first, for the same reason as {@link waitForExit}: everything
+      // that follows can fail on a handle this helper does not control, and
+      // none of it may cost the caller the answer it is waiting for. Clearing
+      // the helper's listeners is no longer part of this at all -- they are
+      // latched, and a handle that keeps its `error` absorber is strictly safer
+      // than one left uncovered.
       resolve(value);
-    };
-    const timer = scheduleTimeout(() => {
-      if (hasEnded(killer)) {
-        finish(false);
-        return;
+      releaseTimer(timer);
+      if (reapTimer !== null) {
+        releaseTimer(reapTimer);
       }
-      killDirectChild(killer);
-      // Observe the helper's exit after killing it. The second bound preserves
-      // totality even if the operating system never reports a terminal event.
-      reapTimer = scheduleTimeout(() => {
-        finish(false);
-      }, TASKKILL_TIMEOUT_MS);
-    }, TASKKILL_TIMEOUT_MS);
-    onEvent(killer, 'error', () => {
+    };
+    const timer = ownTimer(
+      ledger,
+      () => {
+        // Guarded on its own: this runs from a timer callback, which no
+        // enclosing `try` covers, and `hasEnded` reads two accessors of a
+        // handle that can be made to throw. An escape here would reach no
+        // `catch` in this file at all -- it would end the host process, and
+        // with it every exchange in flight, which is the one outcome totality
+        // cannot survive. A faulted observation is answered the way an
+        // inconclusive one already is.
+        let ended: boolean;
+        try {
+          ended = hasEnded(killer);
+        } catch {
+          finish(false);
+          return;
+        }
+        if (ended) {
+          finish(false);
+          return;
+        }
+        // Same signal, same moment, same bound as before -- performed through
+        // the entry that owns this helper so the terminal drain converges on it
+        // instead of issuing a second one. Nothing about the taskkill sequence
+        // moves.
+        releaseOwned(ledger, killerHandle);
+        // Observe the helper's exit after killing it. The second bound
+        // preserves totality even if the operating system never reports a
+        // terminal event, and it is owned so it cannot outlive the exchange.
+        reapTimer = ownTimer(
+          ledger,
+          () => {
+            finish(false);
+          },
+          TASKKILL_TIMEOUT_MS,
+        );
+      },
+      TASKKILL_TIMEOUT_MS,
+    );
+    ownListener(ledger, killer, 'error', () => {
       finish(false);
     });
-    onEvent(killer, 'exit', (code: number | null) => {
+    ownListener(ledger, killer, 'exit', (code: number | null) => {
       finish(code === 0 || code === 128);
     });
   });
@@ -875,6 +1319,7 @@ function runTaskkill(
  * returned scope says *requested*, never *completed*.
  */
 function terminatePosix(
+  ledger: ExchangeLedger,
   child: ChildProcess,
   pid: number,
   graceMs: number,
@@ -897,7 +1342,7 @@ function terminatePosix(
       }
       if (
         !whenSettled(
-          waitForExit(child, graceMs),
+          waitForExit(ledger, child, graceMs),
           (ended: boolean) => {
             if (ended) {
               settle(scopeFor(groupReached));
@@ -945,7 +1390,7 @@ function terminatePosix(
         }
         if (
           !whenSettled(
-            waitForExit(child, graceMs),
+            waitForExit(ledger, child, graceMs),
             () => {
               settle(scopeFor(reached));
             },
@@ -972,6 +1417,7 @@ function terminatePosix(
  * and the scope degrades to `DIRECT_CHILD_ONLY` — descendants are not claimed.
  */
 function terminateWindows(
+  ledger: ExchangeLedger,
   child: ChildProcess,
   pid: number,
   graceMs: number,
@@ -986,7 +1432,7 @@ function terminateWindows(
         killDirectChild(child);
         if (
           !whenSettled(
-            waitForExit(child, graceMs),
+            waitForExit(ledger, child, graceMs),
             () => {
               settle(TERMINATION_SCOPE.DIRECT_CHILD_ONLY);
             },
@@ -1010,7 +1456,7 @@ function terminateWindows(
       try {
         if (
           !whenSettled(
-            waitForExit(child, graceMs),
+            waitForExit(ledger, child, graceMs),
             () => {
               settle(TERMINATION_SCOPE.PROCESS_TREE_REQUESTED);
             },
@@ -1042,7 +1488,7 @@ function terminateWindows(
 
       if (
         !whenSettled(
-          runTaskkill(taskkill, pid),
+          runTaskkill(ledger, taskkill, pid),
           (issued: boolean) => {
             if (!issued) {
               killDirectAndSettle();
@@ -1105,6 +1551,7 @@ function terminateWindows(
  * handle.
  */
 function terminate(
+  ledger: ExchangeLedger,
   child: ChildProcess,
   platform: TransportPlatform,
   graceMs: number,
@@ -1121,8 +1568,8 @@ function terminate(
       if (
         !whenSettled(
           platform === 'posix'
-            ? terminatePosix(child, pid, graceMs)
-            : terminateWindows(child, pid, graceMs),
+            ? terminatePosix(ledger, child, pid, graceMs)
+            : terminateWindows(ledger, child, pid, graceMs),
           settle,
           fail,
         )
@@ -1156,19 +1603,21 @@ function terminate(
  * no process group, tree, or descendant is claimed on that path.
  */
 function releaseUnprotectedChild(
+  ledger: ExchangeLedger,
+  handle: OwnedHandle,
   child: ChildProcess,
   platform: TransportPlatform,
   graceMs: number,
   done: () => void,
 ): void {
-  // The cleanup half, reached on both outcomes of the bounded attempt.
+  // The cleanup half, reached on both outcomes of the bounded attempt. This
+  // decides *when* the local pipe ends should go, which is its own judgement
+  // and stays exactly where it was; it performs the release through the entry
+  // that owns it, so the terminal drain that follows converges on the same
+  // action rather than repeating it. {@link releaseOwned} isolates and counts,
+  // so the per-step guards this used to carry are no longer its business.
   const cleanUp = (): void => {
-    attemptCleanup(() => {
-      destroyReadable(child.stdout);
-    });
-    attemptCleanup(() => {
-      destroyReadable(child.stderr);
-    });
+    releaseOwned(ledger, handle);
     clearEventsKeepingAbsorber(child);
     done();
   };
@@ -1209,7 +1658,13 @@ function releaseUnprotectedChild(
   };
 
   try {
-    if (!whenSettled(terminate(child, platform, graceMs), cleanUp, onAttemptFailed)) {
+    if (
+      !whenSettled(
+        terminate(ledger, child, platform, graceMs),
+        cleanUp,
+        onAttemptFailed,
+      )
+    ) {
       // No continuation was installed, so the attempt will never report. That is
       // the same position a faulted attempt leaves this in, and it takes the
       // same ending: one guarded direct-child signal, then the cleanup.
@@ -1269,6 +1724,16 @@ export function invokeAgentProcess(
   }
   const invocation = read.value;
 
+  // Allocated here, and the position is the whole point. The first resource
+  // this exchange acquires is the caller's abort listener, a few statements
+  // below, and a ledger created after that acquisition could not own it: the
+  // listener would be reachable only through the one early return that happened
+  // to remember it, which is precisely the shape this rebuild exists to remove.
+  // Nothing between the validation above and the registration below acquires
+  // anything, so allocating it here displaces no statement and changes no
+  // outcome -- it only makes every later acquisition nameable.
+  const ledger = createLedger();
+
   let abortPending = false;
   let abortDispatch: (() => void) | null = null;
   const onAbort: EventListener = () => {
@@ -1291,7 +1756,7 @@ export function invokeAgentProcess(
     if (beforeRegistration) {
       return resolved(unspawnedExchange(TRANSPORT_OUTCOME.CANCELLED, null));
     }
-    if (!addAbortListener(invocation.signal, onAbort)) {
+    if (!ownAbortListener(ledger, invocation.signal, onAbort)) {
       return resolved(
         unspawnedExchange(
           TRANSPORT_OUTCOME.SPEC_REJECTED,
@@ -1301,7 +1766,13 @@ export function invokeAgentProcess(
     }
     const afterRegistration = readAbortState(invocation.signal);
     if (afterRegistration === null || afterRegistration) {
-      removeAbortListener(invocation.signal, onAbort);
+      // The listener registered a moment ago is this exchange's, and this is
+      // a terminal path, so it ends the way every other terminal path does
+      // rather than through a bare removal only this exit performed. The
+      // outcome, the rejection code and the exchange handed back are byte for
+      // byte what they were.
+      latchLedger(ledger);
+      drainLedger(ledger);
       return resolved(
         unspawnedExchange(
           afterRegistration === null
@@ -1314,108 +1785,187 @@ export function invokeAgentProcess(
   }
 
   return new NativePromise<AgentExchange>((resolve, reject) => {
-    let child: ChildProcess;
-    try {
-      child = spawn(invocation.executablePath, invocation.args, {
-        cwd: invocation.workingDirectory,
-        env: invocation.environment,
-        stdio: ['pipe', 'pipe', 'pipe'],
-        shell: false,
-        windowsHide: true,
-        windowsVerbatimArguments: false,
-        // POSIX only: makes the child a process-group leader so its ordinary
-        // descendants can be signalled together. On Windows `detached` would
-        // allocate a new console instead, which does not help termination.
-        detached: platform === 'posix',
-      });
-    } catch {
-      if (invocation.signal !== null) {
-        removeAbortListener(invocation.signal, onAbort);
+    // Three facts, kept apart on purpose, because they answer three different
+    // questions and are separated in time.
+    //
+    // `committed` -- a terminal decision has been selected. Set by each terminal
+    // entry point before it does anything, so a decision in flight cannot be
+    // raced by another; on the setup-failure route it is set before a bounded
+    // asynchronous release, and holds across it.
+    //
+    // `claimed` -- the terminal sequence has been entered. Set as the first act
+    // of that sequence, before any work, so re-entry from inside the drain or
+    // from inside the capability invocation cannot start a second one. The
+    // transport previously used the delivery record for this, which cannot work:
+    // a guard read before the write it guards does not cover the interval
+    // between them, and that interval is the whole sequence.
+    //
+    // `ledger.delivered` -- the capability invocation completed. A record, set
+    // after the invocation returns, so it is truthful about an invocation that
+    // did not.
+    let committed = false;
+    let claimed = false;
+
+    /**
+     * Phase 0, phase 1, phase 2, then the capability, in that order.
+     *
+     * The order is the guarantee. Phase 0 is an assignment to a closure
+     * variable and cannot fail, so quiescence is established before anything
+     * that can. Phase 1 is cancellation and phase 2 is operating-system release
+     * requests, each entry isolated, so a release that throws neither abandons
+     * the entries behind it nor reaches the delivery below it. The capability is
+     * invoked last, from a value already computed, which is what makes the
+     * terminal report independent of every release having worked.
+     *
+     * The transport used to do the opposite: it marked the exchange settled,
+     * then ran a cleanup that could throw, and only then resolved. A cleanup
+     * fault there left the exchange marked settled and never delivered, with its
+     * own guard refusing every later attempt.
+     */
+    const finalize = (deliver: () => void): void => {
+      if (claimed) {
+        return;
       }
-      resolve(unspawnedExchange(TRANSPORT_OUTCOME.SPAWN_FAILED, null));
+      claimed = true;
+      latchLedger(ledger);
+      drainLedger(ledger);
+      deliver();
+      ledger.delivered = true;
+    };
+
+    let spawned: OwnedProcess;
+    try {
+      spawned = ownSpawn(
+        ledger,
+        invocation.executablePath,
+        invocation.args,
+        {
+          cwd: invocation.workingDirectory,
+          env: invocation.environment,
+          stdio: ['pipe', 'pipe', 'pipe'],
+          shell: false,
+          windowsHide: true,
+          windowsVerbatimArguments: false,
+          // POSIX only: makes the child a process-group leader so its ordinary
+          // descendants can be signalled together. On Windows `detached` would
+          // allocate a new console instead, which does not help termination.
+          detached: platform === 'posix',
+        },
+        false,
+      );
+    } catch {
+      committed = true;
+      finalize(() => {
+        resolve(unspawnedExchange(TRANSPORT_OUTCOME.SPAWN_FAILED, null));
+      });
       return;
     }
-    // Before anything else can throw: an asynchronous spawn failure is already
-    // queued by now, and the real handler below is not installed until hardening
-    // has succeeded.
-    rearmSpawnFailureAbsorber(child);
-    try {
-      protectChildDispatch(child);
-    } catch (error: unknown) {
-      if (invocation.signal !== null) {
-        removeAbortListener(invocation.signal, onAbort);
+    const child = spawned.child;
+    const childHandle = spawned.handle;
+
+    /**
+     * Mandatory post-spawn setup could not be established.
+     *
+     * One entry point for two routes that used to be one. The first is dispatch
+     * hardening, which has always ended here. The second is every other
+     * mandatory setup statement below -- the spawn-failure absorber, the stdio
+     * and lifecycle registrations, the stdin close, the deadline, the abort
+     * dispatch. Each of those could throw straight out of this executor, and the
+     * runtime would then reject the exchange with whatever value escaped, having
+     * invoked a capability this transport never chose, with a child already
+     * running and no deadline yet armed to bound it.
+     *
+     * Both routes are the same event and get the same answer: run the bounded,
+     * platform-qualified release, then reject with the mandatory failure. That
+     * answer is the one this module's own contract already documents for
+     * post-spawn setup it cannot establish; it is not `SPAWN_FAILED` and is not
+     * an exchange outcome at all.
+     *
+     * Classifying the caught value is not a neutral read. The classification
+     * consults the value's own prototype chain, and a value engineered to refuse
+     * that makes the classification itself throw, so the whole of it sits inside
+     * a guard. Total, though, only because every `Error` here is the captured
+     * {@link NativeError}: a prototype-chain read is a call into the value's own
+     * code, and the cheapest thing that code can do is overwrite the `Error`
+     * global it knows this path is about to construct through. A fresh lookup
+     * would reach that replacement in the fallback and again in the guard meant
+     * to cover it, and the second throw would escape with the release unreached.
+     *
+     * Classification also runs before the release rather than after it. The
+     * release consults `pid`, `exitCode` and `signalCode` synchronously, so a
+     * hostile accessor gets to run first; an ordinary Error whose prototype
+     * chain such an accessor had rewritten would then fail classification and be
+     * replaced by the generic fallback, losing the identity the caller is owed.
+     * Reading the value here, where nothing hostile has been invoked since it
+     * was raised, makes the classification a decision about the value as it
+     * actually was.
+     *
+     * The ordinary case keeps the original Error as the caller-visible reason; a
+     * value that is not an Error, or that faults while being classified, yields
+     * the same stable failure with the original retained as `cause`, which is
+     * safe because a `cause` is only stored and never read.
+     */
+    const failSetup = (error: unknown): void => {
+      if (committed) {
+        return;
       }
-      // Decided first, and decided *completely*, before anything else touches
-      // the handle. Two separate hazards meet here and only this order answers
-      // both.
-      //
-      // Classifying the caught value is not a neutral read: the classification
-      // consults the value's own prototype chain, and a value engineered to
-      // refuse that makes the classification itself throw. That is what the
-      // surrounding `try` is for — the block below is total, so a
-      // classification fault cannot escape, and therefore cannot cost an
-      // already-created child the one bounded release attempt it is owed.
-      // Total, though, only because every `Error` here is the captured
-      // {@link NativeError}. A prototype-chain read is a call into the value's
-      // own code, and the cheapest thing that code can do is overwrite the
-      // `Error` global it knows this path is about to construct through. A
-      // fresh lookup would then reach that replacement — in the ternary's
-      // fallback *and* again in the `catch` that exists to cover it — and the
-      // second throw would escape with the release still unreached. Reading the
-      // constructor from a binding fixed before the value existed is what makes
-      // the guard cover anything at all.
-      // Releasing first would answer that hazard too, but at the price of the
-      // second one: `releaseUnprotectedChild` consults `pid`, `exitCode`, and
-      // `signalCode` synchronously before its first suspension, so a hostile
-      // accessor gets to run before this line does. An ordinary Error that had
-      // its prototype chain rewritten by such an accessor would then fail
-      // classification and be replaced by the generic fallback, losing the very
-      // identity the caller is owed. Reading the value here, where nothing
-      // hostile has been invoked since it was thrown, is what makes the
-      // classification a decision about the value as it was actually raised.
-      //
-      // The ordinary case keeps the original Error as the caller-visible
-      // reason; a value that is not an Error — or that faults while being
-      // classified — yields the same stable hardening failure instead, with the
-      // original value retained as `cause`. Retaining it is safe because a
-      // `cause` is only stored, never read. Neither branch can escape, so the
-      // reason is fixed before the release begins and cannot afterwards be lost
-      // to a hostile read.
-      let hardeningFailure: Error;
+      committed = true;
+      let setupFailure: Error;
       try {
-        hardeningFailure = reflectApply(ordinaryHasInstance, NativeError, [error])
+        setupFailure = reflectApply(ordinaryHasInstance, NativeError, [error])
           ? (error as Error)
           : new NativeError('Process dispatch hardening failed', {
               cause: error,
             });
       } catch {
-        hardeningFailure = new NativeError('Process dispatch hardening failed', {
+        setupFailure = new NativeError('Process dispatch hardening failed', {
           cause: error,
         });
       }
-      // Unconditional: the block above has no escaping path, so the release is
-      // reached on every route through it. Nothing above decides anything this
-      // call depends on — it is ordered second only to keep hostile accessors
-      // away from the caught value, not because it is contingent on the result.
-      // `releaseUnprotectedChild` runs every step, never rejects, and reports
-      // through the callback it is handed, so neither a termination failure nor
-      // a cleanup step that throws on a poisoned `stdout`/`stderr` value can
-      // leave this exchange pending. The mandatory hardening failure stays the
-      // externally visible reason on every one of those paths.
-      //
-      // The release registers its own continuations through the captured
-      // intrinsic rather than through an `await`. The value that faulted
-      // hardening has already run its own code by this point, and the cheapest
-      // thing that code can do is replace the scheduler this path is about to
-      // reach. The `catch` covers a release that throws before it can report:
-      // the rejection is still owed, and this is the last place to deliver it.
+      const deliver = (): void => {
+        reject(setupFailure);
+      };
+      // The release runs before the phases, not inside them: it is a bounded
+      // attempt that needs its own timers, and those are ledger-owned, so
+      // latching first would leave it waiting on callbacks that can no longer
+      // run. It reports through the callback it is handed, never rejects, and
+      // runs every step, so neither a termination failure nor a release that
+      // throws on a poisoned handle can leave this exchange pending. Its own
+      // continuations go through the captured intrinsic rather than an `await`;
+      // the guard below covers a release that throws before it can report, and
+      // the rejection is still owed either way.
       try {
-        releaseUnprotectedChild(child, platform, invocation.graceMs, () => {
-          reject(hardeningFailure);
-        });
+        releaseUnprotectedChild(
+          ledger,
+          childHandle,
+          child,
+          platform,
+          invocation.graceMs,
+          () => {
+            finalize(deliver);
+          },
+        );
       } catch {
-        reject(hardeningFailure);
+        finalize(deliver);
       }
+    };
+
+    // Before anything else can throw: an asynchronous spawn failure is already
+    // queued by now, and the real handler below is not installed until hardening
+    // has succeeded. Guarded, because this is itself a registration: when it
+    // throws, the handle is left with no `error` listener at all, and a queued
+    // failure on an uncovered handle ends the host process rather than this
+    // exchange.
+    try {
+      rearmSpawnFailureAbsorber(child);
+    } catch (error: unknown) {
+      failSetup(error);
+      return;
+    }
+    try {
+      protectChildDispatch(child);
+    } catch (error: unknown) {
+      failSetup(error);
       return;
     }
 
@@ -1423,14 +1973,12 @@ export function invokeAgentProcess(
     const stderrSink = createSink(invocation.maxStderrBytes);
 
     let cause: TransportOutcome | null = null;
-    let settled = false;
     let closed = false;
     /** Set once a termination lifecycle begins, and never cleared thereafter. */
     let terminating = false;
     let exitCode: number | null = null;
     let terminatingSignal: string | null = null;
     let terminationScope: TerminationScope = TERMINATION_SCOPE.NOT_REQUIRED;
-    let deadline: NodeJS.Timeout | null = null;
     let notifyClosed: (() => void) | null = null;
 
     /** Promote only to a stronger declared cause. */
@@ -1448,56 +1996,51 @@ export function invokeAgentProcess(
       }
     };
 
-    const cleanup = (): void => {
-      if (deadline !== null) {
-        cancelTimeout(deadline);
-        deadline = null;
-      }
-      if (notifyClosed !== null) {
-        // Releases the bounded close-wait timer so no timer outlives the
-        // exchange, even on a path that settles while that wait is pending.
-        const notify = notifyClosed;
-        notifyClosed = null;
-        notify();
-      }
-      if (invocation.signal !== null) {
-        removeAbortListener(invocation.signal, onAbort);
-      }
-      if (child.stdout !== null) {
-        removeAllEvents(child.stdout);
-      }
-      if (child.stderr !== null) {
-        removeAllEvents(child.stderr);
-      }
-      if (child.stdin !== null) {
-        removeAllEvents(child.stdin);
-      }
-      removeAllEvents(child);
-    };
-
+    /**
+     * The terminal step for every route that reports an exchange.
+     *
+     * There is no separate cleanup any more, and that is the repair. What used
+     * to live in one was a straight run of handle reads and listener clearings
+     * placed between the flag that marked this exchange finished and the call
+     * that actually finished it, so any one of them throwing left the exchange
+     * marked settled, never delivered, and unrecoverable -- its own guard
+     * refusing every later attempt. Every one of those steps is now a ledger
+     * entry, isolated from its neighbours and from this delivery.
+     *
+     * Three flags, not one. `committed` records that this exchange's terminal
+     * decision is made and is set here; `claimed` refuses re-entry into the
+     * terminal sequence and is set by {@link finalize} before it does anything;
+     * `ledger.delivered` records that the capability invocation completed and is
+     * set after it returns. Conflating any two of them is what made a cleanup
+     * fault permanent.
+     *
+     * The exchange is frozen from data already in hand before a single release
+     * runs, so no release can change what the caller is told.
+     */
     const settle = (): void => {
-      if (settled) {
+      if (committed) {
         return;
       }
-      settled = true;
-      cleanup();
+      committed = true;
+      latchLedger(ledger);
       const out = decodeSink(stdoutSink);
       const err = decodeSink(stderrSink);
-      resolve(
-        objectFreeze({
-          outcome: cause ?? TRANSPORT_OUTCOME.EXITED,
-          rejection: null,
-          exitCode,
-          terminatingSignal,
-          stdout: out.text,
-          stderr: err.text,
-          stdoutTruncated: stdoutSink.truncated,
-          stderrTruncated: stderrSink.truncated,
-          stdoutBytes: out.bytes,
-          stderrBytes: err.bytes,
-          terminationScope,
-        }),
-      );
+      const exchange = objectFreeze({
+        outcome: cause ?? TRANSPORT_OUTCOME.EXITED,
+        rejection: null,
+        exitCode,
+        terminatingSignal,
+        stdout: out.text,
+        stderr: err.text,
+        stdoutTruncated: stdoutSink.truncated,
+        stderrTruncated: stderrSink.truncated,
+        stdoutBytes: out.bytes,
+        stderrBytes: err.bytes,
+        terminationScope,
+      });
+      finalize(() => {
+        resolve(exchange);
+      });
     };
 
     /** Resolve true on close, false when the bounded close wait expires. */
@@ -1506,13 +2049,17 @@ export function invokeAgentProcess(
         return internallyResolved(true);
       }
       const observed = new InternalPromise<boolean>((resolveWait) => {
-        const waiter = scheduleTimeout(() => {
-          notifyClosed = null;
-          resolveWait(false);
-        }, ms);
+        const waiter = ownTimer(
+          ledger,
+          () => {
+            notifyClosed = null;
+            resolveWait(false);
+          },
+          ms,
+        );
         notifyClosed = (): void => {
-          cancelTimeout(waiter);
           resolveWait(true);
+          releaseTimer(waiter);
         };
       });
       return protectPromiseResolution(observed);
@@ -1571,7 +2118,7 @@ export function invokeAgentProcess(
        */
       const finishTermination = (): void => {
         try {
-          if (settled) {
+          if (committed) {
             return;
           }
 
@@ -1587,13 +2134,13 @@ export function invokeAgentProcess(
           // the direct child ends. Releasing this process's local ends before a
           // forced settlement is what keeps the caller from being held alive by
           // leaked wraps, and it is best effort on a handle that can fault.
+          // This lifecycle decides that the local ends should go before a
+          // forced settlement, and that judgement is unchanged. It performs the
+          // release through the entry that owns it, so the drain in the terminal
+          // step that follows converges on the same action instead of repeating
+          // it; {@link releaseOwned} isolates and counts on its own.
           const releaseLocalPipes = (): void => {
-            try {
-              destroyReadable(child.stdout);
-              destroyReadable(child.stderr);
-            } catch {
-              // The settlement that follows is not contingent on this.
-            }
+            releaseOwned(ledger, childHandle);
           };
 
           if (
@@ -1645,7 +2192,7 @@ export function invokeAgentProcess(
 
       if (
         !whenSettled(
-          terminate(child, platform, invocation.graceMs),
+          terminate(ledger, child, platform, invocation.graceMs),
           afterTermination,
           onTerminationFault,
         )
@@ -1679,89 +2226,106 @@ export function invokeAgentProcess(
       }
     };
 
-    if (child.stdout !== null) {
-      onEvent(child.stdout, 'error', () => {
-        // A read-side pipe failure must not escape as an uncaught EventEmitter
-        // error. The child close path remains the provider-neutral outcome.
-      });
-      onReadableData(child.stdout, onStdout);
-    }
-    if (child.stderr !== null) {
-      onEvent(child.stderr, 'error', () => {
-        // Kept separate from stdout so neither stream can contaminate the
-        // other's transcript or settlement path.
-      });
-      onReadableData(child.stderr, onStderr);
-    }
-
-    onEvent(child, 'error', () => {
-      // Only a failure to start is terminal on its own. A post-spawn error such
-      // as a broken pipe is recorded by the close path instead.
-      if (child.pid === undefined) {
-        claim(TRANSPORT_OUTCOME.SPAWN_FAILED);
-        settle();
+    // One guard over every mandatory setup statement that remains. Each of them
+    // registers a listener, arms a timer, closes a pipe or dispatches, and each
+    // can throw out of this executor on a handle whose accessors are not this
+    // module's. Without the guard the runtime settles the exchange itself, with
+    // a value this transport never chose, leaving a running child that nothing
+    // is left to bound -- the deadline below is one of the statements that may
+    // not have been reached. Routing to the same setup failure the hardening
+    // path takes gives the child its bounded release and the caller its
+    // mandatory reason.
+    try {
+      if (child.stdout !== null) {
+        ownListener(ledger, child.stdout, 'error', () => {
+          // A read-side pipe failure must not escape as an uncaught EventEmitter
+          // error. The child close path remains the provider-neutral outcome.
+        });
+        ownReadableData(ledger, child.stdout, onStdout);
       }
-    });
+      if (child.stderr !== null) {
+        ownListener(ledger, child.stderr, 'error', () => {
+          // Kept separate from stdout so neither stream can contaminate the
+          // other's transcript or settlement path.
+        });
+        ownReadableData(ledger, child.stderr, onStderr);
+      }
 
-    onEvent(child, 'exit', (code: number | null, signalName: NodeJS.Signals | null) => {
-      exitCode = code;
-      terminatingSignal = signalName;
-    });
+      ownListener(ledger, child, 'error', () => {
+        // Only a failure to start is terminal on its own. A post-spawn error such
+        // as a broken pipe is recorded by the close path instead.
+        if (child.pid === undefined) {
+          claim(TRANSPORT_OUTCOME.SPAWN_FAILED);
+          settle();
+        }
+      });
 
-    onEvent(child, 'close', () => {
-      closed = true;
-      // Claimed here rather than on 'exit', so output that arrives between exit
-      // and close can still promote the exchange to OUTPUT_LIMIT_EXCEEDED.
-      claim(
-        terminatingSignal !== null
-          ? TRANSPORT_OUTCOME.SIGNALLED
-          : TRANSPORT_OUTCOME.EXITED,
+      ownListener(ledger, child, 'exit', (code: number | null, signalName: NodeJS.Signals | null) => {
+        exitCode = code;
+        terminatingSignal = signalName;
+      });
+
+      ownListener(ledger, child, 'close', () => {
+        closed = true;
+        // Claimed here rather than on 'exit', so output that arrives between exit
+        // and close can still promote the exchange to OUTPUT_LIMIT_EXCEEDED.
+        claim(
+          terminatingSignal !== null
+            ? TRANSPORT_OUTCOME.SIGNALLED
+            : TRANSPORT_OUTCOME.EXITED,
+        );
+        if (notifyClosed !== null) {
+          const notify = notifyClosed;
+          notifyClosed = null;
+          notify();
+        }
+        // A termination lifecycle that has begun owns settlement for the rest of
+        // its run: the notification above releases its bounded close wait, and it
+        // settles from there. Settling here as well would only race that lifecycle.
+        if (!terminating) {
+          settle();
+        }
+      });
+
+      const stdin = child.stdin;
+      if (stdin !== null) {
+        ownListener(ledger, stdin, 'error', () => {
+          // A child that exits before reading breaks the pipe. That is the
+          // child's behaviour, not a transport failure, and the close path
+          // decides the outcome.
+        });
+        reflectApply(writableEnd, stdin, [invocation.stdin, 'utf8']);
+      }
+
+      // Armed before the dispatch below, and that order is load-bearing.
+      //
+      // Registering a continuation is synchronous, and so is the fallback when
+      // registration fails, so an already-aborted signal can run an entire
+      // termination lifecycle — settlement and {@link cleanup} included — before
+      // the dispatch returns. A deadline armed after that would be a ref'd timer
+      // created past the cleanup that was supposed to release it, and nothing
+      // left would cancel it: a completed exchange holding the host for as long
+      // as it was allowed to run. Arming it first leaves {@link cleanup}
+      // authoritative over every resource this exchange owns, whenever it runs.
+      ownTimer(
+        ledger,
+        () => {
+          if (claim(TRANSPORT_OUTCOME.TIMED_OUT)) {
+            runTermination();
+          }
+        },
+        invocation.timeoutMs,
       );
-      if (notifyClosed !== null) {
-        const notify = notifyClosed;
-        notifyClosed = null;
-        notify();
-      }
-      // A termination lifecycle that has begun owns settlement for the rest of
-      // its run: the notification above releases its bounded close wait, and it
-      // settles from there. Settling here as well would only race that lifecycle.
-      if (!terminating) {
-        settle();
-      }
-    });
 
-    const stdin = child.stdin;
-    if (stdin !== null) {
-      onEvent(stdin, 'error', () => {
-        // A child that exits before reading breaks the pipe. That is the
-        // child's behaviour, not a transport failure, and the close path
-        // decides the outcome.
-      });
-      reflectApply(writableEnd, stdin, [invocation.stdin, 'utf8']);
-    }
-
-    // Armed before the dispatch below, and that order is load-bearing.
-    //
-    // Registering a continuation is synchronous, and so is the fallback when
-    // registration fails, so an already-aborted signal can run an entire
-    // termination lifecycle — settlement and {@link cleanup} included — before
-    // the dispatch returns. A deadline armed after that would be a ref'd timer
-    // created past the cleanup that was supposed to release it, and nothing
-    // left would cancel it: a completed exchange holding the host for as long
-    // as it was allowed to run. Arming it first leaves {@link cleanup}
-    // authoritative over every resource this exchange owns, whenever it runs.
-    deadline = scheduleTimeout(() => {
-      if (claim(TRANSPORT_OUTCOME.TIMED_OUT)) {
-        runTermination();
+      // The last statement of this executor, and the only one that can settle
+      // synchronously. Nothing may follow it: everything after this point would
+      // be running against an exchange that may already be over.
+      abortDispatch = dispatchAbort;
+      if (abortPending || (invocation.signal !== null && readAbortState(invocation.signal))) {
+        dispatchAbort();
       }
-    }, invocation.timeoutMs);
-
-    // The last statement of this executor, and the only one that can settle
-    // synchronously. Nothing may follow it: everything after this point would
-    // be running against an exchange that may already be over.
-    abortDispatch = dispatchAbort;
-    if (abortPending || (invocation.signal !== null && readAbortState(invocation.signal))) {
-      dispatchAbort();
+    } catch (error: unknown) {
+      failSetup(error);
     }
   });
 }
