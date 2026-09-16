@@ -27,13 +27,14 @@
  * `verifyKey` to trust even if someone plants one.
  *
  * Before any command is sent, the native pipe attestor is run against the
- * discovered pipe path. It asks the KERNEL which process serves that pipe, pins
- * that process against PID reuse by its creation time, reads its TokenUser SID,
- * and relays exactly one bounded hello read from the SAME pipe handle. This CLI
- * then requires:
+ * discovered pipe path. It connects, reads the OWNER and DACL of the kernel
+ * pipe object behind THAT connected handle, and relays exactly one bounded
+ * hello read from the SAME pipe handle. This CLI then requires:
  *
- *   1. the attested SERVER SID to equal the trusted operator SID the anchor gate
- *      already resolved and proved owns the anchor; and
+ *   1. the attested pipe OWNER to equal the trusted operator SID the anchor gate
+ *      already resolved and proved owns the anchor, AND that object's DACL to be
+ *      exactly the accepted protected operator-only descriptor (owner alone is
+ *      not enough — see DDR-D062-D); and
  *   2. the command session's own hello to announce the VERY SAME `verifyKey`
  *      bytes the attested hello announced.
  *
@@ -53,7 +54,8 @@
  *
  * Because the signing key is ephemeral and lives only in the genuine runtime's
  * memory, a party serving a squatted pipe with a byte-identical copy of a genuine
- * descriptor can neither pass attestation (wrong SID) nor produce `sigS`, and can
+ * descriptor can neither pass attestation (wrong pipe owner, or a descriptor that
+ * is not the accepted operator-only one) nor produce `sigS`, and can
  * never make this CLI exit 0. The CLI's own `nonceC` is fresh per connection, so
  * a signature harvested from a live runtime is useless here once that runtime is
  * gone.

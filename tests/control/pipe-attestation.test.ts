@@ -1,5 +1,5 @@
 /**
- * DDR-D062-B — LIVE PIPE SERVER IDENTITY RELAYER: the focused attack matrix.
+ * DDR-D062-D — LIVE PIPE SERVER IDENTITY RELAYER: the focused attack matrix.
  *
  * The property under test is the one a descriptor can never establish:
  *
@@ -48,7 +48,10 @@ import {
   buildHelloBody,
   buildRequestBody,
   buildResultBody,
+  createControlChannelServer,
   frameMessage,
+  type ControlChannelServer,
+  type CreateControlChannelServerOptions,
   parseClientRequest,
   parseHelloBody,
   parseResultBody,
@@ -62,6 +65,9 @@ import {
   PIPE_ATTESTATION_REJECTION,
   attestPipeServer,
   defaultProcessRunner,
+  loadPipeAcceptor,
+  type OwnerHelperProvenance,
+  type PipeAcceptorLoad,
   parseAttestationEvidence,
   parseWhoamiUser,
   parseDescriptor,
@@ -76,6 +82,7 @@ import {
   FAKE_ANCHOR,
   FAKE_OPERATOR_SID,
   FOREIGN_OPERATOR_SID,
+  acceptedPipeSd,
   attestDouble,
   attestEvidenceText,
   callCli,
@@ -124,7 +131,7 @@ function attestWithStdout(stdout: string, operatorSid = FAKE_OPERATOR_SID): Prom
  * 1. Identity of the SERVING PROCESS decides, not the descriptor
  * ================================================================== */
 
-describe('DDR-D062-B — a perfect descriptor grants nothing (SEAM)', () => {
+describe('DDR-D062-D — a perfect descriptor grants nothing (SEAM)', () => {
   it('1. foreign SID + an attacker-perfect descriptor and pipe → rejected, no command sent', async () => {
     const { runtime, orchestrator } = newOrchestrator();
     orchestrator.open(BINDING);
@@ -143,12 +150,12 @@ describe('DDR-D062-B — a perfect descriptor grants nothing (SEAM)', () => {
 
     const run = await callCli(anchor, {
       descriptorDeps: perfect.deps,
-      attest: attestDouble({ serverSid: FOREIGN_OPERATOR_SID }),
+      attest: attestDouble({ pipeOwnerSid: FOREIGN_OPERATOR_SID }),
     });
     expect(run.outcome.exitCode).toBe(1);
     expect(run.outcome.authenticated).toBe(false);
     expect(run.outcome.status).toBeNull();
-    expect(run.err.some((line) => line.includes('SERVER_SID_MISMATCH'))).toBe(true);
+    expect(run.err.some((line) => line.includes('PIPE_OWNER_MISMATCH'))).toBe(true);
     expect(run.out).toEqual([]);
     expect(runtime.current()?.status).toBe(WORKFLOW_STATUS.OPEN);
   });
@@ -175,11 +182,11 @@ describe('DDR-D062-B — a perfect descriptor grants nothing (SEAM)', () => {
     );
 
     const run = await callCli(rewritten, {
-      attest: attestDouble({ serverSid: FOREIGN_OPERATOR_SID }),
+      attest: attestDouble({ pipeOwnerSid: FOREIGN_OPERATOR_SID }),
     });
     expect(run.outcome.exitCode).toBe(1);
     expect(run.outcome.status).toBeNull();
-    expect(run.err.some((line) => line.includes('SERVER_SID_MISMATCH'))).toBe(true);
+    expect(run.err.some((line) => line.includes('PIPE_OWNER_MISMATCH'))).toBe(true);
     expect(runtime.current()?.status).toBe(WORKFLOW_STATUS.OPEN);
   });
 
@@ -251,7 +258,7 @@ describe('DDR-D062-B — a perfect descriptor grants nothing (SEAM)', () => {
  * 2. Key binding: the session must be the runtime that was attested
  * ================================================================== */
 
-describe('DDR-D062-B — attested key binds the command session (SEAM)', () => {
+describe('DDR-D062-D — attested key binds the command session (SEAM)', () => {
   it('4. genuine attestation, then an attacker takes over the pipe name → rejected before the command is sent', async () => {
     const { runtime, orchestrator } = newOrchestrator();
     orchestrator.open(BINDING);
@@ -431,7 +438,7 @@ describe('DDR-D062-B — attested key binds the command session (SEAM)', () => {
 
 /**
  * A client that verifies the result against whatever key the SESSION announced,
- * instead of the attested one. This is the pre-DDR-D062-B trust shape.
+ * instead of the attested one. This is the pre-DDR-D062-D trust shape.
  */
 function announcedKeyClient(
   pipePath: string,
@@ -519,7 +526,7 @@ function announcedKeyClient(
   });
 }
 
-describe('DDR-D062-B — negative controls (each guard is load-bearing)', () => {
+describe('DDR-D062-D — negative controls (each guard is load-bearing)', () => {
   it('12a. trusting the SESSION-announced key instead of the attested one → the takeover SUCCEEDS', async () => {
     const { orchestrator } = newOrchestrator();
     const anchor = memAnchor();
@@ -542,7 +549,7 @@ describe('DDR-D062-B — negative controls (each guard is load-bearing)', () => 
     preserved.set(runtimeId, serializeDescriptor(parsed.descriptor));
     const run = await callCli(anchor, {
       descriptorDeps: preserved.deps,
-      attest: attestDouble({ serverSid: FOREIGN_OPERATOR_SID }),
+      attest: attestDouble({ pipeOwnerSid: FOREIGN_OPERATOR_SID }),
     });
     expect(run.outcome.status).toBeNull();
   });
@@ -671,22 +678,33 @@ describe('DDR-D062-B — negative controls (each guard is load-bearing)', () => 
  * 4. Evidence parsing is total; every failure is fail-closed
  * ================================================================== */
 
-describe('DDR-D062-B — attestor output is parsed totally (SEAM)', () => {
+describe('DDR-D062-D — attestor output is parsed totally (SEAM)', () => {
   const sid = FAKE_OPERATOR_SID;
   const hello = Buffer.from('{"v":2}', 'utf8');
   const good = attestEvidenceText(sid, hello);
 
+  const hex = hello.toString('hex');
+  const sd = acceptedPipeSd(sid);
+
   it('14a. the exact grammar parses, and the hello bytes survive verbatim', () => {
     const parsed = parseAttestationEvidence(good);
-    expect(parsed?.serverSid).toBe(sid.toLowerCase());
+    expect(parsed?.pipeOwnerSid).toBe(sid.toLowerCase());
+    expect(parsed?.pipeSd).toBe(sd);
     expect(parsed?.helloBody.equals(hello)).toBe(true);
   });
 
   it('14b. malformed, truncated, extra, reordered and non-canonical outputs are all rejected', () => {
     const bad: readonly string[] = [
       '',
-      'AGENTBRIDGE-ATTEST-V1\n',
-      `AGENTBRIDGE-ATTEST-V2\nSERVERSID ${sid}\nHELLO ${hello.toString('hex')}\n`,
+      'AGENTBRIDGE-ATTEST-V2\n',
+      // T7. The V1 grammar is not a fallback: the superseded three-line form,
+      // with the superseded SERVERSID label, is simply malformed evidence now.
+      `AGENTBRIDGE-ATTEST-V1\nSERVERSID ${sid}\nHELLO ${hex}\n`,
+      // the V1 magic carrying V2 fields, and the V2 magic carrying V1 fields
+      `AGENTBRIDGE-ATTEST-V1\nPIPEOWNER ${sid}\nPIPESD ${sd}\nHELLO ${hex}\n`,
+      `AGENTBRIDGE-ATTEST-V2\nSERVERSID ${sid}\nHELLO ${hex}\n`,
+      // a future magic is no more acceptable than a past one
+      `AGENTBRIDGE-ATTEST-V3\nPIPEOWNER ${sid}\nPIPESD ${sd}\nHELLO ${hex}\n`,
       // no trailing newline
       good.slice(0, -1),
       // an extra line
@@ -694,19 +712,31 @@ describe('DDR-D062-B — attestor output is parsed totally (SEAM)', () => {
       // a surplus blank line
       `${good}\n`,
       // reordered
-      `AGENTBRIDGE-ATTEST-V1\nHELLO ${hello.toString('hex')}\nSERVERSID ${sid}\n`,
+      `AGENTBRIDGE-ATTEST-V2\nPIPESD ${sd}\nPIPEOWNER ${sid}\nHELLO ${hex}\n`,
+      `AGENTBRIDGE-ATTEST-V2\nPIPEOWNER ${sid}\nHELLO ${hex}\nPIPESD ${sd}\n`,
+      // the descriptor line dropped entirely
+      `AGENTBRIDGE-ATTEST-V2\nPIPEOWNER ${sid}\nHELLO ${hex}\n`,
       // CRLF instead of LF
       good.replace(/\n/g, '\r\n'),
-      // non-canonical SID
-      `AGENTBRIDGE-ATTEST-V1\nSERVERSID NT-AUTHORITY\\SYSTEM\nHELLO ${hello.toString('hex')}\n`,
+      // non-canonical owner SID
+      `AGENTBRIDGE-ATTEST-V2\nPIPEOWNER NT-AUTHORITY\\SYSTEM\nPIPESD ${sd}\nHELLO ${hex}\n`,
+      // a descriptor that is not even SDDL-shaped, or smuggles whitespace
+      `AGENTBRIDGE-ATTEST-V2\nPIPEOWNER ${sid}\nPIPESD not-a-descriptor\nHELLO ${hex}\n`,
+      `AGENTBRIDGE-ATTEST-V2\nPIPEOWNER ${sid}\nPIPESD D:P(A;;0x12019f;;;${sid})\nHELLO ${hex}\n`,
+      `AGENTBRIDGE-ATTEST-V2\nPIPEOWNER ${sid}\nPIPESD O:${sid} D:P(A;;0x12019f;;;${sid})\nHELLO ${hex}\n`,
+      // a group or SACL field we never asked the kernel for
+      `AGENTBRIDGE-ATTEST-V2\nPIPEOWNER ${sid}\nPIPESD O:${sid}G:${sid}D:P(A;;0x12019f;;;${sid})\nHELLO ${hex}\n`,
+      // an over-long descriptor (the native cap is 1023 characters)
+      `AGENTBRIDGE-ATTEST-V2\nPIPEOWNER ${sid}\nPIPESD O:${sid}D:${'P'.repeat(1100)}\nHELLO ${hex}\n`,
       // uppercase hex
-      `AGENTBRIDGE-ATTEST-V1\nSERVERSID ${sid}\nHELLO ${hello.toString('hex').toUpperCase()}\n`,
+      `AGENTBRIDGE-ATTEST-V2\nPIPEOWNER ${sid}\nPIPESD ${sd}\nHELLO ${hex.toUpperCase()}\n`,
       // odd-length hex
-      `AGENTBRIDGE-ATTEST-V1\nSERVERSID ${sid}\nHELLO abc\n`,
+      `AGENTBRIDGE-ATTEST-V2\nPIPEOWNER ${sid}\nPIPESD ${sd}\nHELLO abc\n`,
       // empty hello
-      `AGENTBRIDGE-ATTEST-V1\nSERVERSID ${sid}\nHELLO \n`,
+      `AGENTBRIDGE-ATTEST-V2\nPIPEOWNER ${sid}\nPIPESD ${sd}\nHELLO \n`,
       // wrong labels
-      `AGENTBRIDGE-ATTEST-V1\nSID ${sid}\nHELLO ${hello.toString('hex')}\n`,
+      `AGENTBRIDGE-ATTEST-V2\nSID ${sid}\nPIPESD ${sd}\nHELLO ${hex}\n`,
+      `AGENTBRIDGE-ATTEST-V2\nPIPEOWNER ${sid}\nSD ${sd}\nHELLO ${hex}\n`,
     ];
     for (const text of bad) {
       expect(parseAttestationEvidence(text), JSON.stringify(text.slice(0, 60))).toBeNull();
@@ -801,14 +831,107 @@ describe('DDR-D062-B — attestor output is parsed totally (SEAM)', () => {
 });
 
 /* ================================================================== *
+ * 4b. The pipe DESCRIPTOR is asserted exactly — owner alone is not enough
+ * ================================================================== */
+
+describe('DDR-D062-D — owner AND the exact descriptor decide (SEAM)', () => {
+  const me = FAKE_OPERATOR_SID;
+  const hex = Buffer.from('{"v":2}', 'utf8').toString('hex');
+  const evidenceOf = (owner: string, descriptor: string): string =>
+    `AGENTBRIDGE-ATTEST-V2\nPIPEOWNER ${owner}\nPIPESD ${descriptor}\nHELLO ${hex}\n`;
+
+  it('T1. the trusted owner carrying the accepted descriptor → attested', async () => {
+    const result = await attestWithStdout(evidenceOf(me, acceptedPipeSd(me)));
+    expect(result.ok).toBe(true);
+  });
+
+  it('T2. a foreign OWNER is rejected even when the DACL is perfect', async () => {
+    // The whole descriptor is impeccable except for who owns the object — which
+    // is exactly the case a foreign principal cannot manufacture, because the
+    // kernel refuses an owner SID the creating token cannot assume.
+    const result = await attestWithStdout(
+      evidenceOf(FOREIGN_OPERATOR_SID, `O:${FOREIGN_OPERATOR_SID}D:P(A;;0x12019f;;;${me})`),
+    );
+    expect(result).toEqual({
+      ok: false,
+      reason: PIPE_ATTESTATION_REJECTION.PIPE_OWNER_MISMATCH,
+    });
+  });
+
+  it('T4/T5/T6. the trusted owner with ANY other descriptor → PIPE_DACL_UNEXPECTED', async () => {
+    // This is the counterexample owner-only proof cannot survive: an unrelated
+    // program running as the operator holds the expected name with a broad
+    // descriptor, and a foreign principal then adds an instance and answers.
+    const unacceptable: readonly string[] = [
+      // T4 — present, but NOT protected (an inheritable parent could widen it)
+      `O:${me}D:(A;;0x12019f;;;${me})`,
+      `O:${me}D:AI(A;;0x12019f;;;${me})`,
+      `O:${me}D:PAI(A;;0x12019f;;;${me})`,
+      // T5 — a second ace, or a broad/foreign principal instead of the operator
+      `O:${me}D:P(A;;0x12019f;;;${me})(A;;0x12019f;;;${FOREIGN_OPERATOR_SID})`,
+      `O:${me}D:P(A;;0x12019f;;;${me})(A;;0x120089;;;WD)`,
+      `O:${me}D:P(A;;0x12019f;;;WD)`,
+      `O:${me}D:P(A;;0x12019f;;;AN)`,
+      `O:${me}D:P(A;;0x12019f;;;BA)`,
+      `O:${me}D:P(A;;0x12019f;;;SY)`,
+      `O:${me}D:P(A;;0x12019f;;;${FOREIGN_OPERATOR_SID})`,
+      // T6 — a wider mask, a narrower mask, or a symbolic one
+      `O:${me}D:P(A;;0x1f01ff;;;${me})`,
+      `O:${me}D:P(A;;0x120089;;;${me})`,
+      `O:${me}D:P(A;;GA;;;${me})`,
+      `O:${me}D:P(A;;FA;;;${me})`,
+      // inheritance flags on the ace
+      `O:${me}D:P(A;ID;0x12019f;;;${me})`,
+      `O:${me}D:P(A;OICI;0x12019f;;;${me})`,
+      // a DENY ace wearing the right mask
+      `O:${me}D:P(D;;0x12019f;;;${me})`,
+      // an audit/alarm ace type
+      `O:${me}D:P(AU;;0x12019f;;;${me})`,
+      // NULL DACL (grants everyone everything) and an empty protected DACL
+      `O:${me}D:NO_ACCESS_CONTROL`,
+      `O:${me}D:P`,
+    ];
+    for (const descriptor of unacceptable) {
+      const result = await attestWithStdout(evidenceOf(me, descriptor));
+      expect(result, descriptor).toEqual({
+        ok: false,
+        reason: PIPE_ATTESTATION_REJECTION.PIPE_DACL_UNEXPECTED,
+      });
+    }
+  });
+
+  it('T3. a nonzero native exit is fail-closed with no descriptor to inspect', async () => {
+    const failed = await attestPipeServer(
+      '\\\\.\\pipe\\x',
+      me,
+      (): Promise<ProcessResult> => Promise.resolve({ ok: false }),
+      simulatedArtifact,
+    );
+    expect(failed).toEqual({
+      ok: false,
+      reason: PIPE_ATTESTATION_REJECTION.ATTESTATION_FAILED,
+    });
+  });
+});
+
+/* ================================================================== *
  * 5. REAL ARTIFACT — the native attestor against real pipes
  * ================================================================== */
 
 const repoRoot = fileURLToPath(new URL('../../', import.meta.url));
 const attestorExe = join(repoRoot, 'dist', 'control', 'native', 'agentbridge-win-pipe-attest.exe');
 const attestorProv = join(repoRoot, 'dist', 'control', 'native', 'pipe-attestor-provenance.js');
+// The accept provider too: under DDR-D062-D the end-to-end case is only real if
+// the pipe under test carries the genuine protected operator-only descriptor,
+// which only the Revision-2 accept provider creates.
+const acceptorAddon = join(repoRoot, 'dist', 'control', 'native', 'agentbridge-win-pipe-accept.node');
+const acceptorProv = join(repoRoot, 'dist', 'control', 'native', 'pipe-acceptor-provenance.js');
 const nativeReady =
-  process.platform === 'win32' && existsSync(attestorExe) && existsSync(attestorProv);
+  process.platform === 'win32' &&
+  existsSync(attestorExe) &&
+  existsSync(attestorProv) &&
+  existsSync(acceptorAddon) &&
+  existsSync(acceptorProv);
 
 /**
  * Point the REAL attestation gate at the REAL built artifact while these tests run
@@ -816,6 +939,25 @@ const nativeReady =
  * generated provenance, the SHA-256-before-exec gate, the bounded runner, the
  * parser and the SID comparison are all the production ones.
  */
+/**
+ * Point the REAL accept provider at the REAL built addon the same way, so a
+ * pipe created in these tests carries the genuine protected operator-only
+ * descriptor. Only the module-resolution root moves: the addon bytes, its
+ * generated provenance and the SHA-256-before-load gate are the production ones.
+ */
+const realAcceptorServer = (options: CreateControlChannelServerOptions): ControlChannelServer =>
+  createControlChannelServer({
+    ...options,
+    loadAcceptor: (): Promise<PipeAcceptorLoad> =>
+      loadPipeAcceptor({
+        loadProvenance: async (): Promise<OwnerHelperProvenance | null> => {
+          const loaded = (await import(pathToFileURL(acceptorProv).href)) as Record<string, unknown>;
+          return (loaded['PIPE_ACCEPTOR_PROVENANCE'] as OwnerHelperProvenance | undefined) ?? null;
+        },
+        resolveAcceptorPath: (): string => acceptorAddon,
+      }),
+  });
+
 const realArtifactDeps: AttestControlPipeDeps = {
   attestor: {
     loadProvenance: async (): Promise<{ filename: string; sha256: string } | null> => {
@@ -872,7 +1014,7 @@ function runAttestor(args: readonly string[]): Promise<RawRun> {
   });
 }
 
-describe.skipIf(!nativeReady)('DDR-D062-B — the REAL native attestor (Windows, dist-gated)', () => {
+describe.skipIf(!nativeReady)('DDR-D062-D — the REAL native attestor (Windows, dist-gated)', () => {
   it('relays the exact hello of a real live pipe and the real SID of its serving process', async () => {
     const keys = generateRuntimeKeyPair();
     const nonceS = randomBytes(NONCE_BYTES);
@@ -900,7 +1042,7 @@ describe.skipIf(!nativeReady)('DDR-D062-B — the REAL native attestor (Windows,
     );
     // And the SID is this test process's own — the process that serves the pipe.
     const self = await runAttestor([pipePath]);
-    expect(parseAttestationEvidence(self.stdout)?.serverSid).toBe(evidence?.serverSid);
+    expect(parseAttestationEvidence(self.stdout)?.pipeOwnerSid).toBe(evidence?.pipeOwnerSid);
   });
 
   it('rejects malformed arguments, non-pipe paths, UNC pipes, and an absent pipe (fail closed, empty stdout)', async () => {
@@ -989,37 +1131,65 @@ describe.skipIf(!nativeReady)('DDR-D062-B — the REAL native attestor (Windows,
     }
   }, 60000);
 
-  it('8b. the reviewed source pins the serving process by creation time and re-proves it before EVERY emission', async () => {
-    // A genuine PID recycle cannot be forced from a test, so the guard is proven
-    // by construction over the exact reviewed source the build compiles.
+  it('T15. the reviewed source and the BUILT binary carry no process-object capability at all', async () => {
+    // PID reuse is no longer guarded — it is structurally impossible, because
+    // no PID is ever consulted. That is a claim about absence, so it is proven
+    // over the exact reviewed source the build compiles AND over the bytes of
+    // the artifact the runtime actually executes.
     const { readFileSync } = await import('node:fs');
     const source = readFileSync(
       join(repoRoot, 'tools', 'control-owner', 'agentbridge-win-pipe-attest.c'),
       'utf8',
     );
-    // The creation FILETIME is captured once, from the pinned handle.
-    expect(source).toContain('GetProcessTimes(proc, &created, &exited, &kernel_time, &user_time)');
-    // Every re-check compares that exact instant, the pipe's server PID, and liveness.
-    expect(source).toContain('return filetime_equal(&now_created, created);');
-    expect(source).toContain('GetNamedPipeServerProcessId(pipe, &current_pid) || current_pid != pid');
-    expect(source).toContain('WaitForSingleObject(proc, 0) != WAIT_TIMEOUT');
-    // Re-proven at least three times: on pin, after the token query, after the hello.
-    expect(source.match(/if \(!pin_still_holds\(pipe, proc, pid, &created\)\)/g)?.length).toBe(3);
-    // The single stdout write happens only after the last pin proof.
-    expect(source.match(/write_stdout\(/g)?.length).toBe(2); // the helper + its one call site
-    const lastPin = source.lastIndexOf('pin_still_holds(pipe, proc, pid, &created)');
+    const binary = readFileSync(attestorExe).toString('latin1');
+    const forbidden = [
+      'OpenProcess',
+      'OpenProcessToken',
+      'GetTokenInformation',
+      'GetNamedPipeServerProcessId',
+      'GetProcessTimes',
+      'AdjustTokenPrivileges',
+      'LookupPrivilegeValue',
+      'SeDebugPrivilege',
+    ];
+    for (const symbol of forbidden) {
+      expect(source.includes(symbol), `source imports ${symbol}`).toBe(false);
+      // Imports are plain ASCII in the PE import directory, so absence there is
+      // absence of the capability, not merely absence of a call site.
+      expect(binary.includes(symbol), `binary imports ${symbol}`).toBe(false);
+    }
+    // What it DOES do: read the security of the handle it already holds.
+    expect(source).toContain('GetSecurityInfo(pipe, SE_KERNEL_OBJECT,');
+    expect(source).toContain(
+      'OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION',
+    );
+    // Exactly one CreateFileW: the pipe is never reopened by name (TOCTOU).
+    expect(source.match(/CreateFileW\(/g)?.length).toBe(1);
+    // And it can never write a byte to the pipe.
+    expect(source).toContain('CreateFileW(pipe_path, GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, NULL)');
+    expect(source.includes('GENERIC_WRITE')).toBe(false);
+    expect(source.includes('WriteFile(')).toBe(false);
+    // The descriptor is read BEFORE the hello, and stdout is written once, last.
+    const query = source.lastIndexOf('query_pipe_security(pipe, &owner, &dacl, &sd)');
+    const hello = source.lastIndexOf('read_exact(pipe, prefix, ATTEST_PREFIX_BYTES)');
     const emit = source.lastIndexOf('write_stdout(out, len);');
-    expect(lastPin).toBeGreaterThan(0);
-    expect(emit).toBeGreaterThan(lastPin);
+    expect(query).toBeGreaterThan(0);
+    expect(hello).toBeGreaterThan(query);
+    expect(emit).toBeGreaterThan(hello);
+    expect(source.match(/write_stdout\(/g)?.length).toBe(2); // the helper + its one call site
   });
 
-  it('15. attesting a live runtime leaks no handles, logs nothing, and does not disturb the next session', async () => {
+  it('T1-live/15. the REAL accept provider + the REAL attestor attest end to end, leak nothing, and log nothing', async () => {
     const { runtime, orchestrator } = newOrchestrator();
     orchestrator.open(BINDING);
     const anchor = memAnchor();
     const logged: string[] = [];
+    // The PRODUCTION server factory, so the pipe under test carries the genuine
+    // protected operator-only descriptor rather than a libuv default one. This
+    // is what makes the assertion below a real T1 and not a simulated one.
     const handle = await startServer(orchestrator, anchor, {
       overrides: {
+        createServer: realAcceptorServer,
         logger: (message: string): void => {
           logged.push(message);
         },
@@ -1062,3 +1232,139 @@ describe.skipIf(!nativeReady)('DDR-D062-B — the REAL native attestor (Windows,
     expect(logged).toEqual([]);
   }, 60000);
 });
+
+/* ================================================================== *
+ * 6. THROWAWAY-PIPE KERNEL REGRESSIONS (Windows)
+ *
+ * The two kernel facts the DDR's trust root rests on, proven against pipes
+ * created and destroyed inside this test and nothing else. No live control
+ * pipe, no runtime, no Scheduled Task, no account, no ACL of anything that
+ * outlives the test is touched, and nothing here needs elevation.
+ *
+ * T11 and T12 — the CROSS-PRINCIPAL denials — are deliberately absent: they
+ * require a second Windows principal, and creating or altering one is outside
+ * this gate's authority. They remain REQUIRED_BUT_AUTHORITY_DEFERRED.
+ * ================================================================== */
+
+/** Run one throwaway-pipe probe script and return its parsed JSON result. */
+function runPipeProbe(script: string): Promise<Record<string, unknown>> {
+  const encoded = Buffer.from(script, 'utf16le').toString('base64');
+  return new Promise<Record<string, unknown>>((resolvePromise, rejectPromise) => {
+    execFile(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
+      { encoding: 'utf8', timeout: 60000, windowsHide: true, shell: false, maxBuffer: 1 << 20 },
+      (error: unknown, stdout: string, stderr: string) => {
+        if (error !== null && stdout.trim() === '') {
+          rejectPromise(new Error(`probe failed: ${stderr}`));
+          return;
+        }
+        resolvePromise(JSON.parse(stdout) as Record<string, unknown>);
+      },
+    );
+  });
+}
+
+const PROBE_PREAMBLE = [
+  "$ErrorActionPreference = 'Stop'",
+  'Add-Type -TypeDefinition @"',
+  'using System;',
+  'using System.Runtime.InteropServices;',
+  'public static class NP {',
+  '  [StructLayout(LayoutKind.Sequential)]',
+  '  public struct SA { public int nLength; public IntPtr sd; public int inherit; }',
+  '  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]',
+  '  public static extern IntPtr CreateNamedPipeW(string n, uint om, uint pm, uint mi, uint ob, uint ib, uint t, ref SA sa);',
+  '  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]',
+  '  public static extern IntPtr CreateFileW(string n, uint a, uint s, IntPtr sa, uint d, uint f, IntPtr t);',
+  '  [DllImport("kernel32.dll", SetLastError=true)] public static extern bool CloseHandle(IntPtr h);',
+  '  [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)]',
+  '  public static extern bool ConvertStringSecurityDescriptorToSecurityDescriptorW(string s, uint r, out IntPtr sd, IntPtr z);',
+  '  [DllImport("advapi32.dll", SetLastError=true)]',
+  '  public static extern uint GetSecurityInfo(IntPtr h, int t, uint i, out IntPtr o, out IntPtr g, out IntPtr d, out IntPtr s, out IntPtr sd);',
+  '  [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)]',
+  '  public static extern bool ConvertSecurityDescriptorToStringSecurityDescriptorW(IntPtr sd, uint r, uint i, out IntPtr s, IntPtr l);',
+  '}',
+  '"@',
+  '$me = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value',
+  'function New-SA([string]$sddl) {',
+  '  $sd = [IntPtr]::Zero',
+  '  if (-not [NP]::ConvertStringSecurityDescriptorToSecurityDescriptorW($sddl, 1, [ref]$sd, [IntPtr]::Zero)) { throw (\'sddl \' + $sddl) }',
+  '  $sa = New-Object NP+SA',
+  "  $sa.nLength = [Runtime.InteropServices.Marshal]::SizeOf([type]'NP+SA')",
+  '  $sa.sd = $sd',
+  '  $sa.inherit = 0',
+  '  return $sa',
+  '}',
+  'function Read-SD([IntPtr]$h) {',
+  '  $o=[IntPtr]::Zero;$g=[IntPtr]::Zero;$d=[IntPtr]::Zero;$s=[IntPtr]::Zero;$p=[IntPtr]::Zero',
+  "  if ([NP]::GetSecurityInfo($h, 6, [uint32]5, [ref]$o, [ref]$g, [ref]$d, [ref]$s, [ref]$p) -ne 0) { return 'QUERY_FAILED' }",
+  '  $t=[IntPtr]::Zero',
+  '  [void][NP]::ConvertSecurityDescriptorToStringSecurityDescriptorW($p, 1, [uint32]5, [ref]$t, [IntPtr]::Zero)',
+  '  return [Runtime.InteropServices.Marshal]::PtrToStringUni($t)',
+  '}',
+  '$OPEN = 3; $MODE = 8; $FIRST = 524288; $INVALID = [IntPtr]::new(-1)',
+].join('\n');
+
+describe.skipIf(process.platform !== 'win32')(
+  'DDR-D062-D — throwaway-pipe kernel regressions (Windows)',
+  () => {
+    it('T13. an unprivileged process CANNOT mint a pipe owned by a foreign principal', async () => {
+      // This is the kernel fact the whole owner check rests on: a foreign
+      // principal cannot forge the operator as owner, because the object
+      // manager refuses an owner SID the creating token cannot assume.
+      const script = [
+        PROBE_PREAMBLE,
+        '$codes = @()',
+        "foreach ($foreign in @('S-1-5-18','S-1-5-32-544')) {",
+        "  $n = '\\\\.\\pipe\\ab-t13-' + [guid]::NewGuid().ToString('N')",
+        "  $sa = New-SA ('O:' + $foreign + 'D:P(A;;0x12019F;;;' + $me + ')')",
+        '  $h = [NP]::CreateNamedPipeW($n, ($OPEN -bor $FIRST), $MODE, 255, 4096, 4096, 0, [ref]$sa)',
+        '  if ($h -eq $INVALID) { $codes += [Runtime.InteropServices.Marshal]::GetLastWin32Error() }',
+        '  else { $codes += 0; [void][NP]::CloseHandle($h) }',
+        '}',
+        "[pscustomobject]@{ codes = $codes } | ConvertTo-Json -Compress",
+      ].join('\n');
+
+      const result = await runPipeProbe(script);
+      // 1307 == ERROR_INVALID_OWNER. A 0 would mean the forgery succeeded.
+      expect(result['codes']).toEqual([1307, 1307]);
+    }, 90000);
+
+    it('T14. the descriptor belongs to the NAME and is fixed at first-instance creation', async () => {
+      // Three instances created with three DIFFERENT security attributes — the
+      // accepted one, a wide-open one, and the kernel default — and every
+      // client, whichever instance it is routed to, reads the FIRST one. A
+      // later instance therefore cannot widen what a client attests.
+      const script = [
+        PROBE_PREAMBLE,
+        "$n = '\\\\.\\pipe\\ab-t14-' + [guid]::NewGuid().ToString('N')",
+        "$accepted = New-SA ('O:' + $me + 'D:P(A;;0x12019F;;;' + $me + ')')",
+        '$i1 = [NP]::CreateNamedPipeW($n, ($OPEN -bor $FIRST), $MODE, 255, 4096, 4096, 0, [ref]$accepted)',
+        "$wide = New-SA ('O:' + $me + 'D:P(A;;GA;;;WD)(A;;GA;;;' + $me + ')')",
+        '$i2 = [NP]::CreateNamedPipeW($n, $OPEN, $MODE, 255, 4096, 4096, 0, [ref]$wide)',
+        '$none = New-Object NP+SA',
+        '$i3 = [NP]::CreateNamedPipeW($n, $OPEN, $MODE, 255, 4096, 4096, 0, [ref]$none)',
+        '$seen = @()',
+        'foreach ($k in 1..3) {',
+        '  $c = [NP]::CreateFileW($n, [uint32]2147483648, 0, [IntPtr]::Zero, 3, 0, [IntPtr]::Zero)',
+        "  if ($c -eq $INVALID) { $seen += 'CONNECT_FAILED'; continue }",
+        '  $seen += (Read-SD $c)',
+        '  [void][NP]::CloseHandle($c)',
+        '}',
+        'foreach ($h in @($i1,$i2,$i3)) { if ($h -ne $INVALID) { [void][NP]::CloseHandle($h) } }',
+        "[pscustomobject]@{ seen = $seen; me = $me } | ConvertTo-Json -Compress",
+      ].join('\n');
+
+      const result = await runPipeProbe(script);
+      const seen = result['seen'] as string[];
+      const me = result['me'] as string;
+      expect(seen).toHaveLength(3);
+      // Every client read the same descriptor...
+      expect(new Set(seen.map((sd) => sd.toUpperCase())).size).toBe(1);
+      // ...and it is exactly the FIRST instance's, which is exactly the
+      // descriptor the production trust layer accepts.
+      expect(seen[0]?.toUpperCase()).toBe(`O:${me}D:P(A;;0x12019F;;;${me})`.toUpperCase());
+    }, 90000);
+  },
+);

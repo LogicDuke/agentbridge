@@ -1,62 +1,85 @@
 /*
  * agentbridge-win-pipe-attest.exe
  *
- * Decision 062 DDR-D062-B — LIVE PIPE SERVER IDENTITY RELAYER.
+ * Decision 062 DDR-D062-D — LIVE PIPE-OBJECT IDENTITY RELAYER.
  *
  * The single-purpose native artifact that answers one question the runtime
- * cannot answer from JavaScript: **who actually owns the process that is
- * serving this named pipe right now, and what did that same process say
- * first?** It connects to a candidate pipe, resolves the SERVER process from
- * the kernel (never from a descriptor, argv, PID file, or any caller-supplied
- * value), pins that process against PID reuse by its creation time, reads the
- * server's TokenUser SID, relays exactly one bounded server hello read from the
- * SAME pipe handle, and prints both as bounded evidence.
+ * cannot answer from JavaScript: **who owns the kernel pipe object this client
+ * is connected to right now, what exactly does its DACL say, and what did that
+ * same connection say first?** It connects to a candidate pipe, reads the
+ * SECURITY DESCRIPTOR of the object behind that CONNECTED handle (never from a
+ * descriptor file, argv, PID file, process listing, or any caller-supplied
+ * value), relays exactly one bounded server hello read from the SAME pipe
+ * handle, and prints the owner, the descriptor and the hello as bounded
+ * evidence.
  *
- * It makes NO policy decision. It does not know the operator SID, does not
+ * WHY THE PIPE OBJECT AND NOT THE PROCESS OBJECT. The former revision resolved
+ * the SERVER PID, pinned it against reuse, and read that process's TokenUser
+ * SID. Its terminal claim was "the serving process runs as the operator SID".
+ * That layer is UNDECIDABLE for the supported ordinary unelevated interactive
+ * operator: against the accepted hosting posture, opening the runtime's
+ * process object refuses EVERY access right, including READ_CONTROL, so the
+ * layer returns no answer at all rather than a wrong one. Note that this file
+ * therefore names none of those APIs even in prose: their absence from the
+ * built import table is an asserted invariant. The pipe object reaches the
+ * identical
+ * claim through a kernel object the supported persona CAN read, and it is
+ * strictly stronger in two places: PID reuse becomes structurally impossible
+ * (no PID is ever consulted), and the claim attaches to the pipe NAME, whose
+ * descriptor is assigned once at first-instance creation and cannot be altered
+ * by a later instance.
+ *
+ * It makes NO identity decision. It does not know the operator SID, does not
  * compare SIDs, does not parse the hello, does not know what a verify key is,
  * and has no notion of success beyond "every structural step succeeded". All
  * authorization lives in the TypeScript trust layer that consumes this
  * evidence. Every failure is fail-closed: a nonzero exit and NO stdout bytes.
  *
- * Read-only always: it never writes a file, never mutates an ACL, never touches
- * the registry, the network, the environment, stdin, or any shell/child
- * process. It opens the pipe with GENERIC_READ only and never writes a byte to
- * it, so it cannot issue a command or perturb a session.
+ * Read-only always: it never writes a file, never mutates an ACL, never takes
+ * ownership, never touches the registry, the network, the environment, stdin,
+ * or any shell/child process. It opens the pipe with GENERIC_READ only and
+ * never writes a byte to it, so it cannot issue a command or perturb a session.
+ * It opens NO process handle and adjusts NO privilege.
  *
  *   agentbridge-win-pipe-attest.exe \\.\pipe\<name>
  *
- * Evidence grammar V1 — exactly three LF-terminated ASCII lines, in this order,
+ * Evidence grammar V2 — exactly four LF-terminated ASCII lines, in this order,
  * and nothing else:
  *
- *     AGENTBRIDGE-ATTEST-V1
- *     SERVERSID <sid>
+ *     AGENTBRIDGE-ATTEST-V2
+ *     PIPEOWNER <sid>
+ *     PIPESD <sddl>
  *     HELLO <hex>
  *
- *   - <sid> is the canonical string SID (ConvertSidToStringSidW) of the SERVER
- *     process's TokenUser. No account name lookup ever happens, so the output
- *     is identical on any locale.
+ *   - <sid> is the canonical string SID (ConvertSidToStringSidW) of the OWNER
+ *     of the connected pipe object. No account name lookup ever happens, so
+ *     the output is identical on any locale.
+ *   - <sddl> is that same object's OWNER + DACL rendered by
+ *     ConvertSecurityDescriptorToStringSecurityDescriptorW. The trust layer
+ *     asserts its exact accepted shape; nothing is interpreted here.
  *   - <hex> is the exact bytes of the server hello frame BODY (the framed
  *     payload after the 4-byte big-endian length prefix), lowercase hex, at
- *     most ATTEST_MAX_BODY bytes. The bytes are relayed verbatim; nothing is
- *     interpreted.
+ *     most ATTEST_MAX_BODY bytes. The bytes are relayed verbatim.
  *
- * PID REUSE GUARD (mandatory). A PID is not an identity: the kernel may reuse
- * it the instant its process dies. The process opened for `pid` is therefore
- * pinned by handle and by its exact creation FILETIME, and that pin is proven
- * intact AFTER the token query and AGAIN after the hello read:
+ * SAME-HANDLE RULE (mandatory). The descriptor is read from the handle
+ * CreateFileW already returned, and the hello is read from that same handle.
+ * The pipe is NEVER reopened by name for inspection: a second open could be
+ * routed to a different object if the name were re-created in between, which
+ * is precisely the time-of-check/time-of-use window this design exists to
+ * close. The descriptor is read BEFORE the hello, so no relayed byte can
+ * precede the identity evidence it is attributed to.
  *
- *   - the pipe handle must still report the SAME server PID;
- *   - the pinned process must still be running (WaitForSingleObject == TIMEOUT,
- *     which is unambiguous where exit code 259 is not);
- *   - its creation FILETIME must be byte-identical to the one first recorded.
+ * ORDERING NOTE. Reading the descriptor first is also why no re-proof loop is
+ * needed where the former revision required three: an NPFS pipe's security
+ * descriptor is fixed for the lifetime of the pipe NAME, assigned when the
+ * first instance is created, and a later instance's SECURITY_ATTRIBUTES are
+ * ignored by the kernel. Only the object's OWNER holds the implicit WRITE_DAC
+ * that could change it, and an owner-SID principal is out of scope under the
+ * frozen threat model.
  *
- * So the SID and the hello are attributed to ONE pinned process instance, or to
- * nothing at all. A server that exits mid-attestation fails the guard.
- *
- * ELEVATION. Any OpenProcess / token-query failure fails closed with no
- * fallback and no weaker path (Commander v1 scope decision): a non-elevated
- * client attesting an elevated runtime is NOT a supported configuration and
- * must never be rescued by degrading the trust boundary.
+ * ELEVATION. None is required, requested, or accepted. There is no fallback
+ * path, no weaker path, and no process-object path: a failed security query
+ * fails closed (DDR-D062-D, rejected alternative D-R2).
  *
  * DEADLINE. The read of a live-but-silent server is bounded by the CALLER: the
  * runtime runs this artifact through its bounded process runner (finite
@@ -65,13 +88,13 @@
  * blocking case is the one the caller's deadline already covers.
  *
  * Contract (see src/control/control-store.ts):
- *   stdout on success : the three evidence lines, nothing else
+ *   stdout on success : the four evidence lines, nothing else
  *   stderr            : a short bounded diagnostic token only (no SID, no bytes)
  *   exit codes        : 0 success
  *                       1 invalid arguments
  *                       2 pipe connect failed
- *                       3 server process resolution / PID-reuse guard failed
- *                       4 token query / SID conversion failed
+ *                       3 object security query failed (or absent/NULL DACL)
+ *                       4 SID / descriptor string conversion failed
  *                       5 hello read failed (framing, bounds, or short read)
  */
 
@@ -81,6 +104,7 @@
 #define WIN32_LEAN_AND_MEAN
 
 #include <windows.h>
+#include <aclapi.h>
 #include <sddl.h>
 
 #include <fcntl.h>
@@ -92,8 +116,8 @@
 #define EXIT_OK 0
 #define EXIT_INVALID_ARGS 1
 #define EXIT_CONNECT_FAILED 2
-#define EXIT_SERVER_IDENTITY 3
-#define EXIT_TOKEN_FAILED 4
+#define EXIT_SECURITY_QUERY 3
+#define EXIT_CONVERT_FAILED 4
 #define EXIT_HELLO_FAILED 5
 
 /* Windows extended maximum path length, in wide characters. */
@@ -102,15 +126,17 @@
 /* A canonical SID string is far shorter than this; the cap keeps output bounded. */
 #define ATTEST_SID_BUF 512
 
+/* The accepted descriptor renders to roughly 110 characters. Anything beyond
+ * this cap cannot be the accepted single-ACE descriptor, so the cap is itself
+ * fail-closed rather than a truncation. */
+#define ATTEST_SDDL_BUF 1024
+
 /* Mirrors MAX_BODY_BYTES in src/control/control-channel.ts. A declared length
  * outside [1, ATTEST_MAX_BODY] is a framing violation, not a large message. */
 #define ATTEST_MAX_BODY 4096
 
 /* The 4-byte big-endian length prefix of one wire frame. */
 #define ATTEST_PREFIX_BYTES 4
-
-/* The TokenUser query is a fixed small structure plus one SID. */
-#define ATTEST_TOKEN_BUF 4096
 
 static void emit_err(const char *token) {
   fputs(token, stderr);
@@ -127,8 +153,7 @@ static void write_stdout(const char *bytes, size_t len) {
 /*
  * Accept only a local named-pipe path: exactly the local pipe prefix followed
  * by at least one more character. A UNC form (\\server\pipe\...) is rejected:
- * this artifact attests a LOCAL server process and a remote pipe has no local
- * process to attest.
+ * this artifact attests a LOCAL kernel object and a remote pipe has none here.
  */
 static int is_local_pipe_path(const wchar_t *p, size_t len) {
   static const wchar_t prefix[] = L"\\\\.\\pipe\\";
@@ -137,35 +162,6 @@ static int is_local_pipe_path(const wchar_t *p, size_t len) {
     return 0;
   }
   return wcsncmp(p, prefix, prefix_len) == 0;
-}
-
-/* Two FILETIMEs are the same instant iff both halves match exactly. */
-static int filetime_equal(const FILETIME *a, const FILETIME *b) {
-  return a->dwLowDateTime == b->dwLowDateTime &&
-         a->dwHighDateTime == b->dwHighDateTime;
-}
-
-/*
- * Re-prove the pin: the pipe still names the same server PID, the pinned
- * process object is still running, and its creation instant is unchanged.
- * Returns 1 when the pin holds, 0 otherwise.
- */
-static int pin_still_holds(HANDLE pipe, HANDLE proc, DWORD pid,
-                           const FILETIME *created) {
-  DWORD current_pid = 0;
-  if (!GetNamedPipeServerProcessId(pipe, &current_pid) || current_pid != pid) {
-    return 0;
-  }
-  /* WAIT_TIMEOUT means "not signalled", i.e. still running. Unlike exit code
-   * 259 (STILL_ACTIVE) this cannot be confused with a genuine exit status. */
-  if (WaitForSingleObject(proc, 0) != WAIT_TIMEOUT) {
-    return 0;
-  }
-  FILETIME now_created, now_exit, now_kernel, now_user;
-  if (!GetProcessTimes(proc, &now_created, &now_exit, &now_kernel, &now_user)) {
-    return 0;
-  }
-  return filetime_equal(&now_created, created);
 }
 
 /*
@@ -200,34 +196,41 @@ static int append_str(char *buf, size_t *len, size_t cap, const char *s) {
 }
 
 /*
- * Convert a validated SID to its canonical string and append the UTF-8 bytes.
- * Returns 1 on success, 0 on any failure. *len advances only on success.
+ * Narrow a wide string to UTF-8 and append it, rejecting anything that is not
+ * printable single-line ASCII. Evidence lines are LF-delimited, so a control
+ * character, a space, or any byte outside 0x21..0x7E could forge a line break
+ * or a field boundary and must fail closed rather than be escaped. Canonical
+ * SID and SDDL strings are entirely inside that range.
  */
-static int append_sid(char *buf, size_t *len, size_t cap, PSID sid) {
-  if (sid == NULL || !IsValidSid(sid)) {
+static int append_narrow_token(char *buf, size_t *len, size_t cap, LPCWSTR wide,
+                               size_t limit) {
+  char utf8[ATTEST_SDDL_BUF];
+  int need;
+  size_t token_len;
+  size_t i;
+
+  if (wide == NULL || limit > ATTEST_SDDL_BUF) {
     return 0;
   }
-  LPWSTR wide = NULL;
-  if (!ConvertSidToStringSidW(sid, &wide)) {
-    return 0;
-  }
-  char utf8[ATTEST_SID_BUF];
-  int need = WideCharToMultiByte(CP_UTF8, 0, wide, -1, NULL, 0, NULL, NULL);
-  if (need <= 0 || need > ATTEST_SID_BUF) {
-    LocalFree(wide);
+  need = WideCharToMultiByte(CP_UTF8, 0, wide, -1, NULL, 0, NULL, NULL);
+  if (need <= 1 || (size_t)need > limit) {
     return 0;
   }
   if (WideCharToMultiByte(CP_UTF8, 0, wide, -1, utf8, need, NULL, NULL) <= 0) {
-    LocalFree(wide);
     return 0;
   }
-  LocalFree(wide);
-  size_t sid_len = (size_t)(need - 1); /* exclude the NUL terminator */
-  if (*len + sid_len > cap) {
+  token_len = (size_t)(need - 1); /* exclude the NUL terminator */
+  for (i = 0; i < token_len; i += 1) {
+    unsigned char c = (unsigned char)utf8[i];
+    if (c < 0x21 || c > 0x7E) {
+      return 0;
+    }
+  }
+  if (*len + token_len > cap) {
     return 0;
   }
-  memcpy(buf + *len, utf8, sid_len);
-  *len += sid_len;
+  memcpy(buf + *len, utf8, token_len);
+  *len += token_len;
   return 1;
 }
 
@@ -247,29 +250,42 @@ static int append_hex(char *buf, size_t *len, size_t cap,
 }
 
 /*
- * The server process's TokenUser SID, appended canonically to the output
- * buffer. The token handle and its buffer never outlive this call.
+ * The OWNER and DACL of the object behind the ALREADY-CONNECTED handle.
+ *
+ * `owner` and `dacl` point INTO `*sd_out`, which the caller must LocalFree.
+ * READ_CONTROL is the only right this needs, and it is already inside the
+ * FILE_GENERIC_READ the handle was opened with, so no access is widened here.
+ *
+ * A NULL or absent DACL is refused: it grants everyone everything and can
+ * never be the accepted operator-only descriptor. WHICH owner, WHICH ACE and
+ * WHICH mask are accepted is NOT decided here — that is the trust layer's.
  */
-static int append_server_user_sid(HANDLE proc, char *out, size_t *len,
-                                  size_t cap) {
-  HANDLE token = NULL;
-  if (!OpenProcessToken(proc, TOKEN_QUERY, &token)) {
+static int query_pipe_security(HANDLE pipe, PSID *owner_out, PACL *dacl_out,
+                               PSECURITY_DESCRIPTOR *sd_out) {
+  PSID owner = NULL;
+  PACL dacl = NULL;
+  PSECURITY_DESCRIPTOR sd = NULL;
+
+  *owner_out = NULL;
+  *dacl_out = NULL;
+  *sd_out = NULL;
+
+  if (GetSecurityInfo(pipe, SE_KERNEL_OBJECT,
+                      OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                      &owner, NULL, &dacl, NULL, &sd) != ERROR_SUCCESS) {
     return 0;
   }
-  DWORD needed = 0;
-  (void)GetTokenInformation(token, TokenUser, NULL, 0, &needed);
-  if (needed == 0 || needed > ATTEST_TOKEN_BUF) {
-    CloseHandle(token);
+  if (sd == NULL || owner == NULL || !IsValidSid(owner) || dacl == NULL ||
+      !IsValidAcl(dacl)) {
+    if (sd != NULL) {
+      LocalFree(sd);
+    }
     return 0;
   }
-  unsigned char buffer[ATTEST_TOKEN_BUF];
-  if (!GetTokenInformation(token, TokenUser, buffer, needed, &needed)) {
-    CloseHandle(token);
-    return 0;
-  }
-  CloseHandle(token);
-  TOKEN_USER *user = (TOKEN_USER *)buffer;
-  return append_sid(out, len, cap, user->User.Sid);
+  *owner_out = owner;
+  *dacl_out = dacl;
+  *sd_out = sd;
+  return 1;
 }
 
 int wmain(int argc, wchar_t **argv) {
@@ -289,7 +305,9 @@ int wmain(int argc, wchar_t **argv) {
   }
 
   /* GENERIC_READ only: this artifact can never write a byte to the pipe, so it
-   * cannot issue a command, complete a handshake, or perturb a live session. */
+   * cannot issue a command, complete a handshake, or perturb a live session.
+   * GENERIC_READ maps to FILE_GENERIC_READ, which already contains the
+   * READ_CONTROL the descriptor query needs — no widening is required. */
   HANDLE pipe =
       CreateFileW(pipe_path, GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, NULL);
   if (pipe == INVALID_HANDLE_VALUE) {
@@ -297,71 +315,52 @@ int wmain(int argc, wchar_t **argv) {
     return EXIT_CONNECT_FAILED;
   }
 
-  /* ---- Server process identity, pinned against PID reuse ----------------- */
+  /* ---- Pipe-object identity, read from THIS connected handle ------------- */
 
-  DWORD pid = 0;
-  if (!GetNamedPipeServerProcessId(pipe, &pid) || pid == 0) {
+  PSID owner = NULL;
+  PACL dacl = NULL;
+  PSECURITY_DESCRIPTOR sd = NULL;
+  if (!query_pipe_security(pipe, &owner, &dacl, &sd)) {
     CloseHandle(pipe);
-    emit_err("ERR_SERVER_PID");
-    return EXIT_SERVER_IDENTITY;
-  }
-  /* The minimum rights the guard needs and nothing more: QUERY_LIMITED for the
-   * creation time and the token, SYNCHRONIZE so WaitForSingleObject can decide
-   * liveness. No READ memory right, no TERMINATE right, no duplication right. */
-  HANDLE proc =
-      OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
-  if (proc == NULL) {
-    /* Fail closed with NO fallback: an unqueryable server (for example an
-     * elevated runtime attested by a non-elevated client) is out of scope,
-     * never a reason to weaken the boundary. */
-    CloseHandle(pipe);
-    emit_err("ERR_OPEN_PROCESS");
-    return EXIT_SERVER_IDENTITY;
-  }
-  FILETIME created, exited, kernel_time, user_time;
-  if (!GetProcessTimes(proc, &created, &exited, &kernel_time, &user_time)) {
-    CloseHandle(proc);
-    CloseHandle(pipe);
-    emit_err("ERR_PROC_TIMES");
-    return EXIT_SERVER_IDENTITY;
-  }
-  /* The window between resolving the PID and pinning the object is exactly
-   * where reuse could land; prove the pipe still names the pinned process. */
-  if (!pin_still_holds(pipe, proc, pid, &created)) {
-    CloseHandle(proc);
-    CloseHandle(pipe);
-    emit_err("ERR_PID_REUSE");
-    return EXIT_SERVER_IDENTITY;
+    emit_err("ERR_SECURITY_QUERY");
+    return EXIT_SECURITY_QUERY;
   }
 
   /* ---- Evidence, built whole in a bounded buffer ------------------------- */
 
-  /* magic + labels + SID + 2 hex chars per body byte + newlines, with room. */
-  char out[64 + ATTEST_SID_BUF + (ATTEST_MAX_BODY * 2) + 32];
+  /* magic + labels + SID + SDDL + 2 hex chars per body byte + newlines. */
+  char out[64 + ATTEST_SID_BUF + ATTEST_SDDL_BUF + (ATTEST_MAX_BODY * 2) + 32];
   const size_t cap = sizeof(out);
   size_t len = 0;
-  int ok = append_str(out, &len, cap, "AGENTBRIDGE-ATTEST-V1\nSERVERSID ");
-  ok = ok && append_server_user_sid(proc, out, &len, cap);
-  if (!ok) {
-    CloseHandle(proc);
-    CloseHandle(pipe);
-    emit_err("ERR_TOKEN");
-    return EXIT_TOKEN_FAILED;
+
+  LPWSTR owner_text = NULL;
+  LPWSTR sd_text = NULL;
+  int ok = append_str(out, &len, cap, "AGENTBRIDGE-ATTEST-V2\nPIPEOWNER ");
+  ok = ok && ConvertSidToStringSidW(owner, &owner_text);
+  ok = ok && append_narrow_token(out, &len, cap, owner_text, ATTEST_SID_BUF);
+  ok = ok && append_str(out, &len, cap, "\nPIPESD ");
+  ok = ok && ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                 sd, SDDL_REVISION_1,
+                 OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                 &sd_text, NULL);
+  ok = ok && append_narrow_token(out, &len, cap, sd_text, ATTEST_SDDL_BUF);
+  if (owner_text != NULL) {
+    LocalFree(owner_text);
   }
-  /* The SID was read from the pinned object; prove the pin still holds before
-   * that SID is allowed to stand as evidence. */
-  if (!pin_still_holds(pipe, proc, pid, &created)) {
-    CloseHandle(proc);
+  if (sd_text != NULL) {
+    LocalFree(sd_text);
+  }
+  LocalFree(sd);
+  if (!ok) {
     CloseHandle(pipe);
-    emit_err("ERR_PID_REUSE");
-    return EXIT_SERVER_IDENTITY;
+    emit_err("ERR_CONVERT");
+    return EXIT_CONVERT_FAILED;
   }
 
   /* ---- Exactly one bounded hello frame, from the SAME pipe handle -------- */
 
   unsigned char prefix[ATTEST_PREFIX_BYTES];
   if (!read_exact(pipe, prefix, ATTEST_PREFIX_BYTES)) {
-    CloseHandle(proc);
     CloseHandle(pipe);
     emit_err("ERR_HELLO_PREFIX");
     return EXIT_HELLO_FAILED;
@@ -369,14 +368,12 @@ int wmain(int argc, wchar_t **argv) {
   DWORD body_len = ((DWORD)prefix[0] << 24) | ((DWORD)prefix[1] << 16) |
                    ((DWORD)prefix[2] << 8) | (DWORD)prefix[3];
   if (body_len == 0 || body_len > ATTEST_MAX_BODY) {
-    CloseHandle(proc);
     CloseHandle(pipe);
     emit_err("ERR_HELLO_LENGTH");
     return EXIT_HELLO_FAILED;
   }
   unsigned char body[ATTEST_MAX_BODY];
   if (!read_exact(pipe, body, body_len)) {
-    CloseHandle(proc);
     CloseHandle(pipe);
     emit_err("ERR_HELLO_BODY");
     return EXIT_HELLO_FAILED;
@@ -386,22 +383,11 @@ int wmain(int argc, wchar_t **argv) {
   ok = ok && append_hex(out, &len, cap, body, (size_t)body_len);
   ok = ok && append_str(out, &len, cap, "\n");
   if (!ok) {
-    CloseHandle(proc);
     CloseHandle(pipe);
     emit_err("ERR_OVERFLOW");
     return EXIT_HELLO_FAILED;
   }
 
-  /* Final pin proof: the hello came from the same pinned process instance the
-   * SID did. A runtime that exited mid-attestation is rejected here. */
-  if (!pin_still_holds(pipe, proc, pid, &created)) {
-    CloseHandle(proc);
-    CloseHandle(pipe);
-    emit_err("ERR_PID_REUSE");
-    return EXIT_SERVER_IDENTITY;
-  }
-
-  CloseHandle(proc);
   CloseHandle(pipe);
   write_stdout(out, len);
   return EXIT_OK;

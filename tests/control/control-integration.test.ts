@@ -152,16 +152,17 @@ describe('D062 control channel — end-to-end via the official CLI', () => {
     const rogue = await startRogueServer(facts.pipePath, { status: CONTROL_RESULT.APPLIED });
     rogues.push(rogue);
 
-    // The squatter runs as another account: the attested SERVER SID is not the
-    // trusted operator's, so no command is ever sent.
+    // The squatter runs as another account: it cannot own a pipe object under
+    // the trusted operator's SID, so the attested pipe OWNER is not the
+    // operator's and no command is ever sent.
     const run = await callCli(anchor, {
       descriptorDeps: preserved.deps,
-      attest: attestDouble({ serverSid: FOREIGN_OPERATOR_SID }),
+      attest: attestDouble({ pipeOwnerSid: FOREIGN_OPERATOR_SID }),
     });
     expect(run.outcome.authenticated).toBe(false);
     expect(run.outcome.status).toBeNull();
     expect(run.out.some((line) => line.includes('APPLIED'))).toBe(false);
-    expect(run.err.some((line) => line.includes('SERVER_SID_MISMATCH'))).toBe(true);
+    expect(run.err.some((line) => line.includes('PIPE_OWNER_MISMATCH'))).toBe(true);
   });
 });
 

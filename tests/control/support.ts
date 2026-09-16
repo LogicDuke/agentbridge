@@ -184,9 +184,25 @@ export function memAnchor(anchorPath: string = FAKE_ANCHOR): MemAnchor {
  * Pipe attestation doubles
  * ------------------------------------------------------------------ */
 
-/** Build the exact AGENTBRIDGE-ATTEST-V1 bytes the native attestor emits. */
-export function attestEvidenceText(serverSid: string, helloBody: Buffer): string {
-  return `AGENTBRIDGE-ATTEST-V1\nSERVERSID ${serverSid}\nHELLO ${helloBody.toString('hex')}\n`;
+/**
+ * The exact descriptor the Revision-2 accept provider gives every instance, as
+ * the kernel renders it: owner = the trusted SID, DACL present, protected, one
+ * ACCESS_ALLOWED ace for that same SID, mask 0x12019F, no inheritance.
+ */
+export function acceptedPipeSd(ownerSid: string): string {
+  return `O:${ownerSid}D:P(A;;0x12019f;;;${ownerSid})`;
+}
+
+/** Build the exact AGENTBRIDGE-ATTEST-V2 bytes the native attestor emits. */
+export function attestEvidenceText(
+  pipeOwnerSid: string,
+  helloBody: Buffer,
+  pipeSd: string = acceptedPipeSd(pipeOwnerSid),
+): string {
+  return (
+    `AGENTBRIDGE-ATTEST-V2\nPIPEOWNER ${pipeOwnerSid}\nPIPESD ${pipeSd}\n` +
+    `HELLO ${helloBody.toString('hex')}\n`
+  );
 }
 
 /**
@@ -236,8 +252,10 @@ export function readOneFrameBody(pipePath: string, timeoutMs = 2000): Promise<Bu
 }
 
 export interface AttestDoubleOptions {
-  /** The SID the simulated native artifact reports for the serving process. */
-  readonly serverSid?: string;
+  /** The SID the simulated native artifact reports as the pipe object's OWNER. */
+  readonly pipeOwnerSid?: string;
+  /** The descriptor it reports; defaults to the accepted operator-only one. */
+  readonly pipeSd?: string;
   /** Rewrite the evidence text (malformed/truncated/extra-line adversarial cases). */
   readonly mangle?: (evidence: string, helloBody: Buffer) => string;
   /** Force the simulated artifact to exit nonzero. */
@@ -259,7 +277,8 @@ export function attestDouble(options: AttestDoubleOptions = {}): AttestFn {
       if (options.fail === true || helloBody === null) {
         return Promise.resolve({ ok: false });
       }
-      const evidence = attestEvidenceText(options.serverSid ?? FAKE_OPERATOR_SID, helloBody);
+      const owner = options.pipeOwnerSid ?? FAKE_OPERATOR_SID;
+      const evidence = attestEvidenceText(owner, helloBody, options.pipeSd ?? acceptedPipeSd(owner));
       return Promise.resolve({
         ok: true,
         stdout: options.mangle === undefined ? evidence : options.mangle(evidence, helloBody),
