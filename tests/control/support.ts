@@ -184,9 +184,47 @@ export function memAnchor(anchorPath: string = FAKE_ANCHOR): MemAnchor {
  * Pipe attestation doubles
  * ------------------------------------------------------------------ */
 
-/** Build the exact AGENTBRIDGE-ATTEST-V1 bytes the native attestor emits. */
-export function attestEvidenceText(serverSid: string, helloBody: Buffer): string {
-  return `AGENTBRIDGE-ATTEST-V1\nSERVERSID ${serverSid}\nHELLO ${helloBody.toString('hex')}\n`;
+/** The structural descriptor facts the native attestor relays (V3 grammar). */
+export interface PipeDescriptorFacts {
+  /** SE_DACL_PRESENT as 0 or 1. */
+  readonly present: 0 | 1;
+  /** SE_DACL_PROTECTED as 0 or 1. */
+  readonly guarded: 0 | 1;
+  /** The TRUE kernel ACE count, which may exceed `aces.length`. */
+  readonly count: number;
+  /** One `<type> <flags> <mask> <trustee>` body per relayed ACE, in order. */
+  readonly aces: readonly string[];
+}
+
+/** The one ACE body the trust layer accepts: ACCESS_ALLOWED, no flags, 0x12019F. */
+export function acceptedAce(trusteeSid: string): string {
+  return `00 00 0012019f ${trusteeSid}`;
+}
+
+/**
+ * The exact descriptor the Revision-2 accept provider gives every instance, as
+ * the kernel STRUCTURES it: DACL present, protected, exactly one
+ * ACCESS_ALLOWED ace for the trusted SID, mask 0x12019F, no inheritance.
+ */
+export function acceptedDescriptor(ownerSid: string): PipeDescriptorFacts {
+  return { present: 1, guarded: 1, count: 1, aces: [acceptedAce(ownerSid)] };
+}
+
+/** Build the exact AGENTBRIDGE-ATTEST-V3 bytes the native attestor emits. */
+export function attestEvidenceText(
+  pipeOwnerSid: string,
+  helloBody: Buffer,
+  descriptor: PipeDescriptorFacts = acceptedDescriptor(pipeOwnerSid),
+): string {
+  const aceLines = descriptor.aces
+    .map((ace, index) => `ACE ${String(index)} ${ace}\n`)
+    .join('');
+  return (
+    `AGENTBRIDGE-ATTEST-V3\nPIPEOWNER ${pipeOwnerSid}\n` +
+    `DACL ${String(descriptor.present)} ${String(descriptor.guarded)} ${String(descriptor.count)}\n` +
+    aceLines +
+    `HELLO ${helloBody.toString('hex')}\n`
+  );
 }
 
 /**
@@ -236,8 +274,10 @@ export function readOneFrameBody(pipePath: string, timeoutMs = 2000): Promise<Bu
 }
 
 export interface AttestDoubleOptions {
-  /** The SID the simulated native artifact reports for the serving process. */
-  readonly serverSid?: string;
+  /** The SID the simulated native artifact reports as the pipe object's OWNER. */
+  readonly pipeOwnerSid?: string;
+  /** The structural descriptor it reports; defaults to the accepted one. */
+  readonly descriptor?: PipeDescriptorFacts;
   /** Rewrite the evidence text (malformed/truncated/extra-line adversarial cases). */
   readonly mangle?: (evidence: string, helloBody: Buffer) => string;
   /** Force the simulated artifact to exit nonzero. */
@@ -259,7 +299,12 @@ export function attestDouble(options: AttestDoubleOptions = {}): AttestFn {
       if (options.fail === true || helloBody === null) {
         return Promise.resolve({ ok: false });
       }
-      const evidence = attestEvidenceText(options.serverSid ?? FAKE_OPERATOR_SID, helloBody);
+      const owner = options.pipeOwnerSid ?? FAKE_OPERATOR_SID;
+      const evidence = attestEvidenceText(
+        owner,
+        helloBody,
+        options.descriptor ?? acceptedDescriptor(owner),
+      );
       return Promise.resolve({
         ok: true,
         stdout: options.mangle === undefined ? evidence : options.mangle(evidence, helloBody),

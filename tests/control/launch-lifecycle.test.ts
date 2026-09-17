@@ -939,9 +939,11 @@ describe('D062 explicit provisioning — builder and gate share one eligibility 
       'FILE_DISPOSITION_FLAG_DO_NOT_DELETE',
       'FILE_DISPOSITION_FLAG_ON_CLOSE',
       'FileDispositionInfoEx,',
-      // The pipe attestor resolves the SERVER process from the pipe itself and
-      // pins it by creation time; an SDK that cannot declare these must fail the
-      // probe, not the attestor build.
+      // Retained toolchain capability probes, not an attestation dependency: the
+      // pipe attestor reads the OWNER and DACL of the connected pipe OBJECT and
+      // consults no PID (DDR-D062-D Amendment 1). These symbols stay in the probe
+      // because an SDK that cannot declare them must fail HERE rather than at a
+      // real build; dropping them would weaken what the probe proves.
       'GetNamedPipeServerProcessId(',
       'GetProcessTimes(',
       'OpenProcess(',

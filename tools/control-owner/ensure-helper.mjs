@@ -16,7 +16,7 @@
  *
  *   agentbridge-win-owner.exe             READ-ONLY   owner/DACL snapshot probe
  *   agentbridge-win-descriptor-create.exe CREATE-ONLY identity-named descriptor creator
- *   agentbridge-win-pipe-attest.exe       READ-ONLY   live pipe-server identity relayer
+ *   agentbridge-win-pipe-attest.exe       READ-ONLY   live pipe-object identity relayer
  *   agentbridge-win-pipe-accept.node      IN-PROCESS  explicit-DACL pipe accept provider
  *                                                     (DDR-D062-C; a Node-API addon, not a process)
  *

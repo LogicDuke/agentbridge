@@ -28,7 +28,7 @@
  *                                          (CREATE-ONLY identity-named descriptor)
  *   agentbridge-win-pipe-attest.c       -> agentbridge-win-pipe-attest.exe
  *                                          pipe-attestor-provenance.js
- *                                          (READ-ONLY live pipe-server identity relayer)
+ *                                          (READ-ONLY live pipe-object identity relayer)
  *   agentbridge-win-pipe-accept.c       -> agentbridge-win-pipe-accept.node
  *                                          pipe-acceptor-provenance.js
  *                                          (IN-PROCESS explicit-DACL pipe accept provider,

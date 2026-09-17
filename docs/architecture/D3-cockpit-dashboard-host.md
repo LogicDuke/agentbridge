@@ -192,7 +192,7 @@ operator/deployment responsibility, outside the scope of these npm scripts.
 (`node tools/control-owner/ensure-helper.mjs`) and nothing else: it provisions
 the three build-provenanced native artifacts — the read-only owner/DACL snapshot
 helper (`agentbridge-win-owner.exe`), the create-only descriptor creator
-(`agentbridge-win-descriptor-create.exe`), and the read-only live pipe-server
+(`agentbridge-win-descriptor-create.exe`), and the read-only live pipe-object
 identity relayer (`agentbridge-win-pipe-attest.exe`, whose generated provenance
 module is `pipe-attestor-provenance.js`) — each with its own generated
 provenance module. It does **not** create, harden, or verify the control anchor.
@@ -270,23 +270,40 @@ malformed and ignored, never deleted), probes each valid candidate's pipe, and
 proceeds only with **exactly one** live candidate. Zero live candidates is
 unavailable; two or more is ambiguous and fails closed. The CLI never deletes.
 
-### Live pipe attestation, then the two-primitive handshake (DDR-D062-B)
+### Live pipe attestation, then the two-primitive handshake (DDR-D062-D Amendment 1)
 
 The one live candidate is **attested before any command is sent**. The third
 native artifact (`agentbridge-win-pipe-attest.exe`) connects to that pipe
-`GENERIC_READ`-only — it can never write a byte to it — asks the **kernel** which
-process serves it, **pins that process against PID reuse** by its exact creation
-FILETIME (re-proved after the token query and again after the read), reads the
-pinned process's **TokenUser SID**, and relays exactly one **bounded server
-hello** read from the SAME pipe handle. It makes no policy decision; every
-failure is a nonzero exit with no stdout.
+`GENERIC_READ`-only — it can never write a byte to it — reads the **OWNER** and
+the **DACL structure** of the kernel **pipe object** behind that **connected
+handle** (numeric SIDs and fixed-width numeric fields, never an SDDL string), and
+relays exactly one **bounded server hello** read from that **same connected
+handle**. It opens **no process handle**, consults **no PID**, pins **no process
+creation time**, and adjusts **no privilege**; `GENERIC_READ` already contains the
+`READ_CONTROL` the descriptor query needs, so nothing is widened. It makes no
+policy decision; every failure is a nonzero exit with no stdout.
 
-The CLI holds the policy, and both of these must hold:
+The CLI holds the policy, and all three of these must hold:
 
-- the attested **server SID must equal the operator SID** the anchor gate already
-  resolved (`SERVER_SID_MISMATCH` otherwise);
+- the attested **pipe OWNER must equal the operator SID** the anchor gate already
+  resolved (`PIPE_OWNER_MISMATCH` otherwise);
+- the attested **DACL must be exactly the protected operator-only descriptor**:
+  present, protected, exactly one `ACCESS_ALLOWED` ACE, no inheritance flags,
+  mask exactly `0x12019F`, trustee the operator SID
+  (`PIPE_DACL_UNEXPECTED` otherwise). Owner alone is deliberately insufficient —
+  an unrelated same-SID program could hold the name with a broad descriptor and a
+  foreign principal could then add an instance to it;
 - the command session's own hello must announce the **very same `verifyKey`** the
   attestation relayed.
+
+There is **no process-object path left to fall back to**: the prior revision
+resolved the server PID, pinned it against reuse and read that process's
+`TokenUser` SID, which is undecidable for the supported unelevated operator
+(`OpenProcess` against the runtime is refused every right, including
+`READ_CONTROL`). The pipe object reaches the identical claim through an object
+that persona can read, and is strictly stronger: PID reuse is structurally
+impossible because no PID is consulted, and the claim attaches to the pipe
+**name**, whose descriptor is fixed at first-instance creation.
 
 The two directions are then authenticated by **different** primitives, because
 they answer different questions:
@@ -306,9 +323,10 @@ Failures fall into two classes, and the difference is operationally
 load-bearing — it decides whether an operator may assume nothing happened:
 
 - **Before the command is sent** — an attestation failure, a
-  `SERVER_SID_MISMATCH`, malformed attestation evidence, or a session hello whose
-  key differs from the attested one. The session is abandoned before any request
-  reaches the runtime, so no mutation can have occurred.
+  `PIPE_OWNER_MISMATCH`, a `PIPE_DACL_UNEXPECTED`, malformed attestation
+  evidence, or a session hello whose key differs from the attested one. The
+  session is abandoned before any request reaches the runtime, so no mutation
+  can have occurred.
 - **After the command is dispatched** — a result that is lost, malformed, or
   unparseable, or an Ed25519 signature that does not verify. The runtime signs
   only after `dispatch` has returned, so a result that never arrives or never

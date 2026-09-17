@@ -1001,9 +1001,11 @@ export type ControlAnchorVerification =
       readonly anchorPath: string;
       /**
        * The trusted operator SID this gate already resolved and proved is the
-       * anchor's exact owner. Surfaced (not re-derived) so pipe attestation
-       * compares the serving process against the SAME identity the anchor gate
-       * accepted — one operator identity, one resolution, no second source.
+       * anchor's exact owner. Surfaced (not re-derived) so the structural
+       * pipe-object attestation policy can compare the connected pipe object's
+       * OWNER SID, and the accepted DACL's ACE trustee SID, against the SAME
+       * identity the anchor gate accepted — one operator identity, one
+       * resolution, no second source.
        */
       readonly operatorSid: string;
     }
@@ -1086,12 +1088,12 @@ export async function verifyDescriptorAcl(
 }
 
 /* ------------------------------------------------------------------ *
- * Live pipe-server attestation (DDR-D062-B)
+ * Live pipe-OBJECT attestation (DDR-D062-D)
  * ------------------------------------------------------------------ *
  *
  * Every gate above answers a question about a FILE. None of them can answer the
  * only question that decides whether a pipe may be believed: **who owns the
- * process that is serving it right now?** A descriptor's bytes are copyable and
+ * kernel object serving it right now?** A descriptor's bytes are copyable and
  * a freed pipe name is re-creatable, so neither ACL inspection nor token
  * possession distinguishes the genuine runtime from a squatter holding a perfect
  * copy of its descriptor.
@@ -1102,16 +1104,43 @@ export async function verifyDescriptorAcl(
  * argument — the candidate pipe path — and it:
  *
  *   1. connects to the pipe (GENERIC_READ only; it can never write a byte);
- *   2. asks the KERNEL which process serves that pipe;
- *   3. pins that process against PID reuse by its exact creation time;
- *   4. reads the pinned process's TokenUser SID;
- *   5. relays exactly one bounded server hello read from the SAME pipe handle.
+ *   2. reads the OWNER and the DACL STRUCTURE of the object behind THAT
+ *      connected handle — numeric SIDs and numeric fields, never SDDL text;
+ *   3. relays exactly one bounded server hello read from the SAME pipe handle.
  *
- * It decides nothing. The evidence is parsed totally here and the SERVER SID is
- * compared against the trusted operator SID the anchor gate already resolved; a
- * foreign SID, malformed evidence, or any failure of the artifact fails closed
- * with no fallback. Only then may the relayed hello's announced key be used, by
- * the CLI, as the ATTESTED verify key.
+ * WHY STRUCTURE AND NOT SDDL (DDR-D062-D AMENDMENT 1). An earlier revision
+ * relayed the descriptor as an SDDL string and compared that string here. SDDL
+ * is a RENDERING, not an identity: Windows canonicalises principals into
+ * two-letter aliases (LA for RID 500, LG, BA, SY, WD, DA, ...) and masks into
+ * symbolic forms (FR, FA, GA, ...). A pipe owned by a RID-500 operator renders
+ * as O:LAD:P(A;;0x12019F;;;LA) — the very same descriptor — and was rejected.
+ * The textual comparison was STRICTLY STRONGER than the invariant: it demanded
+ * a particular rendering as well. The evidence is now structural, so an alias
+ * is not merely unequal but UNREPRESENTABLE, and no alias table exists here or
+ * anywhere else.
+ *
+ * WHY THE PIPE OBJECT (DDR-D062-D). The former revision resolved the SERVER
+ * PID, pinned it against reuse and read that process's TokenUser SID. Its
+ * terminal claim was "the serving process runs as the operator SID" — and that
+ * layer is UNDECIDABLE for the supported ordinary unelevated operator, whose
+ * OpenProcess against the runtime is refused every right including
+ * READ_CONTROL. The pipe object reaches the IDENTICAL claim through an object
+ * that persona can read, and is strictly stronger twice over: no PID is ever
+ * consulted, so PID reuse is structurally impossible; and the claim attaches to
+ * the pipe NAME, whose descriptor is fixed at first-instance creation.
+ *
+ * It decides nothing. The evidence is parsed totally here, and BOTH of the
+ * following must hold — owner-only proof is explicitly insufficient, because an
+ * unrelated same-SID program could hold the name with a broad descriptor and a
+ * foreign principal could then add an instance to it:
+ *
+ *   1. the pipe OWNER equals the trusted operator SID the anchor gate resolved;
+ *   2. the pipe DACL is EXACTLY the accepted operator-only descriptor.
+ *
+ * A foreign owner, an unexpected descriptor, malformed evidence, or any failure
+ * of the artifact fails closed with no fallback — in particular there is no
+ * process-object path left to fall back to. Only then may the relayed hello's
+ * announced key be used, by the CLI, as the ATTESTED verify key.
  */
 
 /** Why a pipe could not be attested. Every value is fail-closed. */
@@ -1121,21 +1150,47 @@ export const PIPE_ATTESTATION_REJECTION = Object.freeze({
   ATTESTOR_HASH_MISMATCH: 'ATTESTOR_HASH_MISMATCH',
   /** The trusted operator SID could not be resolved for the comparison. */
   OPERATOR_UNRESOLVED: 'OPERATOR_UNRESOLVED',
-  /** The artifact did not exit 0 (connect, PID-reuse guard, token, or hello read). */
+  /** The artifact did not exit 0 (connect, security query, conversion, or hello read). */
   ATTESTATION_FAILED: 'ATTESTATION_FAILED',
-  /** Its stdout is not exactly the AGENTBRIDGE-ATTEST-V1 grammar. */
+  /** Its stdout is not exactly the AGENTBRIDGE-ATTEST-V3 grammar. */
   EVIDENCE_MALFORMED: 'EVIDENCE_MALFORMED',
-  /** The pipe is served by a process belonging to some OTHER principal. */
-  SERVER_SID_MISMATCH: 'SERVER_SID_MISMATCH',
+  /** The connected pipe object is OWNED by some OTHER principal. */
+  PIPE_OWNER_MISMATCH: 'PIPE_OWNER_MISMATCH',
+  /** Its DACL is not EXACTLY the accepted protected operator-only descriptor. */
+  PIPE_DACL_UNEXPECTED: 'PIPE_DACL_UNEXPECTED',
 } as const);
 
 export type PipeAttestationRejection =
   (typeof PIPE_ATTESTATION_REJECTION)[keyof typeof PIPE_ATTESTATION_REJECTION];
 
+/** One access-control entry, exactly as the kernel structured it. */
+export interface PipeAceEvidence {
+  /** ACE type, fixed-width 2-char lowercase hex ('00' is ACCESS_ALLOWED). */
+  readonly type: string;
+  /** ACE flags, fixed-width 2-char lowercase hex ('00' is no inheritance). */
+  readonly flags: string;
+  /** Access mask, fixed-width 8-char lowercase hex. */
+  readonly mask: string;
+  /**
+   * Canonical, normalized NUMERIC SID of the trustee — or `none` where the ACE
+   * layout exposes no trustee at the fixed offset (object ACE types), which can
+   * never satisfy the accepted type and so can never be accepted.
+   */
+  readonly trustee: string;
+}
+
 /** The bounded evidence one attestation produced. */
 export interface PipeAttestationEvidence {
-  /** Canonical, normalized SID of the process actually serving the pipe. */
-  readonly serverSid: string;
+  /** Canonical, normalized NUMERIC SID of the OWNER of the connected pipe object. */
+  readonly pipeOwnerSid: string;
+  /** SE_DACL_PRESENT, as the kernel reported it. */
+  readonly daclPresent: boolean;
+  /** SE_DACL_PROTECTED, as the kernel reported it. */
+  readonly daclProtected: boolean;
+  /** The TRUE kernel ACE count, which may exceed the bounded `aces` relayed. */
+  readonly aceCount: number;
+  /** The first `min(aceCount, ATTEST_MAX_ACES)` entries, in kernel order. */
+  readonly aces: readonly PipeAceEvidence[];
   /** The exact relayed hello frame BODY bytes; nothing here interprets them. */
   readonly helloBody: Buffer;
 }
@@ -1157,40 +1212,101 @@ function defaultLoadAttestorProvenance(): Promise<OwnerHelperProvenance | null> 
   return loadProvenanceModule('pipe-attestor-provenance.js', 'PIPE_ATTESTOR_PROVENANCE');
 }
 
-const ATTEST_MAGIC = 'AGENTBRIDGE-ATTEST-V1';
-const ATTEST_SID_PREFIX = 'SERVERSID ';
+const ATTEST_MAGIC = 'AGENTBRIDGE-ATTEST-V3';
+const ATTEST_OWNER_PREFIX = 'PIPEOWNER ';
 const ATTEST_HELLO_PREFIX = 'HELLO ';
 /** Hard cap on evidence we are willing to parse (the runner also caps output). */
 const MAX_ATTESTATION_BYTES = 32 * 1024;
 /** Lowercase hex of at most MAX_DESCRIPTOR_BYTES-worth of hello body bytes. */
 const ATTEST_HEX_PATTERN = /^(?:[0-9a-f]{2})+$/;
+/** Mirrors ATTEST_MAX_ACES in the native artifact: the bound on relayed ACEs. */
+const ATTEST_MAX_ACES = 4;
+/**
+ * `DACL <present> <protected> <count>`. Both booleans are a single 0 or 1, and
+ * the count is canonical decimal with no leading zeros, so there is exactly one
+ * spelling of every value.
+ */
+const ATTEST_DACL_PATTERN = /^DACL ([01]) ([01]) (0|[1-9]\d{0,9})$/;
+/**
+ * `ACE <index> <type> <flags> <mask> <trustee>`. Fixed-width lowercase hex for
+ * the numeric fields, and a NUMERIC SID (or the NONE placeholder) for the
+ * trustee — an SDDL alias such as `LA` or `BA`, or a symbolic mask such as `FR`,
+ * simply cannot be spelled here.
+ */
+const ATTEST_ACE_PATTERN =
+  /^ACE (0|[1-9]\d{0,9}) ([0-9a-f]{2}) ([0-9a-f]{2}) ([0-9a-f]{8}) (S-1-\d+(?:-\d+)+|NONE)$/;
 
 /**
- * Parse the attestor's stdout as EXACTLY the three-line AGENTBRIDGE-ATTEST-V1
- * grammar and nothing else, or `null`. Total and bounded: a wrong magic, a
- * reordered or missing line, a non-canonical SID, non-canonical or odd-length
- * hex, an absent or extra trailing newline, any surplus line, or over-length
- * input all fail closed.
+ * Parse the attestor's stdout as EXACTLY the AGENTBRIDGE-ATTEST-V3 grammar and
+ * nothing else, or `null`. Total and bounded: a wrong magic (the V1 and V2
+ * grammars included), a reordered, missing, duplicated or surplus line, a
+ * non-canonical SID, an alias token where a SID or a hex field belongs, a
+ * non-canonical decimal, a wrong-width hex field, an ACE index that is not its
+ * own position, an ACE-line count that disagrees with the declared ACE count,
+ * an absent or extra trailing newline, or over-length input all fail closed.
+ *
+ * There is NO V1 or V2 compatibility path: the grammar and the artifact's
+ * SHA-256 pin move together, so a mixed build cannot run.
+ *
+ * The grammar is self-describing — the declared count precedes the repeated ACE
+ * lines — so the exact expected line total is known before they are read.
  */
 export function parseAttestationEvidence(stdout: unknown): PipeAttestationEvidence | null {
   if (typeof stdout !== 'string' || stdout.length === 0 || stdout.length > MAX_ATTESTATION_BYTES) {
     return null;
   }
-  // Exactly three LF-terminated lines: splitting yields four parts, the last
-  // empty. A missing trailing newline, a CR, or any extra byte fails here.
+  // Every line is LF-terminated, so splitting yields a final empty part. A
+  // missing trailing newline, a CR, or any extra byte fails here.
   const parts = stdout.split('\n');
-  if (parts.length !== 4 || parts[3] !== '') {
+  if (parts.length < 5 || parts[parts.length - 1] !== '') {
     return null;
   }
-  const [magic, sidLine, helloLine] = parts;
-  if (magic !== ATTEST_MAGIC || sidLine === undefined || helloLine === undefined) {
+  const [magic, ownerLine, daclLine] = parts;
+  if (magic !== ATTEST_MAGIC || ownerLine === undefined || daclLine === undefined) {
     return null;
   }
-  if (!sidLine.startsWith(ATTEST_SID_PREFIX) || !helloLine.startsWith(ATTEST_HELLO_PREFIX)) {
+  if (!ownerLine.startsWith(ATTEST_OWNER_PREFIX)) {
     return null;
   }
-  const sid = sidLine.slice(ATTEST_SID_PREFIX.length);
+  const sid = ownerLine.slice(ATTEST_OWNER_PREFIX.length);
   if (!CANONICAL_SID_PATTERN.test(sid)) {
+    return null;
+  }
+  const dacl = ATTEST_DACL_PATTERN.exec(daclLine);
+  if (dacl === null) {
+    return null;
+  }
+  const aceCount = Number(dacl[3]);
+  if (!Number.isSafeInteger(aceCount) || aceCount < 0) {
+    return null;
+  }
+  const expectedAces = Math.min(aceCount, ATTEST_MAX_ACES);
+  // magic + owner + dacl + expectedAces + hello + the trailing empty part.
+  if (parts.length !== 4 + expectedAces + 1) {
+    return null;
+  }
+
+  const aces: PipeAceEvidence[] = [];
+  for (let index = 0; index < expectedAces; index += 1) {
+    const line = parts[3 + index];
+    if (line === undefined) {
+      return null;
+    }
+    const ace = ATTEST_ACE_PATTERN.exec(line);
+    // The index is not merely well-formed: it must BE this position, so a
+    // duplicated, skipped or reordered entry cannot be silently accepted.
+    if (ace === null || ace[1] !== String(index)) {
+      return null;
+    }
+    const [, , type, flags, mask, trustee] = ace;
+    if (type === undefined || flags === undefined || mask === undefined || trustee === undefined) {
+      return null;
+    }
+    aces.push({ type, flags, mask, trustee: normalizePrincipal(trustee) });
+  }
+
+  const helloLine = parts[3 + expectedAces];
+  if (helloLine === undefined || !helloLine.startsWith(ATTEST_HELLO_PREFIX)) {
     return null;
   }
   const hex = helloLine.slice(ATTEST_HELLO_PREFIX.length);
@@ -1202,15 +1318,68 @@ export function parseAttestationEvidence(stdout: unknown): PipeAttestationEviden
   if (helloBody.length * 2 !== hex.length || helloBody.toString('hex') !== hex) {
     return null;
   }
-  return { serverSid: normalizePrincipal(sid), helloBody };
+  return {
+    pipeOwnerSid: normalizePrincipal(sid),
+    daclPresent: dacl[1] === '1',
+    daclProtected: dacl[2] === '1',
+    aceCount,
+    aces,
+    helloBody,
+  };
+}
+
+/** ACCESS_ALLOWED_ACE_TYPE. A DENY or AUDIT ace wearing the right mask is not it. */
+const ACCEPTED_ACE_TYPE = '00';
+/** No inheritance: every ACE flag clear. */
+const ACCEPTED_ACE_FLAGS = '00';
+/** FILE_GENERIC_READ | FILE_GENERIC_WRITE | SYNCHRONIZE, and nothing else. */
+const ACCEPTED_ACE_MASK = '0012019f';
+
+/**
+ * The ONE descriptor an attested control pipe may carry: the exact protected,
+ * operator-only descriptor the Revision-2 accept provider creates every
+ * instance with (DDR-D062-C sections 9-11, asserted here CLIENT-side).
+ *
+ * The comparison is STRUCTURAL, over the kernel's own fields, so it decides
+ * exactly the frozen invariant and not one character more. Every bullet is a
+ * separate conjunct: the DACL is PRESENT and PROTECTED; there is EXACTLY ONE
+ * ace, proven from the kernel's true count AND from the relayed entries, so a
+ * second ace beyond the relay bound cannot hide; the ace is ACCESS_ALLOWED with
+ * no inheritance flags; its mask is exactly 0x12019F; and its trustee is the
+ * trusted operator SID compared as a SID.
+ *
+ * No alias resolution is possible or needed: an alias cannot be spelled in the
+ * evidence at all (DDR-D062-D Amendment 1).
+ */
+function pipeDescriptorAccepted(
+  evidence: PipeAttestationEvidence,
+  operatorSid: string,
+): boolean {
+  if (!evidence.daclPresent || !evidence.daclProtected) {
+    return false;
+  }
+  if (evidence.aceCount !== 1 || evidence.aces.length !== 1) {
+    return false;
+  }
+  const ace = evidence.aces[0];
+  if (ace === undefined) {
+    return false;
+  }
+  return (
+    ace.type === ACCEPTED_ACE_TYPE &&
+    ace.flags === ACCEPTED_ACE_FLAGS &&
+    ace.mask === ACCEPTED_ACE_MASK &&
+    ace.trustee === operatorSid
+  );
 }
 
 /**
  * Resolve, hash-verify, and run the read-only pipe attestor against one pipe
- * path, then require that the process serving that pipe belongs to
- * `operatorSid`. Fail-closed on every fault, with no fallback path: an
- * unqueryable server (for example an elevated runtime attested by a
- * non-elevated client) is out of scope and is rejected, never rescued.
+ * path, then require that the connected pipe OBJECT is owned by `operatorSid`
+ * AND carries exactly the accepted protected operator-only descriptor.
+ * Fail-closed on every fault, with no fallback path — and with no process
+ * handle opened anywhere, so an unreadable process object can no longer deny
+ * the supported operator an answer.
  */
 export async function attestPipeServer(
   pipePath: string,
@@ -1253,8 +1422,14 @@ export async function attestPipeServer(
   if (evidence === null) {
     return { ok: false, reason: PIPE_ATTESTATION_REJECTION.EVIDENCE_MALFORMED };
   }
-  if (evidence.serverSid !== expectedSid) {
-    return { ok: false, reason: PIPE_ATTESTATION_REJECTION.SERVER_SID_MISMATCH };
+  if (evidence.pipeOwnerSid !== expectedSid) {
+    return { ok: false, reason: PIPE_ATTESTATION_REJECTION.PIPE_OWNER_MISMATCH };
+  }
+  // Owner alone is NOT enough: an unrelated same-SID program could hold the
+  // name with a broad descriptor, and a foreign principal could then add an
+  // instance to it and answer. The exact descriptor closes that.
+  if (!pipeDescriptorAccepted(evidence, expectedSid)) {
+    return { ok: false, reason: PIPE_ATTESTATION_REJECTION.PIPE_DACL_UNEXPECTED };
   }
   return { ok: true, evidence };
 }
@@ -2055,8 +2230,12 @@ export async function createDescriptorFileNative(
  * server leaves every pipe instance with the kernel DEFAULT security
  * descriptor, which admits broad local principals. The FOURTH build-provenanced
  * native artifact is not a process: it is a Node-API addon loaded INTO the
- * runtime process, so Node remains the pipe SERVER PROCESS (the attestor still
- * observes the runtime's own PID and TokenUser SID). It creates every server
+ * runtime process, so Node remains the pipe SERVER PROCESS. That is a TOPOLOGY
+ * fact and nothing more: attestation derives server identity from the OWNER and
+ * the structural DACL facts of the ALREADY-CONNECTED pipe KERNEL OBJECT — never
+ * from a PID, never from a serving process's TokenUser SID, and with no
+ * process-object fallback (DDR-D062-D Amendment 1). What this addon supplies to
+ * that policy is the descriptor itself. It creates every server
  * instance with an explicit descriptor — owner = the runtime's exact TokenUser
  * SID, a PRESENT + PROTECTED DACL with exactly one ALLOW ACE for that same SID
  * granting exactly FILE_GENERIC_READ | FILE_GENERIC_WRITE | SYNCHRONIZE
