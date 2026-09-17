@@ -82,7 +82,7 @@ import {
   FAKE_ANCHOR,
   FAKE_OPERATOR_SID,
   FOREIGN_OPERATOR_SID,
-  acceptedPipeSd,
+  acceptedAce,
   attestDouble,
   attestEvidenceText,
   callCli,
@@ -678,65 +678,99 @@ describe('DDR-D062-D — negative controls (each guard is load-bearing)', () => 
  * 4. Evidence parsing is total; every failure is fail-closed
  * ================================================================== */
 
-describe('DDR-D062-D — attestor output is parsed totally (SEAM)', () => {
+describe('DDR-D062-D/A1 — attestor output is parsed totally (SEAM)', () => {
   const sid = FAKE_OPERATOR_SID;
   const hello = Buffer.from('{"v":2}', 'utf8');
   const good = attestEvidenceText(sid, hello);
 
   const hex = hello.toString('hex');
-  const sd = acceptedPipeSd(sid);
+  const head = `AGENTBRIDGE-ATTEST-V3\nPIPEOWNER ${sid}\n`;
+  const aceLine = `ACE 0 ${acceptedAce(sid)}\n`;
 
-  it('14a. the exact grammar parses, and the hello bytes survive verbatim', () => {
+  it('14a. the exact grammar parses structurally, and the hello bytes survive verbatim', () => {
     const parsed = parseAttestationEvidence(good);
     expect(parsed?.pipeOwnerSid).toBe(sid.toLowerCase());
-    expect(parsed?.pipeSd).toBe(sd);
+    expect(parsed?.daclPresent).toBe(true);
+    expect(parsed?.daclProtected).toBe(true);
+    expect(parsed?.aceCount).toBe(1);
+    expect(parsed?.aces).toEqual([
+      { type: '00', flags: '00', mask: '0012019f', trustee: sid.toLowerCase() },
+    ]);
     expect(parsed?.helloBody.equals(hello)).toBe(true);
   });
 
   it('14b. malformed, truncated, extra, reordered and non-canonical outputs are all rejected', () => {
     const bad: readonly string[] = [
       '',
-      'AGENTBRIDGE-ATTEST-V2\n',
-      // T7. The V1 grammar is not a fallback: the superseded three-line form,
-      // with the superseded SERVERSID label, is simply malformed evidence now.
+      'AGENTBRIDGE-ATTEST-V3\n',
+      // T7. NEITHER superseded grammar is a fallback. The V1 three-line form
+      // with SERVERSID, and the V2 four-line form with PIPESD, are both simply
+      // malformed evidence now — including when they wear the V3 magic.
       `AGENTBRIDGE-ATTEST-V1\nSERVERSID ${sid}\nHELLO ${hex}\n`,
-      // the V1 magic carrying V2 fields, and the V2 magic carrying V1 fields
-      `AGENTBRIDGE-ATTEST-V1\nPIPEOWNER ${sid}\nPIPESD ${sd}\nHELLO ${hex}\n`,
-      `AGENTBRIDGE-ATTEST-V2\nSERVERSID ${sid}\nHELLO ${hex}\n`,
-      // a future magic is no more acceptable than a past one
-      `AGENTBRIDGE-ATTEST-V3\nPIPEOWNER ${sid}\nPIPESD ${sd}\nHELLO ${hex}\n`,
-      // no trailing newline
+      `AGENTBRIDGE-ATTEST-V2\nPIPEOWNER ${sid}\nPIPESD O:${sid}D:P(A;;0x12019f;;;${sid})\nHELLO ${hex}\n`,
+      `AGENTBRIDGE-ATTEST-V3\nSERVERSID ${sid}\nHELLO ${hex}\n`,
+      `AGENTBRIDGE-ATTEST-V3\nPIPEOWNER ${sid}\nPIPESD O:${sid}D:P(A;;0x12019f;;;${sid})\nHELLO ${hex}\n`,
+      // the V3 shape under a past or future magic
+      `AGENTBRIDGE-ATTEST-V2\nPIPEOWNER ${sid}\nDACL 1 1 1\n${aceLine}HELLO ${hex}\n`,
+      `AGENTBRIDGE-ATTEST-V4\nPIPEOWNER ${sid}\nDACL 1 1 1\n${aceLine}HELLO ${hex}\n`,
+      // no trailing newline / extra line / surplus blank line
       good.slice(0, -1),
-      // an extra line
       `${good}EXTRA junk\n`,
-      // a surplus blank line
       `${good}\n`,
-      // reordered
-      `AGENTBRIDGE-ATTEST-V2\nPIPESD ${sd}\nPIPEOWNER ${sid}\nHELLO ${hex}\n`,
-      `AGENTBRIDGE-ATTEST-V2\nPIPEOWNER ${sid}\nHELLO ${hex}\nPIPESD ${sd}\n`,
-      // the descriptor line dropped entirely
-      `AGENTBRIDGE-ATTEST-V2\nPIPEOWNER ${sid}\nHELLO ${hex}\n`,
       // CRLF instead of LF
       good.replace(/\n/g, '\r\n'),
-      // non-canonical owner SID
-      `AGENTBRIDGE-ATTEST-V2\nPIPEOWNER NT-AUTHORITY\\SYSTEM\nPIPESD ${sd}\nHELLO ${hex}\n`,
-      // a descriptor that is not even SDDL-shaped, or smuggles whitespace
-      `AGENTBRIDGE-ATTEST-V2\nPIPEOWNER ${sid}\nPIPESD not-a-descriptor\nHELLO ${hex}\n`,
-      `AGENTBRIDGE-ATTEST-V2\nPIPEOWNER ${sid}\nPIPESD D:P(A;;0x12019f;;;${sid})\nHELLO ${hex}\n`,
-      `AGENTBRIDGE-ATTEST-V2\nPIPEOWNER ${sid}\nPIPESD O:${sid} D:P(A;;0x12019f;;;${sid})\nHELLO ${hex}\n`,
-      // a group or SACL field we never asked the kernel for
-      `AGENTBRIDGE-ATTEST-V2\nPIPEOWNER ${sid}\nPIPESD O:${sid}G:${sid}D:P(A;;0x12019f;;;${sid})\nHELLO ${hex}\n`,
-      // an over-long descriptor (the native cap is 1023 characters)
-      `AGENTBRIDGE-ATTEST-V2\nPIPEOWNER ${sid}\nPIPESD O:${sid}D:${'P'.repeat(1100)}\nHELLO ${hex}\n`,
-      // uppercase hex
-      `AGENTBRIDGE-ATTEST-V2\nPIPEOWNER ${sid}\nPIPESD ${sd}\nHELLO ${hex.toUpperCase()}\n`,
-      // odd-length hex
-      `AGENTBRIDGE-ATTEST-V2\nPIPEOWNER ${sid}\nPIPESD ${sd}\nHELLO abc\n`,
-      // empty hello
-      `AGENTBRIDGE-ATTEST-V2\nPIPEOWNER ${sid}\nPIPESD ${sd}\nHELLO \n`,
+      // reordered top-level lines
+      `${head}${aceLine}DACL 1 1 1\nHELLO ${hex}\n`,
+      `AGENTBRIDGE-ATTEST-V3\nDACL 1 1 1\nPIPEOWNER ${sid}\n${aceLine}HELLO ${hex}\n`,
+      `${head}DACL 1 1 1\nHELLO ${hex}\n${aceLine}`,
+      // the DACL line missing, or duplicated
+      `${head}${aceLine}HELLO ${hex}\n`,
+      `${head}DACL 1 1 1\nDACL 1 1 1\n${aceLine}HELLO ${hex}\n`,
+      // an ACE line beyond the declared count, and a declared count with no ACE
+      `${head}DACL 1 1 1\n${aceLine}${aceLine}HELLO ${hex}\n`,
+      `${head}DACL 1 1 1\nHELLO ${hex}\n`,
+      `${head}DACL 1 1 2\n${aceLine}HELLO ${hex}\n`,
+      // duplicated, skipped and reordered ACE indices
+      `${head}DACL 1 1 2\nACE 0 ${acceptedAce(sid)}\nACE 0 ${acceptedAce(sid)}\nHELLO ${hex}\n`,
+      `${head}DACL 1 1 2\nACE 0 ${acceptedAce(sid)}\nACE 2 ${acceptedAce(sid)}\nHELLO ${hex}\n`,
+      `${head}DACL 1 1 2\nACE 1 ${acceptedAce(sid)}\nACE 0 ${acceptedAce(sid)}\nHELLO ${hex}\n`,
+      // non-canonical decimals
+      `${head}DACL 1 1 01\n${aceLine}HELLO ${hex}\n`,
+      `${head}DACL 1 1 1\nACE 00 ${acceptedAce(sid)}\nHELLO ${hex}\n`,
+      // booleans that are not exactly 0 or 1
+      `${head}DACL true 1 1\n${aceLine}HELLO ${hex}\n`,
+      `${head}DACL 1 2 1\n${aceLine}HELLO ${hex}\n`,
+      // T16. SDDL ALIASES cannot be spelled: not as an owner, not as a trustee,
+      // and a symbolic mask is not a hex field.
+      `AGENTBRIDGE-ATTEST-V3\nPIPEOWNER LA\nDACL 1 1 1\n${aceLine}HELLO ${hex}\n`,
+      `AGENTBRIDGE-ATTEST-V3\nPIPEOWNER BA\nDACL 1 1 1\n${aceLine}HELLO ${hex}\n`,
+      `${head}DACL 1 1 1\nACE 0 00 00 0012019f LA\nHELLO ${hex}\n`,
+      `${head}DACL 1 1 1\nACE 0 00 00 0012019f BA\nHELLO ${hex}\n`,
+      `${head}DACL 1 1 1\nACE 0 00 00 0012019f SY\nHELLO ${hex}\n`,
+      `${head}DACL 1 1 1\nACE 0 00 00 FR ${sid}\nHELLO ${hex}\n`,
+      `${head}DACL 1 1 1\nACE 0 00 00 FA ${sid}\nHELLO ${hex}\n`,
+      // uppercase / short / long hex fields
+      `${head}DACL 1 1 1\nACE 0 00 00 0012019F ${sid}\nHELLO ${hex}\n`,
+      `${head}DACL 1 1 1\nACE 0 00 00 12019f ${sid}\nHELLO ${hex}\n`,
+      `${head}DACL 1 1 1\nACE 0 00 00 000012019f ${sid}\nHELLO ${hex}\n`,
+      `${head}DACL 1 1 1\nACE 0 0 00 0012019f ${sid}\nHELLO ${hex}\n`,
+      `${head}DACL 1 1 1\nACE 0 00 000 0012019f ${sid}\nHELLO ${hex}\n`,
+      // a malformed or non-canonical SID anywhere
+      `AGENTBRIDGE-ATTEST-V3\nPIPEOWNER NT-AUTHORITY\\SYSTEM\nDACL 1 1 1\n${aceLine}HELLO ${hex}\n`,
+      `${head}DACL 1 1 1\nACE 0 00 00 0012019f S-1-\nHELLO ${hex}\n`,
+      `${head}DACL 1 1 1\nACE 0 00 00 0012019f not-a-sid\nHELLO ${hex}\n`,
+      // a field separator smuggled into a token
+      `${head}DACL 1 1 1\nACE 0 00 00 0012019f ${sid} extra\nHELLO ${hex}\n`,
+      // uppercase / odd-length / empty hello hex
+      `${head}DACL 1 1 1\n${aceLine}HELLO ${hex.toUpperCase()}\n`,
+      `${head}DACL 1 1 1\n${aceLine}HELLO abc\n`,
+      `${head}DACL 1 1 1\n${aceLine}HELLO \n`,
       // wrong labels
-      `AGENTBRIDGE-ATTEST-V2\nSID ${sid}\nPIPESD ${sd}\nHELLO ${hex}\n`,
-      `AGENTBRIDGE-ATTEST-V2\nPIPEOWNER ${sid}\nSD ${sd}\nHELLO ${hex}\n`,
+      `AGENTBRIDGE-ATTEST-V3\nSID ${sid}\nDACL 1 1 1\n${aceLine}HELLO ${hex}\n`,
+      `${head}ACL 1 1 1\n${aceLine}HELLO ${hex}\n`,
+      `${head}DACL 1 1 1\nENTRY 0 ${acceptedAce(sid)}\nHELLO ${hex}\n`,
+      // evidence beyond the configured bound
+      `${head}DACL 1 1 1\n${aceLine}HELLO ${'ab'.repeat(40000)}\n`,
     ];
     for (const text of bad) {
       expect(parseAttestationEvidence(text), JSON.stringify(text.slice(0, 60))).toBeNull();
@@ -834,14 +868,18 @@ describe('DDR-D062-D — attestor output is parsed totally (SEAM)', () => {
  * 4b. The pipe DESCRIPTOR is asserted exactly — owner alone is not enough
  * ================================================================== */
 
-describe('DDR-D062-D — owner AND the exact descriptor decide (SEAM)', () => {
+describe('DDR-D062-D/A1 — owner AND the exact structural descriptor decide (SEAM)', () => {
   const me = FAKE_OPERATOR_SID;
   const hex = Buffer.from('{"v":2}', 'utf8').toString('hex');
-  const evidenceOf = (owner: string, descriptor: string): string =>
-    `AGENTBRIDGE-ATTEST-V2\nPIPEOWNER ${owner}\nPIPESD ${descriptor}\nHELLO ${hex}\n`;
+  /** Build V3 evidence from a DACL header and raw ACE bodies. */
+  const evidenceOf = (owner: string, dacl: string, aces: readonly string[] = []): string =>
+    `AGENTBRIDGE-ATTEST-V3\nPIPEOWNER ${owner}\nDACL ${dacl}\n` +
+    aces.map((ace, index) => `ACE ${String(index)} ${ace}\n`).join('') +
+    `HELLO ${hex}\n`;
+  const accepted = (owner: string): string => evidenceOf(owner, '1 1 1', [acceptedAce(owner)]);
 
   it('T1. the trusted owner carrying the accepted descriptor → attested', async () => {
-    const result = await attestWithStdout(evidenceOf(me, acceptedPipeSd(me)));
+    const result = await attestWithStdout(accepted(me));
     expect(result.ok).toBe(true);
   });
 
@@ -850,7 +888,7 @@ describe('DDR-D062-D — owner AND the exact descriptor decide (SEAM)', () => {
     // is exactly the case a foreign principal cannot manufacture, because the
     // kernel refuses an owner SID the creating token cannot assume.
     const result = await attestWithStdout(
-      evidenceOf(FOREIGN_OPERATOR_SID, `O:${FOREIGN_OPERATOR_SID}D:P(A;;0x12019f;;;${me})`),
+      evidenceOf(FOREIGN_OPERATOR_SID, '1 1 1', [acceptedAce(me)]),
     );
     expect(result).toEqual({
       ok: false,
@@ -862,38 +900,49 @@ describe('DDR-D062-D — owner AND the exact descriptor decide (SEAM)', () => {
     // This is the counterexample owner-only proof cannot survive: an unrelated
     // program running as the operator holds the expected name with a broad
     // descriptor, and a foreign principal then adds an instance and answers.
-    const unacceptable: readonly string[] = [
-      // T4 — present, but NOT protected (an inheritable parent could widen it)
-      `O:${me}D:(A;;0x12019f;;;${me})`,
-      `O:${me}D:AI(A;;0x12019f;;;${me})`,
-      `O:${me}D:PAI(A;;0x12019f;;;${me})`,
-      // T5 — a second ace, or a broad/foreign principal instead of the operator
-      `O:${me}D:P(A;;0x12019f;;;${me})(A;;0x12019f;;;${FOREIGN_OPERATOR_SID})`,
-      `O:${me}D:P(A;;0x12019f;;;${me})(A;;0x120089;;;WD)`,
-      `O:${me}D:P(A;;0x12019f;;;WD)`,
-      `O:${me}D:P(A;;0x12019f;;;AN)`,
-      `O:${me}D:P(A;;0x12019f;;;BA)`,
-      `O:${me}D:P(A;;0x12019f;;;SY)`,
-      `O:${me}D:P(A;;0x12019f;;;${FOREIGN_OPERATOR_SID})`,
-      // T6 — a wider mask, a narrower mask, or a symbolic one
-      `O:${me}D:P(A;;0x1f01ff;;;${me})`,
-      `O:${me}D:P(A;;0x120089;;;${me})`,
-      `O:${me}D:P(A;;GA;;;${me})`,
-      `O:${me}D:P(A;;FA;;;${me})`,
+    const unacceptable: readonly (readonly [string, readonly string[], string])[] = [
+      // T4 — present but NOT protected; or absent entirely
+      ['1 0 1', [acceptedAce(me)], 'DACL not protected'],
+      ['0 1 1', [acceptedAce(me)], 'DACL not present'],
+      ['0 0 1', [acceptedAce(me)], 'DACL neither present nor protected'],
+      // T5 — a second ace, including one the relay bound would not have shown
+      ['1 1 2', [acceptedAce(me), acceptedAce(FOREIGN_OPERATOR_SID)], 'second ace'],
+      ['1 1 2', [acceptedAce(me), '00 00 00120089 S-1-1-0'], 'second ace, broad'],
+      // A true count beyond the relay bound: the grammar still demands the
+      // bounded ACE lines, and the count alone is what rejects it, so extra
+      // entries can never hide behind the relay limit.
+      [
+        '1 1 9',
+        [acceptedAce(me), acceptedAce(me), acceptedAce(me), acceptedAce(me)],
+        'true count beyond the relay bound',
+      ],
+      ['1 1 0', [], 'no ace at all'],
+      // T5 — a broad or foreign trustee instead of the operator
+      ['1 1 1', ['00 00 0012019f S-1-1-0'], 'Everyone'],
+      ['1 1 1', ['00 00 0012019f S-1-5-7'], 'ANONYMOUS LOGON'],
+      ['1 1 1', ['00 00 0012019f S-1-5-32-544'], 'Administrators'],
+      ['1 1 1', ['00 00 0012019f S-1-5-18'], 'SYSTEM'],
+      ['1 1 1', [`00 00 0012019f ${FOREIGN_OPERATOR_SID}`], 'foreign operator'],
+      // T6 — a wider or narrower mask
+      ['1 1 1', [`00 00 001f01ff ${me}`], 'FILE_ALL_ACCESS'],
+      ['1 1 1', [`00 00 00120089 ${me}`], 'read-only'],
+      ['1 1 1', [`00 00 10000000 ${me}`], 'GENERIC_ALL'],
+      ['1 1 1', [`00 00 0012019e ${me}`], 'one bit short'],
+      ['1 1 1', [`00 00 0012039f ${me}`], 'one bit extra'],
       // inheritance flags on the ace
-      `O:${me}D:P(A;ID;0x12019f;;;${me})`,
-      `O:${me}D:P(A;OICI;0x12019f;;;${me})`,
-      // a DENY ace wearing the right mask
-      `O:${me}D:P(D;;0x12019f;;;${me})`,
-      // an audit/alarm ace type
-      `O:${me}D:P(AU;;0x12019f;;;${me})`,
-      // NULL DACL (grants everyone everything) and an empty protected DACL
-      `O:${me}D:NO_ACCESS_CONTROL`,
-      `O:${me}D:P`,
+      ['1 1 1', [`00 10 0012019f ${me}`], 'INHERITED_ACE'],
+      ['1 1 1', [`00 03 0012019f ${me}`], 'OBJECT|CONTAINER inherit'],
+      // a DENY, AUDIT or ALARM ace wearing the right mask
+      ['1 1 1', [`01 00 0012019f ${me}`], 'ACCESS_DENIED'],
+      ['1 1 1', [`02 00 0012019f ${me}`], 'SYSTEM_AUDIT'],
+      ['1 1 1', [`03 00 0012019f ${me}`], 'SYSTEM_ALARM'],
+      ['1 1 1', [`09 00 0012019f ${me}`], 'ALLOWED_CALLBACK'],
+      // an object ace, whose trustee the kernel layout does not expose
+      ['1 1 1', ['05 00 0012019f NONE'], 'ACCESS_ALLOWED_OBJECT'],
     ];
-    for (const descriptor of unacceptable) {
-      const result = await attestWithStdout(evidenceOf(me, descriptor));
-      expect(result, descriptor).toEqual({
+    for (const [dacl, aces, label] of unacceptable) {
+      const result = await attestWithStdout(evidenceOf(me, dacl, aces));
+      expect(result, label).toEqual({
         ok: false,
         reason: PIPE_ATTESTATION_REJECTION.PIPE_DACL_UNEXPECTED,
       });
@@ -1131,6 +1180,55 @@ describe.skipIf(!nativeReady)('DDR-D062-D — the REAL native attestor (Windows,
     }
   }, 60000);
 
+  it('F-C1. an ACE carrying NO trustee bytes is observed safely, never read out of bounds', async () => {
+    // The exact counterexample independent validation reproduced: a
+    // kernel-VALID ACL (IsValidAcl TRUE, CreateNamedPipeW succeeds) whose
+    // second ACE is an unknown type with AceSize == 8 — the ACE_HEADER and the
+    // access mask, and not one byte more. Pointing IsValidSid at offset 8 there
+    // would read Revision and SubAuthorityCount past the end of the ACE.
+    //
+    // Both shapes are exercised so the size guard is proven LOAD-BEARING: the
+    // same unknown ACE type yields the real trustee when the SID is actually
+    // present, and NONE only when there is no room for one. A bug that simply
+    // mapped "unknown type" to NONE would fail the second case.
+    const operatorSid = await realOperatorSid();
+    for (const withSid of [false, true]) {
+      const { pipePath } = await startCustomAclPipe(withSid);
+      const run = await runAttestor([pipePath]);
+      // No crash: a STATUS_ACCESS_VIOLATION would surface as a huge/negative
+      // code and an empty stdout, never as a clean exit 0 with evidence.
+      expect(run.code, `withSid=${String(withSid)} stderr=${run.stderr}`).toBe(0);
+      const evidence = parseAttestationEvidence(run.stdout);
+      expect(evidence, `withSid=${String(withSid)}`).not.toBeNull();
+      expect(evidence?.daclPresent).toBe(true);
+      expect(evidence?.daclProtected).toBe(true);
+      expect(evidence?.aceCount).toBe(2);
+      expect(evidence?.aces).toHaveLength(2);
+      // The ordinary ACE is relayed exactly as before.
+      expect(evidence?.aces[0]).toEqual({
+        type: '00',
+        flags: '00',
+        mask: '0012019f',
+        trustee: operatorSid.toLowerCase(),
+      });
+      // The unknown ACE: its trustee is NONE only when the ACE cannot hold a
+      // SID's fixed head, and the genuine SID otherwise.
+      expect(evidence?.aces[1]?.type).toBe('40');
+      expect(evidence?.aces[1]?.trustee).toBe(withSid ? operatorSid.toLowerCase() : 'none');
+      // And it is still rejected — on the ACE count, before any trustee matters.
+      const gate = await attestPipeServer(
+        pipePath,
+        operatorSid,
+        (): Promise<ProcessResult> => Promise.resolve({ ok: true, stdout: run.stdout }),
+        simulatedArtifact,
+      );
+      expect(gate).toEqual({
+        ok: false,
+        reason: PIPE_ATTESTATION_REJECTION.PIPE_DACL_UNEXPECTED,
+      });
+    }
+  }, 90000);
+
   it('T15. the reviewed source and the BUILT binary carry no process-object capability at all', async () => {
     // PID reuse is no longer guarded — it is structurally impossible, because
     // no PID is ever consulted. That is a claim about absence, so it is proven
@@ -1158,11 +1256,28 @@ describe.skipIf(!nativeReady)('DDR-D062-D — the REAL native attestor (Windows,
       // absence of the capability, not merely absence of a call site.
       expect(binary.includes(symbol), `binary imports ${symbol}`).toBe(false);
     }
-    // What it DOES do: read the security of the handle it already holds.
+    // What it DOES do: read the STRUCTURE of the security of the handle it
+    // already holds — and nothing that renders it as text.
     expect(source).toContain('GetSecurityInfo(pipe, SE_KERNEL_OBJECT,');
     expect(source).toContain(
       'OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION',
     );
+    expect(source).toContain('GetSecurityDescriptorControl(sd, &control, &revision)');
+    expect(source).toContain('GetAclInformation(dacl, &acl_size,');
+    expect(source).toContain('GetAce(dacl, index, &raw)');
+    expect(source).toContain('ConvertSidToStringSidW(sid, &text)');
+    // No SDDL rendering survives anywhere in the artifact: that API, and the
+    // V2 evidence label it fed, are the defect this amendment removes.
+    for (const banned of [
+      'ConvertSecurityDescriptorToStringSecurityDescriptorW',
+      'ConvertStringSecurityDescriptorToSecurityDescriptorW',
+      'PIPESD',
+      'SDDL_REVISION',
+    ]) {
+      expect(source.includes(banned), `source still renders SDDL via ${banned}`).toBe(false);
+      expect(binary.includes(banned), `binary still imports ${banned}`).toBe(false);
+    }
+    expect(source).toContain('AGENTBRIDGE-ATTEST-V3');
     // Exactly one CreateFileW: the pipe is never reopened by name (TOCTOU).
     expect(source.match(/CreateFileW\(/g)?.length).toBe(1);
     // And it can never write a byte to the pipe.
@@ -1282,8 +1397,28 @@ const PROBE_PREAMBLE = [
   '  public static extern bool ConvertStringSecurityDescriptorToSecurityDescriptorW(string s, uint r, out IntPtr sd, IntPtr z);',
   '  [DllImport("advapi32.dll", SetLastError=true)]',
   '  public static extern uint GetSecurityInfo(IntPtr h, int t, uint i, out IntPtr o, out IntPtr g, out IntPtr d, out IntPtr s, out IntPtr sd);',
+  '  [DllImport("advapi32.dll", SetLastError=true)]',
+  '  public static extern bool GetSecurityDescriptorControl(IntPtr sd, out ushort c, out uint r);',
+  '  [DllImport("advapi32.dll", SetLastError=true)]',
+  '  public static extern bool GetAclInformation(IntPtr acl, out ACLSIZE info, uint len, int cls);',
+  '  [DllImport("advapi32.dll", SetLastError=true)]',
+  '  public static extern bool GetAce(IntPtr acl, uint idx, out IntPtr ace);',
   '  [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)]',
-  '  public static extern bool ConvertSecurityDescriptorToStringSecurityDescriptorW(IntPtr sd, uint r, uint i, out IntPtr s, IntPtr l);',
+  '  public static extern bool ConvertSidToStringSidW(IntPtr sid, out IntPtr s);',
+  '  [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)]',
+  '  public static extern bool ConvertStringSidToSidW(string s, out IntPtr sid);',
+  '  [DllImport("advapi32.dll", SetLastError=true)] public static extern uint GetLengthSid(IntPtr sid);',
+  '  [DllImport("advapi32.dll", SetLastError=true)] public static extern bool IsValidAcl(IntPtr acl);',
+  '  [DllImport("advapi32.dll", SetLastError=true)] public static extern bool InitializeSecurityDescriptor(IntPtr sd, uint rev);',
+  '  [DllImport("advapi32.dll", SetLastError=true)] public static extern bool SetSecurityDescriptorOwner(IntPtr sd, IntPtr owner, bool def);',
+  '  [DllImport("advapi32.dll", SetLastError=true)] public static extern bool SetSecurityDescriptorDacl(IntPtr sd, bool present, IntPtr dacl, bool def);',
+  '  [DllImport("advapi32.dll", SetLastError=true)] public static extern bool SetSecurityDescriptorControl(IntPtr sd, ushort of, ushort to);',
+  '  [DllImport("kernel32.dll", SetLastError=true)] public static extern bool ConnectNamedPipe(IntPtr h, IntPtr ov);',
+  '  [DllImport("kernel32.dll", SetLastError=true)] public static extern bool WriteFile(IntPtr h, byte[] b, uint n, out uint w, IntPtr ov);',
+  '  [StructLayout(LayoutKind.Sequential)]',
+  '  public struct ACLSIZE { public uint AceCount; public uint BytesInUse; public uint BytesFree; }',
+  '  [StructLayout(LayoutKind.Sequential)]',
+  '  public struct ACEHDR { public byte AceType; public byte AceFlags; public ushort AceSize; }',
   '}',
   '"@',
   '$me = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value',
@@ -1296,39 +1431,209 @@ const PROBE_PREAMBLE = [
   '  $sa.inherit = 0',
   '  return $sa',
   '}',
-  'function Read-SD([IntPtr]$h) {',
+  'function Sid-Text([IntPtr]$sid) {',
+  '  $t=[IntPtr]::Zero',
+  "  if (-not [NP]::ConvertSidToStringSidW($sid, [ref]$t)) { return 'SID_FAILED' }",
+  '  return [Runtime.InteropServices.Marshal]::PtrToStringUni($t)',
+  '}',
+  '# Read the descriptor the way the production attestor now does: STRUCTURALLY,',
+  '# as numeric SIDs and numeric fields. No SDDL rendering is involved at all.',
+  'function Read-Struct([IntPtr]$h) {',
   '  $o=[IntPtr]::Zero;$g=[IntPtr]::Zero;$d=[IntPtr]::Zero;$s=[IntPtr]::Zero;$p=[IntPtr]::Zero',
   "  if ([NP]::GetSecurityInfo($h, 6, [uint32]5, [ref]$o, [ref]$g, [ref]$d, [ref]$s, [ref]$p) -ne 0) { return 'QUERY_FAILED' }",
-  '  $t=[IntPtr]::Zero',
-  '  [void][NP]::ConvertSecurityDescriptorToStringSecurityDescriptorW($p, 1, [uint32]5, [ref]$t, [IntPtr]::Zero)',
-  '  return [Runtime.InteropServices.Marshal]::PtrToStringUni($t)',
+  '  $c=0;$r=0',
+  "  if (-not [NP]::GetSecurityDescriptorControl($p, [ref]$c, [ref]$r)) { return 'CONTROL_FAILED' }",
+  '  $info = New-Object NP+ACLSIZE',
+  "  if (-not [NP]::GetAclInformation($d, [ref]$info, 12, 2)) { return 'ACL_FAILED' }",
+  '  $aces = @()',
+  '  for ($i = 0; $i -lt $info.AceCount; $i++) {',
+  '    $ace=[IntPtr]::Zero',
+  "    if (-not [NP]::GetAce($d, [uint32]$i, [ref]$ace)) { return 'ACE_FAILED' }",
+  "    $hdr = [Runtime.InteropServices.Marshal]::PtrToStructure($ace, [type]'NP+ACEHDR')",
+  '    $mask = [Runtime.InteropServices.Marshal]::ReadInt32($ace, 4)',
+  "    $aces += ('{0:x2} {1:x2} {2:x8} {3}' -f $hdr.AceType, $hdr.AceFlags, $mask, (Sid-Text ([IntPtr]::Add($ace, 8))))",
+  '  }',
+  "  $present = [int][bool]($c -band 4); $guarded = [int][bool]($c -band 4096)",
+  "  return ('OWNER=' + (Sid-Text $o) + ' DACL=' + $present + ' ' + $guarded + ' ' + $info.AceCount + ' ACES=' + ($aces -join '|'))",
   '}',
   '$OPEN = 3; $MODE = 8; $FIRST = 524288; $INVALID = [IntPtr]::new(-1)',
 ].join('\n');
 
+/**
+ * Serve ONE throwaway pipe whose DACL is built BYTE BY BYTE, so an ACE shape
+ * the normal APIs will not produce can still be presented to the attestor: two
+ * ACEs, the second an unknown type 0x40 that either carries a trustee SID or
+ * has AceSize == 8 and carries none at all. The ACL is proven kernel-valid
+ * (IsValidAcl) before the pipe is created. The server then accepts one client
+ * and writes one framed hello, so the attestor completes normally.
+ *
+ * Resolves once the child announces the pipe path; the child is registered for
+ * teardown and is never the live control pipe.
+ */
+function startCustomAclPipe(withSid: boolean): Promise<{ readonly pipePath: string }> {
+  const script = [
+    PROBE_PREAMBLE,
+    `$withSid = $${withSid ? 'true' : 'false'}`,
+    '$meSid = [IntPtr]::Zero',
+    "if (-not [NP]::ConvertStringSidToSidW($me, [ref]$meSid)) { throw 'sid' }",
+    '$sidLen = [int][NP]::GetLengthSid($meSid)',
+    '$sidBytes = New-Object byte[] $sidLen',
+    '[Runtime.InteropServices.Marshal]::Copy($meSid, $sidBytes, 0, $sidLen)',
+    '$ace1 = 8 + $sidLen',
+    'if ($withSid) { $ace2 = 8 + $sidLen } else { $ace2 = 8 }',
+    '$aclSize = 8 + $ace1 + $ace2',
+    '$acl = New-Object byte[] $aclSize',
+    '$acl[0] = 2; $acl[1] = 0',
+    '$acl[2] = $aclSize -band 0xFF; $acl[3] = ($aclSize -shr 8) -band 0xFF',
+    '$acl[4] = 2; $acl[5] = 0; $acl[6] = 0; $acl[7] = 0',
+    '$o = 8',
+    '$acl[$o] = 0; $acl[$o+1] = 0',
+    '$acl[$o+2] = $ace1 -band 0xFF; $acl[$o+3] = ($ace1 -shr 8) -band 0xFF',
+    '$acl[$o+4] = 0x9F; $acl[$o+5] = 0x01; $acl[$o+6] = 0x12; $acl[$o+7] = 0x00',
+    '[Array]::Copy($sidBytes, 0, $acl, $o+8, $sidLen)',
+    '$o = $o + $ace1',
+    '$acl[$o] = 0x40; $acl[$o+1] = 0',
+    '$acl[$o+2] = $ace2 -band 0xFF; $acl[$o+3] = ($ace2 -shr 8) -band 0xFF',
+    '$acl[$o+4] = 0x9F; $acl[$o+5] = 0x01; $acl[$o+6] = 0x12; $acl[$o+7] = 0x00',
+    'if ($withSid) { [Array]::Copy($sidBytes, 0, $acl, $o+8, $sidLen) }',
+    '$aclPtr = [Runtime.InteropServices.Marshal]::AllocHGlobal($aclSize)',
+    '[Runtime.InteropServices.Marshal]::Copy($acl, 0, $aclPtr, $aclSize)',
+    "if (-not [NP]::IsValidAcl($aclPtr)) { throw 'the kernel rejected the hand-built ACL' }",
+    '$sdPtr = [Runtime.InteropServices.Marshal]::AllocHGlobal(64)',
+    "if (-not [NP]::InitializeSecurityDescriptor($sdPtr, 1)) { throw 'sd' }",
+    '[void][NP]::SetSecurityDescriptorOwner($sdPtr, $meSid, $false)',
+    '[void][NP]::SetSecurityDescriptorDacl($sdPtr, $true, $aclPtr, $false)',
+    '[void][NP]::SetSecurityDescriptorControl($sdPtr, 4096, 4096)',
+    '$sa = New-Object NP+SA',
+    "$sa.nLength = [Runtime.InteropServices.Marshal]::SizeOf([type]'NP+SA')",
+    '$sa.sd = $sdPtr; $sa.inherit = 0',
+    "$n = '\\\\.\\pipe\\ab-fc1-' + [guid]::NewGuid().ToString('N')",
+    '$h = [NP]::CreateNamedPipeW($n, ($OPEN -bor $FIRST), $MODE, 255, 4096, 4096, 0, [ref]$sa)',
+    "if ($h -eq $INVALID) { throw ('create ' + [Runtime.InteropServices.Marshal]::GetLastWin32Error()) }",
+    "[Console]::Out.WriteLine('READY ' + $n)",
+    '[Console]::Out.Flush()',
+    '[void][NP]::ConnectNamedPipe($h, [IntPtr]::Zero)',
+    "$body = [Text.Encoding]::ASCII.GetBytes('{\"v\":2}')",
+    '$frame = New-Object byte[] (4 + $body.Length)',
+    '$frame[0]=0; $frame[1]=0; $frame[2]=0; $frame[3]=$body.Length',
+    '[Array]::Copy($body, 0, $frame, 4, $body.Length)',
+    '$w = 0',
+    '[void][NP]::WriteFile($h, $frame, [uint32]$frame.Length, [ref]$w, [IntPtr]::Zero)',
+    'Start-Sleep -Seconds 5',
+  ].join('\n');
+  const encoded = Buffer.from(script, 'utf16le').toString('base64');
+  return new Promise<{ readonly pipePath: string }>((resolvePromise, rejectPromise) => {
+    const child = spawn(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
+      { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    children.push(child);
+    let out = '';
+    let err = '';
+    child.stdout.on('data', (chunk: Buffer) => {
+      out += chunk.toString('utf8');
+      const ready = /READY (\S+)/.exec(out);
+      if (ready?.[1] !== undefined) {
+        resolvePromise({ pipePath: ready[1] });
+      }
+    });
+    child.stderr.on('data', (chunk: Buffer) => {
+      err += chunk.toString('utf8');
+    });
+    child.on('exit', () => {
+      rejectPromise(new Error(`custom-ACL server exited early: ${err || out}`));
+    });
+  });
+}
+
+/**
+ * Whether T13's NEGATIVE oracle is valid in this token. With SeRestorePrivilege
+ * ENABLED the kernel legitimately permits assigning an arbitrary owner, so
+ * ERROR_INVALID_OWNER is not the correct expectation and the oracle must be
+ * SKIPPED — never silently passed. Total and pure, so both branches are
+ * provable on any machine.
+ */
+type T13Decision = { readonly kind: 'run' } | { readonly kind: 'skip'; readonly reason: string };
+
+function t13NegativeOracle(restoreEnabled: boolean): T13Decision {
+  if (restoreEnabled) {
+    return {
+      kind: 'skip',
+      reason:
+        'SeRestorePrivilege is ENABLED in this token: the kernel legitimately permits ' +
+        'assigning an arbitrary owner, so the negative ERROR_INVALID_OWNER oracle is ' +
+        'not valid here. The own-SID positive control still ran.',
+    };
+  }
+  return { kind: 'run' };
+}
+
 describe.skipIf(process.platform !== 'win32')(
   'DDR-D062-D — throwaway-pipe kernel regressions (Windows)',
   () => {
-    it('T13. an unprivileged process CANNOT mint a pipe owned by a foreign principal', async () => {
-      // This is the kernel fact the whole owner check rests on: a foreign
-      // principal cannot forge the operator as owner, because the object
-      // manager refuses an owner SID the creating token cannot assume.
+    it('T13-decision. an enabled SeRestorePrivilege SKIPS the negative oracle, never passes it', () => {
+      // The dynamic branch is decided by a TOTAL PURE function, so both
+      // outcomes are provable here — including the one this machine's token
+      // cannot reach. There is no third outcome, and the enabled case never
+      // maps to "run", so it can never be reported as a pass of the oracle.
+      const enabled = t13NegativeOracle(true);
+      expect(enabled.kind).toBe('skip');
+      expect(enabled.kind === 'skip' ? enabled.reason : '').toContain('SeRestorePrivilege');
+      expect(enabled.kind === 'skip' ? enabled.reason.length : 0).toBeGreaterThan(40);
+      expect(t13NegativeOracle(false)).toEqual({ kind: 'run' });
+    });
+
+    it('T13. an unprivileged process CANNOT mint a pipe owned by a non-owner-eligible SID', async (ctx) => {
+      // This is the kernel fact the whole owner check rests on: a principal
+      // cannot assign an owner its token cannot assume.
+      //
+      // The foreign SID is SYNTHESISED PER RUN in a random authority-21 domain.
+      // Well-known SIDs are unusable as "foreign": exact-head CI proved that
+      // BUILTIN\Administrators (S-1-5-32-544) is owner-ELIGIBLE in an elevated
+      // administrator token, and S-1-5-18 would be wrong if a job ever ran as
+      // SYSTEM. A random synthetic domain SID can be neither the caller's user
+      // SID nor a group in its token, on any machine, with no account created
+      // and no lookup performed.
       const script = [
         PROBE_PREAMBLE,
-        '$codes = @()',
-        "foreach ($foreign in @('S-1-5-18','S-1-5-32-544')) {",
-        "  $n = '\\\\.\\pipe\\ab-t13-' + [guid]::NewGuid().ToString('N')",
-        "  $sa = New-SA ('O:' + $foreign + 'D:P(A;;0x12019F;;;' + $me + ')')",
-        '  $h = [NP]::CreateNamedPipeW($n, ($OPEN -bor $FIRST), $MODE, 255, 4096, 4096, 0, [ref]$sa)',
-        '  if ($h -eq $INVALID) { $codes += [Runtime.InteropServices.Marshal]::GetLastWin32Error() }',
-        '  else { $codes += 0; [void][NP]::CloseHandle($h) }',
-        '}',
-        "[pscustomobject]@{ codes = $codes } | ConvertTo-Json -Compress",
+        '$r = New-Object Random',
+        "$foreign = 'S-1-5-21-' + $r.Next(100000000,2000000000) + '-' + $r.Next(100000000,2000000000) + '-' + $r.Next(100000000,2000000000) + '-' + $r.Next(2000,900000)",
+        '# The negative expectation is only valid while SeRestorePrivilege is',
+        '# DISABLED: enabled, it legitimately permits assigning ANY owner.',
+        '$restore = (whoami /priv /fo csv | ConvertFrom-Csv) | Where-Object { $_."Privilege Name" -eq "SeRestorePrivilege" }',
+        "$restoreEnabled = ($restore -ne $null) -and ($restore.State -like 'Enabled*')",
+        "$n1 = '\\\\.\\pipe\\ab-t13-' + [guid]::NewGuid().ToString('N')",
+        "$saForeign = New-SA ('O:' + $foreign + 'D:P(A;;0x12019F;;;' + $me + ')')",
+        '$h1 = [NP]::CreateNamedPipeW($n1, ($OPEN -bor $FIRST), $MODE, 255, 4096, 4096, 0, [ref]$saForeign)',
+        '$foreignCode = 0',
+        'if ($h1 -eq $INVALID) { $foreignCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error() }',
+        'else { [void][NP]::CloseHandle($h1) }',
+        '# POSITIVE CONTROL: the caller MAY assign its own user SID as owner, so a',
+        '# 1307 above cannot be an unrelated failure of the same call.',
+        "$n2 = '\\\\.\\pipe\\ab-t13-own-' + [guid]::NewGuid().ToString('N')",
+        "$saOwn = New-SA ('O:' + $me + 'D:P(A;;0x12019F;;;' + $me + ')')",
+        '$h2 = [NP]::CreateNamedPipeW($n2, ($OPEN -bor $FIRST), $MODE, 255, 4096, 4096, 0, [ref]$saOwn)',
+        '$ownCode = 0',
+        'if ($h2 -eq $INVALID) { $ownCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error() }',
+        'else { [void][NP]::CloseHandle($h2) }',
+        '[pscustomobject]@{ foreignCode = $foreignCode; ownCode = $ownCode; restoreEnabled = $restoreEnabled } | ConvertTo-Json -Compress',
       ].join('\n');
 
       const result = await runPipeProbe(script);
+      // The positive control runs FIRST and must hold in every case, or the
+      // probe proves nothing — including on the path that skips below.
+      expect(result['ownCode'], 'assigning the caller own SID must succeed').toBe(0);
+
+      const decision = t13NegativeOracle(result['restoreEnabled'] === true);
+      if (decision.kind === 'skip') {
+        // A REAL vitest skip, recorded with its reason. Not an early return:
+        // an early return would be reported as a PASS of an oracle that never
+        // ran, which is exactly what DDR-D062-D Amendment 1 forbids.
+        ctx.skip(decision.reason);
+      }
       // 1307 == ERROR_INVALID_OWNER. A 0 would mean the forgery succeeded.
-      expect(result['codes']).toEqual([1307, 1307]);
+      expect(result['foreignCode']).toBe(1307);
     }, 90000);
 
     it('T14. the descriptor belongs to the NAME and is fixed at first-instance creation', async () => {
@@ -1349,7 +1654,7 @@ describe.skipIf(process.platform !== 'win32')(
         'foreach ($k in 1..3) {',
         '  $c = [NP]::CreateFileW($n, [uint32]2147483648, 0, [IntPtr]::Zero, 3, 0, [IntPtr]::Zero)',
         "  if ($c -eq $INVALID) { $seen += 'CONNECT_FAILED'; continue }",
-        '  $seen += (Read-SD $c)',
+        '  $seen += (Read-Struct $c)',
         '  [void][NP]::CloseHandle($c)',
         '}',
         'foreach ($h in @($i1,$i2,$i3)) { if ($h -ne $INVALID) { [void][NP]::CloseHandle($h) } }',
@@ -1360,11 +1665,16 @@ describe.skipIf(process.platform !== 'win32')(
       const seen = result['seen'] as string[];
       const me = result['me'] as string;
       expect(seen).toHaveLength(3);
-      // Every client read the same descriptor...
-      expect(new Set(seen.map((sd) => sd.toUpperCase())).size).toBe(1);
-      // ...and it is exactly the FIRST instance's, which is exactly the
-      // descriptor the production trust layer accepts.
-      expect(seen[0]?.toUpperCase()).toBe(`O:${me}D:P(A;;0x12019F;;;${me})`.toUpperCase());
+      // Every client read the same STRUCTURE...
+      expect(new Set(seen.map((s) => s.toLowerCase())).size).toBe(1);
+      // ...and it is exactly the FIRST instance's: the accepted owner, a
+      // present+protected DACL, exactly one ACCESS_ALLOWED ace with no flags,
+      // mask 0x12019F and the operator as trustee. Asserted as STRUCTURE, over
+      // numeric SIDs and numeric fields, so no SDDL rendering — and therefore
+      // no canonical alias such as LA or BA — can change the outcome.
+      expect(seen[0]?.toLowerCase()).toBe(
+        `owner=${me} dacl=1 1 1 aces=00 00 0012019f ${me}`.toLowerCase(),
+      );
     }, 90000);
   },
 );
