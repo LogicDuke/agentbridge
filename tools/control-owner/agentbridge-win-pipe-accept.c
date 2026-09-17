@@ -11,7 +11,7 @@
  * descriptor, which grants broad principals (Everyone / ANONYMOUS LOGON /
  * Users, depending on the system) read/write access to the pipe. The control
  * channel's authorization never rested on that descriptor — token possession
- * (HMAC) and live pipe-server attestation are the authenticators — but a
+ * (HMAC) and live pipe-object attestation are the authenticators — but a
  * pipe reachable by every local principal is a wider transport access boundary
  * than the control channel needs, and JavaScript cannot narrow it: neither
  * Node nor libuv exposes SECURITY_ATTRIBUTES for a listening pipe.
@@ -35,9 +35,12 @@
  * removed here.
  *
  * NODE REMAINS THE SERVER PROCESS. The instances are created INSIDE the Node
- * runtime process by this addon, so GetNamedPipeServerProcessId observed by the
- * existing attestation path continues to report the Node runtime PID and the
- * Node runtime's TokenUser SID. There is no helper, broker, or service.
+ * runtime process by this addon: there is no helper, broker, or service. The
+ * attestation path does not observe that fact through any process identity — it
+ * reads the OWNER and DACL of the kernel PIPE OBJECT behind its own connected
+ * handle, and never resolves a server PID or a server process's TokenUser SID.
+ * What this addon guarantees for it is the descriptor above, written onto every
+ * instance of the pipe NAME.
  *
  * WHAT IT DOES (the complete list)
  *   1. reads its own process token's TokenUser SID;

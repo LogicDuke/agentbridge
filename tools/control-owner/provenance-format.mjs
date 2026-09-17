@@ -60,7 +60,7 @@ export const DESCRIPTOR_CREATOR_SOURCE_BASENAME = 'agentbridge-win-descriptor-cr
 /** The generated creator provenance module's basename under dist/control/native/. */
 export const CREATOR_PROVENANCE_BASENAME = 'descriptor-creator-provenance.js';
 
-/** The live pipe-server identity relayer's filename (DDR-D062-B). */
+/** The live pipe-object identity relayer's filename (DDR-D062-D Amendment 1). */
 export const PIPE_ATTESTOR_BASENAME = 'agentbridge-win-pipe-attest.exe';
 
 /** The pipe attestor's reviewed C source basename (this directory). */
@@ -160,7 +160,7 @@ export function encodeCreatorProvenance(sha256Hex, sourceId) {
 }
 
 /**
- * Encode the canonical provenance ES-module text for the READ-ONLY live pipe-server
+ * Encode the canonical provenance ES-module text for the READ-ONLY live pipe-object
  * identity relayer: again a separate binding name, a separate filename, and its own
  * reviewed-source digest, so no artifact's trust root can satisfy another's.
  *

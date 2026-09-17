@@ -1001,9 +1001,11 @@ export type ControlAnchorVerification =
       readonly anchorPath: string;
       /**
        * The trusted operator SID this gate already resolved and proved is the
-       * anchor's exact owner. Surfaced (not re-derived) so pipe attestation
-       * compares the serving process against the SAME identity the anchor gate
-       * accepted — one operator identity, one resolution, no second source.
+       * anchor's exact owner. Surfaced (not re-derived) so the structural
+       * pipe-object attestation policy can compare the connected pipe object's
+       * OWNER SID, and the accepted DACL's ACE trustee SID, against the SAME
+       * identity the anchor gate accepted — one operator identity, one
+       * resolution, no second source.
        */
       readonly operatorSid: string;
     }
@@ -2228,8 +2230,12 @@ export async function createDescriptorFileNative(
  * server leaves every pipe instance with the kernel DEFAULT security
  * descriptor, which admits broad local principals. The FOURTH build-provenanced
  * native artifact is not a process: it is a Node-API addon loaded INTO the
- * runtime process, so Node remains the pipe SERVER PROCESS (the attestor still
- * observes the runtime's own PID and TokenUser SID). It creates every server
+ * runtime process, so Node remains the pipe SERVER PROCESS. That is a TOPOLOGY
+ * fact and nothing more: attestation derives server identity from the OWNER and
+ * the structural DACL facts of the ALREADY-CONNECTED pipe KERNEL OBJECT — never
+ * from a PID, never from a serving process's TokenUser SID, and with no
+ * process-object fallback (DDR-D062-D Amendment 1). What this addon supplies to
+ * that policy is the descriptor itself. It creates every server
  * instance with an explicit descriptor — owner = the runtime's exact TokenUser
  * SID, a PRESENT + PROTECTED DACL with exactly one ALLOW ACE for that same SID
  * granting exactly FILE_GENERIC_READ | FILE_GENERIC_WRITE | SYNCHRONIZE

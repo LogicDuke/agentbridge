@@ -1,6 +1,6 @@
 /**
- * Decision 062 control-path authentication (DDR-D062-B — LIVE PIPE SERVER
- * IDENTITY RELAYER).
+ * Decision 062 control-path authentication (DDR-D062-D Amendment 1 — LIVE
+ * PIPE-OBJECT IDENTITY RELAYER).
  *
  * The two directions are authenticated by **different** primitives, because they
  * answer different questions:
@@ -12,9 +12,10 @@
  *   4. server returns the result with
  *      `sigS = Ed25519(sk, T("S", runtimeId, pipeName, verifyKey, nonceS, nonceC, command, result))`;
  *   5. the CLI verifies `sigS` against the **ATTESTED** `verifyKey` — the one the
- *      native pipe attestor relayed out of a hello read from a pipe whose SERVER
- *      PROCESS it proved belongs to the trusted operator SID — and refuses to
- *      trust the result otherwise.
+ *      native pipe attestor relayed out of a hello read from the SAME connected
+ *      handle whose kernel PIPE OBJECT it proved is owned by the trusted operator
+ *      SID and carries exactly the accepted descriptor — and refuses to trust the
+ *      result otherwise.
  *
  * ## Where the verify key may come from, and where it may not
  *
@@ -25,12 +26,18 @@
  * copied earlier — that is a predicate over history, not over state at time t.
  *
  * The only admissible source of a `verifyKey` is the live pipe itself, relayed
- * by the attestor together with the SID of the process actually serving that
- * pipe. Authority therefore rests on a kernel fact (who owns the serving
- * process) rather than on a file's contents, and the keypair supplies freshness
- * and non-exportability on top of it: the private half exists only in the live
- * runtime's process memory and is never serialized, so copied descriptor bytes
- * alone carry no signing capability.
+ * by the attestor from the SAME GENERIC_READ-only connected handle whose kernel
+ * PIPE OBJECT it read the OWNER and DACL from. The CLI then requires that owner
+ * to equal the trusted operator SID (`PIPE_OWNER_MISMATCH` otherwise) and that
+ * DACL to be exactly the protected single-ACE operator-only descriptor — present,
+ * protected, one ACCESS_ALLOWED ACE, no inheritance flags, mask 0x12019F, trustee
+ * the operator SID (`PIPE_DACL_UNEXPECTED` otherwise). Authority therefore rests
+ * on kernel facts about the pipe object itself rather than on a file's contents;
+ * no PID or process object is consulted, there is no SDDL string to compare, and
+ * no privilege is widened. The keypair supplies freshness and non-exportability
+ * on top of it: the private half exists only in the live runtime's process memory
+ * and is never serialized, so copied descriptor bytes alone carry no signing
+ * capability.
  *
  * The token is RETAINED, scope-reduced, as the client-to-server authorizer only:
  * possession still means "could read the descriptor inside the hardened anchor".

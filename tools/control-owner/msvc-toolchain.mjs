@@ -298,8 +298,14 @@ export function defaultRunCompiler(cl, args, { cwd, env }) {
  * FILE_DISPOSITION_INFO_EX / FILE_DISPOSITION_FLAG_* the creator's delete-on-close
  * cancellation needs (declared only by Windows SDK 10.0.14393 / RS1 and later, so
  * an older SDK fails here instead of at the creator build). It also references the
- * named-pipe server-process resolution and process creation-time pinning the pipe
- * attestor's PID-reuse guard needs. A header missing inside an existing include dir,
+ * named-pipe server-process resolution and process creation-time surface
+ * (`GetNamedPipeServerProcessId` / `GetProcessTimes` / `OpenProcess`). No shipped
+ * artifact uses those for attestation any more — the pipe attestor reads the OWNER
+ * and DACL of the connected pipe OBJECT and consults no PID (DDR-D062-D
+ * Amendment 1) — but they are RETAINED here deliberately as toolchain capability
+ * probes: they are the surface an SDK is most likely to be missing, and dropping
+ * them would weaken what this probe proves about the include and lib dirs. A
+ * header missing inside an existing include dir,
  * or an import library missing inside an existing lib dir, fails the probe exactly as
  * it would fail the real build, for EVERY artifact.
  * `wmain` + /SUBSYSTEM:CONSOLE matches their entry/link shape.

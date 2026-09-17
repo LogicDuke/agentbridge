@@ -1,11 +1,13 @@
 /**
- * DDR-D062-D — LIVE PIPE SERVER IDENTITY RELAYER: the focused attack matrix.
+ * DDR-D062-D Amendment 1 — LIVE PIPE-OBJECT IDENTITY RELAYER: the focused
+ * attack matrix.
  *
  * The property under test is the one a descriptor can never establish:
  *
- *     CLI EXIT 0 (APPLIED)  ⇒  the pipe that answered was served by a process
- *                              owned by the trusted operator, holding the
- *                              private half of the key that attestation relayed.
+ *     CLI EXIT 0 (APPLIED)  ⇒  the pipe that answered is a kernel object OWNED
+ *                              by the trusted operator and carrying exactly the
+ *                              protected operator-only DACL, whose server holds
+ *                              the private half of the key attestation relayed.
  *
  * Nothing here trusts a file. A descriptor supplies a pipe name and the
  * client-to-server token; every server-direction decision comes from attesting
@@ -128,7 +130,11 @@ function attestWithStdout(stdout: string, operatorSid = FAKE_OPERATOR_SID): Prom
 }
 
 /* ================================================================== *
- * 1. Identity of the SERVING PROCESS decides, not the descriptor
+ * 1. The CONNECTED PIPE OBJECT decides, not the descriptor file.
+ *    Both conjuncts are load-bearing: the pipe object's OWNER SID AND the
+ *    exact protected operator-only DACL structure. Owner alone is
+ *    insufficient — a same-SID program could hold the name with a broad
+ *    descriptor and a foreign principal could then add an instance to it.
  * ================================================================== */
 
 describe('DDR-D062-D — a perfect descriptor grants nothing (SEAM)', () => {
@@ -1064,7 +1070,7 @@ function runAttestor(args: readonly string[]): Promise<RawRun> {
 }
 
 describe.skipIf(!nativeReady)('DDR-D062-D — the REAL native attestor (Windows, dist-gated)', () => {
-  it('relays the exact hello of a real live pipe and the real SID of its serving process', async () => {
+  it('relays the exact hello of a real live pipe and the real OWNER SID of its pipe object', async () => {
     const keys = generateRuntimeKeyPair();
     const nonceS = randomBytes(NONCE_BYTES);
     const helloBody = buildHelloBody(nonceS, keys.verifyKey);
@@ -1089,7 +1095,9 @@ describe.skipIf(!nativeReady)('DDR-D062-D — the REAL native attestor (Windows,
     expect(parseHelloBody(evidence?.helloBody ?? Buffer.alloc(0))?.verifyKey.equals(keys.verifyKey)).toBe(
       true,
     );
-    // And the SID is this test process's own — the process that serves the pipe.
+    // And the OWNER SID is stable across two independent observations of the
+    // SAME pipe object — the current test principal's SID, read from the
+    // connected handle, never a process identity.
     const self = await runAttestor([pipePath]);
     expect(parseAttestationEvidence(self.stdout)?.pipeOwnerSid).toBe(evidence?.pipeOwnerSid);
   });
@@ -1135,18 +1143,23 @@ describe.skipIf(!nativeReady)('DDR-D062-D — the REAL native attestor (Windows,
   }
 
   it('9. a server that exits the moment it is attested (before any hello) is ALWAYS rejected', async () => {
-    // Deterministic: the connection is accepted, then the serving process is
-    // gone. The pin cannot hold and no hello can arrive, so there is nothing the
-    // artifact could ever emit.
+    // Deterministic: either the connect never lands at all, or it lands and the
+    // pipe session is already gone, so the bounded hello read on that same
+    // connected handle can never complete. Either way the artifact fails closed
+    // with no stdout; there is nothing it could ever emit.
+    //
+    // Reachable stderr tokens, from the attestor's control flow: ERR_CONNECT
+    // (CreateFileW failed) or ERR_HELLO_PREFIX (connected, but not one hello
+    // byte exists). The descriptor query cannot fail here — it reads the
+    // security of the handle already held, which server death does not disturb —
+    // and ERR_HELLO_BODY is unreachable because no prefix can ever be read.
     const pipePath = pipePathFromName(pipeNameForRuntimeId('abcd'.repeat(8)));
     for (let attempt = 0; attempt < 4; attempt += 1) {
       const child = await startChildServer(pipePath, 'process.exit(0);');
       const run = await runAttestor([pipePath]);
       expect(run.code, `attempt ${String(attempt)}: ${run.stderr}`).not.toBe(0);
       expect(run.stdout).toBe('');
-      expect(run.stderr.trim()).toMatch(
-        /^(ERR_CONNECT|ERR_SERVER_PID|ERR_OPEN_PROCESS|ERR_PROC_TIMES|ERR_PID_REUSE|ERR_HELLO_PREFIX|ERR_HELLO_BODY)$/,
-      );
+      expect(run.stderr.trim()).toMatch(/^(ERR_CONNECT|ERR_HELLO_PREFIX)$/);
       child.kill('SIGKILL');
       await delay(20);
     }
@@ -1155,9 +1168,15 @@ describe.skipIf(!nativeReady)('DDR-D062-D — the REAL native attestor (Windows,
   it('8/9b. a server exiting right after its hello either attests completely or not at all', async () => {
     // Here the exit races the attestation, so BOTH outcomes are legitimate. What
     // must never happen is a half-result: an exit 0 whose evidence does not parse,
-    // or any stdout at all on a failure. The pin is what makes that true — the SID
-    // and the hello are re-attributed to the same live process instance before the
+    // or any stdout at all on a failure. The SAME-HANDLE rule is what makes that
+    // true — the OWNER, the DACL and the hello all come from the one connected
+    // handle, and the evidence is built whole in a bounded buffer before the
     // single stdout write.
+    //
+    // Reachable stderr tokens add ERR_HELLO_BODY to the previous test's set: the
+    // server does write, so a flushed prefix with a truncated body is possible.
+    // ERR_HELLO_LENGTH stays unreachable — those four prefix bytes, if all
+    // readable, are the real body length, and a torn prefix is ERR_HELLO_PREFIX.
     const pipePath = pipePathFromName(pipeNameForRuntimeId('abce'.repeat(8)));
     const onConnection =
       "const body=Buffer.from(JSON.stringify({v:2,nonceS:'a'.repeat(43),verifyKey:'b'.repeat(43)}),'utf8');" +
@@ -1172,7 +1191,7 @@ describe.skipIf(!nativeReady)('DDR-D062-D — the REAL native attestor (Windows,
       } else {
         expect(run.stdout).toBe('');
         expect(run.stderr.trim()).toMatch(
-          /^(ERR_CONNECT|ERR_SERVER_PID|ERR_OPEN_PROCESS|ERR_PROC_TIMES|ERR_PID_REUSE|ERR_HELLO_PREFIX|ERR_HELLO_BODY)$/,
+          /^(ERR_CONNECT|ERR_HELLO_PREFIX|ERR_HELLO_BODY)$/,
         );
       }
       child.kill('SIGKILL');

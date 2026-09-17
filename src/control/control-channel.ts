@@ -32,12 +32,17 @@
  * The hello announces this runtime's raw Ed25519 `verifyKey`. That announcement
  * carries no authority by itself — anyone can announce a key. It becomes
  * trustworthy only when the native pipe attestor relays it out of a hello read
- * from a pipe whose SERVER PROCESS it proved belongs to the trusted operator
- * SID; the CLI then requires the command session's hello to announce the very
- * same key bytes. The result is signed with the runtime's EPHEMERAL private key,
- * which exists only in this process's memory and is never serialized, so a party
- * holding nothing but a copied descriptor cannot answer a client even after the
- * genuine runtime has exited and its pipe name has been freed.
+ * from the SAME GENERIC_READ-only connected handle whose kernel PIPE OBJECT it
+ * read the OWNER and DACL from, and the CLI has accepted both: the owner equals
+ * the trusted operator SID (`PIPE_OWNER_MISMATCH` otherwise) and the DACL is
+ * exactly the protected single-ACE operator-only descriptor with mask 0x12019F
+ * (`PIPE_DACL_UNEXPECTED` otherwise). No PID or process object is consulted and
+ * no SDDL string is compared. The CLI then requires the command session's hello
+ * to announce the very same key bytes. The result is signed with the runtime's
+ * EPHEMERAL private key, which exists only in this process's memory and is never
+ * serialized, so a party holding nothing but a copied descriptor cannot answer a
+ * client even after the genuine runtime has exited and its pipe name has been
+ * freed.
  *
  * ## Transport access boundary (DDR-D062-C, Revision 2)
  *
