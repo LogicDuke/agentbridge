@@ -157,3 +157,113 @@ export function readStartupWorkflowConfig(
 
   return binding;
 }
+
+/**
+ * Environment variable names that make up the Autoflow Job #1 contract
+ * (Decision 065 Revision 2).
+ *
+ * Every value is **operator-supplied and exact**. Nothing here is discovered,
+ * generated, defaulted, or widened: the candidate identity is immutable and fixed
+ * at boot (Decision 065 §2), so there is no variable that lets the runtime choose
+ * a candidate, and no variable that carries a token, a credential, or a URL.
+ */
+export const JOB1_ENV = Object.freeze({
+  /** Presence-and-exact-value trigger. Exactly `"1"` enables Job #1. */
+  ENABLED: 'AGENTBRIDGE_JOB1_ENABLED',
+  /** The immutable candidate ref, e.g. `refs/heads/repair/foo`. */
+  CANDIDATE_REF: 'AGENTBRIDGE_JOB1_CANDIDATE_REF',
+  /** The immutable candidate SHA. 40 lowercase hex. */
+  CANDIDATE_SHA: 'AGENTBRIDGE_JOB1_CANDIDATE_SHA',
+  /** The configured authoritative main SHA. */
+  MAIN_SHA: 'AGENTBRIDGE_JOB1_AUTHORITATIVE_MAIN_SHA',
+  /** Absolute path to the managed repository. */
+  REPOSITORY_PATH: 'AGENTBRIDGE_JOB1_REPOSITORY_PATH',
+  /** Absolute runtime root, used as the observer child's `HOME`. */
+  RUNTIME_ROOT: 'AGENTBRIDGE_JOB1_RUNTIME_ROOT',
+  /** Path to the PRE-RUN gate's governance run manifest document. */
+  MANIFEST_PATH: 'AGENTBRIDGE_JOB1_MANIFEST_PATH',
+  /** The manifest digest, supplied out of band from the document itself. */
+  MANIFEST_SHA256: 'AGENTBRIDGE_JOB1_MANIFEST_SHA256',
+  /** Externally supplied assessment timestamp. Observation data, not a clock read. */
+  GENERATED_AT: 'AGENTBRIDGE_JOB1_GENERATED_AT',
+} as const);
+
+/**
+ * The bounded Job #1 startup configuration, or `null` when Job #1 is not
+ * requested.
+ *
+ * `owner`/`repo` are split from the runtime repository identity rather than
+ * configured separately, so one snapshot can never describe two repositories and
+ * there is no variable through which a caller could point the GitHub path at a
+ * different repository than the one being observed.
+ */
+export interface Job1Config {
+  readonly owner: string;
+  readonly repo: string;
+  readonly candidateRef: string;
+  readonly candidateSha: string;
+  readonly authoritativeMainSha: string;
+  readonly repositoryPath: string;
+  readonly runtimeRoot: string;
+  readonly manifestPath: string;
+  readonly manifestDigest: string;
+  readonly generatedAt: string;
+}
+
+/**
+ * Read the bounded Job #1 startup configuration.
+ *
+ * **Fail-closed, exactly as the workflow-open seam is:**
+ *
+ * - `AGENTBRIDGE_JOB1_ENABLED` absent → Job #1 not requested (`null`);
+ * - present and not exactly `"1"` → throws; startup fails closed;
+ * - enabled with any required variable missing or blank → throws;
+ * - a `repositoryId` that is not exactly `owner/repo` → throws.
+ *
+ * There is deliberately no trimming, case-folding, or truthy parsing of the
+ * trigger, and no default for any required value. Field-*content* validity
+ * beyond non-blankness is not re-judged here: the observer validates the ref and
+ * SHAs against their exact readers, and an invalid value makes its fact
+ * indeterminate — hence `BLOCKED` — rather than being silently corrected.
+ *
+ * @param env The process-scoped environment (typically `process.env`).
+ * @param runtimeRepositoryId The already-validated runtime repository identity.
+ * @throws Error when the request is enabled but incomplete or inconsistent.
+ */
+export function readJob1Config(env: StartupEnv, runtimeRepositoryId: string): Job1Config | null {
+  const raw = env[JOB1_ENV.ENABLED];
+  if (raw === undefined) {
+    return null;
+  }
+  if (raw !== '1') {
+    throw new Error(`Job #1 config invalid: ${JOB1_ENV.ENABLED} must be exactly "1" when set.`);
+  }
+
+  const required = (name: string): string => {
+    const value = env[name];
+    if (value === undefined || value.trim().length === 0) {
+      throw new Error(`Job #1 config invalid: ${name} is required when Job #1 is enabled.`);
+    }
+    return value;
+  };
+
+  const slash = runtimeRepositoryId.indexOf('/');
+  if (slash <= 0 || slash !== runtimeRepositoryId.lastIndexOf('/') || slash === runtimeRepositoryId.length - 1) {
+    throw new Error(
+      'Job #1 config invalid: the runtime repository identity must be exactly "owner/repo".',
+    );
+  }
+
+  return {
+    owner: runtimeRepositoryId.slice(0, slash),
+    repo: runtimeRepositoryId.slice(slash + 1),
+    candidateRef: required(JOB1_ENV.CANDIDATE_REF),
+    candidateSha: required(JOB1_ENV.CANDIDATE_SHA),
+    authoritativeMainSha: required(JOB1_ENV.MAIN_SHA),
+    repositoryPath: required(JOB1_ENV.REPOSITORY_PATH),
+    runtimeRoot: required(JOB1_ENV.RUNTIME_ROOT),
+    manifestPath: required(JOB1_ENV.MANIFEST_PATH),
+    manifestDigest: required(JOB1_ENV.MANIFEST_SHA256),
+    generatedAt: required(JOB1_ENV.GENERATED_AT),
+  };
+}

@@ -78,6 +78,11 @@ import {
   type ReviewFindingStatus,
   type ReviewSeverity,
 } from '../domain/review.js';
+import {
+  readRetirementAssessment,
+  RETIREMENT_BOUNDS,
+  type RetirementAssessmentEnvelope,
+} from '../domain/retirement-assessment.js';
 import type { WorkflowState } from '../domain/workflow.js';
 import { readWorkflowState } from '../domain/workflow-transitions.js';
 
@@ -184,20 +189,28 @@ export const COCKPIT_BOUNDS = objectFreeze({
   MAX_FINDINGS: 1_000,
   /** Entries permitted in `repairJobs`. Oversize rejects the snapshot. */
   MAX_REPAIR_JOBS: 500,
+  /**
+   * Entries permitted in `retirementAssessments` (schema v3). Matches the
+   * domain's `RETIREMENT_BOUNDS.MAX_ASSESSMENTS` — a snapshot re-presents
+   * admitted assessments and must not need a smaller universe than the kernel
+   * admits. A test pins the equality.
+   */
+  MAX_RETIREMENT_ASSESSMENTS: RETIREMENT_BOUNDS.MAX_ASSESSMENTS,
 } as const);
 
 /**
  * The one schema version D1 defines. A snapshot carrying any other value is
  * rejected whole: a reader must never guess at a future shape.
  *
- * Version 2 adds the required `autoflow` field (a serialized PR 007
- * `WorkflowState`, or `null`). The reader accepts version 2 **only**: no durable
- * version-1 snapshot exists to migrate — the sole version-1 producer was fixture
- * code — so a second accepted shape would guard nothing, and every non-2 value
- * (including 1) is rejected whole, as this boundary already rejected every value
- * but its one supported version.
+ * Version 2 added the required `autoflow` field (a serialized PR 007
+ * `WorkflowState`, or `null`). Version 3 adds the required, bounded
+ * `retirementAssessments` list (Decision 065). The reader accepts version 3
+ * **only**: no durable older snapshot exists to migrate — every producer is
+ * in-tree and moves with this constant — so a second accepted shape would guard
+ * nothing, and every non-3 value (including 1 and 2) is rejected whole, exactly
+ * as this boundary has always rejected every value but its one supported version.
  */
-export const COCKPIT_SNAPSHOT_SCHEMA_VERSION = 2;
+export const COCKPIT_SNAPSHOT_SCHEMA_VERSION = 3;
 
 export type CockpitSnapshotSchemaVersion = typeof COCKPIT_SNAPSHOT_SCHEMA_VERSION;
 
@@ -404,6 +417,12 @@ export interface CockpitRepairJobReadModel {
  * deeply-frozen state, or `null` when no workflow was observed. It is display
  * input only: authority over a workflow stays entirely in the Autoflow engine,
  * and nothing reads this field back into a transition.
+ *
+ * `retirementAssessments` (schema v3, Decision 065) is a **required, bounded**
+ * list of already-verified Job #1 assessment envelopes, re-read here through the
+ * domain's own hostile reader and cross-checked against this snapshot's
+ * repository identity. It is display input only. An assessment classified
+ * `RETIRE_ELIGIBLE` is an observation, never deletion authority.
  */
 export interface CockpitSnapshot {
   readonly schemaVersion: CockpitSnapshotSchemaVersion;
@@ -414,6 +433,7 @@ export interface CockpitSnapshot {
   readonly findings: readonly CockpitFindingReadModel[];
   readonly repairJobs: readonly CockpitRepairJobReadModel[];
   readonly autoflow: WorkflowState | null;
+  readonly retirementAssessments: readonly RetirementAssessmentEnvelope[];
 }
 
 /**
@@ -432,6 +452,7 @@ export const COCKPIT_SNAPSHOT_FIELD_ORDER: readonly string[] = objectFreeze([
   'findings',
   'repairJobs',
   'autoflow',
+  'retirementAssessments',
 ]);
 
 /** The outcome of reading a snapshot exactly once. */
@@ -817,6 +838,35 @@ export function readCockpitSnapshot(value: unknown): CockpitSnapshotReadResult {
     }
   }
 
+  // Retirement assessments (schema v3, Decision 065): a **required** bounded
+  // list, all-or-nothing, read through the domain's own hostile envelope reader.
+  // An empty list is the ordinary "no assessment observed" case; an absent,
+  // inherited, unreadable, oversized, or malformed list rejects the whole
+  // snapshot rather than folding to a legitimate empty one.
+  //
+  // Integrity step I4 begins here. D1 enforces two things and no more: the
+  // evidence-id **format** (`readRetirementAssessment` requires
+  // `sha256:` + 64 hex) and the **repository binding** — an envelope whose
+  // `body.repositoryId` is not this snapshot's already-captured, trusted
+  // repository identity is rejected, because one snapshot describes exactly one
+  // repository. D1 deliberately does **not** re-digest: the digest is a runtime
+  // concern (Decision 065, integrity step 3), the store already re-proved the
+  // binding on the read that produced this list (I3), and D4 performs the
+  // remaining pointer/`candidateSha` cross-check before projecting. A reader that
+  // re-hashed here would be a second integrity authority that could disagree with
+  // the store's.
+  const retirementAssessments = readCockpitList(
+    readOwnProperty(record, 'retirementAssessments'),
+    COCKPIT_BOUNDS.MAX_RETIREMENT_ASSESSMENTS,
+    (element: unknown): RetirementAssessmentEnvelope | null => {
+      const envelope = readRetirementAssessment(element);
+      if (envelope === null || envelope.body.repositoryId !== repositoryId) {
+        return null;
+      }
+      return envelope;
+    },
+  );
+
   const invalidFields: string[] = [];
   if (!schemaVersionValid) {
     append(invalidFields, 'schemaVersion');
@@ -851,6 +901,9 @@ export function readCockpitSnapshot(value: unknown): CockpitSnapshotReadResult {
   if (!autoflowValid) {
     append(invalidFields, 'autoflow');
   }
+  if (retirementAssessments === null) {
+    append(invalidFields, 'retirementAssessments');
+  }
 
   if (invalidFields.length > 0) {
     return objectFreeze({ snapshot: null, invalidFields: objectFreeze(invalidFields) });
@@ -866,7 +919,8 @@ export function readCockpitSnapshot(value: unknown): CockpitSnapshotReadResult {
     pullRequests === null ||
     evidence === null ||
     findings === null ||
-    repairJobs === null
+    repairJobs === null ||
+    retirementAssessments === null
   ) {
     return ALL_COCKPIT_FIELDS_INVALID;
   }
@@ -885,6 +939,7 @@ export function readCockpitSnapshot(value: unknown): CockpitSnapshotReadResult {
       findings,
       repairJobs,
       autoflow,
+      retirementAssessments,
     }),
     invalidFields: objectFreeze([] as string[]),
   });

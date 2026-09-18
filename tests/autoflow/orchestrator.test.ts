@@ -72,11 +72,22 @@ describe('AutoflowOrchestrator single-writer boundary', () => {
     expect(reader['apply']).toBeUndefined();
   });
 
-  it('the orchestrator public method surface carries exactly open, openHumanGate and reader', () => {
+  it('the orchestrator public method surface carries exactly the two event origins, open and reader', () => {
     const proto = Object.getPrototypeOf(new AutoflowOrchestrator(new AutoflowRuntime())) as object;
     const methods = Object.getOwnPropertyNames(proto).filter((n) => n !== 'constructor');
-    // Structurally narrow: a startup human-gate verb, but NO generic apply(event).
-    expect(methods.sort()).toEqual(['open', 'openHumanGate', 'reader']);
+    // Structurally narrow. Production may originate exactly two of the domain's
+    // seven event kinds, through one named verb each:
+    //   - `openHumanGate`      -> HUMAN_GATE_OPENED   (Decision 061)
+    //   - `admitRetirementAssessment` -> EVIDENCE_ADMITTED (Decision 065)
+    // plus the startup `open` and the read-only `reader`. There is still NO
+    // generic `apply(event)`: adding one would put terminal `CLOSE_REQUESTED`
+    // and the four unsourced kinds a single argument away.
+    expect(methods.sort()).toEqual([
+      'admitRetirementAssessment',
+      'open',
+      'openHumanGate',
+      'reader',
+    ]);
     expect(methods).not.toContain('apply');
   });
 });

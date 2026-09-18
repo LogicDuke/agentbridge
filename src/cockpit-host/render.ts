@@ -26,6 +26,8 @@ import type {
   CockpitRepairJobReadModel,
   CockpitSnapshot,
 } from '../cockpit/index.js';
+import { projectCockpitRetirementAssessments } from '../cockpit/autoflow-projection.js';
+import type { CockpitRetirementProjection } from '../cockpit/index.js';
 import { escapeHtml } from './escape.js';
 
 /** Escape a required string for text/attribute output. */
@@ -169,6 +171,103 @@ function autoflowSection(autoflow: CockpitAutoflowProjection | null): string {
       <div class="count"><b>${num(counts.reviewAdmissions)}</b><span>review admissions</span></div>
     </div>
     ${autoflowInvocations(autoflow)}
+  </section>`;
+}
+
+/**
+ * The Job #1 retirement-assessment sub-panel (Decision 065; Amendment 1 B-6).
+ *
+ * The sub-projection is a **pure D4 function invoked from the renderer** with the
+ * D1-validated list — `src/cockpit-host/server.ts` is frozen and its call sites
+ * are not edited, so the derivation happens here rather than in the host.
+ *
+ * Three honest states, and no fourth. Every value is echoed verbatim from the
+ * digest-bound body and escaped. There is no control, no button, no form, and no
+ * authority wording: the panel describes what was observed and says plainly that
+ * it authorizes nothing.
+ */
+function retirementSection(projection: CockpitRetirementProjection): string {
+  const heading = `<h2>Retirement assessment <span class="section-cat cat cat-orchestration">Job #1 observation</span></h2>`;
+
+  // State 3: nothing admitted at this revision.
+  if (projection.assessment === null && !projection.integrityFailure) {
+    return `
+  <section>
+    ${heading}
+    <p class="empty">No assessment observed.</p>
+    <p>
+      No Job #1 retirement assessment was admitted at the current workflow
+      revision. This panel deliberately shows no classification, fact, or reason
+      unless one is projected: those would be manufactured, not observed.
+    </p>
+  </section>`;
+  }
+
+  // State 2: a pointer exists, but no verified body backs it. The classification
+  // is withheld — an integrity failure is never reinterpreted as one.
+  if (projection.assessment === null) {
+    return `
+  <section>
+    ${heading}
+    <p class="empty">No verified assessment (integrity failure recorded)</p>
+    <dl class="kv">
+      <dt>Admitted evidence pointer</dt><dd class="mono">${optional(projection.pointerId)}</dd>
+    </dl>
+    <p>
+      An assessment pointer was admitted, but its body did not re-digest to that
+      pointer. The classification and facts are withheld: an integrity failure is
+      never reinterpreted as a classification. Workflow state is unchanged, and an
+      already-open human gate gains no authority from this.
+    </p>
+  </section>`;
+  }
+
+  const assessment = projection.assessment;
+  const reasons =
+    assessment.reasonCodes.length === 0
+      ? '<span class="empty">none</span>'
+      : assessment.reasonCodes.map((reason) => `<span class="tag">${text(reason)}</span>`).join(' ');
+  const factRows = assessment.facts
+    .map(
+      (fact) => `
+      <tr>
+        <td class="mono">${text(fact.key)}</td>
+        <td><span class="tag">${fact.determinate ? 'determinate' : 'indeterminate'}</span></td>
+        <td class="mono">${optional(fact.value)}</td>
+      </tr>`,
+    )
+    .join('');
+
+  return `
+  <section>
+    ${heading}
+    <p class="empty">Projected verbatim from one digest-bound assessment body. Observation only — never authority, deletion permission, or a next action.</p>
+    <dl class="kv">
+      <dt>Classification</dt><dd><span class="tag">${text(assessment.classification)}</span></dd>
+      <dt>Candidate ref</dt><dd class="mono">${text(assessment.candidateRef)}</dd>
+      <dt>Candidate SHA</dt><dd class="mono">${text(assessment.candidateSha)}</dd>
+      <dt>Authoritative main SHA</dt><dd class="mono">${text(assessment.authoritativeMainSha)}</dd>
+      <dt>Evidence pointer</dt><dd class="mono">${text(assessment.evidenceId)}</dd>
+      <dt>Governance manifest digest</dt><dd class="mono">${text(assessment.manifestDigest)}</dd>
+      <dt>Generated at</dt><dd class="mono">${text(assessment.generatedAt)}</dd>
+      <dt>Observer</dt><dd class="mono">${text(assessment.observerVersion)}</dd>
+      <dt>Human gate requested</dt><dd>${assessment.gateRequested ? 'yes' : 'no'}</dd>
+      <dt>Reason codes</dt><dd>${reasons}</dd>
+    </dl>
+    <table>
+      <thead><tr><th>Fact</th><th>Determinacy</th><th>Value</th></tr></thead>
+      <tbody>${factRows}</tbody>
+    </table>
+    <p>
+      ${
+        assessment.gateRequested
+          ? `A human gate was requested. RETIRE_ELIGIBLE is an observation, not deletion
+             authority, and opening the gate grants no mutation authority: retirement
+             remains a separate authorized sequence performed by a human.`
+          : `Assessment complete, no human gate open, Job #1 stopped. No further
+             production transition follows, and no mutation is authorized.`
+      }
+    </p>
   </section>`;
 }
 
@@ -443,6 +542,7 @@ export function renderDashboard(
   ${findingsSection(snapshot.findings)}
   ${repairJobsSection(snapshot.repairJobs)}
   ${autoflowSection(autoflow)}
+  ${retirementSection(projectCockpitRetirementAssessments(snapshot.retirementAssessments, snapshot.autoflow))}
   ${legendSection()}
   <footer>
     AgentBridge Cockpit D3 · ${text(copy.footerNote)} · read-only ·

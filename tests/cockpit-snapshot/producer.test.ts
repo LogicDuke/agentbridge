@@ -45,7 +45,7 @@ describe('produceCockpitSnapshot → D1 acceptance', () => {
     const read = readCockpitSnapshot(produceCockpitSnapshot(observation()));
     expect(read.invalidFields).toEqual([]);
     expect(read.snapshot).not.toBeNull();
-    expect(read.snapshot?.schemaVersion).toBe(2);
+    expect(read.snapshot?.schemaVersion).toBe(3);
   });
 
   it('2. the observed repositoryId binds the reconstructed workflow exactly', () => {
@@ -134,11 +134,20 @@ describe('producer grants no authority and owns no validation', () => {
     'utf8',
   );
 
-  it('imports only the Cockpit barrel and the domain workflow type — no transition module', () => {
+  it('imports only the Cockpit barrel and two domain types — no transition module', () => {
     const specifiers = [...producerText.matchAll(/from\s+'([^']+)'/g)].map((match) => match[1]);
     expect(specifiers.length).toBeGreaterThan(0);
     for (const specifier of specifiers) {
-      expect(['../cockpit/index.js', '../domain/workflow.js']).toContain(specifier);
+      // `retirement-assessment.js` supplies the envelope **type** the producer
+      // echoes under Decision 065 Amendment 1 B-2. It is a type-only import: the
+      // producer calls nothing from that module, and the architecture test in
+      // tests/runtime/retirement-architecture.test.ts pins that it reaches
+      // neither the classifier, the canonicalizer, nor any digest.
+      expect([
+        '../cockpit/index.js',
+        '../domain/workflow.js',
+        '../domain/retirement-assessment.js',
+      ]).toContain(specifier);
     }
     // Neither the transitions module nor the domain barrel (which re-exports the
     // transition entry points) is reachable from here.

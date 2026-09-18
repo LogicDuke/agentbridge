@@ -46,6 +46,7 @@ import type {
   CockpitPullRequestObservation,
   CockpitRepairJobReadModel,
 } from '../cockpit/index.js';
+import type { RetirementAssessmentEnvelope } from '../domain/retirement-assessment.js';
 import type { WorkflowState } from '../domain/workflow.js';
 
 /**
@@ -78,6 +79,19 @@ export interface CockpitObservation {
    * crosses into the Cockpit.
    */
   readonly autoflow: WorkflowState | null;
+  /**
+   * The already-verified Job #1 retirement-assessment envelopes, supplied by the
+   * composition root from the assessment store's verified read (Decision 065
+   * Amendment 1 B-2).
+   *
+   * They arrive here as **data**, already verified. The producer does not — and
+   * structurally cannot — classify, canonicalize, hash, verify an `evidenceId`,
+   * read the store, or hold a store handle (Amendment 1 B-4): this is a plain
+   * value on an input record, not a capability. Like the four lists above it is
+   * optional and defaults to empty **only when absent**, so a malformed runtime
+   * value still reaches D1 to be rejected.
+   */
+  readonly retirementAssessments?: readonly RetirementAssessmentEnvelope[];
 }
 
 /**
@@ -99,7 +113,7 @@ function defaultOptionalList<T>(value: readonly T[] | undefined): readonly T[] {
 }
 
 /**
- * Produce a serialized, JSON-shaped schema-v2 Cockpit snapshot from one
+ * Produce a serialized, JSON-shaped schema-v3 Cockpit snapshot from one
  * authoritative observation.
  *
  * Pure, deterministic, synchronous, side-effect free, and non-mutating. The
@@ -131,6 +145,11 @@ export function produceCockpitSnapshot(observation: CockpitObservation): unknown
     findings: defaultOptionalList(observation.findings),
     repairJobs: defaultOptionalList(observation.repairJobs),
     autoflow: observation.autoflow,
+    // Echo only (Amendment 1 B-3): the verified list is serialized unchanged into
+    // the single D1 schema-v3 field Decision 065 requires. No element is
+    // inspected, reordered, filtered, re-digested, or defaulted beyond the
+    // absent-list rule the four existing lists already use.
+    retirementAssessments: defaultOptionalList(observation.retirementAssessments),
   };
 
   // Serialization firewall: one JSON round-trip guarantees the returned value is

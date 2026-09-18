@@ -87,9 +87,9 @@ function raw(
   return snapshot;
 }
 
-describe('D1 strict schema-v2 / autoflow compatibility matrix', () => {
-  it('the reader defines version 2', () => {
-    expect(COCKPIT_SNAPSHOT_SCHEMA_VERSION).toBe(2);
+describe('D1 strict schema-v3 / autoflow compatibility matrix', () => {
+  it('the reader defines version 3', () => {
+    expect(COCKPIT_SNAPSHOT_SCHEMA_VERSION).toBe(3);
   });
 
   // Cases 1–4: version 1 is unsupported, whatever autoflow carries.
@@ -114,22 +114,22 @@ describe('D1 strict schema-v2 / autoflow compatibility matrix', () => {
     expect(r.invalidFields).toContain('schemaVersion');
   });
 
-  // Cases 5–8: version 2 discriminates absent / null / valid / malformed.
-  it('5. v2 + autoflow absent → REJECT (autoflow), distinct from null', () => {
-    const r = readCockpitSnapshot(raw(2, 'absent'));
+  // Cases 5–8: the supported version discriminates absent / null / valid / malformed.
+  it('5. v3 + autoflow absent → REJECT (autoflow), distinct from null', () => {
+    const r = readCockpitSnapshot(raw(COCKPIT_SNAPSHOT_SCHEMA_VERSION, 'absent'));
     expect(r.snapshot).toBeNull();
     expect(r.invalidFields).toContain('autoflow');
     expect(r.invalidFields).not.toContain('schemaVersion');
   });
-  it('6. v2 + autoflow null → ACCEPT with trusted null', () => {
-    const r = readCockpitSnapshot(raw(2, { value: null }));
+  it('6. v3 + autoflow null → ACCEPT with trusted null', () => {
+    const r = readCockpitSnapshot(raw(COCKPIT_SNAPSHOT_SCHEMA_VERSION, { value: null }));
     expect(r.invalidFields).toEqual([]);
     expect(r.snapshot).not.toBeNull();
     expect(r.snapshot?.autoflow).toBeNull();
   });
-  it('7. v2 + autoflow valid → ACCEPT with a trusted, frozen, detached WorkflowState', () => {
+  it('7. v3 + autoflow valid → ACCEPT with a trusted, frozen, detached WorkflowState', () => {
     const input = validAutoflow();
-    const r = readCockpitSnapshot(raw(2, { value: input }));
+    const r = readCockpitSnapshot(raw(COCKPIT_SNAPSHOT_SCHEMA_VERSION, { value: input }));
     expect(r.invalidFields).toEqual([]);
     const state = r.snapshot?.autoflow ?? null;
     expect(state).not.toBeNull();
@@ -146,8 +146,8 @@ describe('D1 strict schema-v2 / autoflow compatibility matrix', () => {
     expect(projection.workflowId).toBe('wf-1');
     expect(projection.counts.invocationsTotal).toBe(1);
   });
-  it('8. v2 + autoflow malformed → REJECT (autoflow), whole snapshot', () => {
-    const r = readCockpitSnapshot(raw(2, { value: malformedAutoflow() }));
+  it('8. v3 + autoflow malformed → REJECT (autoflow), whole snapshot', () => {
+    const r = readCockpitSnapshot(raw(COCKPIT_SNAPSHOT_SCHEMA_VERSION, { value: malformedAutoflow() }));
     expect(r.snapshot).toBeNull();
     expect(r.invalidFields).toContain('autoflow');
   });
@@ -156,8 +156,9 @@ describe('D1 strict schema-v2 / autoflow compatibility matrix', () => {
   it('9. v0 → REJECT', () => {
     expect(readCockpitSnapshot(raw(0, { value: null })).snapshot).toBeNull();
   });
-  it('10. v3 → REJECT', () => {
-    expect(readCockpitSnapshot(raw(3, { value: null })).snapshot).toBeNull();
+  it('10. v2 (the previous version) and v4 → REJECT', () => {
+    expect(readCockpitSnapshot(raw(2, { value: null })).snapshot).toBeNull();
+    expect(readCockpitSnapshot(raw(4, { value: null })).snapshot).toBeNull();
   });
   it('11. non-integer schemaVersion → REJECT', () => {
     expect(readCockpitSnapshot(raw(1.5, { value: null })).snapshot).toBeNull();
@@ -185,7 +186,7 @@ describe('D1 autoflow determinism and round trip', () => {
   });
 
   it('a populated-autoflow snapshot survives a plain-JSON round trip', () => {
-    const first = readCockpitSnapshot(raw(2, { value: validAutoflow() })).snapshot;
+    const first = readCockpitSnapshot(raw(COCKPIT_SNAPSHOT_SCHEMA_VERSION, { value: validAutoflow() })).snapshot;
     expect(first).not.toBeNull();
     const revived: unknown = JSON.parse(JSON.stringify(first));
     const second = readCockpitSnapshot(revived);
@@ -226,7 +227,7 @@ describe('D1 snapshot serialization is safe with a non-null autoflow (PR74-F1)',
   }
 
   it('serializing a snapshot whose autoflow was ingested under a poisoned toJSON is safe', () => {
-    const read = readCockpitSnapshot(raw(2, { value: autoflowPoisoningDuringRead() }));
+    const read = readCockpitSnapshot(raw(COCKPIT_SNAPSHOT_SCHEMA_VERSION, { value: autoflowPoisoningDuringRead() }));
     expect(read.snapshot).not.toBeNull();
     expect(read.snapshot?.autoflow).not.toBeNull();
     // The poison is live; serializing the D1 snapshot must not execute it.
@@ -249,12 +250,12 @@ describe('D1 autoflow repository-binding invariant (PR74-F2)', () => {
   // envelope identity already captured while reading `repository.repositoryId`.
 
   it('1. repository=A + autoflow.repositoryId=B → whole snapshot REJECT', () => {
-    const r = readCockpitSnapshot(raw(2, { value: validAutoflow(REPO_B) }));
+    const r = readCockpitSnapshot(raw(COCKPIT_SNAPSHOT_SCHEMA_VERSION, { value: validAutoflow(REPO_B) }));
     expect(r.snapshot).toBeNull();
   });
 
   it('2. the mismatch flags exactly `autoflow`, leaving the valid envelope repository untouched', () => {
-    const r = readCockpitSnapshot(raw(2, { value: validAutoflow(REPO_B) }));
+    const r = readCockpitSnapshot(raw(COCKPIT_SNAPSHOT_SCHEMA_VERSION, { value: validAutoflow(REPO_B) }));
     expect(r.invalidFields).toContain('autoflow');
     // The envelope's own repository identity is valid: the cross-field check adds
     // no second repository source of truth and does not corrupt envelope reads.
@@ -263,7 +264,7 @@ describe('D1 autoflow repository-binding invariant (PR74-F2)', () => {
   });
 
   it('3. repository=A + autoflow.repositoryId=A → ACCEPT (matching binds)', () => {
-    const r = readCockpitSnapshot(raw(2, { value: validAutoflow(REPO_A) }));
+    const r = readCockpitSnapshot(raw(COCKPIT_SNAPSHOT_SCHEMA_VERSION, { value: validAutoflow(REPO_A) }));
     expect(r.invalidFields).toEqual([]);
     expect(r.snapshot).not.toBeNull();
     expect(r.snapshot?.repository.repositoryId).toBe(REPO_A);
@@ -271,20 +272,20 @@ describe('D1 autoflow repository-binding invariant (PR74-F2)', () => {
   });
 
   it('4. null autoflow still ACCEPTs under the binding check (null semantics unchanged)', () => {
-    const r = readCockpitSnapshot(raw(2, { value: null }));
+    const r = readCockpitSnapshot(raw(COCKPIT_SNAPSHOT_SCHEMA_VERSION, { value: null }));
     expect(r.invalidFields).toEqual([]);
     expect(r.snapshot).not.toBeNull();
     expect(r.snapshot?.autoflow).toBeNull();
   });
 
   it('5. malformed autoflow still REJECTs as `autoflow` (malformed semantics unchanged)', () => {
-    const r = readCockpitSnapshot(raw(2, { value: malformedAutoflow() }));
+    const r = readCockpitSnapshot(raw(COCKPIT_SNAPSHOT_SCHEMA_VERSION, { value: malformedAutoflow() }));
     expect(r.snapshot).toBeNull();
     expect(r.invalidFields).toContain('autoflow');
   });
 
   it('6. a matching-autoflow snapshot survives a plain-JSON round trip unchanged', () => {
-    const first = readCockpitSnapshot(raw(2, { value: validAutoflow(REPO_A) })).snapshot;
+    const first = readCockpitSnapshot(raw(COCKPIT_SNAPSHOT_SCHEMA_VERSION, { value: validAutoflow(REPO_A) })).snapshot;
     expect(first).not.toBeNull();
     const revived: unknown = JSON.parse(JSON.stringify(first));
     const second = readCockpitSnapshot(revived);
@@ -295,13 +296,13 @@ describe('D1 autoflow repository-binding invariant (PR74-F2)', () => {
   it('7. neither the workflow nor the envelope repositoryId is mutated or coerced', () => {
     // Mismatch: the foreign input keeps its own id; nothing is rewritten to A.
     const foreign = validAutoflow(REPO_B);
-    readCockpitSnapshot(raw(2, { value: foreign }));
+    readCockpitSnapshot(raw(COCKPIT_SNAPSHOT_SCHEMA_VERSION, { value: foreign }));
     expect(foreign.repositoryId).toBe(REPO_B);
 
     // Match: the reconstructed state reports A because the input already said A,
     // not because the envelope id was injected over some other value.
     const owned = validAutoflow(REPO_A);
-    const r = readCockpitSnapshot(raw(2, { value: owned }));
+    const r = readCockpitSnapshot(raw(COCKPIT_SNAPSHOT_SCHEMA_VERSION, { value: owned }));
     expect(owned.repositoryId).toBe(REPO_A);
     expect(r.snapshot?.autoflow?.repositoryId).toBe(REPO_A);
     expect(r.snapshot?.repository.repositoryId).toBe(REPO_A);

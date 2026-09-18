@@ -25,7 +25,7 @@ const HEAD_SHA = 'c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00';
 const OLD_SHA = 'dead0000dead0000dead0000dead0000dead0000';
 
 export const STAGE_A_FIXTURE: unknown = {
-  schemaVersion: 2,
+  schemaVersion: 3,
   repository: {
     repositoryId: 'LogicDuke/agentbridge',
     observedHeadSha: HEAD_SHA,
@@ -210,4 +210,11 @@ export const STAGE_A_FIXTURE: unknown = {
     evidence: [],
     reviews: [],
   },
+  // Schema v3 (Decision 065). The Stage-A fixture observes **no** Job #1
+  // assessment: the fixture's workflow admitted no evidence, so there is no
+  // pointer at its current revision and D4 has nothing to project. An empty list
+  // is the honest shape — inventing a fixture assessment would put a
+  // classification on the page that was never observed, which is exactly what the
+  // Autoflow panel's absence state exists to prevent.
+  retirementAssessments: [],
 };
