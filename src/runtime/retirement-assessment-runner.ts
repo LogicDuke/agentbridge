@@ -466,6 +466,7 @@ export async function runRetirementAssessment(
   const verification = verifyGovernanceRunManifest({
     manifestText,
     expectedDigest: config.manifestDigest,
+    candidateRef: config.candidateRef,
     candidateSha: config.candidateSha,
     authoritativeMainSha: config.authoritativeMainSha,
     bootEpochMs: config.bootEpochMs,

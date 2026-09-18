@@ -11,6 +11,7 @@ import {
   verifyGovernanceRunManifest,
 } from '../../src/runtime/retirement-manifest.js';
 
+const CANDIDATE_REF = 'refs/heads/repair/example';
 const CANDIDATE_SHA = 'a'.repeat(40);
 const MAIN_SHA = 'c'.repeat(40);
 const BOOT_MS = Date.UTC(2026, 8, 18, 12, 0, 0);
@@ -18,7 +19,7 @@ const GENERATED_AT = '2026-09-18T06:00:00.000Z';
 
 function manifestObject(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
-    candidateRef: 'refs/heads/repair/example',
+    candidateRef: CANDIDATE_REF,
     candidateSha: CANDIDATE_SHA,
     authoritativeMainSha: MAIN_SHA,
     generatedAt: GENERATED_AT,
@@ -66,12 +67,18 @@ function signed(overrides: Record<string, unknown> = {}): {
 
 function verify(
   overrides: Record<string, unknown> = {},
-  inputOverrides: Partial<{ text: string; digest: string; bootEpochMs: number }> = {},
+  inputOverrides: Partial<{
+    text: string;
+    digest: string;
+    bootEpochMs: number;
+    candidateRef: string;
+  }> = {},
 ): ReturnType<typeof verifyGovernanceRunManifest> {
   const base = signed(overrides);
   return verifyGovernanceRunManifest({
     manifestText: inputOverrides.text ?? base.text,
     expectedDigest: inputOverrides.digest ?? base.digest,
+    candidateRef: inputOverrides.candidateRef ?? CANDIDATE_REF,
     candidateSha: CANDIDATE_SHA,
     authoritativeMainSha: MAIN_SHA,
     bootEpochMs: inputOverrides.bootEpochMs ?? BOOT_MS,
@@ -160,6 +167,7 @@ describe('verifyGovernanceRunManifest — the verified path', () => {
     const result = verifyGovernanceRunManifest({
       manifestText: reordered,
       expectedDigest: base.digest,
+      candidateRef: CANDIDATE_REF,
       candidateSha: CANDIDATE_SHA,
       authoritativeMainSha: MAIN_SHA,
       bootEpochMs: BOOT_MS,
@@ -200,6 +208,7 @@ describe('verifyGovernanceRunManifest — every failure is indeterminate, never 
     const result = verifyGovernanceRunManifest({
       manifestText: JSON.stringify(mutated),
       expectedDigest: base.digest,
+      candidateRef: CANDIDATE_REF,
       candidateSha: CANDIDATE_SHA,
       authoritativeMainSha: MAIN_SHA,
       bootEpochMs: BOOT_MS,
@@ -212,6 +221,52 @@ describe('verifyGovernanceRunManifest — every failure is indeterminate, never 
     const result = verify({}, { digest: 'nope' });
     expect(result.failures).toContain(MANIFEST_FAILURE.EXPECTED_DIGEST_INVALID);
     expect(result.holdResult).toBeNull();
+  });
+
+  it('candidate REF mismatch — a manifest prepared for another ref is refused', () => {
+    // Decision 065 INVARIANT 2: candidate identity is the pair (ref, SHA), and
+    // drift is BLOCKED. A manifest whose candidateRef is not the configured one
+    // was prepared under the PRE-RUN gate for a different candidate.
+    const result = verify({}, { candidateRef: 'refs/heads/repair/somewhere-else' });
+    expect(result.failures).toContain(MANIFEST_FAILURE.CANDIDATE_REF_MISMATCH);
+    expect(result.holdResult).toBeNull();
+    expect(result.manifest).toBeNull();
+  });
+
+  it('REF ALIASING: two refs at one SHA cannot share a NO_HOLD manifest', () => {
+    // The finding, reproduced exactly. Branch A and branch B point at the same
+    // commit. A NO_HOLD manifest was prepared for A. Configured for B, every
+    // other check still passes — digest, SHA, main, window, sources — so the
+    // ref binding is the only thing standing between B and a governance answer
+    // that was never researched for B.
+    const forA = signed({ candidateRef: 'refs/heads/repair/branch-a' });
+
+    const reused = verifyGovernanceRunManifest({
+      manifestText: forA.text,
+      expectedDigest: forA.digest,
+      candidateRef: 'refs/heads/repair/branch-b',
+      candidateSha: CANDIDATE_SHA,
+      authoritativeMainSha: MAIN_SHA,
+      bootEpochMs: BOOT_MS,
+    });
+
+    // Refused, and F9 is indeterminate -> BLOCKED. Never NO_HOLD.
+    expect(reused.failures).toEqual([MANIFEST_FAILURE.CANDIDATE_REF_MISMATCH]);
+    expect(reused.holdResult).toBeNull();
+    expect(reused.holdResult).not.toBe(GOVERNANCE_HOLD.NO_HOLD);
+
+    // The same manifest still verifies for the ref it was actually prepared for,
+    // so the new check rejects only the aliasing case and nothing else.
+    const forItsOwnRef = verifyGovernanceRunManifest({
+      manifestText: forA.text,
+      expectedDigest: forA.digest,
+      candidateRef: 'refs/heads/repair/branch-a',
+      candidateSha: CANDIDATE_SHA,
+      authoritativeMainSha: MAIN_SHA,
+      bootEpochMs: BOOT_MS,
+    });
+    expect(forItsOwnRef.failures).toEqual([]);
+    expect(forItsOwnRef.holdResult).toBe(GOVERNANCE_HOLD.NO_HOLD);
   });
 
   it('candidate SHA drift', () => {
@@ -278,6 +333,7 @@ describe('verifyGovernanceRunManifest — every failure is indeterminate, never 
         verifyGovernanceRunManifest({
           manifestText: text,
           expectedDigest: 'nope',
+          candidateRef: CANDIDATE_REF,
           candidateSha: CANDIDATE_SHA,
           authoritativeMainSha: MAIN_SHA,
           bootEpochMs: BOOT_MS,

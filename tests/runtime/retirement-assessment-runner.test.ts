@@ -291,6 +291,29 @@ describe('observation failures are informative, not fatal', () => {
     expect(result.gateOpened).toBe(false);
   });
 
+  it('a manifest prepared for ANOTHER ref renders BLOCKED, never NO_HOLD', async () => {
+    // End-to-end form of the ref-aliasing finding: branch A and the configured
+    // candidate share a commit, and A's NO_HOLD manifest is supplied with its
+    // own correct digest. Every other freshness check passes; only the ref
+    // binding refuses it, so F9 is indeterminate and the run is BLOCKED.
+    scriptEligibleGit();
+    const forOtherRef = signedManifest({ candidateRef: 'refs/heads/repair/branch-a' });
+    const orchestrator = openOrchestrator();
+    const { result } = await runRetirementAssessment(
+      orchestrator,
+      baseConfig({ manifestText: forOtherRef.text, manifestDigest: forOtherRef.digest }),
+    );
+
+    expect(result.abort).toBeNull();
+    expect(result.admitted).toBe(true);
+    expect(result.envelope?.body.classification).toBe(RETIREMENT_CLASSIFICATION.BLOCKED);
+    expect(result.gateOpened).toBe(false);
+
+    // F9 is indeterminate, not NO_HOLD: the governance fact was never established.
+    const f9 = result.envelope?.body.facts['f9GovernanceManifest'];
+    expect(f9).toEqual({ determinate: false, value: null });
+  });
+
   it('a Git timeout renders BLOCKED, still admitted', async () => {
     scriptEligibleGit();
     gitScript.outcome = 'TIMED_OUT';

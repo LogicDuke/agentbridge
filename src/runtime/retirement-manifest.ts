@@ -209,6 +209,8 @@ export const MANIFEST_FAILURE = objectFreeze({
   EXPECTED_DIGEST_INVALID: 'EXPECTED_DIGEST_INVALID',
   /** The computed digest does not equal the out-of-band expected digest. */
   DIGEST_MISMATCH: 'DIGEST_MISMATCH',
+  /** The manifest's candidate ref is not the configured candidate ref. */
+  CANDIDATE_REF_MISMATCH: 'CANDIDATE_REF_MISMATCH',
   /** The manifest's candidate SHA is not the configured candidate SHA. */
   CANDIDATE_SHA_MISMATCH: 'CANDIDATE_SHA_MISMATCH',
   /** The manifest's authoritative main SHA is not the configured one. */
@@ -228,6 +230,7 @@ export const MANIFEST_FAILURES: readonly ManifestFailure[] = objectFreeze([
   MANIFEST_FAILURE.NOT_CANONICALIZABLE,
   MANIFEST_FAILURE.EXPECTED_DIGEST_INVALID,
   MANIFEST_FAILURE.DIGEST_MISMATCH,
+  MANIFEST_FAILURE.CANDIDATE_REF_MISMATCH,
   MANIFEST_FAILURE.CANDIDATE_SHA_MISMATCH,
   MANIFEST_FAILURE.MAIN_SHA_MISMATCH,
   MANIFEST_FAILURE.GENERATED_AT_OUT_OF_WINDOW,
@@ -463,6 +466,17 @@ export interface ManifestVerificationInput {
   readonly manifestText: string;
   /** `AGENTBRIDGE_JOB1_MANIFEST_SHA256`, supplied out of band from the text. */
   readonly expectedDigest: string;
+  /**
+   * The configured immutable candidate ref.
+   *
+   * Candidate identity is the **pair** (ref, SHA) — Decision 065 INVARIANT 2 —
+   * so the manifest must be bound to both. Binding the SHA alone would let a
+   * manifest prepared for one ref satisfy F9 for a *different* ref that happens
+   * to point at the same commit, consuming governance research that was never
+   * done for the candidate actually being assessed. Two refs at one commit is
+   * an ordinary state, not an exotic one.
+   */
+  readonly candidateRef: string;
   /** The configured immutable candidate SHA. */
   readonly candidateSha: string;
   /** The configured authoritative main SHA. */
@@ -570,7 +584,7 @@ function verification(
  * 1. the text parses and satisfies the schema;
  * 2. the document canonicalizes under AB-CJSON-1 and its digest equals the
  *    out-of-band expected digest;
- * 3. `candidateSha` equals the configured candidate SHA;
+ * 3. `candidateRef` and `candidateSha` equal the configured candidate identity;
  * 4. `authoritativeMainSha` equals the configured main SHA;
  * 5. `generatedAt` is within the 24-hour window before boot, and not in the
  *    future;
@@ -619,6 +633,13 @@ export function verifyGovernanceRunManifest(
     append(failures, MANIFEST_FAILURE.DIGEST_MISMATCH);
   }
 
+  // Candidate identity is bound as (ref, SHA). Both halves are compared against
+  // the configured values; a manifest prepared under the PRE-RUN gate for some
+  // other ref is not this run's manifest, whatever commit it names
+  // (Decision 065 INVARIANT 2 and INVARIANT 13).
+  if (manifest.candidateRef !== input.candidateRef) {
+    append(failures, MANIFEST_FAILURE.CANDIDATE_REF_MISMATCH);
+  }
   if (manifest.candidateSha !== input.candidateSha) {
     append(failures, MANIFEST_FAILURE.CANDIDATE_SHA_MISMATCH);
   }
