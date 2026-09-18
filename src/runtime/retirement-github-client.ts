@@ -127,11 +127,17 @@ export function createHttpsGet(): GitHubGet {
   return async (path: string): Promise<GitHubResponse | null> =>
     new Promise<GitHubResponse | null>((resolve) => {
       let settled = false;
+      let deadline: ReturnType<typeof setTimeout> | null = null;
       const finish = (value: GitHubResponse | null): void => {
-        if (!settled) {
-          settled = true;
-          resolve(value);
+        if (settled) {
+          return;
         }
+        settled = true;
+        if (deadline !== null) {
+          clearTimeout(deadline);
+          deadline = null;
+        }
+        resolve(value);
       };
       let clientRequest;
       try {
@@ -159,6 +165,10 @@ export function createHttpsGet(): GitHubGet {
               total += chunk.length;
               if (total > GITHUB_LIMITS.MAX_RESPONSE_BYTES) {
                 truncated = true;
+                // Settle before teardown. Destroying a response emits
+                // `aborted` then `close` — never `end`, never `error` — so no
+                // later event on it would ever settle this promise.
+                finish(null);
                 response.destroy();
                 return;
               }
@@ -189,6 +199,16 @@ export function createHttpsGet(): GitHubGet {
         clientRequest.destroy();
         finish(null);
       });
+      // The absolute deadline. The `timeout` option above is a socket
+      // *inactivity* timer, which a peer that keeps dripping bytes never
+      // trips; this one is armed once at initiation and is never reset or
+      // extended by traffic, so it bounds the request as a whole. Both route
+      // through the same idempotent `finish`: whichever fires first settles,
+      // and the other is absorbed.
+      deadline = setTimeout((): void => {
+        finish(null);
+        clientRequest.destroy();
+      }, GITHUB_LIMITS.TIMEOUT_MS);
       // No body is ever written: `end()` with no argument closes the request.
       clientRequest.end();
     });
@@ -257,8 +277,26 @@ function encodeSegment(value: string): string {
   return encodeURIComponent(value);
 }
 
-/** Extract the `rel="next"` target from a `Link` header, or `null`. */
-function nextLink(linkHeader: string | null): string | null {
+/**
+ * A `rel="next"` relation that is present but whose target cannot be read.
+ *
+ * Deliberately distinct from absence. "There is no next page" ends pagination
+ * successfully; "there is a next page and we cannot tell where" is a pagination
+ * anomaly that must fail closed. Collapsing the two silently truncates an
+ * enumeration, which would let F8 clear on evidence that was never gathered.
+ */
+const MALFORMED_NEXT: unique symbol = Symbol('MALFORMED_NEXT');
+
+/** The three outcomes of reading a `Link` header's `next` relation. */
+type NextRelation = string | null | typeof MALFORMED_NEXT;
+
+/**
+ * Extract the `rel="next"` target from a `Link` header.
+ *
+ * `null` means no `next` relation is present. {@link MALFORMED_NEXT} means one
+ * is present but unreadable.
+ */
+function nextLink(linkHeader: string | null): NextRelation {
   if (linkHeader === null) {
     return null;
   }
@@ -271,7 +309,7 @@ function nextLink(linkHeader: string | null): string | null {
     const open = part.indexOf('<');
     const close = part.indexOf('>');
     if (open === -1 || close === -1 || close <= open + 1) {
-      return null;
+      return MALFORMED_NEXT;
     }
     return part.slice(open + 1, close);
   }
@@ -377,6 +415,11 @@ export function createRetirementGitHubClient(
         append(items, item);
       }
       const next = nextLink(response.linkHeader);
+      if (next === MALFORMED_NEXT) {
+        // A next relation we cannot parse is an anomaly, not the end of the
+        // pages: refuse rather than report a set we cannot prove whole.
+        return null;
+      }
       path = next === null ? null : pathFromNext(next);
       if (next !== null && path === null) {
         // A next link that does not reduce to a pinned-host path: refuse rather
