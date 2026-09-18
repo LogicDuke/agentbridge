@@ -32,6 +32,9 @@ export type {
   CockpitAutoflowCounts,
   CockpitAutoflowInvocation,
   CockpitAutoflowProjection,
+  CockpitRetirementAssessment,
+  CockpitRetirementFact,
+  CockpitRetirementProjection,
 } from './autoflow-projection.js';
 
 export {
@@ -57,3 +60,11 @@ export {
   type CockpitSnapshotReadResult,
   type CockpitSnapshotSchemaVersion,
 } from './read-model.js';
+
+export type {
+  RetirementAssessmentBody,
+  RetirementAssessmentEnvelope,
+  RetirementClassification,
+  RetirementFactRecord,
+  RetirementReason,
+} from '../domain/retirement-assessment.js';

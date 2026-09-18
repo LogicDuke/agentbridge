@@ -57,8 +57,16 @@
  */
 
 import type { AgentReportStatus, InvocationPurpose } from '../domain/agent-invocation.js';
+import { EVIDENCE_KIND } from '../domain/evidence.js';
+import {
+  RETIREMENT_FACT_ORDER,
+  type RetirementAssessmentEnvelope,
+  type RetirementClassification,
+  type RetirementReason,
+} from '../domain/retirement-assessment.js';
 import {
   INVOCATION_STATE,
+  type AdmittedEvidence,
   type InvocationState,
   type TrackedInvocation,
   type WorkflowClosure,
@@ -253,5 +261,198 @@ export function projectCockpitAutoflow(state: WorkflowState): CockpitAutoflowPro
     humanGateOpenedAtRevision: state.humanGateOpenedAtRevision,
     invocations: freezeList(invocations),
     counts,
+  });
+}
+
+/* ------------------------------------------------------------------------- *
+ * D4 sub-projection — Job #1 retirement assessment (Decision 065, step I4)
+ * ------------------------------------------------------------------------- */
+
+/** One fact, flattened for display. `value` is already stringified, never judged. */
+export interface CockpitRetirementFact {
+  /** The fact key, in `RETIREMENT_FACT_ORDER`. */
+  readonly key: string;
+  readonly determinate: boolean;
+  /** The observed value rendered as text, or `null` when indeterminate. */
+  readonly value: string | null;
+}
+
+/**
+ * One projected assessment. Every field is echoed **verbatim** from the
+ * digest-bound body; nothing is derived into a second verdict, and there is no
+ * `mayDelete`, `authorized`, `approved`, `ready`, or `nextAction` field — an
+ * authority-shaped value has nowhere to land.
+ */
+export interface CockpitRetirementAssessment {
+  readonly evidenceId: string;
+  readonly candidateRef: string;
+  readonly candidateSha: string;
+  readonly authoritativeMainSha: string;
+  readonly classification: RetirementClassification;
+  readonly reasonCodes: readonly RetirementReason[];
+  /** Echoed inert. A request, never an authority. */
+  readonly gateRequested: boolean;
+  readonly manifestDigest: string;
+  readonly generatedAt: string;
+  readonly observerVersion: string;
+  /** The ten facts in `RETIREMENT_FACT_ORDER`, flattened for display. */
+  readonly facts: readonly CockpitRetirementFact[];
+}
+
+/**
+ * The sub-projection.
+ *
+ * Exactly one of three honest states:
+ *
+ * - `assessment` non-null — a pointer at the current revision matched a
+ *   digest-bound envelope whose `candidateSha` equals the workflow's
+ *   `boundCommitSha`;
+ * - `integrityFailure` true — such a pointer exists, but no verified envelope
+ *   backs it. The classification is **withheld**, and only the pointer id is
+ *   shown;
+ * - both empty — no assessment was admitted at this revision at all.
+ */
+export interface CockpitRetirementProjection {
+  readonly assessment: CockpitRetirementAssessment | null;
+  /** `true` when a pointer exists but no verified body backs it. */
+  readonly integrityFailure: boolean;
+  /** The admitted pointer id, when one exists at the current revision. */
+  readonly pointerId: string | null;
+}
+
+/** Render one fact value as inert text. No branch reads it for meaning. */
+function factValueText(value: string | number | boolean | null): string | null {
+  if (value === null) {
+    return null;
+  }
+  if (typeof value === 'boolean') {
+    return value ? 'true' : 'false';
+  }
+  return typeof value === 'number' ? String(value) : value;
+}
+
+/**
+ * Project the Job #1 retirement assessment for display — integrity step **I4**.
+ *
+ * The projection gate is deliberately narrow and is applied here, once:
+ *
+ * 1. the workflow must have an **admitted evidence pointer at the current
+ *    revision** (admission is keyed on revision, so a pointer admitted before a
+ *    HEAD advance no longer counts);
+ * 2. an envelope in the D1-validated list must carry **exactly that id**;
+ * 3. that envelope's `body.candidateSha` must equal the workflow's
+ *    `boundCommitSha`.
+ *
+ * All three, or nothing is projected. D4 performs **no digest computation** — the
+ * store re-proved the binding on the read that produced this list (I3) and D1
+ * enforced the id format and repository binding; re-hashing here would create a
+ * second integrity authority that could disagree with the store's.
+ *
+ * An integrity failure is **never** reinterpreted as a classification: the
+ * `BLOCKED`/`PRESERVE_FOR_HISTORY`/`RETIRE_ELIGIBLE` vocabulary belongs to the
+ * classifier, which never saw a digest. The failure surfaces as its own state
+ * with the classification withheld.
+ *
+ * Pure, deterministic, synchronous, side-effect free, and non-mutating; the
+ * result is deeply frozen and survives `JSON.parse(JSON.stringify(...))`.
+ *
+ * @param assessments The D1-validated envelope list, already verified upstream.
+ * @param state The observed workflow, or `null` when none was observed.
+ */
+export function projectCockpitRetirementAssessments(
+  assessments: readonly RetirementAssessmentEnvelope[],
+  state: WorkflowState | null,
+): CockpitRetirementProjection {
+  const empty = freezeRecord({
+    assessment: null,
+    integrityFailure: false,
+    pointerId: null,
+  });
+  if (state === null) {
+    return empty;
+  }
+
+  // 1. The admitted pointer at the **current** revision, if any.
+  let pointerId: string | null = null;
+  const admissions: readonly AdmittedEvidence[] = state.evidence;
+  for (let index = 0; index < admissions.length; index += 1) {
+    const admission = admissions[index];
+    if (admission === undefined) {
+      continue;
+    }
+    if (
+      admission.admittedAtRevision === state.revision &&
+      admission.kind === EVIDENCE_KIND.REPOSITORY_STATE
+    ) {
+      pointerId = admission.evidenceId;
+    }
+  }
+  if (pointerId === null) {
+    return empty;
+  }
+
+  // 2 and 3. A verified envelope carrying exactly that id, bound to this commit.
+  let matched: RetirementAssessmentEnvelope | null = null;
+  for (let index = 0; index < assessments.length; index += 1) {
+    const envelope = assessments[index];
+    if (envelope === undefined) {
+      continue;
+    }
+    if (
+      envelope.evidenceId === pointerId &&
+      envelope.body.candidateSha === state.boundCommitSha
+    ) {
+      matched = envelope;
+    }
+  }
+  if (matched === null) {
+    return freezeRecord({ assessment: null, integrityFailure: true, pointerId });
+  }
+
+  const body = matched.body;
+  const facts: CockpitRetirementFact[] = [];
+  for (let index = 0; index < RETIREMENT_FACT_ORDER.length; index += 1) {
+    const key = RETIREMENT_FACT_ORDER[index];
+    if (key === undefined) {
+      continue;
+    }
+    const record = body.facts[key];
+    if (record === undefined) {
+      continue;
+    }
+    append(
+      facts,
+      freezeRecord({
+        key,
+        determinate: record.determinate,
+        value: factValueText(record.value),
+      }),
+    );
+  }
+
+  const reasons: RetirementReason[] = [];
+  for (let index = 0; index < body.reasonCodes.length; index += 1) {
+    const reason = body.reasonCodes[index];
+    if (reason !== undefined) {
+      append(reasons, reason);
+    }
+  }
+
+  return freezeRecord({
+    assessment: freezeRecord({
+      evidenceId: matched.evidenceId,
+      candidateRef: body.candidateRef,
+      candidateSha: body.candidateSha,
+      authoritativeMainSha: body.authoritativeMainSha,
+      classification: body.classification,
+      reasonCodes: freezeList(reasons),
+      gateRequested: body.gateRequested,
+      manifestDigest: body.manifestDigest,
+      generatedAt: body.generatedAt,
+      observerVersion: body.observerVersion,
+      facts: freezeList(facts),
+    }),
+    integrityFailure: false,
+    pointerId,
   });
 }

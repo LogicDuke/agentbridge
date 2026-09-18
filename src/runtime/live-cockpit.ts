@@ -49,11 +49,17 @@ import {
   type RepositoryObserver,
 } from './repository-observer.js';
 import {
+  readJob1Config,
   readStartupHumanGateConfig,
   readStartupWorkflowConfig,
   STARTUP_HUMAN_GATE_ENV,
   type StartupEnv,
 } from './orchestration-input.js';
+import {
+  runRetirementAssessment,
+  type RetirementRunResult,
+} from './retirement-assessment-runner.js';
+import type { RetirementAssessmentStore } from './retirement-assessment-store.js';
 import {
   startControlChannel,
   type ControlChannelHandle,
@@ -71,6 +77,17 @@ export interface LiveCockpitConfig {
   readonly collectorId: string;
   /** Read once per observation for `observedAt` (whole-observation collection time). */
   readonly clock: () => Date;
+  /**
+   * The Job #1 assessment store, when Job #1 ran at boot (Decision 065).
+   *
+   * The store is read **here, in the composition root**, and only its verified
+   * *values* are placed on the observation. The producer never receives this
+   * handle (Amendment 1 B-4): it gets a plain list and could not re-read or
+   * re-verify anything if it tried. `undefined` — every composition that is not
+   * running Job #1 — yields an empty list, which is the honest "no assessment
+   * observed" shape.
+   */
+  readonly assessmentStore?: RetirementAssessmentStore;
 }
 
 /**
@@ -106,6 +123,12 @@ export function createLiveObservation(config: LiveCockpitConfig): CockpitObserva
   const repository = config.observer.observe();
   const autoflow = config.reader.current();
   const observedAt = config.clock().toISOString();
+  // The store's verified read (I3) happens here, once per observation, inside the
+  // whole-observation capture. A body that stopped digesting to its pointer since
+  // the last GET simply stops appearing, and D4 then renders the honest
+  // integrity-failure copy against the still-admitted pointer.
+  const retirementAssessments =
+    config.assessmentStore === undefined ? [] : config.assessmentStore.list();
 
   return {
     repositoryId: repository.repositoryId,
@@ -118,6 +141,7 @@ export function createLiveObservation(config: LiveCockpitConfig): CockpitObserva
     findings: [],
     repairJobs: [],
     autoflow,
+    retirementAssessments,
   };
 }
 
@@ -231,6 +255,56 @@ export function runStartupProgression(
   }
 }
 
+/**
+ * Run the bounded Autoflow Job #1 assessment once at boot, when it is configured
+ * (Decision 065 Revision 2 + Amendment 1).
+ *
+ * This is the **single production call site** for the Job #1 runner: there is no
+ * loop, timer, poll, callback, or post-start path, exactly as the human-gate
+ * progression has none. It runs after the startup workflow-open, because the
+ * assessment is admitted against that workflow's binding.
+ *
+ * An **integrity** abort (a body that will not canonicalize, a failed digest
+ * self-check, a refused store put, a rejected admission, a failed gate) throws,
+ * and `main` exits non-zero **before serving**. An **observation** failure does
+ * not: it produced an admitted `BLOCKED` assessment, and the Cockpit's whole job
+ * is to show why.
+ *
+ * Returns the store to hand to the observation path, or `null` when Job #1 is not
+ * configured.
+ */
+export async function runStartupJob1(
+  orchestrator: AutoflowOrchestrator,
+  env: StartupEnv,
+  repositoryId: string,
+): Promise<RetirementAssessmentStore | null> {
+  const job1 = readJob1Config(env, repositoryId);
+  if (job1 === null) {
+    return null;
+  }
+  const parts = await runRetirementAssessment(orchestrator, {
+    repositoryId,
+    owner: job1.owner,
+    repo: job1.repo,
+    candidateRef: job1.candidateRef,
+    candidateSha: job1.candidateSha,
+    authoritativeMainSha: job1.authoritativeMainSha,
+    repositoryPath: job1.repositoryPath,
+    runtimeRoot: job1.runtimeRoot,
+    manifestPath: job1.manifestPath,
+    manifestDigest: job1.manifestDigest,
+    generatedAt: job1.generatedAt,
+    bootEpochMs: Date.now(),
+    platform: process.platform === 'win32' ? 'win32' : 'posix',
+    environmentSource: process.env,
+  });
+  const result: RetirementRunResult = parts.result;
+  if (result.abort !== null) {
+    throw new Error(`Live Cockpit runtime: Job #1 aborted before serving (${result.abort}).`);
+  }
+  return parts.store;
+}
+
 /** A control-channel starter; production binds `startControlChannel` over the orchestrator. */
 export type ControlChannelStarter = () => Promise<ControlChannelHandle | null>;
 
@@ -316,13 +390,18 @@ export function startControlChannelAfterCockpitBind(
  * {@link WorkflowEvent} after startup. Any startup fault, including a rejected
  * startup open or human-gate, exits non-zero (fail closed).
  */
-function main(): void {
+async function main(): Promise<void> {
   let server: http.Server;
   let controlChannel: BindGatedControlChannel;
   try {
     const runtime = new AutoflowRuntime();
-    const orchestrator = new AutoflowOrchestrator(runtime);
     const repositoryId = requireEnv('AGENTBRIDGE_REPOSITORY_ID');
+    // The Job #1 candidate ref is fixed on the orchestrator at construction, so
+    // the new admission origin is bound to one immutable candidate for the whole
+    // process and refuses every foreign envelope. With Job #1 unconfigured it is
+    // `null` and the origin is inert.
+    const job1CandidateRef = readJob1Config(process.env, repositoryId)?.candidateRef ?? null;
+    const orchestrator = new AutoflowOrchestrator(runtime, job1CandidateRef);
     const observer = createConfiguredRepositoryObserver({
       repositoryId,
       observedHeadSha: requireEnv('AGENTBRIDGE_OBSERVED_HEAD_SHA'),
@@ -336,13 +415,26 @@ function main(): void {
     // (fail closed) before serving. No post-start event source exists.
     runStartupProgression(orchestrator, process.env, repositoryId);
 
+    // Decision 065: the one bounded Job #1 run, once, after the startup open.
+    // An integrity abort throws here and the host never binds.
+    const assessmentStore = await runStartupJob1(orchestrator, process.env, repositoryId);
+
     server = startLiveCockpit({
-      config: {
-        reader: orchestrator.reader(),
-        observer,
-        collectorId,
-        clock: (): Date => new Date(),
-      },
+      config:
+        assessmentStore === null
+          ? {
+              reader: orchestrator.reader(),
+              observer,
+              collectorId,
+              clock: (): Date => new Date(),
+            }
+          : {
+              reader: orchestrator.reader(),
+              observer,
+              collectorId,
+              clock: (): Date => new Date(),
+              assessmentStore,
+            },
     });
 
     // Decision 062: start the post-start operator control channel only AFTER the
@@ -395,5 +487,5 @@ function main(): void {
 const entryArgument = process.argv[1];
 const isEntry = entryArgument !== undefined && import.meta.url === pathToFileURL(entryArgument).href;
 if (isEntry) {
-  main();
+  void main();
 }

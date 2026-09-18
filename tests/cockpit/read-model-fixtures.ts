@@ -101,7 +101,7 @@ export function buildRepairJob(
 
 export function buildSnapshot(overrides: Partial<CockpitSnapshot> = {}): CockpitSnapshot {
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     repository: buildRepository(),
     provenance: buildProvenance(),
     pullRequests: [buildPullRequest()],
@@ -109,6 +109,7 @@ export function buildSnapshot(overrides: Partial<CockpitSnapshot> = {}): Cockpit
     findings: [buildFinding()],
     repairJobs: [buildRepairJob()],
     autoflow: null,
+    retirementAssessments: [],
     ...overrides,
   };
 }

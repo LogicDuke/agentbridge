@@ -1739,11 +1739,31 @@ describe('the transport is dormant', () => {
     expect(barrel).not.toContain('adapters');
   });
 
-  it('has no production caller anywhere in src', () => {
+  /**
+   * The §14.8 boundary, as a test.
+   *
+   * Decision 065 Amendment 1 Clause A discharges the deferred-findings-register
+   * §14.8 constraint for **exactly one** production consumer: the Job #1
+   * dedicated read-only Git observer. The constraint remains an ACTIVE BINDING
+   * CONSTRAINT for every other present or future consumer, and Amendment 1 A-8
+   * says each future one needs its own separate architecture/authority gate.
+   *
+   * This assertion is what makes that enforceable rather than merely stated: the
+   * approved set below is the whole exception. A second consumer — anywhere in
+   * `src/` — fails this test, and the only way to add one is to change this list,
+   * which is exactly the reopening Amendment 1 requires.
+   *
+   * `src/adapters/**` itself remains FROZEN (A-7); the two adapter files are in
+   * the set because they *are* the transport, not because they consume it.
+   */
+  it('has exactly one authorized production caller in src (Decision 065 Amendment 1 §14.8)', () => {
     const sourceRoot = fileURLToPath(new URL('../../src/', import.meta.url));
     const approved = new Set([
       join(sourceRoot, 'adapters', 'agent-transport.ts'),
       join(sourceRoot, 'adapters', 'process-transport.ts'),
+      // The one narrow §14.8 scope exception. Nothing else may be added here
+      // without reopening governance first.
+      join(sourceRoot, 'runtime', 'retirement-git-observer.ts'),
     ]);
     const pending = [sourceRoot];
     const callers: string[] = [];
