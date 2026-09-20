@@ -49,6 +49,7 @@ import {
   type RepositoryObserver,
 } from './repository-observer.js';
 import {
+  JOB1_ENV,
   readJob1Config,
   readStartupHumanGateConfig,
   readStartupWorkflowConfig,
@@ -200,18 +201,26 @@ function requireEnv(name: string): string {
 /**
  * Run the whole bounded, synchronous **startup progression** through the one
  * production writer, exactly once at boot (Decision 061 — Startup-Scripted
- * Human-Gate Progression). This is the **single production call site** capable of
- * invoking {@link AutoflowOrchestrator.openHumanGate}: there is no loop, timer,
- * poll, callback, or post-start path anywhere.
+ * Human-Gate Progression).
+ *
+ * There are exactly **two** authorized production origins of
+ * {@link AutoflowOrchestrator.openHumanGate}: this Decision 061 startup
+ * progression, and the Decision 065 Job #1 runner reached through
+ * {@link runStartupJob1}. Under `INV-STARTUP-GATE-EXCLUSIVITY` a single boot may
+ * configure **at most one** of them, and a configuration requesting both is
+ * rejected here before any transition. Neither origin introduces a loop, timer,
+ * poll, callback, or post-start path.
  *
  * The authorized boot flow, and the only one:
  *
  * 1. read the bounded startup workflow-open config (existing authorized path);
  * 2. read the startup human-gate trigger **exactly once** (strict `"1"`);
- * 3. gate requested **without** a valid startup-open binding → fail closed (the
+ * 3. startup gate requested **together with** a Job #1 request → fail closed;
+ *    the two gate origins are mutually incompatible in one boot;
+ * 4. gate requested **without** a valid startup-open binding → fail closed (the
  *    trigger carries no identity and may never manufacture a workflow);
- * 4. with a binding, `open` it — a non-`APPLIED` result is startup-fatal;
- * 5. if the gate is requested, submit exactly one `HUMAN_GATE_OPENED` via
+ * 5. with a binding, `open` it — a non-`APPLIED` result is startup-fatal;
+ * 6. if the gate is requested, submit exactly one `HUMAN_GATE_OPENED` via
  *    {@link AutoflowOrchestrator.openHumanGate} — a non-`APPLIED` result is
  *    startup-fatal.
  *
@@ -228,6 +237,20 @@ export function runStartupProgression(
   const startupBinding = readStartupWorkflowConfig(env, repositoryId);
   // Read the human-gate trigger exactly once; strict "1" or throw.
   const humanGateRequested = readStartupHumanGateConfig(env);
+
+  // INV-STARTUP-GATE-EXCLUSIVITY: a boot may configure at most one production
+  // HUMAN_GATE_OPENED origin. Decision 061's startup gate and Decision 065's
+  // Job #1 are mutually incompatible in one boot, so the combination is refused
+  // here — synchronously, on presence alone, before `open`, before any gate
+  // transition, and before Job #1 runs. Presence is the whole test: the Job #1
+  // config is neither parsed nor validated here, so an incomplete one is refused
+  // as incompatible rather than tolerated, and no new authority state is created.
+  if (humanGateRequested && env[JOB1_ENV.ENABLED] !== undefined) {
+    throw new Error(
+      `Live Cockpit runtime: ${STARTUP_HUMAN_GATE_ENV}=1 is incompatible with ` +
+        `${JOB1_ENV.ENABLED}; a boot may configure at most one human-gate origin.`,
+    );
+  }
 
   // The gate trigger cannot open a workflow. Requesting it without a valid
   // startup-open is a misconfiguration — fail closed before serving.
