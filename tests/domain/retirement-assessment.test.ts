@@ -627,6 +627,226 @@ describe('envelope reader', () => {
 });
 
 /* ------------------------------------------------------------------------- *
+ * Envelope reader — facts to verdict binding
+ * ------------------------------------------------------------------------- */
+
+/** An envelope over `facts`, carrying whatever verdict tuple `claim` states. */
+function envelopeClaiming(
+  facts: RetirementFacts,
+  claim: {
+    readonly classification: string;
+    readonly reasonCodes: readonly string[];
+    readonly gateRequested: boolean;
+  },
+): Record<string, unknown> {
+  const body = { ...eligibleBody(), facts: toFactRecords(facts), ...claim };
+  return plain({ evidenceId: EVIDENCE_ID, body }) as unknown as Record<string, unknown>;
+}
+
+/** An envelope over `facts` carrying exactly the verdict those facts produce. */
+function honestEnvelope(facts: RetirementFacts): Record<string, unknown> {
+  return envelopeClaiming(facts, classifyRetirementCandidate(facts));
+}
+
+/** F5 > 0 with the consistent F4: PRESERVE_FOR_HISTORY, two reasons. */
+function preserveFacts(): RetirementFacts {
+  return withFact(
+    withFact(eligibleFacts(), 'f5UniqueCommits', determinate(2)),
+    'f4Containment',
+    determinate(false),
+  );
+}
+
+/** F7 false: BLOCKED with exactly one reason. */
+function blockedFacts(): RetirementFacts {
+  return withFact(eligibleFacts(), 'f7WorktreeClean', determinate(false));
+}
+
+/** F1 and F3 false: BLOCKED with two reasons, in vocabulary order. */
+function twoReasonFacts(): RetirementFacts {
+  return withFact(
+    withFact(eligibleFacts(), 'f1CandidateIdentity', determinate(false)),
+    'f3StableMain',
+    determinate(false),
+  );
+}
+
+/** F5 = 1 with F6 = 5: F6 may not exceed F5, so BLOCKED on a contradiction. */
+function contradictoryFacts(): RetirementFacts {
+  return withFact(
+    withFact(eligibleFacts(), 'f5UniqueCommits', determinate(1)),
+    'f6UniquePatches',
+    determinate(5),
+  );
+}
+
+describe('envelope reader — the verdict is bound to the facts', () => {
+  it('rejects a blocking fact claiming RETIRE_ELIGIBLE with an empty reason list', () => {
+    const facts = withFact(eligibleFacts(), 'f1CandidateIdentity', determinate(false));
+
+    expect(
+      readRetirementAssessment(
+        envelopeClaiming(facts, {
+          classification: RETIREMENT_CLASSIFICATION.RETIRE_ELIGIBLE,
+          reasonCodes: [],
+          gateRequested: true,
+        }),
+      ),
+    ).toBeNull();
+  });
+
+  it('rejects preserving facts claiming RETIRE_ELIGIBLE', () => {
+    expect(
+      readRetirementAssessment(
+        envelopeClaiming(preserveFacts(), {
+          classification: RETIREMENT_CLASSIFICATION.RETIRE_ELIGIBLE,
+          reasonCodes: [],
+          gateRequested: true,
+        }),
+      ),
+    ).toBeNull();
+  });
+
+  it('rejects eligible facts claiming BLOCKED: the binding runs in both directions', () => {
+    expect(
+      readRetirementAssessment(
+        envelopeClaiming(eligibleFacts(), {
+          classification: RETIREMENT_CLASSIFICATION.BLOCKED,
+          reasonCodes: [RETIREMENT_REASON.INDETERMINATE_FACT],
+          gateRequested: false,
+        }),
+      ),
+    ).toBeNull();
+  });
+
+  it('rejects the right classification carrying the wrong reason', () => {
+    expect(
+      readRetirementAssessment(
+        envelopeClaiming(blockedFacts(), {
+          classification: RETIREMENT_CLASSIFICATION.BLOCKED,
+          reasonCodes: [RETIREMENT_REASON.MAIN_UNSTABLE],
+          gateRequested: false,
+        }),
+      ),
+    ).toBeNull();
+  });
+
+  it('rejects reordered reason codes: the order is part of the verdict', () => {
+    const derived = classifyRetirementCandidate(twoReasonFacts());
+    const reversed = [...derived.reasonCodes].reverse();
+
+    expect(reversed).not.toEqual(derived.reasonCodes);
+    expect(
+      readRetirementAssessment(
+        envelopeClaiming(twoReasonFacts(), { ...derived, reasonCodes: reversed }),
+      ),
+    ).toBeNull();
+  });
+
+  it('rejects a duplicated reason code', () => {
+    expect(
+      readRetirementAssessment(
+        envelopeClaiming(blockedFacts(), {
+          classification: RETIREMENT_CLASSIFICATION.BLOCKED,
+          reasonCodes: [RETIREMENT_REASON.WORKTREE_NOT_CLEAN, RETIREMENT_REASON.WORKTREE_NOT_CLEAN],
+          gateRequested: false,
+        }),
+      ),
+    ).toBeNull();
+  });
+
+  it('rejects the right classification carrying the wrong gateRequested', () => {
+    expect(
+      readRetirementAssessment(
+        envelopeClaiming(eligibleFacts(), {
+          classification: RETIREMENT_CLASSIFICATION.RETIRE_ELIGIBLE,
+          reasonCodes: [],
+          gateRequested: false,
+        }),
+      ),
+    ).toBeNull();
+  });
+
+  it('rejects a self-consistent verdict tuple that disagrees with the facts', () => {
+    const claim = classifyRetirementCandidate(blockedFacts());
+
+    // The tuple is internally coherent — it is simply not this body's verdict.
+    expect(claim.gateRequested).toBe(
+      claim.classification === RETIREMENT_CLASSIFICATION.RETIRE_ELIGIBLE,
+    );
+    expect(readRetirementAssessment(envelopeClaiming(preserveFacts(), claim))).toBeNull();
+  });
+
+  it('rejects an indeterminate fact claiming RETIRE_ELIGIBLE', () => {
+    const facts = withFact(eligibleFacts(), 'f8DependencyClearance', INDETERMINATE);
+
+    expect(
+      readRetirementAssessment(
+        envelopeClaiming(facts, {
+          classification: RETIREMENT_CLASSIFICATION.RETIRE_ELIGIBLE,
+          reasonCodes: [],
+          gateRequested: true,
+        }),
+      ),
+    ).toBeNull();
+  });
+
+  it('rejects contradiction-producing facts claiming a favourable verdict', () => {
+    expect(
+      readRetirementAssessment(
+        envelopeClaiming(contradictoryFacts(), {
+          classification: RETIREMENT_CLASSIFICATION.RETIRE_ELIGIBLE,
+          reasonCodes: [],
+          gateRequested: true,
+        }),
+      ),
+    ).toBeNull();
+  });
+
+  it('rejects a strict subset of the derived reason codes', () => {
+    const derived = classifyRetirementCandidate(twoReasonFacts());
+    const subset = derived.reasonCodes.slice(0, 1);
+
+    expect(subset.length).toBeLessThan(derived.reasonCodes.length);
+    expect(
+      readRetirementAssessment(
+        envelopeClaiming(twoReasonFacts(), { ...derived, reasonCodes: subset }),
+      ),
+    ).toBeNull();
+  });
+
+  it('rejects a strict superset of the derived reason codes', () => {
+    const derived = classifyRetirementCandidate(blockedFacts());
+    const superset = [...derived.reasonCodes, RETIREMENT_REASON.MAIN_UNSTABLE];
+
+    expect(
+      readRetirementAssessment(
+        envelopeClaiming(blockedFacts(), { ...derived, reasonCodes: superset }),
+      ),
+    ).toBeNull();
+  });
+
+  for (const [label, facts] of [
+    ['a genuinely eligible', eligibleFacts()],
+    ['a preserve-for-history', preserveFacts()],
+    ['a blocked', blockedFacts()],
+    ['an indeterminate', withFact(eligibleFacts(), 'f8DependencyClearance', INDETERMINATE)],
+    ['an internally contradictory', contradictoryFacts()],
+    ['a multi-reason', twoReasonFacts()],
+  ] as readonly (readonly [string, RetirementFacts])[]) {
+    it(`accepts ${label} body carrying exactly its derived tuple`, () => {
+      const derived = classifyRetirementCandidate(facts);
+      const read = readRetirementAssessment(honestEnvelope(facts));
+
+      expect(read).not.toBeNull();
+      expect(read?.body.classification).toBe(derived.classification);
+      expect(read?.body.gateRequested).toBe(derived.gateRequested);
+      expect(read?.body.reasonCodes).toEqual(derived.reasonCodes);
+    });
+  }
+});
+
+/* ------------------------------------------------------------------------- *
  * AB-CJSON-1
  * ------------------------------------------------------------------------- */
 

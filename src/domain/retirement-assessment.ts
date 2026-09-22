@@ -781,14 +781,43 @@ function readReasonCodes(value: unknown): readonly RetirementReason[] | null {
 }
 
 /**
+ * Rebuild the typed fact set from validated records — the exact inverse of
+ * {@link toFactRecords}, and the only way back. A determinate record becomes a
+ * determinate fact carrying its already type-checked value; an indeterminate
+ * one becomes {@link INDETERMINATE}, which carries no value at all.
+ */
+function factsFromRecords(records: RetirementFactRecords): RetirementFacts {
+  const facts: Partial<Record<RetirementFactKey, RetirementFact<string | number | boolean>>> = {};
+  objectSetPrototypeOf(facts, null);
+  for (let index = 0; index < RETIREMENT_FACT_ORDER.length; index += 1) {
+    const key = RETIREMENT_FACT_ORDER[index];
+    if (key === undefined) {
+      continue;
+    }
+    const record = records[key];
+    const fact: RetirementFact<string | number | boolean> = record.determinate
+      ? determinate(record.value as string | number | boolean)
+      : INDETERMINATE;
+    defineOwn(facts, key, fact, false);
+  }
+  return facts as RetirementFacts;
+}
+
+/**
  * Read one untrusted `{ evidenceId, body }` envelope, or `null`.
  *
  * Pure, total, deterministic, never throws. Exact own-key sets at every level,
  * each value read once, all-or-nothing acceptance, and a frozen copy built from
- * validated locals. This checks **shape**, not binding: it does not verify that
- * `evidenceId` digests `body`, because the digest is a runtime concern. An
- * envelope that reads cleanly here is still unbound until the runtime proves
- * otherwise.
+ * validated locals.
+ *
+ * The verdict fields are **derived**, never authoritative, so the body's
+ * `classification`, ordered `reasonCodes` and `gateRequested` must equal
+ * {@link classifyRetirementCandidate} applied to the body's own facts. A body
+ * that claims a verdict its facts do not produce is rejected whole.
+ *
+ * This still does not verify that `evidenceId` digests `body`, because the
+ * digest is a runtime concern. An envelope that reads cleanly here is still
+ * unbound until the runtime proves otherwise.
  */
 export function readRetirementAssessment(value: unknown): RetirementAssessmentEnvelope | null {
   if (typeof value !== 'object' || value === null) {
@@ -834,10 +863,23 @@ export function readRetirementAssessment(value: unknown): RetirementAssessmentEn
     return null;
   }
 
-  // `gateRequested` restates the classification; a body whose two disagree is
-  // rejected whole, never repaired by preferring one side.
-  if (rawGateRequested !== (classification === RETIREMENT_CLASSIFICATION.RETIRE_ELIGIBLE)) {
+  // Bind the claimed verdict to the facts it claims to summarize. Comparing the
+  // claimed classification with the claimed `gateRequested` only relates two
+  // claims; the classifier is the one derivation, so recompute from the facts
+  // and require an exact match. A mismatch is rejected whole, never repaired by
+  // preferring one side or by regenerating the fields.
+  const derived = classifyRetirementCandidate(factsFromRecords(facts));
+  if (
+    classification !== derived.classification ||
+    rawGateRequested !== derived.gateRequested ||
+    reasonCodes.length !== derived.reasonCodes.length
+  ) {
     return null;
+  }
+  for (let index = 0; index < derived.reasonCodes.length; index += 1) {
+    if (reasonCodes[index] !== derived.reasonCodes[index]) {
+      return null;
+    }
   }
 
   return freezeRecord({
