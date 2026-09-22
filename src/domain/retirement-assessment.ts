@@ -57,6 +57,9 @@ const numberIsInteger = Number.isInteger;
 const numberIsSafeInteger = Number.isSafeInteger;
 const jsonStringify = JSON.stringify;
 const reflectApply = Reflect.apply;
+// The global `String` is mutable, so a numeric scalar reached after a hostile
+// getter has run must not resolve it live.
+const stringOf = String;
 // Captured unbound and invoked through `Reflect.apply`, so a poisoned
 // `Function.prototype.call` is never on the path.
 // eslint-disable-next-line @typescript-eslint/unbound-method
@@ -988,7 +991,7 @@ function canonicalize(value: unknown, depth: number, seen: readonly object[]): s
   }
   if (typeof value === 'number') {
     // `-0` serializes as `0`, so two distinct inputs would share one digest.
-    return numberIsSafeInteger(value) && !objectIs(value, -0) ? String(value) : null;
+    return numberIsSafeInteger(value) && !objectIs(value, -0) ? stringOf(value) : null;
   }
   if (typeof value !== 'object') {
     // bigint, symbol, function, undefined.

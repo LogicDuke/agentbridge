@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 
 import {
   canonicalizeAssessmentBody,
@@ -1159,4 +1159,183 @@ describe('AB-CJSON-1 canonicalization', () => {
     expect(canonicalizeAssessmentBody(plain(body))).toBe(direct);
     expect(direct).not.toContain(' ');
   });
+});
+
+/* ------------------------------------------------------------------------- *
+ * AB-CJSON-1 — numeric conversion is immune to a mutated global String
+ * ------------------------------------------------------------------------- */
+
+const REAL_STRING = String;
+
+/**
+ * Run `body` with `globalThis.String` replaced by `poison`, restoring the real
+ * intrinsic even if canonicalization throws. Returns the canonical text, or the
+ * thrown error, so a test can assert on either.
+ */
+function withPoisonedString(poison: unknown, value: unknown): string | null | Error {
+  try {
+    (globalThis as unknown as Record<string, unknown>)['String'] = poison;
+    return canonicalizeAssessmentBody(value);
+  } catch (error) {
+    return error as Error;
+  } finally {
+    (globalThis as unknown as Record<string, unknown>)['String'] = REAL_STRING;
+  }
+}
+
+/** A body whose earlier key `a` poisons `String` before the later key `z` is read. */
+function poisonsBeforeNumber(poison: unknown, later: unknown): Record<string, unknown> {
+  const body: Record<string, unknown> = {};
+  Object.defineProperty(body, 'a', {
+    enumerable: true,
+    configurable: true,
+    get: () => {
+      (globalThis as unknown as Record<string, unknown>)['String'] = poison;
+      return 'x';
+    },
+  });
+  Object.defineProperty(body, 'z', { enumerable: true, configurable: true, value: later });
+  return body;
+}
+
+describe('AB-CJSON-1 — a mutated global String cannot reach numeric conversion', () => {
+  afterEach(() => {
+    (globalThis as unknown as Record<string, unknown>)['String'] = REAL_STRING;
+  });
+
+  it('restores the real intrinsic after every probe', () => {
+    expect(globalThis.String).toBe(REAL_STRING);
+  });
+
+  it('encodes the number when a getter installs a throwing String', () => {
+    const poison = (): string => {
+      throw new Error('poisoned String');
+    };
+
+    expect(withPoisonedString(poison, poisonsBeforeNumber(poison, 42))).toBe('{"a":"x","z":42}');
+  });
+
+  it('encodes the number when a getter installs a constant formatter', () => {
+    const poison = (): string => '0';
+
+    expect(withPoisonedString(poison, poisonsBeforeNumber(poison, 42))).toBe('{"a":"x","z":42}');
+  });
+
+  it('encodes the number when a getter installs a non-function', () => {
+    expect(withPoisonedString(123, poisonsBeforeNumber(123, 42))).toBe('{"a":"x","z":42}');
+  });
+
+  it('encodes the number when a getter removes String entirely', () => {
+    expect(withPoisonedString(undefined, poisonsBeforeNumber(undefined, 42))).toBe(
+      '{"a":"x","z":42}',
+    );
+  });
+
+  it('encodes the number when a getter installs a state-changing formatter', () => {
+    let calls = 0;
+    const poison = (): string => REAL_STRING((calls += 1));
+
+    expect(withPoisonedString(poison, poisonsBeforeNumber(poison, 42))).toBe('{"a":"x","z":42}');
+  });
+
+  it('is unaffected when the poisoning happens after an earlier numeric member', () => {
+    const poison = (): string => '0';
+    const body: Record<string, unknown> = {};
+    Object.defineProperty(body, 'a', { enumerable: true, configurable: true, value: 42 });
+    Object.defineProperty(body, 'z', {
+      enumerable: true,
+      configurable: true,
+      get: () => {
+        (globalThis as unknown as Record<string, unknown>)['String'] = poison;
+        return 7;
+      },
+    });
+
+    expect(withPoisonedString(poison, body)).toBe('{"a":42,"z":7}');
+  });
+
+  it('encodes every later numeric member, not just the first', () => {
+    const poison = (): string => '0';
+    const body: Record<string, unknown> = {};
+    Object.defineProperty(body, 'a', {
+      enumerable: true,
+      configurable: true,
+      get: () => {
+        (globalThis as unknown as Record<string, unknown>)['String'] = poison;
+        return 'x';
+      },
+    });
+    for (const [key, value] of [
+      ['w', 11],
+      ['x', 22],
+      ['y', 33],
+      ['z', 44],
+    ] as readonly (readonly [string, number])[]) {
+      Object.defineProperty(body, key, { enumerable: true, configurable: true, value });
+    }
+
+    expect(withPoisonedString(poison, body)).toBe('{"a":"x","w":11,"x":22,"y":33,"z":44}');
+  });
+
+  it('encodes a number nested behind a poisoning array element', () => {
+    const poison = (): string => '0';
+    const first: Record<string, unknown> = {};
+    Object.defineProperty(first, 'k', {
+      enumerable: true,
+      configurable: true,
+      get: () => {
+        (globalThis as unknown as Record<string, unknown>)['String'] = poison;
+        return 'x';
+      },
+    });
+
+    expect(withPoisonedString(poison, [first, { n: 99 }])).toBe('[{"k":"x"},{"n":99}]');
+  });
+
+  it('is unaffected when String is replaced after module load but before the call', () => {
+    expect(withPoisonedString((): string => '0', { z: 42 })).toBe('{"z":42}');
+  });
+
+  it('keeps two different numbers distinguishable under poisoning', () => {
+    const poison = (): string => '0';
+    const first = withPoisonedString(poison, poisonsBeforeNumber(poison, 42));
+    const second = withPoisonedString(poison, poisonsBeforeNumber(poison, 7));
+
+    expect(first).toBe('{"a":"x","z":42}');
+    expect(second).toBe('{"a":"x","z":7}');
+    expect(first).not.toBe(second);
+  });
+
+  it('is unchanged in an ordinary environment', () => {
+    expect(canonicalizeAssessmentBody({ a: 'x', z: 42 })).toBe('{"a":"x","z":42}');
+  });
+
+  for (const [label, value, expected] of [
+    ['0', 0, '0'],
+    ['1', 1, '1'],
+    ['-1', -1, '-1'],
+    ['42', 42, '42'],
+    ['-42', -42, '-42'],
+    ['MAX_SAFE_INTEGER', Number.MAX_SAFE_INTEGER, '9007199254740991'],
+    ['MIN_SAFE_INTEGER', Number.MIN_SAFE_INTEGER, '-9007199254740991'],
+  ] as readonly (readonly [string, number, string])[]) {
+    it(`encodes ${label} byte-identically`, () => {
+      expect(canonicalizeAssessmentBody(value)).toBe(expected);
+      expect(withPoisonedString((): string => 'POISON', value)).toBe(expected);
+    });
+  }
+
+  for (const [label, value] of [
+    ['-0', -0],
+    ['NaN', NaN],
+    ['Infinity', Infinity],
+    ['-Infinity', -Infinity],
+    ['1.5', 1.5],
+    ['an unsafe integer', Number.MAX_SAFE_INTEGER + 2],
+  ] as readonly (readonly [string, number])[]) {
+    it(`still rejects ${label}`, () => {
+      expect(canonicalizeAssessmentBody(value)).toBeNull();
+      expect(withPoisonedString((): string => 'POISON', value)).toBeNull();
+    });
+  }
 });
