@@ -936,13 +936,15 @@ describe('AB-CJSON-1 canonicalization', () => {
     expect(canonicalizeAssessmentBody({ nested: custom })).toBeNull();
   });
 
-  it('reads only own enumerable keys of a plain object', () => {
+  // Inverted under DDR-WF3-PR113-F02-FAMILY-WF2 §19: a non-enumerable own key is
+  // state the encoding would drop, so the object rejects rather than projects.
+  it('rejects a plain object carrying an own non-enumerable key', () => {
     const record: Record<string, unknown> = { visible: 1 };
     Object.defineProperty(record, 'hidden', { value: 2, enumerable: false });
 
     expect(Object.getPrototypeOf(record)).toBe(Object.prototype);
     expect(Object.hasOwn(record, 'hidden')).toBe(true);
-    expect(canonicalizeAssessmentBody(record)).toBe('{"visible":1}');
+    expect(canonicalizeAssessmentBody(record)).toBeNull();
   });
 
   it('returns null, and never propagates, for an enumerable own getter that throws', () => {
@@ -1158,6 +1160,194 @@ describe('AB-CJSON-1 canonicalization', () => {
     expect(direct).not.toBeNull();
     expect(canonicalizeAssessmentBody(plain(body))).toBe(direct);
     expect(direct).not.toContain(' ');
+  });
+});
+
+/* ------------------------------------------------------------------------- *
+ * AB-CJSON-1 — own state the encoding would drop rejects, never projects
+ * (DDR-WF3-PR113-F02-FAMILY-WF2 §15)
+ * ------------------------------------------------------------------------- */
+
+/** An own symbol accessor whose getter throws, counting every invocation. */
+function withSymbolAccessor<T extends object>(target: T): { readonly target: T; readonly calls: () => number } {
+  let calls = 0;
+  Object.defineProperty(target, Symbol('acc'), {
+    enumerable: true,
+    configurable: true,
+    get: () => {
+      calls += 1;
+      throw new Error('hostile');
+    },
+  });
+  return { target, calls: () => calls };
+}
+
+function withSymbol<T extends object>(target: T, enumerable = true, key: symbol = Symbol('secret')): T {
+  Object.defineProperty(target, key, { value: 2, enumerable, configurable: true, writable: true });
+  return target;
+}
+
+function withHiddenKey<T extends object>(target: T): T {
+  Object.defineProperty(target, 'hidden', { value: 2, enumerable: false });
+  return target;
+}
+
+/** AB-CJSON-1 text of {@link eligibleBody}, as emitted at the reviewed head 034d809. */
+const ELIGIBLE_BODY_TEXT =
+  '{"authoritativeMainSha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","candidateRef":"refs/heads/repair/example-candidate","candidateSha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","classification":"RETIRE_ELIGIBLE","facts":{"f10NotProtected":{"determinate":true,"value":true},"f1CandidateIdentity":{"determinate":true,"value":true},"f2RemoteAgreement":{"determinate":true,"value":true},"f3StableMain":{"determinate":true,"value":true},"f4Containment":{"determinate":true,"value":true},"f5UniqueCommits":{"determinate":true,"value":0},"f6UniquePatches":{"determinate":true,"value":0},"f7WorktreeClean":{"determinate":true,"value":true},"f8DependencyClearance":{"determinate":true,"value":true},"f9GovernanceManifest":{"determinate":true,"value":"NO_HOLD"}},"gateRequested":true,"generatedAt":"2026-09-21T00:00:00Z","manifestDigest":"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","observerVersion":"agentbridge-job1-observer/2","reasonCodes":[],"repositoryId":"LogicDuke/agentbridge"}';
+
+describe('AB-CJSON-1 — extra own container state rejects, never drops', () => {
+  it('rejects an array carrying an own enumerable string property', () => {
+    const carrier: unknown[] = [1];
+    (carrier as unknown as Record<string, unknown>)['secret'] = 2;
+    expect(canonicalizeAssessmentBody(carrier)).toBeNull();
+  });
+
+  it('rejects an array carrying an own non-enumerable string property', () => {
+    expect(canonicalizeAssessmentBody(withHiddenKey<unknown[]>([1]))).toBeNull();
+  });
+
+  it('rejects an array carrying an own symbol property', () => {
+    expect(canonicalizeAssessmentBody(withSymbol<unknown[]>([1]))).toBeNull();
+  });
+
+  it('rejects an array carrying an own non-enumerable symbol property', () => {
+    expect(canonicalizeAssessmentBody(withSymbol<unknown[]>([1], false))).toBeNull();
+  });
+
+  it('rejects an array carrying an own Symbol.iterator', () => {
+    const carrier: unknown[] = [1];
+    (carrier as unknown as Record<symbol, unknown>)[Symbol.iterator] = function* (): Generator<number> {
+      yield 9;
+    };
+    expect(canonicalizeAssessmentBody(carrier)).toBeNull();
+  });
+
+  it('rejects an array carrying several own symbol keys', () => {
+    const carrier = withSymbol(withSymbol(withSymbol<unknown[]>([1], true, Symbol('s1')), false, Symbol('s2')), true, Symbol('s3'));
+    expect(canonicalizeAssessmentBody(carrier)).toBeNull();
+  });
+
+  it('rejects an array carrying an own symbol accessor without invoking its getter', () => {
+    const { target, calls } = withSymbolAccessor<unknown[]>([1]);
+    expect(() => canonicalizeAssessmentBody(target)).not.toThrow();
+    expect(canonicalizeAssessmentBody(target)).toBeNull();
+    expect(calls()).toBe(0);
+  });
+
+  it('rejects a plain object carrying an own non-enumerable string property', () => {
+    expect(canonicalizeAssessmentBody(withHiddenKey<Record<string, unknown>>({ a: 1 }))).toBeNull();
+  });
+
+  it('rejects a plain object carrying an own symbol property', () => {
+    expect(canonicalizeAssessmentBody(withSymbol<Record<string, unknown>>({ a: 1 }))).toBeNull();
+  });
+
+  it('rejects a plain object carrying an own non-enumerable symbol property', () => {
+    expect(canonicalizeAssessmentBody(withSymbol<Record<string, unknown>>({ a: 1 }, false))).toBeNull();
+  });
+
+  it('rejects a plain object carrying several own symbol keys', () => {
+    const carrier = withSymbol(withSymbol<Record<string, unknown>>({ a: 1 }, true, Symbol('s1')), false, Symbol('s2'));
+    expect(canonicalizeAssessmentBody(carrier)).toBeNull();
+  });
+
+  it('rejects a plain object carrying an own symbol accessor without invoking its getter', () => {
+    const { target, calls } = withSymbolAccessor<Record<string, unknown>>({ a: 1 });
+    expect(() => canonicalizeAssessmentBody(target)).not.toThrow();
+    expect(canonicalizeAssessmentBody(target)).toBeNull();
+    expect(calls()).toBe(0);
+  });
+
+  it('rejects a null-prototype object carrying a symbol or a hidden key', () => {
+    const base = (): Record<string, unknown> => {
+      const record = Object.create(null) as Record<string, unknown>;
+      record['a'] = 1;
+      return record;
+    };
+    expect(canonicalizeAssessmentBody(withSymbol(base()))).toBeNull();
+    expect(canonicalizeAssessmentBody(withHiddenKey(base()))).toBeNull();
+  });
+
+  it('rejects symbol carriers nested at any depth in arrays and objects', () => {
+    expect(canonicalizeAssessmentBody([withSymbol<unknown[]>([1])])).toBeNull();
+    expect(canonicalizeAssessmentBody({ list: withSymbol<unknown[]>([1]) })).toBeNull();
+    expect(canonicalizeAssessmentBody({ inner: withSymbol<Record<string, unknown>>({ a: 1 }) })).toBeNull();
+    expect(canonicalizeAssessmentBody([withSymbol<Record<string, unknown>>({ a: 1 })])).toBeNull();
+    expect(canonicalizeAssessmentBody({ x: [{ y: [withSymbol<unknown[]>([1])] }] })).toBeNull();
+  });
+
+  it('rejects a hidden-key object nested in an array and in an object', () => {
+    expect(canonicalizeAssessmentBody([withHiddenKey<Record<string, unknown>>({ a: 1 })])).toBeNull();
+    expect(canonicalizeAssessmentBody({ inner: withHiddenKey<Record<string, unknown>>({ a: 1 }) })).toBeNull();
+    expect(canonicalizeAssessmentBody({ x: [{ y: withHiddenKey<Record<string, unknown>>({ a: 1 }) }] })).toBeNull();
+  });
+
+  it('never lets a carrier collide with its clean baseline', () => {
+    const carriers: readonly (readonly [unknown, unknown])[] = [
+      [withSymbol<unknown[]>([1]), [1]],
+      [withSymbol<unknown[]>([1], false), [1]],
+      [withSymbolAccessor<unknown[]>([1]).target, [1]],
+      [withHiddenKey<Record<string, unknown>>({ a: 1 }), { a: 1 }],
+      [withSymbol<Record<string, unknown>>({ a: 1 }), { a: 1 }],
+      [withSymbolAccessor<Record<string, unknown>>({ a: 1 }).target, { a: 1 }],
+      [{ list: withSymbol<unknown[]>([1]) }, { list: [1] }],
+      [{ inner: withHiddenKey<Record<string, unknown>>({ a: 1 }) }, { inner: { a: 1 } }],
+    ];
+    for (const [carrier, baseline] of carriers) {
+      expect(canonicalizeAssessmentBody(baseline)).not.toBeNull();
+      expect(canonicalizeAssessmentBody(carrier)).not.toBe(canonicalizeAssessmentBody(baseline));
+    }
+  });
+
+  /* Positive controls — byte-identical to the reviewed head 034d809. */
+
+  const UNCHANGED: readonly (readonly [string, unknown, string])[] = [
+    ['an empty array', [], '[]'],
+    ['an array of scalars', [1, 'a', true, null], '[1,"a",true,null]'],
+    ['nested arrays', [[1, [2]], []], '[[1,[2]],[]]'],
+    ['an ordinary object', { b: 1, a: 'x' }, '{"a":"x","b":1}'],
+    ['nested objects', { z: { y: { x: null } }, a: {} }, '{"a":{},"z":{"y":{"x":null}}}'],
+    ['mixed arrays and objects', { list: [{ k: [1, { m: false }] }], n: -7 }, '{"list":[{"k":[1,{"m":false}]}],"n":-7}'],
+    ['safe-integer extremes', [Number.MAX_SAFE_INTEGER, Number.MIN_SAFE_INTEGER, 0], '[9007199254740991,-9007199254740991,0]'],
+    ['a frozen plain object', Object.freeze({ b: [2], a: 1 }), '{"a":1,"b":[2]}'],
+  ];
+  for (const [label, value, text] of UNCHANGED) {
+    it(`still canonicalizes ${label} byte-identically`, () => {
+      expect(canonicalizeAssessmentBody(value)).toBe(text);
+    });
+  }
+
+  it('still canonicalizes a null-prototype object byte-identically', () => {
+    const record = Object.create(null) as Record<string, unknown>;
+    record['b'] = [1];
+    record['a'] = 2;
+    expect(canonicalizeAssessmentBody(record)).toBe('{"a":2,"b":[1]}');
+  });
+
+  it('still accepts an array with a non-enumerable index, emitted positionally', () => {
+    const carrier: unknown[] = [1, 2];
+    Object.defineProperty(carrier, '0', { value: 1, enumerable: false, writable: true, configurable: true });
+    expect(Object.getOwnPropertyDescriptor(carrier, '0')?.enumerable).toBe(false);
+    expect(canonicalizeAssessmentBody(carrier)).toBe('[1,2]');
+  });
+
+  it('still accepts an enumerable string accessor, emitting its result', () => {
+    const record = {};
+    Object.defineProperty(record, 'a', { enumerable: true, get: () => 1 });
+    expect(canonicalizeAssessmentBody(record)).toBe('{"a":1}');
+  });
+
+  it('still canonicalizes the module’s frozen reasonCodes, toJSON shadow included', () => {
+    const { reasonCodes } = classifyRetirementCandidate(
+      withFact(eligibleFacts(), 'f9GovernanceManifest', determinate(GOVERNANCE_HOLD.HOLD)),
+    );
+    expect(Object.getOwnPropertySymbols(reasonCodes)).toEqual([]);
+    expect(canonicalizeAssessmentBody(reasonCodes)).toBe('["GOVERNANCE_HOLD"]');
+  });
+
+  it('still canonicalizes the full assessment body byte-identically', () => {
+    expect(canonicalizeAssessmentBody(eligibleBody())).toBe(ELIGIBLE_BODY_TEXT);
   });
 });
 

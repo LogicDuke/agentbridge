@@ -49,6 +49,7 @@ const objectGetPrototypeOf = Object.getPrototypeOf;
 const objectSetPrototypeOf = Object.setPrototypeOf;
 const objectDefineProperty = Object.defineProperty;
 const objectGetOwnPropertyNames = Object.getOwnPropertyNames;
+const objectGetOwnPropertySymbols = Object.getOwnPropertySymbols;
 const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
 const objectPrototype: unknown = Object.prototype;
 const arrayIsArray = Array.isArray;
@@ -970,9 +971,12 @@ function encodeString(text: string): string | null {
  * `undefined`, a sparse hole, a non-plain object (Date, Map, class instance,
  * boxed primitive), a non-ordinary array (an Array subclass, a reparented
  * array, or one carrying a named own property, whose extra state the indexed
- * encoding would drop), a cycle, a throwing getter or Proxy, or a value over a
- * {@link RETIREMENT_BOUNDS} limit. Only own enumerable string keys are read,
- * each exactly once. This function hashes nothing.
+ * encoding would drop), a container carrying any own symbol key, a plain object
+ * carrying any own non-enumerable string key, a cycle, a throwing getter or
+ * Proxy, or a value over a {@link RETIREMENT_BOUNDS} limit. Own state the
+ * encoding cannot represent rejects; it is never silently dropped. An admitted
+ * object's own string keys are all enumerable, and each is read exactly once.
+ * This function hashes nothing.
  */
 export function canonicalizeAssessmentBody(value: unknown): string | null {
   return canonicalize(value, 0, []);
@@ -1063,6 +1067,19 @@ function hasBenignToJsonShadow(elements: readonly unknown[]): boolean {
   );
 }
 
+/**
+ * Any own symbol key is own state AB-CJSON-1 cannot represent. Only the key's
+ * existence is observed, so a symbol accessor's getter is never invoked.
+ * Unreadable (a hostile Proxy trap) rejects.
+ */
+function carriesOwnSymbolKey(target: object): boolean {
+  try {
+    return objectGetOwnPropertySymbols(target).length !== 0;
+  } catch {
+    return true;
+  }
+}
+
 function canonicalizeArray(
   elements: readonly unknown[],
   depth: number,
@@ -1123,6 +1140,9 @@ function canonicalizeArray(
   if (ownNames.length !== length + structural) {
     return null;
   }
+  if (carriesOwnSymbolKey(elements)) {
+    return null;
+  }
   let out = '[';
   for (let index = 0; index < length; index += 1) {
     let element: unknown;
@@ -1159,6 +1179,21 @@ function canonicalizeObject(node: object, depth: number, ancestors: readonly obj
   }
   const keys = ownKeysOf(node);
   if (keys === null || keys.length > RETIREMENT_BOUNDS.MAX_CANONICAL_KEYS) {
+    return null;
+  }
+  // Every own key must be emitted: a symbol key, or a non-enumerable string key
+  // the enumerable-key read above skips, is own state the encoding would drop.
+  // (Arrays need no enumerability check: indices are emitted by position.)
+  if (carriesOwnSymbolKey(node)) {
+    return null;
+  }
+  let allNames: readonly string[];
+  try {
+    allNames = objectGetOwnPropertyNames(node);
+  } catch {
+    return null;
+  }
+  if (allNames.length !== keys.length) {
     return null;
   }
   const sorted = sortKeysByCodeUnit(keys);
