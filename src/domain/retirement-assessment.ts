@@ -58,6 +58,7 @@ const numberIsInteger = Number.isInteger;
 const numberIsSafeInteger = Number.isSafeInteger;
 const jsonStringify = JSON.stringify;
 const reflectApply = Reflect.apply;
+const reflectOwnKeys = Reflect.ownKeys;
 // The global `String` is mutable, so a numeric scalar reached after a hostile
 // getter has run must not resolve it live.
 const stringOf = String;
@@ -136,24 +137,41 @@ function ownKeysOf(target: object): readonly string[] | null {
 }
 
 /**
- * Does `target` carry **exactly** the expected own enumerable keys — every one
- * present as an own property, and no surplus? An inherited key does not count
- * as present; an extra own key rejects.
+ * Is `key` an own, enumerable **data** property of `target`? The descriptor is
+ * inspected and the property is never read, so a getter never runs. An accessor
+ * is not schema state: its answer can change between reads, and running it
+ * would let hostile code reshape a container after its shape was checked.
+ */
+function isEnumerableOwnData(target: object, key: string | number): boolean {
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = objectGetOwnPropertyDescriptor(target, key);
+  } catch {
+    return false;
+  }
+  return descriptor !== undefined && descriptor.enumerable === true && objectHasOwn(descriptor, 'value');
+}
+
+/**
+ * Does `target` carry **exactly** the expected own state — every expected key
+ * an own enumerable data property, and no other own key of any kind? All own
+ * keys are counted, string and symbol, enumerable or not; with every expected
+ * key proved own, an equal count leaves no room for a surplus. An inherited
+ * key does not count as present.
  */
 function hasExactOwnKeys(target: object, expected: readonly string[]): boolean {
-  const keys = ownKeysOf(target);
-  if (keys === null || keys.length !== expected.length) {
+  let keys: readonly (string | symbol)[];
+  try {
+    keys = reflectOwnKeys(target);
+  } catch {
+    return false;
+  }
+  if (keys.length !== expected.length) {
     return false;
   }
   for (let index = 0; index < expected.length; index += 1) {
     const key = expected[index];
-    let present: boolean;
-    try {
-      present = key !== undefined && objectHasOwn(target, key);
-    } catch {
-      return false;
-    }
-    if (!present) {
+    if (key === undefined || !isEnumerableOwnData(target, key)) {
       return false;
     }
   }
@@ -764,11 +782,23 @@ function readReasonCodes(value: unknown): readonly RetirementReason[] | null {
   ) {
     return null;
   }
+  // Exactly the indices, `length`, and at most the data-free `freezeList`
+  // shadow: every index is proved own below, so an equal count leaves no room
+  // for a named, index-like, or symbol-keyed own property.
+  let ownKeys: readonly (string | symbol)[];
+  try {
+    ownKeys = reflectOwnKeys(elements);
+  } catch {
+    return null;
+  }
+  if (ownKeys.length !== length + (hasBenignToJsonShadow(elements) ? 2 : 1)) {
+    return null;
+  }
   const reasons: RetirementReason[] = [];
   for (let index = 0; index < length; index += 1) {
     let element: unknown;
     try {
-      if (!objectHasOwn(elements, index)) {
+      if (!isEnumerableOwnData(elements, index)) {
         return null;
       }
       element = elements[index];

@@ -847,6 +847,316 @@ describe('envelope reader — the verdict is bound to the facts', () => {
 });
 
 /* ------------------------------------------------------------------------- *
+ * Hostile readers — exact own state at every level
+ * (DDR-WF2-PR113-EXACT-OWN-STATE-READER §12)
+ * ------------------------------------------------------------------------- */
+
+/** F9 = HOLD: the smallest honest body whose reasonCodes list is non-empty. */
+function holdFacts(): RetirementFacts {
+  return withFact(eligibleFacts(), 'f9GovernanceManifest', determinate(GOVERNANCE_HOLD.HOLD));
+}
+
+function bodyOf(envelope: Record<string, unknown>): Record<string, unknown> {
+  return envelope['body'] as Record<string, unknown>;
+}
+
+function factsOf(envelope: Record<string, unknown>): Record<string, unknown> {
+  return bodyOf(envelope)['facts'] as Record<string, unknown>;
+}
+
+function reasonCodesOf(envelope: Record<string, unknown>): unknown[] {
+  return bodyOf(envelope)['reasonCodes'] as unknown[];
+}
+
+/** Redefine the own property `key` with another descriptor shape, keeping its value. */
+function redefine(target: object, key: string, shape: 'hidden' | 'getter' | 'throwing'): void {
+  const value: unknown = (target as Record<string, unknown>)[key];
+  if (shape === 'hidden') {
+    Object.defineProperty(target, key, { enumerable: false });
+  } else if (shape === 'getter') {
+    Object.defineProperty(target, key, { enumerable: true, configurable: true, get: () => value });
+  } else {
+    Object.defineProperty(target, key, {
+      enumerable: true,
+      configurable: true,
+      get: () => {
+        throw new Error('hostile');
+      },
+    });
+  }
+}
+
+type ReaderVerdict = 'ACCEPT' | 'REJECT';
+
+/** Never throws; REJECT is exactly `null`, ACCEPT is exactly the honest readback. */
+function expectReaderVerdict(read: () => unknown, verdict: ReaderVerdict): void {
+  let result: unknown;
+  expect(() => {
+    result = read();
+  }).not.toThrow();
+  if (verdict === 'REJECT') {
+    expect(result).toBeNull();
+  } else {
+    expect(result).toEqual(readRetirementAssessment(honestEnvelope(holdFacts())));
+  }
+}
+
+const OBJECT_SITES: readonly (readonly [string, (envelope: Record<string, unknown>) => object, string])[] = [
+  ['E envelope', (envelope) => envelope, 'evidenceId'],
+  ['B body', (envelope) => bodyOf(envelope), 'generatedAt'],
+  ['F fact map', (envelope) => factsOf(envelope), 'f1CandidateIdentity'],
+  ['R fact record', (envelope) => factsOf(envelope)['f5UniqueCommits'] as object, 'determinate'],
+];
+
+const OBJECT_ROWS: readonly (readonly [string, ReaderVerdict, (target: object, required: string) => void])[] = [
+  ['O1 exact valid', 'ACCEPT', () => undefined],
+  ['O2 + enumerable surplus', 'REJECT', (target) => {
+    (target as Record<string, unknown>)['mayDelete'] = true;
+  }],
+  ['O3 + non-enumerable surplus', 'REJECT', (target) => {
+    withHiddenKey(target);
+  }],
+  ['O4 + symbol', 'REJECT', (target) => {
+    withSymbol(target);
+  }],
+  ['O5 + non-enumerable symbol', 'REJECT', (target) => {
+    withSymbol(target, false);
+  }],
+  ['O6 required key non-enumerable', 'REJECT', (target, required) => {
+    redefine(target, required, 'hidden');
+  }],
+  ['O7 required key non-enumerable + enumerable surplus', 'REJECT', (target, required) => {
+    redefine(target, required, 'hidden');
+    (target as Record<string, unknown>)['mayDelete'] = true;
+  }],
+  ['O8 inherited surplus only', 'ACCEPT', (target) => {
+    Object.setPrototypeOf(target, { mayDelete: true });
+  }],
+  ['O9 required key as enumerable getter', 'REJECT', (target, required) => {
+    redefine(target, required, 'getter');
+  }],
+  ['O10 required key as throwing getter', 'REJECT', (target, required) => {
+    redefine(target, required, 'throwing');
+  }],
+];
+
+const ARRAY_ROWS: readonly (readonly [string, ReaderVerdict, (envelope: Record<string, unknown>) => void])[] = [
+  ['A1 ordinary dense valid', 'ACCEPT', () => undefined],
+  ['A2 + enumerable named', 'REJECT', (envelope) => {
+    (reasonCodesOf(envelope) as unknown as Record<string, unknown>)['mayDelete'] = true;
+  }],
+  ['A3 + non-enumerable named', 'REJECT', (envelope) => {
+    withHiddenKey(reasonCodesOf(envelope));
+  }],
+  ['A4 + own symbol', 'REJECT', (envelope) => {
+    withSymbol(reasonCodesOf(envelope));
+  }],
+  ['A4b + own non-enumerable symbol', 'REJECT', (envelope) => {
+    withSymbol(reasonCodesOf(envelope), false);
+  }],
+  ['A5 + own Symbol.iterator', 'REJECT', (envelope) => {
+    withSymbol(reasonCodesOf(envelope), true, Symbol.iterator);
+  }],
+  ['A6 + own arbitrary toJSON', 'REJECT', (envelope) => {
+    Object.defineProperty(reasonCodesOf(envelope), 'toJSON', {
+      value: () => ['FORGED'],
+      enumerable: false,
+      writable: true,
+      configurable: true,
+    });
+  }],
+  ['A7 + "4294967295"', 'REJECT', (envelope) => {
+    (reasonCodesOf(envelope) as unknown as Record<string, unknown>)['4294967295'] = 'X';
+  }],
+  ['A8 + "01"', 'REJECT', (envelope) => {
+    (reasonCodesOf(envelope) as unknown as Record<string, unknown>)['01'] = 'X';
+  }],
+  ['A9 + "-1"', 'REJECT', (envelope) => {
+    (reasonCodesOf(envelope) as unknown as Record<string, unknown>)['-1'] = 'X';
+  }],
+  ['A10 trailing hole', 'REJECT', (envelope) => {
+    const list = reasonCodesOf(envelope);
+    list.length = list.length + 1;
+  }],
+  ['A11 leading hole', 'REJECT', (envelope) => {
+    const list: unknown[] = [];
+    list[1] = RETIREMENT_REASON.GOVERNANCE_HOLD;
+    bodyOf(envelope)['reasonCodes'] = list;
+  }],
+  ['A12 benign freezeList toJSON shadow', 'ACCEPT', (envelope) => {
+    bodyOf(envelope)['reasonCodes'] = classifyRetirementCandidate(holdFacts()).reasonCodes;
+  }],
+  ['A14 over MAX_REASON_CODES', 'REJECT', (envelope) => {
+    bodyOf(envelope)['reasonCodes'] = new Array<string>(RETIREMENT_BOUNDS.MAX_REASON_CODES + 1).fill(
+      RETIREMENT_REASON.GOVERNANCE_HOLD,
+    );
+  }],
+  ['A15 non-enumerable index 0', 'REJECT', (envelope) => {
+    redefine(reasonCodesOf(envelope), '0', 'hidden');
+  }],
+  ['A16 index as getter', 'REJECT', (envelope) => {
+    redefine(reasonCodesOf(envelope), '0', 'getter');
+  }],
+  ['A17 Proxy whose ownKeys trap throws', 'REJECT', (envelope) => {
+    bodyOf(envelope)['reasonCodes'] = new Proxy(reasonCodesOf(envelope), {
+      ownKeys: () => {
+        throw new Error('hostile');
+      },
+    });
+  }],
+  ['P3 Array subclass (prototype out of scope, unchanged)', 'ACCEPT', (envelope) => {
+    class ReasonList extends Array<unknown> {}
+    bodyOf(envelope)['reasonCodes'] = ReasonList.from(reasonCodesOf(envelope));
+  }],
+];
+
+describe('hostile readers — exact own state at every level', () => {
+  for (const [row, verdict, mutate] of OBJECT_ROWS) {
+    for (const [site, pick, required] of OBJECT_SITES) {
+      it(`${row} at ${site}: ${verdict}`, () => {
+        const envelope = honestEnvelope(holdFacts());
+        mutate(pick(envelope), required);
+        expectReaderVerdict(() => readRetirementAssessment(envelope), verdict);
+      });
+    }
+  }
+
+  it('O11 body Proxy whose ownKeys trap throws: REJECT', () => {
+    const envelope = honestEnvelope(holdFacts());
+    envelope['body'] = new Proxy(bodyOf(envelope), {
+      ownKeys: () => {
+        throw new Error('hostile');
+      },
+    });
+    expectReaderVerdict(() => readRetirementAssessment(envelope), 'REJECT');
+  });
+
+  it('O12 body Proxy whose descriptor trap throws: REJECT', () => {
+    const envelope = honestEnvelope(holdFacts());
+    envelope['body'] = new Proxy(bodyOf(envelope), {
+      getOwnPropertyDescriptor: () => {
+        throw new Error('hostile');
+      },
+    });
+    expectReaderVerdict(() => readRetirementAssessment(envelope), 'REJECT');
+  });
+
+  it('O13 revoked Proxy body: REJECT', () => {
+    const envelope = honestEnvelope(holdFacts());
+    const revocable = Proxy.revocable({}, {});
+    revocable.revoke();
+    envelope['body'] = revocable.proxy;
+    expectReaderVerdict(() => readRetirementAssessment(envelope), 'REJECT');
+  });
+
+  it('M1 a body getter adding hidden and symbol state to the checked envelope: REJECT', () => {
+    const envelope = honestEnvelope(holdFacts());
+    const body = bodyOf(envelope);
+    const version = body['observerVersion'];
+    Object.defineProperty(body, 'observerVersion', {
+      enumerable: true,
+      configurable: true,
+      get: () => {
+        withHiddenKey(envelope);
+        withSymbol(envelope);
+        return version;
+      },
+    });
+    expectReaderVerdict(() => readRetirementAssessment(envelope), 'REJECT');
+  });
+
+  it('M2 a body getter adding symbol state to the checked fact map: REJECT', () => {
+    const envelope = honestEnvelope(holdFacts());
+    const body = bodyOf(envelope);
+    const version = body['observerVersion'];
+    Object.defineProperty(body, 'observerVersion', {
+      enumerable: true,
+      configurable: true,
+      get: () => {
+        withSymbol(factsOf(envelope));
+        return version;
+      },
+    });
+    expectReaderVerdict(() => readRetirementAssessment(envelope), 'REJECT');
+  });
+
+  it('M3 an index getter adding a named property to the checked array: REJECT', () => {
+    const envelope = honestEnvelope(holdFacts());
+    const list = reasonCodesOf(envelope);
+    const first = list[0];
+    Object.defineProperty(list, '0', {
+      enumerable: true,
+      configurable: true,
+      get: () => {
+        (list as unknown as Record<string, unknown>)['mayDelete'] = true;
+        return first;
+      },
+    });
+    expectReaderVerdict(() => readRetirementAssessment(envelope), 'REJECT');
+  });
+
+  for (const [row, verdict, mutate] of ARRAY_ROWS) {
+    it(`${row}: ${verdict}`, () => {
+      const envelope = honestEnvelope(holdFacts());
+      mutate(envelope);
+      expectReaderVerdict(() => readRetirementAssessment(envelope), verdict);
+    });
+  }
+
+  it('A13 empty valid []: ACCEPT', () => {
+    const input = honestEnvelope(eligibleFacts());
+    expect(reasonCodesOf(input)).toEqual([]);
+    expect(readRetirementAssessment(input)).toEqual(input);
+  });
+
+  it('D1 readRetirementFactRecords with an own symbol: REJECT', () => {
+    expectReaderVerdict(() => readRetirementFactRecords(withSymbol(validFactMap())), 'REJECT');
+  });
+
+  it('D2 readRetirementFactRecords with an own non-enumerable key: REJECT', () => {
+    expectReaderVerdict(() => readRetirementFactRecords(withHiddenKey(validFactMap())), 'REJECT');
+  });
+
+  it('P1 null-prototype body (prototype out of scope, unchanged): ACCEPT', () => {
+    const envelope = honestEnvelope(holdFacts());
+    Object.setPrototypeOf(bodyOf(envelope), null);
+    expectReaderVerdict(() => readRetirementAssessment(envelope), 'ACCEPT');
+  });
+
+  it('P2 custom-prototype body with exact own keys (prototype out of scope, unchanged): ACCEPT', () => {
+    const envelope = honestEnvelope(holdFacts());
+    Object.setPrototypeOf(bodyOf(envelope), { x: 1 });
+    expectReaderVerdict(() => readRetirementAssessment(envelope), 'ACCEPT');
+  });
+
+  it('R1 the reader’s own frozen readback re-reads to itself: ACCEPT', () => {
+    const first = readRetirementAssessment(honestEnvelope(holdFacts()));
+    expect(first).not.toBeNull();
+    expect(readRetirementAssessment(first)).toEqual(first);
+  });
+
+  for (const [label, facts] of [
+    ['eligible', eligibleFacts()],
+    ['preserve-for-history', preserveFacts()],
+    ['blocked', blockedFacts()],
+    ['indeterminate', withFact(eligibleFacts(), 'f8DependencyClearance', INDETERMINATE)],
+    ['contradictory', contradictoryFacts()],
+    ['multi-reason', twoReasonFacts()],
+    ['governance-hold', holdFacts()],
+  ] as readonly (readonly [string, RetirementFacts])[]) {
+    it(`reads a valid ${label} envelope back unchanged, AB-CJSON-1 bytes included`, () => {
+      const input = honestEnvelope(facts);
+      const read = readRetirementAssessment(input);
+
+      expect(read).toEqual(input);
+      expect(Object.isFrozen(read?.body.reasonCodes)).toBe(true);
+      expect(Object.getPrototypeOf(read?.body)).toBeNull();
+      expect(canonicalizeAssessmentBody(read?.body)).toBe(canonicalizeAssessmentBody(bodyOf(input)));
+    });
+  }
+});
+
+/* ------------------------------------------------------------------------- *
  * AB-CJSON-1
  * ------------------------------------------------------------------------- */
 
